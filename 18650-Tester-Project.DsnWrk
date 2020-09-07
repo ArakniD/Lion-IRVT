@@ -1,0 +1,10 @@
+[ProjectGroup]
+Version=1.0
+[Project1]
+ProjectPath=References\Ti PMP15043\PMP15043.PrjPcb
+[Project2]
+ProjectPath=References\Ti SV601272A(2_12_2019)\SV601272A.PrjPCB
+[Project3]
+ProjectPath=..\..\SpotWelder\Source\SpotWelder.PrjPcb
+[Project4]
+ProjectPath=Hardware\schematics\Lion-IRVT\Lion-IRVT.PrjPcb
