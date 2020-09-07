@@ -1,0 +1,6 @@
+*.log
+*.zip
+References/*
+__Previews/*
+Hardware/schematics/Lion-IRVT/__Previews/*
+Hardware/schematics/Lion-IRVT/Celestial Altium Library - altium_library.DbLib
