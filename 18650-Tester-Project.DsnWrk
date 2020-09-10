@@ -10,3 +10,5 @@ ProjectPath=Hardware\schematics\Lion-IRVT\Lion-IRVT.PrjPcb
 ProjectPath=References\Footprints\AltiumDesigner\2020-09-07_04-42-35\UL_Import.PrjScr
 [Project5]
 ProjectPath=References\ul_25SVPF330M\AltiumDesigner\2020-09-07_06-58-36\2020-09-07_06-58-36.LibPkg
+[Project6]
+ProjectPath=References\ul_OPA180ID\AltiumDesigner\2020-09-07_10-30-31\2020-09-07_10-30-31.LibPkg
