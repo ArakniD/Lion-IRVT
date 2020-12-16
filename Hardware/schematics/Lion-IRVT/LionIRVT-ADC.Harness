@@ -1,0 +1,2 @@
+MUX.SLOT=VSense,ISense,Ivcom
+SPI=MISO,MOSI,CS,SCLK

@@ -1,0 +1,3 @@
+CNTRL.SLOT=VSet,ISet,Ivcom,VSense,ISense
+MUX.SLOT=VSense,ISense,Ivcom
+SPI=SCLK,MOSI,MISO,CS

@@ -1,10 +1,6 @@
 [ProjectGroup]
 Version=1.0
 [Project1]
-ProjectPath=References\Ti PMP15043\PMP15043.PrjPcb
-[Project2]
-ProjectPath=References\Ti SV601272A(2_12_2019)\SV601272A.PrjPCB
-[Project3]
-ProjectPath=Hardware\schematics\Lion-IRVT\Lion-IRVT.PrjPcb
-[Project4]
 ProjectPath=References\Footprints\AltiumDesigner\2020-09-07_04-42-35\UL_Import.PrjScr
+[Project2]
+ProjectPath=Hardware\schematics\TIDA-010086\TIDA-010086_mod.PrjPcb
