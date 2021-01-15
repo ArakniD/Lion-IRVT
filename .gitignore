@@ -8,3 +8,5 @@ Hardware/schematics/*.zip
 Hardware/schematics/TIDA-010086/Project Logs for TIDA-010086_mod/*
 Hardware/schematics/TIDA-010086/__Previews/*
 Hardware/schematics/TIDA-010086/Project Outputs/*
+*.SchDocPreview
+*.bak

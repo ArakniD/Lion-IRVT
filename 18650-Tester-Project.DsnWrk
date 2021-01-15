@@ -4,3 +4,7 @@ Version=1.0
 ProjectPath=References\Footprints\AltiumDesigner\2020-09-07_04-42-35\UL_Import.PrjScr
 [Project2]
 ProjectPath=Hardware\schematics\TIDA-010086\TIDA-010086_mod.PrjPcb
+[Project3]
+ProjectPath=Hardware\schematics\controlCARD\TMDSCNCD28379D\R1_3\Imported F2837x_180controlCARD_R1_3_SCH_PADS.PrjPcb\F2837x_180controlCARD_R1_3_SCH_PADS.PrjPcb
+[Project4]
+ProjectPath=..\..\Hardware\Main\MAT\BatPack\BatPack-BQ40Z60-LTO.PrjPcb
