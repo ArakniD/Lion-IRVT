@@ -8,3 +8,5 @@ ProjectPath=Hardware\schematics\TIDA-010086\TIDA-010086_mod.PrjPcb
 ProjectPath=Hardware\schematics\controlCARD\TMDSCNCD28379D\R1_3\Imported F2837x_180controlCARD_R1_3_SCH_PADS.PrjPcb\F2837x_180controlCARD_R1_3_SCH_PADS.PrjPcb
 [Project4]
 ProjectPath=..\..\Hardware\Main\MAT\BatPack\BatPack-BQ40Z60-LTO.PrjPcb
+[Project5]
+ProjectPath=..\scripts-libraries\Scripts - PCB\AdjustDesignators2\Adjust Designators 2.PrjScr
