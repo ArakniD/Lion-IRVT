@@ -1,0 +1,2 @@
+Texas Instruments
+SUBCKT OPA188         IN+ IN- VCC VEE OUT  Texas:OPA188 [OpAmp]

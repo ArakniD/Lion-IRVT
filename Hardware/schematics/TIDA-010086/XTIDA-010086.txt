@@ -1,0 +1,110 @@
+Board Information Report
+Filename     : C:\sandbox\github\Lion-IRVT\Hardware\schematics\TIDA-010086\XTIDA-010086.PcbDoc
+Date         : 14/12/2020
+Time         : 9:30:38 PM
+Time Elapsed : 00:00:00
+
+General
+    Board Size, 375mmx210mm
+    Components on board, 1864
+count : 2
+
+Non-Plated Hole Size, Pads, Vias
+    1.4mm, 2, 0
+    3.2mm, 10, 0
+count : 2
+
+Plated Hole Size, Pads, Vias
+    0mm, 4508, 0
+    0.2mm, 0, 40
+    0.3048mm, 0, 1227
+    0.4064mm, 0, 5455
+    0.81mm, 2, 0
+    0.9mm, 67, 0
+    1.016mm, 136, 0
+    1.02mm, 3, 0
+    1.1mm, 36, 0
+    1.27mm, 12, 0
+    1.65mm, 3, 0
+    3.2mm, 0, 12
+    3.556mm, 0, 16
+    4.7752mm, 2, 0
+count : 14
+
+Non-Plated Slot Size / Length, Pads
+count : 0
+
+Plated Slot Size / Length, Pads
+count : 0
+
+Top Layer Annular Ring Size, Count
+    0mm, 10
+    0mm, 2
+    0.3mm, 40
+    0.3048mm, 1227
+    0.4064mm, 5455
+    0.49mm, 2
+    0.5mm, 32
+    0.53mm, 3
+    0.6mm, 35
+    0.7662mm, 3
+    1.016mm, 136
+    1.27mm, 12
+    1.4mm, 36
+    1.8mm, 12
+    1.894mm, 16
+    9.1948mm, 2
+count : 16
+
+Bottom Layer Annular Ring Size, Count
+    0mm, 10
+    0mm, 2
+    0.3mm, 40
+    0.3048mm, 1227
+    0.4064mm, 5455
+    0.49mm, 2
+    0.5mm, 32
+    0.53mm, 3
+    0.6mm, 35
+    0.7662mm, 3
+    1.016mm, 136
+    1.27mm, 12
+    1.4mm, 36
+    1.8mm, 12
+    1.894mm, 16
+    9.1948mm, 2
+count : 16
+
+Track Width, Count
+    0mm, 2
+    0.0025mm, 6877
+    0.0254mm, 1220
+    0.05mm, 388
+    0.07mm, 96
+    0.0762mm, 8
+    0.1mm, 24489
+    0.127mm, 7048
+    0.15mm, 8
+    0.1524mm, 1593
+    0.17mm, 64
+    0.175mm, 22
+    0.1778mm, 7353
+    0.2mm, 1444
+    0.2032mm, 184
+    0.254mm, 6742
+    0.3048mm, 67
+    0.3556mm, 3
+    0.381mm, 2049
+    0.5mm, 51
+    0.504mm, 1
+    0.508mm, 725
+    0.541mm, 876
+    0.6mm, 7
+    0.635mm, 72
+    0.7mm, 15
+    0.762mm, 64
+    0.889mm, 7
+    1mm, 44
+    1.016mm, 2
+    2mm, 19
+count : 31
