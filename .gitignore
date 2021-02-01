@@ -1,5 +1,10 @@
 *.log
-*.zip
+*.SchDoc.Zip
+*.PrjPcb.Zip
+*.PcbDoc.Zip
+*.PcbLib.Zip
+*.BomDoc.Zip
+*.SchLib.Zip
 References/*
 __Previews/*
 Hardware/schematics/Lion-IRVT/__Previews/*
