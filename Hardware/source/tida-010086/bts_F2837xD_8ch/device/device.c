@@ -81,6 +81,8 @@ void Device_init(void)
     // are created by the linker. Refer to the device .cmd file.
     //
     memcpy(&RamfuncsRunStart, &RamfuncsLoadStart, (size_t)&RamfuncsLoadSize);
+    memcpy(&isrcodefuncsRunStart,&isrcodefuncsLoadStart,  (size_t)&isrcodefuncsLoadSize );
+    memcpy(&Cla1ConstRunStart,&Cla1ConstLoadStart, (size_t)&Cla1ConstLoadSize );
 
     //
     // Call Flash Initialization to setup flash waitstates. This function must

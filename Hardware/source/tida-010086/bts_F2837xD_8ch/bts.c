@@ -162,8 +162,8 @@ void BTS_initUserVariables(void)
 
     BTS_userInput_ch1.IoutGain_pu = BTS_IoutGain_ch1_pu;
     BTS_userInput_ch1.IoutOffset_pu = BTS_IoutOffset_ch1_pu;
-    BTS_userInput_ch1.IoutGain_A = BTS_IoutGain_ch1_pu;
-    BTS_userInput_ch1.IoutOffset_A = BTS_IoutOffset_ch1_pu;
+    BTS_userInput_ch1.IoutGain_A = BTS_IoutGain_ch1_A;
+    BTS_userInput_ch1.IoutOffset_A = BTS_IoutOffset_ch1_A;
 
     BTS_userInput_ch1.VoutGain_pu = BTS_VoutGain_ch1_pu;
     BTS_userInput_ch1.VoutOffset_pu = BTS_VoutOffset_ch1_pu;
@@ -179,8 +179,8 @@ void BTS_initUserVariables(void)
 
     BTS_userInput_ch2.IoutGain_pu = BTS_IoutGain_ch2_pu;
     BTS_userInput_ch2.IoutOffset_pu = BTS_IoutOffset_ch2_pu;
-    BTS_userInput_ch2.IoutGain_A = BTS_IoutGain_ch2_pu;
-    BTS_userInput_ch2.IoutOffset_A = BTS_IoutOffset_ch2_pu;
+    BTS_userInput_ch2.IoutGain_A = BTS_IoutGain_ch2_A;
+    BTS_userInput_ch2.IoutOffset_A = BTS_IoutOffset_ch2_A;
 
     BTS_userInput_ch2.VoutGain_pu = BTS_VoutGain_ch2_pu;
     BTS_userInput_ch2.VoutOffset_pu = BTS_VoutOffset_ch2_pu;
@@ -196,8 +196,8 @@ void BTS_initUserVariables(void)
 
     BTS_userInput_ch3.IoutGain_pu = BTS_IoutGain_ch3_pu;
     BTS_userInput_ch3.IoutOffset_pu = BTS_IoutOffset_ch3_pu;
-    BTS_userInput_ch3.IoutGain_A = BTS_IoutGain_ch3_pu;
-    BTS_userInput_ch3.IoutOffset_A = BTS_IoutOffset_ch3_pu;
+    BTS_userInput_ch3.IoutGain_A = BTS_IoutGain_ch3_A;
+    BTS_userInput_ch3.IoutOffset_A = BTS_IoutOffset_ch3_A;
 
     BTS_userInput_ch3.VoutGain_pu = BTS_VoutGain_ch3_pu;
     BTS_userInput_ch3.VoutOffset_pu = BTS_VoutOffset_ch3_pu;
@@ -213,8 +213,8 @@ void BTS_initUserVariables(void)
 
     BTS_userInput_ch4.IoutGain_pu = BTS_IoutGain_ch4_pu;
     BTS_userInput_ch4.IoutOffset_pu = BTS_IoutOffset_ch4_pu;
-    BTS_userInput_ch4.IoutGain_A = BTS_IoutGain_ch4_pu;
-    BTS_userInput_ch4.IoutOffset_A = BTS_IoutOffset_ch4_pu;
+    BTS_userInput_ch4.IoutGain_A = BTS_IoutGain_ch4_A;
+    BTS_userInput_ch4.IoutOffset_A = BTS_IoutOffset_ch4_A;
 
     BTS_userInput_ch4.VoutGain_pu = BTS_VoutGain_ch4_pu;
     BTS_userInput_ch4.VoutOffset_pu = BTS_VoutOffset_ch4_pu;
@@ -230,8 +230,8 @@ void BTS_initUserVariables(void)
 
     BTS_userInput_ch5.IoutGain_pu = BTS_IoutGain_ch5_pu;
     BTS_userInput_ch5.IoutOffset_pu = BTS_IoutOffset_ch5_pu;
-    BTS_userInput_ch5.IoutGain_A = BTS_IoutGain_ch5_pu;
-    BTS_userInput_ch5.IoutOffset_A = BTS_IoutOffset_ch5_pu;
+    BTS_userInput_ch5.IoutGain_A = BTS_IoutGain_ch5_A;
+    BTS_userInput_ch5.IoutOffset_A = BTS_IoutOffset_ch5_A;
 
     BTS_userInput_ch5.VoutGain_pu = BTS_VoutGain_ch5_pu;
     BTS_userInput_ch5.VoutOffset_pu = BTS_VoutOffset_ch5_pu;
@@ -247,8 +247,8 @@ void BTS_initUserVariables(void)
 
     BTS_userInput_ch6.IoutGain_pu = BTS_IoutGain_ch6_pu;
     BTS_userInput_ch6.IoutOffset_pu = BTS_IoutOffset_ch6_pu;
-    BTS_userInput_ch6.IoutGain_A = BTS_IoutGain_ch6_pu;
-    BTS_userInput_ch6.IoutOffset_A = BTS_IoutOffset_ch6_pu;
+    BTS_userInput_ch6.IoutGain_A = BTS_IoutGain_ch6_A;
+    BTS_userInput_ch6.IoutOffset_A = BTS_IoutOffset_ch6_A;
 
     BTS_userInput_ch6.VoutGain_pu = BTS_VoutGain_ch6_pu;
     BTS_userInput_ch6.VoutOffset_pu = BTS_VoutOffset_ch6_pu;
@@ -264,8 +264,8 @@ void BTS_initUserVariables(void)
 
     BTS_userInput_ch7.IoutGain_pu = BTS_IoutGain_ch7_pu;
     BTS_userInput_ch7.IoutOffset_pu = BTS_IoutOffset_ch7_pu;
-    BTS_userInput_ch7.IoutGain_A = BTS_IoutGain_ch7_pu;
-    BTS_userInput_ch7.IoutOffset_A = BTS_IoutOffset_ch7_pu;
+    BTS_userInput_ch7.IoutGain_A = BTS_IoutGain_ch7_A;
+    BTS_userInput_ch7.IoutOffset_A = BTS_IoutOffset_ch7_A;
 
     BTS_userInput_ch7.VoutGain_pu = BTS_VoutGain_ch7_pu;
     BTS_userInput_ch7.VoutOffset_pu = BTS_VoutOffset_ch7_pu;
@@ -281,8 +281,8 @@ void BTS_initUserVariables(void)
 
     BTS_userInput_ch8.IoutGain_pu = BTS_IoutGain_ch8_pu;
     BTS_userInput_ch8.IoutOffset_pu = BTS_IoutOffset_ch8_pu;
-    BTS_userInput_ch8.IoutGain_A = BTS_IoutGain_ch8_pu;
-    BTS_userInput_ch8.IoutOffset_A = BTS_IoutOffset_ch8_pu;
+    BTS_userInput_ch8.IoutGain_A = BTS_IoutGain_ch8_A;
+    BTS_userInput_ch8.IoutOffset_A = BTS_IoutOffset_ch8_A;
 
     BTS_userInput_ch8.VoutGain_pu = BTS_VoutGain_ch8_pu;
     BTS_userInput_ch8.VoutOffset_pu = BTS_VoutOffset_ch8_pu;

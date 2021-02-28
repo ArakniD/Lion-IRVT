@@ -11,35 +11,36 @@
 
 #include "bts_user_calibration.h"
 
+#define BTS_ENABLE_DETECT_CODE (false)
 #define BTS_ENABLE_CH1 (true)
-#define BTS_ENABLE_CH2 (true)
-#define BTS_ENABLE_CH3 (true)
-#define BTS_ENABLE_CH4 (true)
-#define BTS_ENABLE_CH5 (true)
-#define BTS_ENABLE_CH6 (true)
-#define BTS_ENABLE_CH7 (true)
-#define BTS_ENABLE_CH8 (true)
+#define BTS_ENABLE_CH2 (false)
+#define BTS_ENABLE_CH3 (false)
+#define BTS_ENABLE_CH4 (false)
+#define BTS_ENABLE_CH5 (false)
+#define BTS_ENABLE_CH6 (false)
+#define BTS_ENABLE_CH7 (false)
+#define BTS_ENABLE_CH8 (false)
 
 #define BTS_TRIP_CODE   (true)
 #define BTS_OCP_TRIGGER (false)
-#define BTS_USER_DEFAULT_TRIP_A           ((float32_t)12.0)
+#define BTS_USER_DEFAULT_TRIP_A           ((float32_t)8)
 #define BTS_USER_DEFAULT_TRIP_pu (BTS_IoutGain_ch1_pu *BTS_USER_DEFAULT_TRIP_A +BTS_IoutOffset_ch1_pu)
 #define BTS_USER_DEFAULT_TRIP_16b ((int16_t)(BTS_USER_DEFAULT_TRIP_pu *(float32_t)32768.0))
 #define BTS_USER_DEFAULT_TRIP_N_16b (-1*BTS_USER_DEFAULT_TRIP_16b)
+
+#define BTS_SFRA_MODE_CC_PLANT  0
+#define BTS_SFRA_MODE_CC_CLOSED 1
+
+#define BTS_SFRA_ENABLED (true)
+#define BTS_SFRA_CH_SELECT BTS_SFRA_CH1
 
 #define BTS_ISR_MODE BTS_ISR_MODE_CLOSED_LOOP
 #define BTS_ISR_MODE_OPEN_LOOP 1
 #define BTS_ISR_MODE_CLOSED_LOOP 2
 
-#define BTS_ISR_CL_MODE BTS_ISR_CL_MODE_CCCV
-
 #define BTS_ISR_CL_MODE_CCCV 1
 #define BTS_ISR_CL_MODE_CV 2
 #define BTS_ISR_CL_MODE_CC 3
-
-
-#define BTS_SFRA_ENABLED (false)
-#define BTS_SFRA_CH_SELECT BTS_SFRA_CH1
 
 #define BTS_SFRA_CH1 (1)
 #define BTS_SFRA_CH2 (2)
@@ -50,13 +51,10 @@
 #define BTS_SFRA_CH7 (7)
 #define BTS_SFRA_CH8 (8)
 
-
-#define BTS_SFRA_CAPTURE_SETTINGS BTS_SFRA_CAPTURE_ISET_IOUT
 #define BTS_SFRA_CAPTURE_DUTY_IOUT (1)
 #define BTS_SFRA_CAPTURE_ISET_IOUT (2)
 #define BTS_SFRA_CAPTURE_ISET_VOUT (3)
 #define BTS_SFRA_CAPTURE_VSET_VOUT (4)
-
 
 #define BTS_LAB_OPEN_LOOP_ACMC_IOUT (1)
 #define BTS_LAB_CLOSED_LOOP_ACMC_IOUT (2)
@@ -64,16 +62,29 @@
 #define BTS_LAB_CLOSED_LOOP_ACMC_VOUT (4)
 #define BTS_LAB_CLOSED_LOOP_CCCV (5)
 
+#define BTS_LAB_TYPE    BTS_LAB_CLOSED_LOOP_ACMC_IOUT
 
+
+#if BTS_LAB_TYPE == BTS_LAB_OPEN_LOOP_ACMC_IOUT
+#define BTS_SFRA_CAPTURE_SETTINGS BTS_SFRA_CAPTURE_DUTY_IOUT
+#define BTS_ISR_CL_MODE BTS_ISR_CL_MODE_CC
+#define BTS_ISR_MODE BTS_ISR_MODE_OPEN_LOOP
+#elif BTS_LAB_TYPE == BTS_LAB_CLOSED_LOOP_ACMC_IOUT
+#define BTS_SFRA_CAPTURE_SETTINGS BTS_SFRA_CAPTURE_ISET_IOUT
+#define BTS_ISR_CL_MODE BTS_ISR_CL_MODE_CC
+#define BTS_ISR_MODE BTS_ISR_MODE_CLOSED_LOOP
+#else
+#define BTS_ISR_CL_MODE BTS_ISR_CL_MODE_CCCV
+#define BTS_ISR_MODE BTS_ISR_MODE_CLOSED_LOOP
+#endif
 
 //
 // Device clocking conditions
 //
-#define BTS_SYSCLK_HZ        ((float32_t)100 * 1000000)
+#define BTS_SYSCLK_HZ        DEVICE_SYSCLK_FREQ
 #define BTS_SYSCLK_NS        ((float32_t)1000000000 / BTS_SYSCLK_HZ)
-#define BTS_EPWM_HZ          ((float32_t)100 * 1000000)
+#define BTS_EPWM_HZ          (DEVICE_SYSCLK_FREQ/2)
 #define BTS_EPWM_NS          ((float32_t)1000000000 / BTS_EPWM_HZ)
-#define BTS_INTOSC_HZ        ((float32_t) 10 * 1000000)
 
 
 //
@@ -84,8 +95,8 @@
 #define TASKC_CPUTIMER_BASE CPUTIMER2_BASE
 
 #define TASKA_FREQ_HZ         ((uint16_t)1000)
-#define TASKB_FREQ_HZ         ((uint16_t) 100)
-#define TASKC_FREQ_HZ         ((uint16_t)  10)
+#define TASKB_FREQ_HZ         ((uint16_t) 200)
+#define TASKC_FREQ_HZ         ((uint16_t)  20)
 
 #define GET_TASKA_TIMER_OVERFLOW_STATUS CPUTimer_getTimerOverflowStatus(TASKA_CPUTIMER_BASE)
 #define CLEAR_TASKA_TIMER_OVERFLOW_FLAG CPUTimer_clearOverflowFlag(TASKA_CPUTIMER_BASE)
@@ -100,14 +111,14 @@
 #define BTS_DRV_EPWM_HR_ENABLED           true
 #define BTS_EPWM_HR_ENABLED               true
 
-#define BTS_DRV_EPWM_BASE                 EPWM2_BASE //change here
-#define BTS_DRV_EPWM_NUM                  ((uint16_t)2)
-#define BTS_DRV_EPWM_H_GPIO               ((uint16_t)2)
-#define BTS_DRV_EPWM_H_PIN_CONFIG_EPWM    GPIO_2_EPWM2A
-#define BTS_DRV_EPWM_H_PIN_CONFIG_GPIO    GPIO_2_GPIO2
+#define BTS_DRV_EPWM_BASE                 EPWM1_BASE //change here
+#define BTS_DRV_EPWM_NUM                  ((uint16_t)1)
+#define BTS_DRV_EPWM_H_GPIO               ((uint16_t)1)
+#define BTS_DRV_EPWM_H_PIN_CONFIG_EPWM    GPIO_0_EPWM1A
+#define BTS_DRV_EPWM_H_PIN_CONFIG_GPIO    GPIO_0_GPIO0
 #define BTS_DRV_EPWM_L_GPIO               ((uint16_t)3)
-#define BTS_DRV_EPWM_L_PIN_CONFIG_EPWM    GPIO_3_EPWM2B
-#define BTS_DRV_EPWM_L_PIN_CONFIG_GPIO    GPIO_3_GPIO3
+#define BTS_DRV_EPWM_L_PIN_CONFIG_EPWM    GPIO_1_EPWM1B
+#define BTS_DRV_EPWM_L_PIN_CONFIG_GPIO    GPIO_1_GPIO1
 
 //CHANNEL 1
 #define BTS_EPWM_BASE_CH1                 EPWM1_BASE
@@ -210,15 +221,16 @@
 #define BTS_SPI_RESET_GPIO_ADC1           ((uint16_t)24)
 #define BTS_SPI_DOUT_GPIO_ADC1            ((uint16_t)17)
 #define BTS_SPI_DIN_GPIO_ADC1             ((uint16_t)16)
-#define BTS_SPI_SCLK_GPIO_ADC             ((uint16_t)18)
+#define BTS_SPI_SCLK_GPIO_ADC1            ((uint16_t)18)
 #define BTS_SPI_CS_PIN_CONFIG_ADC1        GPIO_19_GPIO19
 #define BTS_SPI_DRDY_PIN_CONFIG_ADC1      GPIO_25_GPIO25
 #define BTS_SPI_RESET_PIN_CONFIG_ADC1     GPIO_24_GPIO24
 #define BTS_SPI_DOUT_PIN_CONFIG_ADC1      GPIO_17_SPISOMIA
 #define BTS_SPI_DIN_PIN_CONFIG_ADC1       GPIO_16_SPISIMOA
-#define BTS_SPI_SCLK_PIN_CONFIG_ADC       GPIO_18_SPICLKA
-#define BTS_SPI_DRDY_XINT_ADC1            XINT1
-#define BTS_SPI_DRDY_CINT_ADC1
+#define BTS_SPI_SCLK_PIN_CONFIG_ADC1      GPIO_18_SPICLKA
+#define BTS_SPI_DRDY_XINT_ADC1            INT_XINT1
+#define BTS_PSI_DRDY_XINT_GPIO1           GPIO_INT_XINT1
+#define BTS_SPI_DRDY_CINT_ADC1            INT_SPIA_RX
 #define BTS_DRDY_ADC1                     ISR1
 #define BTS_RXFIFO_SPI1                   ISR2
 
@@ -227,67 +239,116 @@
 #define BTS_SPI_CS_GPIO_ADC2              ((uint16_t)53)
 #define BTS_SPI_DRDY_GPIO_ADC2            ((uint16_t)49)
 #define BTS_SPI_RESET_GPIO_ADC2           ((uint16_t)48)
-#define BTS_SPI_DOUT_GPIO_ADC1            ((uint16_t)51)
-#define BTS_SPI_DIN_GPIO_ADC1             ((uint16_t)50)
-#define BTS_SPI_SCLK_GPIO_ADC             ((uint16_t)52)
+#define BTS_SPI_DOUT_GPIO_ADC2            ((uint16_t)51)
+#define BTS_SPI_DIN_GPIO_ADC2             ((uint16_t)50)
+#define BTS_SPI_SCLK_GPIO_ADC2            ((uint16_t)52)
 #define BTS_SPI_CS_PIN_CONFIG_ADC2        GPIO_53_GPIO53
 #define BTS_SPI_DRDY_PIN_CONFIG_ADC2      GPIO_49_GPIO49
 #define BTS_SPI_RESET_PIN_CONFIG_ADC2     GPIO_48_GPIO48
-#define BTS_SPI_DOUT_PIN_CONFIG_ADC1      GPIO_51_SPISOMIC
-#define BTS_SPI_DIN_PIN_CONFIG_ADC1       GPIO_50_SPISIMOC
-#define BTS_SPI_SCLK_PIN_CONFIG_ADC       GPIO_52_SPICLKC
-#define BTS_SPI_DRDY_XINT_ADC2            XINT2
-#define BTS_SPI_DRDY_CINT_ADC2
+#define BTS_SPI_DOUT_PIN_CONFIG_ADC2      GPIO_51_SPISOMIC
+#define BTS_SPI_DIN_PIN_CONFIG_ADC2       GPIO_50_SPISIMOC
+#define BTS_SPI_SCLK_PIN_CONFIG_ADC2      GPIO_52_SPICLKC
+#define BTS_SPI_DRDY_XINT_ADC2            INT_XINT2
+#define BTS_PSI_DRDY_XINT_GPIO2           GPIO_INT_XINT2
+#define BTS_SPI_DRDY_CINT_ADC2            INT_SPIC_RX
 #define BTS_DRDY_ADC2                     ISR3
-#define BTS_RXFIFO_SPI3                   ISR4
+#define BTS_RXFIFO_SPI2                   ISR4
 
 //
 
 
-#define BTS_senseAverageFactor 32U
+#define BTS_senseAverageFactor 32 //32U
 
-#define VIN ((float32_t)12V)
+#define VIN ((float32_t)12)
 
+
+#if 0
 
 #define BTS_DCL_CC_B0                ((float32_t) 0.0342955642)
 #define BTS_DCL_CC_B1                ((float32_t)-0.0611383610)
 #define BTS_DCL_CC_B2                ((float32_t) 0.0270789596)
 #define BTS_DCL_CC_A1                ((float32_t)-1.9244278933)
 #define BTS_DCL_CC_A2                ((float32_t) 0.9244278933)
+#elif 0
+//Kdc 150
+//Fz0 0.1
+//Fz1 0.7
+//Fp1 0.5
 
+#define BTS_DCL_CC_B0                ((float32_t) 0.1755347)
+#define BTS_DCL_CC_B1                ((float32_t) -0.3244942)
+#define BTS_DCL_CC_B2                ((float32_t)  0.1494189)
+#define BTS_DCL_CC_A1                ((float32_t) -1.9042804)
+#define BTS_DCL_CC_A2                ((float32_t) 0.9042804)
+#else
+//Kdc 50
+//Fz0 0.1
+//Fz1 0.5
+//Fp1 0.2
+#define BTS_DCL_CC_B0                ((float32_t) 0.0331015)
+#define BTS_DCL_CC_B1                ((float32_t) -0.0623757)
+#define BTS_DCL_CC_B2                ((float32_t)  0.0293372)
+#define BTS_DCL_CC_A1                ((float32_t) -1.9605802)
+#define BTS_DCL_CC_A2                ((float32_t) 0.9605802)
+#endif
 
 #define BTS_DCL_CV_KDC               ((float32_t)5000)
 #define BTS_DCL_CV_Z0                ((float32_t)0.100)
-#define BTS_DCL_CV_Z1                ((float32_t)1.000)
-#define BTS_DCL_CV_P1                ((float32_t)1.000)
+#define BTS_DCL_CV_Z1                ((float32_t)1.000) // 2
+#define BTS_DCL_CV_P1                ((float32_t)1.000) // 2
 
 
+#if 0
 #define BTS_DCL_CV_B0                ((float32_t) 1.3718226)
 #define BTS_DCL_CV_B1                ((float32_t)-2.4455344)
 #define BTS_DCL_CV_B2                ((float32_t) 1.0831584)
 #define BTS_DCL_CV_A1                ((float32_t)-1.9244279)
 #define BTS_DCL_CV_A2                ((float32_t) 0.9244279)
+#else
+#define BTS_DCL_CV_KDC               ((float32_t)5000)
+#define BTS_DCL_CV_Z0                ((float32_t)0.100)
+#define BTS_DCL_CV_Z1                ((float32_t)2.000) // 2
+#define BTS_DCL_CV_P1                ((float32_t)2.000) // 2
 
+#define BTS_DCL_CV_B0                ((float32_t) 8.0377472)
+#define BTS_DCL_CV_B1                ((float32_t)-13.2244008)
+#define BTS_DCL_CV_B2                ((float32_t) 5.2402228)
+#define BTS_DCL_CV_A1                ((float32_t)-1.6651931)
+#define BTS_DCL_CV_A2                ((float32_t) 0.6651931)
+
+#endif
+
+
+#define BTS_SFRA_ISR_SRC_ADC 0
+#define BTS_SFRA_ISR_SRC_PWM 1
+#define BTS_SFRA_ISR_SRC                   BTS_SFRA_ISR_SRC_ADC
 
 #if(BTS_SFRA_ENABLED == true)
-//    #define BTS_SFRA_ISR_FREQ             BTS_DRV_EPWM_SWITCHING_FREQUENCY
-    #define BTS_SFRA_ISR_FREQ             ((float32_t)16000)
-    #define BTS_SFRA_FREQ_START           ((float32_t)10)
+    //#define BTS_SFRA_EPWM               (EPWM9_BASE)
+    //#define BTS_SFRA_TDRD               ((BTS_DRV_EPWM_SWITCHING_FREQUENCY / BTS_SFRA_ISR_FREQ_REQ ) - 1)
+#if (BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_ADC)
+    #define BTS_SFRA_ISR_FREQ             ((float32_t)31250)
+    #define BTS_SFRA_FREQ_LENGTH          ((int16_t)103)
+#else
+    #define BTS_SFRA_ISR_FREQ             ((float32_t)100000)
+    #define BTS_SFRA_FREQ_LENGTH          ((int16_t)120)
+#endif
+
+    #define BTS_SFRA_FREQ_START           ((float32_t)10.0f)
 
     //
     // SFRA step Multiply = 10^(1/No of steps per decade(35))
     //
-    #define BTS_SFRA_FREQ_STEP_MULTIPLY   ((float32_t)1.0680004)
-    #define BTS_SFRA_FREQ_LENGTH          ((int16_t)100)
+    #define BTS_SFRA_FREQ_STEP_MULTIPLY   ((float32_t) 1.0746078283213174972f)
 
 #if(BTS_SFRA_CAPTURE_SETTINGS == BTS_SFRA_CAPTURE_DUTY_IOUT)
-    #define BTS_SFRA_AMPLITUDE            ((float32_t)0.005)
+    #define BTS_SFRA_AMPLITUDE            ((float32_t)0.0075)
 #elif((BTS_SFRA_CAPTURE_SETTINGS==BTS_SFRA_CAPTURE_ISET_IOUT)||(BTS_SFRA_CAPTURE_SETTINGS==BTS_SFRA_CAPTURE_ISET_VOUT))
 #define BTS_SFRA_AMPLITUDE            ((float32_t)0.1)
 #elif(BTS_SFRA_CAPTURE_SETTINGS == BTS_SFRA_CAPTURE_VSET_VOUT)
 #define BTS_SFRA_AMPLITUDE            ((float32_t)0.005)
 #endif
-    #define BTS_SFRA_SWEEP_SPEED          ((int16_t)1)
+    #define BTS_SFRA_SWEEP_SPEED          ((int16_t)3)
 
     #define BTS_SFRA_GUI_SCI_BASE         SCIA_BASE
     #define BTS_SFRA_GUI_SCI_BAUDRATE     ((uint32_t)57600)
@@ -299,12 +360,12 @@
     #define BTS_SFRA_GUI_LED_ENABLE       ((uint16_t)1)
     #define BTS_SFRA_GUI_LED_GPIO         ((uint16_t)47)
     #define BTS_SFRA_GUI_LED_PIN_CONFIG   GPIO_47_GPIO47
-    #define BTS_SFRA_GUI_PLOT_OPTION      ((uint16_t)1)
+    #define BTS_SFRA_GUI_PLOT_OPTION      ((uint16_t)SFRA_GUI_PLOT_GH_H)
 #endif
 
-//#define BTS_SFRA_CHANNEL ((uint16_t)2)
+#define BTS_SFRA_CHANNEL 1
 
-#define BTS_DUTY_SET_MIN_PU               ((float32_t)0.00)
+#define BTS_DUTY_SET_MIN_PU               ((float32_t)0.0)
 #define BTS_DUTY_SET_MAX_PU               ((float32_t)0.55)
 
 
@@ -368,6 +429,21 @@
 
 #define BTS_DRV_EPWM_SWITCHING_FREQUENCY  ((float32_t)100 * 1000)
 
+#define BTS_DRV_ADC_EPWMCLK_DIV          EPWM_CLOCK_DIVIDER_1
+#define BTS_DRV_ADC_HSCLK_DIV            EPWM_HSCLOCK_DIVIDER_1
+
+#if(BTS_DRV_ADC_HSCLK_DIV == EPWM_HSCLOCK_DIVIDER_1)
+    #define BTS_DRV_ADC_TOTAL_CLKDIV     ((uint16_t)0x1 << BTS_DRV_ADC_EPWMCLK_DIV)
+#else
+    #define BTS_DRV_ADC_TOTAL_CLKDIV     (((uint16_t)0x1 << BTS_DRV_ADC_EPWMCLK_DIV) * (BUCK_DRV_ADC_HSCLK_DIV << 1))
+#endif
+
+#define BTS_DRV_ADC_PERIOD_TICKS         ((uint32_t)((BTS_EPWM_HZ) / BTS_DRV_ADC_SWITCHING_FREQUENCY / BTS_DRV_ADC_TOTAL_CLKDIV))
+#define BTS_DRV_ADC_TBPRD                ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS - 1)
+#define BTS_DRV_ADC_PERIOD_SEC           ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS / BTS_EPWM_HZ / 2)
+
+#define BTS_DRV_ADC_SWITCHING_FREQUENCY  ((float32_t)8000 * 1000)
+
 #if(BTS_DRV_EPWM_HR_ENABLED == true)
     #define BTS_DRV_EPWM_CMPAHR_BITS          8
     #define BTS_DRV_EPWM_CMPAHR_SCALE         ((uint16_t)0x1 << BUCK_DRV_EPWM_CMPAHR_BITS)
@@ -379,7 +455,7 @@
 //
 // Heart beat LED on board
 //
-#define BTS_RUN_LED_GPIO                  347
+#define BTS_RUN_LED_GPIO                  47
 #define BTS_RUN_LED_PIN_CONFIG            GPIO_47_GPIO47
 #define BTS_RUN_LED_PRESCALE              ((uint16_t)5)
 

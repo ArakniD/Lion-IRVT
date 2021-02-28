@@ -54,7 +54,7 @@ void BTS_HAL_setupDevice(void)
     // Initialize device clock and peripherals
     //
     Device_init();
-    SysCtl_setLowSpeedClock(SYSCTL_LSPCLK_PRESCALE_1);
+    //SysCtl_setLowSpeedClock(SYSCTL_LSPCLK_PRESCALE_1);
     //
     // Disable pin locks and enable internal pull-ups.
     //
@@ -160,7 +160,7 @@ void BTS_HAL_setupExAdc_ch1_4(void)
      */
 //        writeSingleRegister(MODE_ADDRESS, MODE_DEFAULT);
 
-    while(!GPIO_readPin(BTS_SPI_DRDY_GPIO_ADC1));
+    //while(!GPIO_readPin(BTS_SPI_DRDY_GPIO_ADC1));
 
     //adc 1 mode set
     //adc register 0x02
@@ -203,6 +203,25 @@ void BTS_HAL_setupExAdc_ch1_4(void)
     GPIO_writePin(BTS_SPI_CS_GPIO_ADC1, 1);
 
     SysCtl_delay(100000);
+#if 0
+    // desired 16 bit mode/////////////////////////////////
+    GPIO_writePin(BTS_SPI_CS_GPIO_ADC1, 0);
+    //wreg add
+    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0x6100); // adc address 0x02
+    SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC1);
+    //reg data
+    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0x0400); // adc address 0x02
+    SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC1);
+
+    //SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0x0000); // adc address 0x02
+    //SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC1);
+    //no crc
+//        SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0x0000); // adc address 0x02
+//        SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC1);
+    //cs bar high
+    GPIO_writePin(BTS_SPI_CS_GPIO_ADC1, 1);
+#endif
+    SysCtl_delay(100000);
 
     //adc register 0x03. mode register, 0xFF47, external reference ENABLED, OSR 128 16k SAMPLE RATE
     // cs1 bar low
@@ -211,11 +230,11 @@ void BTS_HAL_setupExAdc_ch1_4(void)
     SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0x6180); // adc address 0x02
     SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC1);
     //reg data
-    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0xFF47); // adc address 0x02
+    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0xFF43); // adc address 0x02
     SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC1);
     //crc
-    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0x0000); // adc address 0x02
-    SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC1);
+    //SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC1, 0x0000); // adc address 0x02
+    //SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC1);
     //cs bar high
     GPIO_writePin(BTS_SPI_CS_GPIO_ADC1, 1);
 
@@ -257,7 +276,7 @@ void BTS_HAL_setupExAdc_ch5_8(void)
      */
 //        writeSingleRegister(MODE_ADDRESS, MODE_DEFAULT);
 
-    while(!GPIO_readPin(BTS_SPI_DRDY_GPIO_ADC2));
+    //while(!GPIO_readPin(BTS_SPI_DRDY_GPIO_ADC2));
 
     //adc 1 mode set
     //adc register 0x02
@@ -302,17 +321,18 @@ void BTS_HAL_setupExAdc_ch5_8(void)
     SysCtl_delay(100000);
 
 
-    //adc register 0x03. mode register, 0xFF47, external reference ENABLED, OSR 128 16k SAMPLE RATE
+    //adc register 0x03. mode register, 0xFF47, external reference ENABLED, OSR 256 13.95k SAMPLE RATE ( 0xFF47)
+    //adc register 0x03. mode register, 0xFF4B, external reference ENABLED, OSR 512 13.95k SAMPLE RATE ( 0xFF47)
     // cs1 bar low
     GPIO_writePin(BTS_SPI_CS_GPIO_ADC2, 0);
     //wreg add
-    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC2, 0x6180); // adc address 0x02
+    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC2, 0x6180); // adc address 0x03
     SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC2);
     //reg data
-    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC2, 0xFF47); // adc address 0x02
+    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC2, 0xFF43); // adc address 0x03 // 0xFF47
     SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC2);
     //crc
-    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC2, 0x0000); // adc address 0x02
+    SPI_writeDataBlockingFIFO(BTS_SPI_BASE_ADC2, 0x0000); // adc address 0x03
     SPI_readDataBlockingFIFO(BTS_SPI_BASE_ADC2);
     //cs bar high
     GPIO_writePin(BTS_SPI_CS_GPIO_ADC2, 1);
@@ -327,46 +347,73 @@ void BTS_HAL_setupExAdc_ch5_8(void)
 void delay_ms_2(const uint32_t delay_time_ms)
 {
     /* --- INSERT YOUR CODE HERE --- */
-
-    const uint32_t cycles_per_loop = 3;
-    SysCtl_delay(delay_time_ms * SysCtl_getClock(100000000U) / (cycles_per_loop * 1000u));
-    //MAP_SysCtlDelay( delay_time_ms * getSysClockHz() / (cycles_per_loop * 1000u) );
+   const uint32_t cycles_per_loop = 3;
+   SysCtl_delay(delay_time_ms * SysCtl_getClock(100000000U) / (cycles_per_loop * 1000u));
+   //MAP_SysCtlDelay( delay_time_ms * getSysClockHz() / (cycles_per_loop * 1000u) );
 }
 
 
 
-void BTS_HAL_setupExAdcGpio(void)
+void BTS_HAL_setupExAdcGpio_Adc1(void)
 {
-
-#warning "need here"
     // configure xint GPIO for ADC ///////////////////////////////////
-    GPIO_setPinConfig(GPIO_40_GPIO40);
-    GPIO_setDirectionMode(40, GPIO_DIR_MODE_IN);
-    GPIO_setQualificationMode(40, GPIO_QUAL_SYNC);
+    GPIO_setPinConfig(BTS_SPI_DRDY_PIN_CONFIG_ADC1);
+    GPIO_setDirectionMode(BTS_SPI_DRDY_GPIO_ADC1, GPIO_DIR_MODE_IN);
+    GPIO_setQualificationMode(BTS_SPI_DRDY_GPIO_ADC1, GPIO_QUAL_SYNC);
     //
     // Select GPIO40 as XINT1
     //
-    GPIO_setInterruptPin(40, GPIO_INT_XINT1);
+    GPIO_setInterruptPin(BTS_SPI_DRDY_GPIO_ADC1, BTS_PSI_DRDY_XINT_GPIO1);
 
     //
     // Configure XINT1 to be a triggered by a falling edge and XINT2 to be
     // triggered by a rising edge.
     //
-    GPIO_setInterruptType(GPIO_INT_XINT1, GPIO_INT_TYPE_FALLING_EDGE);
+    GPIO_setInterruptType(BTS_PSI_DRDY_XINT_GPIO1, GPIO_INT_TYPE_FALLING_EDGE);
 
     //
     // Enable XINT1
     //
-    GPIO_enableInterrupt(GPIO_INT_XINT1);
+    GPIO_enableInterrupt(BTS_PSI_DRDY_XINT_GPIO1);
 
 
-    GPIO_setAnalogMode(22, GPIO_ANALOG_DISABLED); //pin 22 digital mode
+    GPIO_setAnalogMode(BTS_SPI_RESET_GPIO_ADC1, GPIO_ANALOG_DISABLED);    //pin 24 digital mode
     // configure reset pin
-    GPIO_setPadConfig(22, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO6
-    GPIO_writePin(22, 1);                            // Load output latch
-    GPIO_setPinConfig(GPIO_22_GPIO22
-                      );                // GPIO6 = GPIO6
-    GPIO_setDirectionMode(22, GPIO_DIR_MODE_OUT);
+    GPIO_setPadConfig(BTS_SPI_RESET_GPIO_ADC1, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO24
+    GPIO_writePin(BTS_SPI_RESET_GPIO_ADC1, 1);                            // Load output latch
+    GPIO_setPinConfig(BTS_SPI_RESET_PIN_CONFIG_ADC1);                     // GPIO24 = GPIO24
+    GPIO_setDirectionMode(BTS_SPI_RESET_GPIO_ADC1, GPIO_DIR_MODE_OUT);
+}
+
+void BTS_HAL_setupExAdcGpio_Adc2(void)
+{
+    // configure xint GPIO for ADC ///////////////////////////////////
+    GPIO_setPinConfig(BTS_SPI_DRDY_PIN_CONFIG_ADC2);
+    GPIO_setDirectionMode(BTS_SPI_DRDY_GPIO_ADC2, GPIO_DIR_MODE_IN);
+    GPIO_setQualificationMode(BTS_SPI_DRDY_GPIO_ADC2, GPIO_QUAL_SYNC);
+    //
+    // Select GPIO49 as XINT2
+    //
+    GPIO_setInterruptPin(BTS_SPI_DRDY_GPIO_ADC2, BTS_PSI_DRDY_XINT_GPIO2);
+
+    //
+    // Configure XINT2 to be a triggered by a falling edge and XINT2 to be
+    // triggered by a rising edge.
+    //
+    GPIO_setInterruptType(BTS_PSI_DRDY_XINT_GPIO2, GPIO_INT_TYPE_FALLING_EDGE);
+
+    //
+    // Enable XINT2
+    //
+    GPIO_enableInterrupt(BTS_PSI_DRDY_XINT_GPIO2);
+
+
+    GPIO_setAnalogMode(BTS_SPI_RESET_GPIO_ADC2, GPIO_ANALOG_DISABLED);    //pin 24 digital mode
+    // configure reset pin
+    GPIO_setPadConfig(BTS_SPI_RESET_GPIO_ADC2, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO24
+    GPIO_writePin(BTS_SPI_RESET_GPIO_ADC2, 1);                            // Load output latch
+    GPIO_setPinConfig(BTS_SPI_RESET_PIN_CONFIG_ADC2);                     // GPIO24 = GPIO24
+    GPIO_setDirectionMode(BTS_SPI_RESET_GPIO_ADC2, GPIO_DIR_MODE_OUT);
 }
 
 
@@ -653,6 +700,114 @@ void BTS_HAL_setupSyncBuckPwm(uint32_t EPWM_BASE)
     #endif
 }
 
+//
+// BUCK_HAL_setupSyncBuckPwm - Configure ePWM to actuate complementary
+// Buck switches with variable duty-cycle control and deadband
+//
+void BTS_HAL_setupAdcClock(uint32_t EPWM_BASE)
+{
+    //
+    // Maximum supported ePWM clock speed is specified in the datasheet
+    //
+    EPWM_setClockPrescaler(EPWM_BASE,
+                           BTS_DRV_ADC_EPWMCLK_DIV,
+                           BTS_DRV_ADC_HSCLK_DIV);
+
+    EPWM_setEmulationMode(EPWM_BASE, EPWM_EMULATION_FREE_RUN);
+
+    //
+    // Configure ePWM for count-up operation
+    //
+    EPWM_setTimeBaseCounter(EPWM_BASE, 0);
+    EPWM_setTimeBasePeriod(EPWM_BASE, BTS_DRV_ADC_TBPRD);
+    EPWM_setPeriodLoadMode(EPWM_BASE, EPWM_PERIOD_SHADOW_LOAD);
+    EPWM_setTimeBaseCounterMode(EPWM_BASE, EPWM_COUNTER_MODE_UP);
+    EPWM_disablePhaseShiftLoad(EPWM_BASE);
+
+    //
+    // Set Compare values
+    //
+    EPWM_setCounterCompareValue(EPWM_BASE,
+                                EPWM_COUNTER_COMPARE_A,
+                                (BTS_DRV_ADC_TBPRD / 2));
+    EPWM_setCounterCompareValue(EPWM_BASE,
+                                EPWM_COUNTER_COMPARE_B,
+                                (BTS_DRV_ADC_TBPRD + 1) / 2);
+
+
+    //
+    // Set up counter mode
+    //
+    EPWM_setTimeBaseCounterMode(EPWM_BASE, EPWM_COUNTER_MODE_UP);
+    EPWM_disablePhaseShiftLoad(EPWM_BASE);
+    EPWM_setClockPrescaler(EPWM_BASE,
+                           EPWM_CLOCK_DIVIDER_1,
+                           EPWM_HSCLOCK_DIVIDER_1);
+
+
+    //
+    // Use shadow mode to update CMPA on TBPRD
+    //
+    EPWM_setCounterCompareShadowLoadMode(EPWM_BASE,
+                                         EPWM_COUNTER_COMPARE_A,
+                                         EPWM_COMP_LOAD_ON_CNTR_PERIOD);
+
+    EPWM_setCounterCompareShadowLoadMode(EPWM_BASE,
+                                         EPWM_COUNTER_COMPARE_B,
+                                         EPWM_COMP_LOAD_ON_CNTR_PERIOD);
+
+    //
+    // Configure Action Qualifier SubModule to:
+    //     Output High when TBCTR=0
+    //     Output  Low when TBCTR=CMPA (for VMC only)
+    //
+    // Use shadow mode to update AQCTL
+    //
+    EPWM_setActionQualifierShadowLoadMode(EPWM_BASE,
+                                          EPWM_ACTION_QUALIFIER_A,
+                                          EPWM_AQ_LOAD_ON_CNTR_PERIOD);
+
+    EPWM_setActionQualifierAction(EPWM_BASE,
+                                  EPWM_AQ_OUTPUT_A,
+                                  EPWM_AQ_OUTPUT_TOGGLE,
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_ZERO);
+
+    EPWM_setActionQualifierAction(EPWM_BASE,
+                                  EPWM_AQ_OUTPUT_A,
+                                  EPWM_AQ_OUTPUT_TOGGLE,
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_UP_CMPA);
+
+    /*EPWM_setActionQualifierAction(EPWM_BASE,
+                                  EPWM_AQ_OUTPUT_A,
+                                  EPWM_AQ_OUTPUT_TOGGLE,
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_UP_CMPB);
+
+    EPWM_setActionQualifierAction(EPWM_BASE,
+                                  EPWM_AQ_OUTPUT_A,
+                                  EPWM_AQ_OUTPUT_TOGGLE,
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_PERIOD);
+
+    EPWM_setActionQualifierAction(EPWM_BASE,
+                                  EPWM_AQ_OUTPUT_A,
+                                  EPWM_AQ_OUTPUT_TOGGLE,
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_DOWN_CMPB);
+
+    EPWM_setActionQualifierAction(EPWM_BASE,
+                                  EPWM_AQ_OUTPUT_A,
+                                  EPWM_AQ_OUTPUT_TOGGLE,
+                                  EPWM_AQ_OUTPUT_ON_TIMEBASE_DOWN_CMPA);
+*/
+
+}
+
+
+void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE)
+{
+    EPWM_setInterruptSource(EPWM_BASE, EPWM_INT_TBCTR_ZERO);
+
+    EPWM_enableInterrupt(EPWM_BASE);
+    EPWM_setInterruptEventCount(EPWM_BASE, 1U);
+}
 
 void BTS_HAL_enableEpwmCounting(void)
 {
@@ -664,83 +819,121 @@ void BTS_HAL_disableEpwmCounting(void){
     SysCtl_disablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);
 }
 
-
-void BTS_HAL_setupInterruptTrigger(void)
+void BTS_HAL_setupInterruptTrigger_Adc1(void)
 {
-    Interrupt_enable(INT_XINT1);
-    SPI_clearInterruptStatus(SPIA_BASE, SPI_INT_RXFF );
-    SPI_resetRxFIFO(SPIA_BASE);
-    SPI_resetTxFIFO(SPIA_BASE);
-    Interrupt_enable(INT_SPIA_RX);
+    Interrupt_enable(BTS_SPI_DRDY_XINT_ADC1);
+    SPI_clearInterruptStatus(BTS_SPI_BASE_ADC1, SPI_INT_RXFF );
+    SPI_resetRxFIFO(BTS_SPI_BASE_ADC1);
+    SPI_resetTxFIFO(BTS_SPI_BASE_ADC1);
+    Interrupt_enable(BTS_SPI_DRDY_CINT_ADC1);
 
 }
 
+void BTS_HAL_setupInterruptTrigger_Adc2(void)
+{
+    Interrupt_enable(BTS_SPI_DRDY_XINT_ADC2);
+    SPI_clearInterruptStatus(BTS_SPI_BASE_ADC2, SPI_INT_RXFF );
+    SPI_resetRxFIFO(BTS_SPI_BASE_ADC2);
+    SPI_resetTxFIFO(BTS_SPI_BASE_ADC2);
+    Interrupt_enable(BTS_SPI_DRDY_CINT_ADC2);
+
+}
+
+void BTS_HAL_setupInterrupt_Adc1(void)
+{
+    SPI_clearInterruptStatus(BTS_SPI_BASE_ADC1, SPI_INT_RXFF );
+    Interrupt_register(BTS_SPI_DRDY_XINT_ADC1, &BTS_DRDY_ADC1);
+    Interrupt_register(BTS_SPI_DRDY_CINT_ADC1, &BTS_RXFIFO_SPI1);
+}
+
+void BTS_HAL_setupInterrupt_Adc2(void)
+{
+    SPI_clearInterruptStatus(BTS_SPI_BASE_ADC2, SPI_INT_RXFF );
+    Interrupt_register(BTS_SPI_DRDY_XINT_ADC2, &BTS_DRDY_ADC2);
+    Interrupt_register(BTS_SPI_DRDY_CINT_ADC2, &BTS_RXFIFO_SPI2);
+}
 
 void BTS_HAL_setupInterrupt(void)
 {
-    SPI_clearInterruptStatus(SPIA_BASE, SPI_INT_RXFF );
-    Interrupt_register(INT_XINT1, &BTS_DRDY_ADC1);
-    Interrupt_register(INT_SPIA_RX, &BTS_RXFIFO_SPI1);
-
+#if(BTS_SFRA_ENABLED == true) && (BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
+    Interrupt_register(INT_EPWM1, &epwm1ISR);
+    Interrupt_enable(INT_EPWM1);
+#endif
     EALLOW;
     EINT;  // Enable Global interrupt INTM
     ERTM;  // Enable Global real-time interrupt DBGM
     EDIS;
 }
 
-void BTS_HAL_SetupSpi(void)
+void BTS_HAL_SetupSpi(uint32_t spiBase)
 {
     //
     // Must put SPI into reset before configuring it
     //
-    SPI_disableModule(SPIA_BASE);
+    SPI_disableModule(spiBase);
     //
     // SPI configuration. Use a 1MHz SPICLK and 16-bit word size.
     //
-    SPI_enableHighSpeedMode(SPIA_BASE);
-    SPI_setConfig(SPIA_BASE, (DEVICE_OSCSRC_FREQ * 10 * 1) / 2, SPI_PROT_POL0PHA0,
-                  SPI_MODE_MASTER, 100000000 /7, 16); // working code uses 16 bit
+    SPI_enableHighSpeedMode(spiBase);
+    SPI_setConfig(spiBase, DEVICE_LSPCLK_FREQ, SPI_PROT_POL0PHA0,
+                  SPI_MODE_MASTER, DEVICE_LSPCLK_FREQ / 4, 16); // working code uses 16 bit
 
 
     //SPI_enableLoopback(SPIA_BASE);
-    SPI_setEmulationMode(SPIA_BASE, SPI_EMULATION_STOP_MIDWAY);
-    SPI_enableFIFO(SPIA_BASE);
+    SPI_setEmulationMode(spiBase, SPI_EMULATION_STOP_MIDWAY);
+    SPI_enableFIFO(spiBase);
 
-    SPI_clearInterruptStatus(SPIA_BASE, SPI_INT_RX_DATA_TX_EMPTY|SPI_INT_RXFF|SPI_INT_TXFF );
+    SPI_clearInterruptStatus(spiBase, SPI_INT_RX_DATA_TX_EMPTY|SPI_INT_RXFF|SPI_INT_TXFF );
 
-    SPI_setFIFOInterruptLevel(SPIA_BASE, SPI_FIFO_TX0, SPI_FIFO_RX10);
+    SPI_setFIFOInterruptLevel(spiBase, SPI_FIFO_TX0, SPI_FIFO_RX10);
 
-    SPI_enableInterrupt(SPIA_BASE, SPI_INT_RXFF|SPI_INT_TXFF);
+    SPI_enableInterrupt(spiBase, SPI_INT_RXFF|SPI_INT_TXFF);
 
 
     //
     // Configuration complete. Enable the module.
     //
-    SPI_enableModule(SPIA_BASE);
+    SPI_enableModule(spiBase);
 
    // uint32_t junk;
     //while(junk = SPI_readDataNonBlocking(SPIA_BASE));
 }
 
-void BTS_HAL_SetupSpiPinsGpio(void){
+void BTS_HAL_SetupSpiPinsGpio_Adc1(void){
     // configure SPI GPIO pins for SPIA
 
-    GPIO_setQualificationMode(16, GPIO_QUAL_ASYNC); // asynch input
-    GPIO_setQualificationMode(17, GPIO_QUAL_ASYNC); // asynch input
-    GPIO_setQualificationMode(56, GPIO_QUAL_ASYNC); // asynch input changed from 9 to 56
-    GPIO_setQualificationMode(19, GPIO_QUAL_ASYNC); // asynch input //not used
-    GPIO_setPinConfig(GPIO_16_SPISIMOA);            // GPIO16 = SPISIMOA
-    GPIO_setPinConfig(GPIO_17_SPISOMIA);            // GPIO17 = SPIS0MIA
-    GPIO_setPinConfig(GPIO_56_SPICLKA);             // GPIO18 = SPICLKA
+    GPIO_setQualificationMode(BTS_SPI_DIN_GPIO_ADC1,   GPIO_QUAL_ASYNC); // asynch input
+    GPIO_setQualificationMode(BTS_SPI_DOUT_GPIO_ADC1,  GPIO_QUAL_ASYNC); // asynch input
+    GPIO_setQualificationMode(BTS_SPI_RESET_GPIO_ADC1, GPIO_QUAL_ASYNC); // asynch input changed from 9 to 56
+    GPIO_setQualificationMode(BTS_SPI_SCLK_GPIO_ADC1,  GPIO_QUAL_ASYNC); // asynch input //not used
+    GPIO_setPinConfig(BTS_SPI_DIN_PIN_CONFIG_ADC1);            // GPIO16 = SPISIMOA
+    GPIO_setPinConfig(BTS_SPI_DOUT_PIN_CONFIG_ADC1);           // GPIO17 = SPIS0MIA
+    GPIO_setPinConfig(BTS_SPI_SCLK_PIN_CONFIG_ADC1);           // GPIO18 = SPICLKA
 
     // cs bar for SPIA
-    GPIO_setPadConfig(57, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO6
-    GPIO_writePin(57, 1);                            // Load output latch
-    GPIO_setPinConfig(GPIO_57_GPIO57);                // GPIO6 = GPIO6
-    GPIO_setDirectionMode(57, GPIO_DIR_MODE_OUT);    // GPIO6 = output
-
+    GPIO_setPadConfig(BTS_SPI_CS_GPIO_ADC1, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO6
+    GPIO_writePin(BTS_SPI_CS_GPIO_ADC1, 1);                            // Load output latch
+    GPIO_setPinConfig(BTS_SPI_CS_PIN_CONFIG_ADC1);                     // GPIO6 = GPIO6
+    GPIO_setDirectionMode(BTS_SPI_CS_GPIO_ADC1, GPIO_DIR_MODE_OUT);    // GPIO6 = output
 }
 
+void BTS_HAL_SetupSpiPinsGpio_Adc2(void){
+    // configure SPI GPIO pins for SPIA
+
+    GPIO_setQualificationMode(BTS_SPI_DIN_GPIO_ADC2,   GPIO_QUAL_ASYNC); // asynch input
+    GPIO_setQualificationMode(BTS_SPI_DOUT_GPIO_ADC2,  GPIO_QUAL_ASYNC); // asynch input
+    GPIO_setQualificationMode(BTS_SPI_RESET_GPIO_ADC2, GPIO_QUAL_ASYNC); // asynch input changed from 9 to 56
+    GPIO_setQualificationMode(BTS_SPI_SCLK_GPIO_ADC2,  GPIO_QUAL_ASYNC); // asynch input //not used
+    GPIO_setPinConfig(BTS_SPI_DIN_PIN_CONFIG_ADC2);            // GPIO50 = SPISIMOC
+    GPIO_setPinConfig(BTS_SPI_DOUT_PIN_CONFIG_ADC2);           // GPIO51 = SPISOMIC
+    GPIO_setPinConfig(BTS_SPI_SCLK_PIN_CONFIG_ADC2);           // GPIO52 = SPICLKC
+
+    // cs bar for SPIA
+    GPIO_setPadConfig(BTS_SPI_CS_GPIO_ADC2, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO6
+    GPIO_writePin(BTS_SPI_CS_GPIO_ADC2, 1);                            // Load output latch
+    GPIO_setPinConfig(BTS_SPI_CS_PIN_CONFIG_ADC2);                     // GPIO6 = GPIO6
+    GPIO_setDirectionMode(BTS_SPI_CS_GPIO_ADC2, GPIO_DIR_MODE_OUT);    // GPIO6 = output
+}
 
 //
 // End of buck_hal.c

@@ -1,3 +1,6 @@
 /.metadata/
 /.jxbrowser-data/
-/RELEASE/
+*/RELEASE/
+*.zip/
+*.zip
+bts_F2800x_4ch_v2_16thNov_zip_file/

@@ -1,6 +1,6 @@
 ;***************************************************************
 ;* TMS320C2000 G3 C/C++ Codegen                               PC v20.2.4.LTS *
-;* Date/Time created: Mon Jan 11 05:48:46 2021                 *
+;* Date/Time created: Thu Feb 18 21:13:34 2021                 *
 ;***************************************************************
 	.compiler_opts --abi=eabi --cla_support=cla1 --diag_wrap=off --float_support=fpu32 --hll_source=on --mem_model:code=flat --mem_model:data=large --object_format=elf --quiet --silicon_errata_fpu1_workaround=off --silicon_version=28 --symdebug:dwarf --symdebug:dwarf_version=4 --tmu_support=tmu0 --vcu_support=vcu2 
 	.asg	XAR2, FP
@@ -9,7 +9,7 @@ $C$DW$CU	.dwtag  DW_TAG_compile_unit
 	.dwattr $C$DW$CU, DW_AT_name("../libraries/sfra/sfra_gui_scicomms_driverlib.c")
 	.dwattr $C$DW$CU, DW_AT_producer("TI TMS320C2000 G3 C/C++ Codegen PC v20.2.4.LTS Copyright (c) 1996-2018 Texas Instruments Incorporated")
 	.dwattr $C$DW$CU, DW_AT_TI_version(0x01)
-	.dwattr $C$DW$CU, DW_AT_comp_dir("C:\sandbox\github\Lion-IRVT\Hardware\source\tida-010086\bts_F2837xD_8ch\RELEASE")
+	.dwattr $C$DW$CU, DW_AT_comp_dir("C:\sandbox\github\Lion-IRVT\Hardware\source\tida-010086\bts_F2837xD_8ch\release")
 
 ;**************************************************************
 ;* FUNCTION SYNONYMS                                          *
@@ -544,8 +544,8 @@ $C$DW$54	.dwtag  DW_TAG_variable
 	.dwattr $C$DW$54, DW_AT_decl_column(0x14)
 
 	.sblock	".bss"
-;	C:\ti\ccs1011\ccs\tools\compiler\ti-cgt-c2000_20.2.4.LTS\bin\opt2000.exe C:\\Users\\LUCAS~1.OLD\\AppData\\Local\\Temp\\{D3879C9A-F1E2-4935-9868-85B2B589D42B} C:\\Users\\LUCAS~1.OLD\\AppData\\Local\\Temp\\{C654BA2A-6AE7-4B0D-AF34-2DC3BA59893F} 
-;	C:\ti\ccs1011\ccs\tools\compiler\ti-cgt-c2000_20.2.4.LTS\bin\acia2000.exe -@C:\\Users\\LUCAS~1.OLD\\AppData\\Local\\Temp\\{0836A08E-D48B-43AF-9BD5-AB47F70B8024} 
+;	C:\ti\ccs1011\ccs\tools\compiler\ti-cgt-c2000_20.2.4.LTS\bin\opt2000.exe C:\\Users\\LUCAS~1.OLD\\AppData\\Local\\Temp\\{4396FF00-7285-44AB-A2FF-5E502C9337ED} C:\\Users\\LUCAS~1.OLD\\AppData\\Local\\Temp\\{3C0ACC14-C004-4EC1-AB1C-A68D87F9053F} 
+;	C:\ti\ccs1011\ccs\tools\compiler\ti-cgt-c2000_20.2.4.LTS\bin\acia2000.exe -@C:\\Users\\LUCAS~1.OLD\\AppData\\Local\\Temp\\{1A2C7EB9-01CC-4324-9DDE-AC56D0ABEAA9} 
 	.sect	".text:__signbitl"
 	.clink
 	.global	||__signbitl||

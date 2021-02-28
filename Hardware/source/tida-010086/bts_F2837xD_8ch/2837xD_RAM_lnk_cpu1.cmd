@@ -8,9 +8,10 @@ PAGE 0 :  /* Program Memory */
    BEGIN           	: origin = 0x080000, length = 0x000002
    RAMM0           	: origin = 0x000122, length = 0x0002DE
    RAMD0           	: origin = 0x00B000, length = 0x000800
-   RAMLS0LS1LS2LS3LS4     : origin = 0x008000, length = 0x002800
-// RAMGS14          : origin = 0x01A000, length = 0x001000
-// RAMGS15          : origin = 0x01B000, length = 0x00FF8
+   RAMLS0_4         : origin = 0x008000, length = 0x002800
+
+   RAMGS14          : origin = 0x01A000, length = 0x001000
+   RAMGS15          : origin = 0x01B000, length = 0x00FF8
 // RAMGS15_RSVD     : origin = 0x01BFF8, length = 0x000008  /* Reserve and do not use for code as per the errata advisory "Memory: Prefetching Beyond Valid Memory" */
                                                             /* Only on F28379D, F28377D, F28375D devices. Remove line on other devices. */
    RESET           	: origin = 0x3FFFC0, length = 0x000002
@@ -41,6 +42,7 @@ PAGE 1 : /* Data Memory */
 
    RAMLS5      : origin = 0x00A800, length = 0x000800
 
+
    RAMGS0      : origin = 0x00C000, length = 0x001000
    RAMGS1      : origin = 0x00D000, length = 0x001000
    RAMGS2      : origin = 0x00E000, length = 0x001000
@@ -55,12 +57,11 @@ PAGE 1 : /* Data Memory */
 
 // RAMGS11     : origin = 0x017000, length = 0x000FF8     /* Uncomment for F28374D, F28376D devices */
 // RAMGS11_RSVD: origin = 0x017FF8, length = 0x000008     /* Reserve and do not use for code as per the errata advisory "Memory: Prefetching Beyond Valid Memory" */
-
    RAMGS11     : origin = 0x017000, length = 0x001000     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
    RAMGS12     : origin = 0x018000, length = 0x001000     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
    RAMGS13     : origin = 0x019000, length = 0x001000     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
-   RAMGS14     : origin = 0x01A000, length = 0x001000     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
-   RAMGS15     : origin = 0x01B000, length = 0x000FF8     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
+// RAMGS14     : origin = 0x01A000, length = 0x001000     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
+// RAMGS15     : origin = 0x01B000, length = 0x000FF8     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
    
 // RAMGS15_RSVD: origin = 0x01BFF8, length = 0x000008     /* Reserve and do not use for code as per the errata advisory "Memory: Prefetching Beyond Valid Memory" */
                                                           /* Only on F28379D, F28377D, F28375D devices. Remove line on other devices. */
@@ -87,23 +88,36 @@ SECTIONS
             -l sfra_f32_tmu_eabi.lib
         }
         ramfuncs
-        dclfuncs
     }
-    LOAD = FLASHD,
-    RUN = RAMLS0LS1LS2LS3LS4,
-    LOAD_START(RamfuncsLoadStart),
-    LOAD_SIZE(RamfuncsLoadSize),
-    LOAD_END(RamfuncsLoadEnd),
-    RUN_START(RamfuncsRunStart),
-    RUN_SIZE(RamfuncsRunSize),
-    RUN_END(RamfuncsRunEnd),
-    PAGE = 0, ALIGN(4)
+        LOAD = FLASHJ,
+        RUN = RAMGS14,
+        LOAD_START(RamfuncsLoadStart),
+        LOAD_SIZE(RamfuncsLoadSize),
+        LOAD_END(RamfuncsLoadEnd),
+        RUN_START(RamfuncsRunStart),
+        RUN_SIZE(RamfuncsRunSize),
+        RUN_END(RamfuncsRunEnd),
+        PAGE = 0, ALIGN(4)
+
+    GROUP
+    {
+        isrcodefuncs
+        dclfuncs
+    }    LOAD = FLASHK,
+         RUN =  RAMLS0_4,
+         LOAD_START(isrcodefuncsLoadStart),
+         LOAD_SIZE(isrcodefuncsLoadSize),
+         LOAD_END(isrcodefuncsLoadEnd),
+         RUN_START(isrcodefuncsRunStart),
+         RUN_SIZE(isrcodefuncsRunSize),
+         RUN_END(isrcodefuncsRunEnd),
+         PAGE = 0, ALIGN(4)
 
    /* Allocate uninitalized data sections: */
-   .stack             : > RAMM1        PAGE = 1
-   .bss               : >> RAMLS5 | RAMGS0 | RAMGS1       PAGE = 1
-   .sysmem            : > RAMLS5       PAGE = 1
-   .data           	  : >> RAMM1 | RAMD1        PAGE = 1   //added from COFF to EABI
+   .stack             : > RAMM1              PAGE = 1
+   .bss               : >> RAMGS0 | RAMGS1   PAGE = 1
+   .sysmem            : > RAMGS2             PAGE = 1
+   .data           	  : >> RAMM1 | RAMD1     PAGE = 1   //added from COFF to EABI
 
    /* Initalized sections go in Flash */
    .const             : >> FLASHF | FLASHG | FLASHH      PAGE = 0, ALIGN(4)
@@ -111,12 +125,23 @@ SECTIONS
 
    .reset              : > RESET,     PAGE = 0, TYPE = DSECT /* not used, */
 
-   Filter_RegsFile     : > RAMGS0,	   PAGE = 1
+   Filter_RegsFile     : > RAMGS0,	  PAGE = 1
 
    SHARERAMGS0		: > RAMGS0,		PAGE = 1
    SHARERAMGS1		: > RAMGS1,		PAGE = 1
    ramgs0           : > RAMGS0,     PAGE = 1
    ramgs1           : > RAMGS1,     PAGE = 1
+
+   .scratchpad      : > RAMGS10, PAGE = 1
+   .bss_cla         : > RAMGS10,  PAGE = 1
+   controlVariables : > RAMGS10,  PAGE = 1
+
+   .const_cla       :  LOAD = FLASHL,
+                       RUN = RAMGS15,
+                       RUN_START(Cla1ConstRunStart),
+                       LOAD_START(Cla1ConstLoadStart),
+                       LOAD_SIZE(Cla1ConstLoadSize),
+                       PAGE = 0
 
    /* The following section definitions are required when using the IPC API Drivers */
     GROUP : > CPU1TOCPU2RAM, PAGE = 1
@@ -141,9 +166,10 @@ SECTIONS
    Difference_RegsFile : >RAMGS5, 	PAGE = 1, fill=0x3333
 
 
-    SFRA_F32_Data		: > RAMGS2, ALIGN = 64, PAGE = 1
+    SFRA_F32_Data : > RAMGS2, ALIGN = 64, PAGE = 1
 
- 	FPUmathTables	: > FLASHN, PAGE = 0
+ 	//FPUmathTables	: > FLASHN, PAGE = 0
+    FPUmathTables	: > RAMGS3, PAGE =1
 
  	cntl_coeff_RAM	: > RAMGS3, PAGE = 1
  	cntl_var_RAM	: > RAMGS2, PAGE = 1

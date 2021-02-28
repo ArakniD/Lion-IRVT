@@ -115,17 +115,38 @@ void main(void)
     BTS_HAL_setupSyncBuckPwm(BTS_EPWM_BASE_CH6);
     BTS_HAL_setupSyncBuckPwm(BTS_EPWM_BASE_CH7);
     BTS_HAL_setupSyncBuckPwm(BTS_EPWM_BASE_CH8);
+
+    BTS_HAL_setupAdcClock(BTS_EPWM_BASE_ADC1);
+    BTS_HAL_setupAdcClock(BTS_EPWM_BASE_ADC2);
+
+#if BTS_SFRA_ENABLED && ( BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
+    BTS_HAL_setupSfraClock(BTS_EPWM_BASE_CH1);
+
+    Interrupt_enable(INT_EPWM1);
+#endif
+
     BTS_setupHrpwmMepScaleFactor();
+
+    //
+    // Start ePWM clocks
+    //
+    BTS_HAL_enableEpwmCounting();
 
     //
     // Configure the embedded ADC to sample Vin, Vout, ILFB, and ILFB_AVG
     //
     // setup SPI
-    BTS_HAL_SetupSpiPinsGpio();
-    BTS_HAL_SetupSpi();
+    BTS_HAL_SetupSpiPinsGpio_Adc1();
+    BTS_HAL_SetupSpi(BTS_SPI_BASE_ADC1);
 
-    BTS_HAL_setupExAdcGpio();
-    BTS_HAL_setupExAdc();
+    BTS_HAL_SetupSpiPinsGpio_Adc2();
+    BTS_HAL_SetupSpi(BTS_SPI_BASE_ADC2);
+
+    BTS_HAL_setupExAdcGpio_Adc1();
+    BTS_HAL_setupExAdc_ch1_4();
+
+    BTS_HAL_setupExAdcGpio_Adc2();
+    BTS_HAL_setupExAdc_ch5_8();
 
     //
     // Initialize global variables used in solution
@@ -143,22 +164,22 @@ void main(void)
     //
     // Configure and enable system interrupt
     //
-    BTS_HAL_setupInterruptTrigger();
-    BTS_HAL_setupInterrupt();
+    BTS_HAL_setupInterruptTrigger_Adc1();
+    BTS_HAL_setupInterruptTrigger_Adc2();
 
-    //
-    // Start ePWM clocks
-    //
-    BTS_HAL_enableEpwmCounting();
+    BTS_HAL_setupInterrupt_Adc1();
+    BTS_HAL_setupInterrupt_Adc2();
+
+    BTS_HAL_setupInterrupt();
 
     //
     // Switch actuation pins over to ePWM function
     //
     BTS_HAL_setupSyncBuckPinsEpwm();
 
-    BTS_HAL_ExAdcTxframe(SPIA_BASE);
+    BTS_HAL_ExAdcTxframe(BTS_SPI_BASE_ADC1);
 
-    BTS_HAL_ExAdcTxframe(SPIC_BASE);
+    BTS_HAL_ExAdcTxframe(BTS_SPI_BASE_ADC2);
 
     //
     // Background loop with periodic branches to state-machine tasks.
@@ -220,6 +241,18 @@ interrupt void ISR4(void)
 
 }
 
+#if (BTS_SFRA_ENABLED == true) && ( BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
+#pragma CODE_SECTION(epwm1ISR,"isrcodefuncs");
+#pragma INTERRUPT(epwm1ISR, HPI)
+interrupt void epwm1ISR(void)
+{
+    BTS_ISR_SFRA();
+
+    EPWM_clearEventTriggerInterruptFlag(BTS_EPWM_BASE_CH1);
+
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP3);                    // Acknowledge the interrupt
+}
+#endif
 //
 //=============================================================================
 //  STATE-MACHINE SEQUENCING AND SYNCRONIZATION FOR SLOW BACKGROUND TASKS

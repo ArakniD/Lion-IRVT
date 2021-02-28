@@ -148,15 +148,15 @@ a single CPU should be defined."
 // Define to pass to SysCtl_setClock(). Will configure the clock as follows:
 // PLLSYSCLK = 20MHz (XTAL_OSC) * 20 (IMULT) * 1 (FMULT) / 2 (PLLCLK_BY_2)
 //
-#define DEVICE_SETCLOCK_CFG         (SYSCTL_OSCSRC_XTAL | SYSCTL_IMULT(20) |  \
+#define DEVICE_SETCLOCK_CFG         (SYSCTL_OSCSRC_XTAL | SYSCTL_IMULT(16) |  \
                                      SYSCTL_FMULT_NONE | SYSCTL_SYSDIV(2) |   \
                                      SYSCTL_PLL_ENABLE)
 
 //
-// 200MHz SYSCLK frequency based on the above DEVICE_SETCLOCK_CFG. Update the
+// 160MHz SYSCLK frequency based on the above DEVICE_SETCLOCK_CFG. Update the
 // code below if a different clock configuration is used!
 //
-#define DEVICE_SYSCLK_FREQ          ((DEVICE_OSCSRC_FREQ * 20 * 1) / 2)
+#define DEVICE_SYSCLK_FREQ          ((DEVICE_OSCSRC_FREQ * 16 * 1) / 2)
 
 #endif
 
@@ -220,6 +220,13 @@ extern uint16_t RamfuncsLoadSize;
 extern uint16_t RamfuncsRunStart;
 extern uint16_t RamfuncsRunEnd;
 extern uint16_t RamfuncsRunSize;
+
+extern uint16_t isrcodefuncsRunStart;
+extern uint16_t isrcodefuncsLoadStart;
+extern uint16_t isrcodefuncsLoadSize;
+extern uint16_t Cla1ConstRunStart;
+extern uint16_t Cla1ConstLoadStart;
+extern uint16_t Cla1ConstLoadSize;
 
 #define DEVICE_FLASH_WAITSTATES 3
 

@@ -62,7 +62,9 @@ typedef struct
 } adc_data;
 
 extern adc_data  BTS_ADC1;
-extern volatile uint16_t BTS_ExAdcRxflag ;
+extern adc_data  BTS_ADC2;
+extern volatile uint16_t BTS_ExAdcRxflag1 ;
+extern volatile uint16_t BTS_ExAdcRxflag2 ;
 extern uint32_t  MEP_ScaleFactor;
 
 //
@@ -71,23 +73,29 @@ extern uint32_t  MEP_ScaleFactor;
 //=============================================================================
 //
 void BTS_HAL_setupDevice(void);
-void BTS_HAL_setupExAdc(void);
+void BTS_HAL_setupExAdc_ch1_4(void);
+void BTS_HAL_setupExAdc_ch5_8(void);
 void delay_ms_2(const uint32_t);
-void BTS_HAL_setupExAdcGpio(void);
+void BTS_HAL_setupExAdcGpio_Adc1(void);
+void BTS_HAL_setupExAdcGpio_Adc2(void);
 
 void BTS_HAL_setupSyncBuckPinsGpio(void);
 void BTS_HAL_setupSyncBuckPinsEpwm(void);
 void BTS_HAL_setupSyncBuckPwm(uint32_t);
-
+void BTS_HAL_setupAdcClock(uint32_t EPWM_BASE);
 
 void BTS_HAL_disableEpwmCounting(void);
 void BTS_HAL_enableEpwmCounting(void);
-void BTS_HAL_setupInterruptTrigger(void);
-void BTS_HAL_setupInterruptTrigger(void);
+void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE);
+void BTS_HAL_setupInterruptTrigger_Adc1(void);
+void BTS_HAL_setupInterruptTrigger_Adc2(void);
 void BTS_HAL_setupInterrupt(void);
+void BTS_HAL_setupInterrupt_Adc1(void);
+void BTS_HAL_setupInterrupt_Adc2(void);
 
-void BTS_HAL_SetupSpi(void);
-void BTS_HAL_SetupSpiPinsGpio(void);
+void BTS_HAL_SetupSpi(uint32_t base);
+void BTS_HAL_SetupSpiPinsGpio_Adc1(void);
+void BTS_HAL_SetupSpiPinsGpio_Adc2(void);
 
 static inline void BTS_HAL_ExAdcTxframe(uint32_t base){
     //set CS low before this function
@@ -144,6 +152,7 @@ interrupt void ISR1(void); // from buck_main.c
 interrupt void ISR2(void); // from buck_main.c
 interrupt void ISR3(void); // from buck_main.c
 interrupt void ISR4(void); // from buck_main.c
+interrupt void epwm1ISR(void); // from buck_main.c
 
 static inline void BTS_ExAdcSendTxFrame_ch1_4(void){
     if(BTS_ExAdcRxflag1==1)// data is available in the FIFO to read
@@ -180,6 +189,10 @@ static inline void BTS_ExAdcRead_ch1_4(){
     //SPI_resetTxFIFO(BTS_SPI_BASE_ADC1);
     SPI_clearInterruptStatus(BTS_SPI_BASE_ADC1, SPI_INT_RXFF );
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP6);
+
+    if (GPIO_readPin(BTS_SPI_DRDY_GPIO_ADC1) == 0) {
+        BTS_ExAdcSendTxFrame_ch1_4();
+    }
 }
 
 static inline void BTS_ExAdcRead_ch5_8(){
@@ -191,6 +204,10 @@ static inline void BTS_ExAdcRead_ch5_8(){
     //SPI_resetTxFIFO(BTS_SPI_BASE_ADC2);
     SPI_clearInterruptStatus(BTS_SPI_BASE_ADC2, SPI_INT_RXFF );
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP6);
+
+    if (GPIO_readPin(BTS_SPI_DRDY_GPIO_ADC2) == 0) {
+        BTS_ExAdcSendTxFrame_ch5_8();
+    }
 }
 
 //

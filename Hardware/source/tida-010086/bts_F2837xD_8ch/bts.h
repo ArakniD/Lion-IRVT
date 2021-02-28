@@ -588,9 +588,9 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
 
     BTS_HAL_updateDuty(EPWM_BASE, ctrlLoopVariable->dutyH_pu,ctrlLoopVariable->dutyL_pu);
 
-#if(BTS_ENABLE_SFRA)
-    BTS_SFRA_COLLECT(&(ctrlLoopVariable->dutySet_pu),
-                      &(ctrlLoopVariable->ioutSense_pu));
+#if(BTS_SFRA_ENABLED)
+    //BTS_SFRA_COLLECT(&(ctrlLoopVariable->dutySet_pu),
+    //                  &(ctrlLoopVariable->ioutSense_pu));
 
 #endif
 
@@ -639,9 +639,12 @@ static inline void BTS_ISR_SFRA(void){
 #pragma FUNC_ALWAYS_INLINE(BTS_runISR_ch1_4)
 static inline void BTS_runISR_ch1_4(void){
 
-    BTS_ExAdcSendTxFrame();
-
-    BTS_ISR_SFRA();
+    if (BTS_ExAdcRxflag1 == 1) {
+        BTS_ExAdcSendTxFrame_ch1_4();
+#if (BTS_SFRA_ENABLED == true) && ( BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_ADC) && ( BTS_SFRA_CHANNEL <= 4)
+        BTS_ISR_SFRA();
+#endif
+    }
 
 #if(BTS_SFRA_ENABLED ==(false))
 
@@ -686,16 +689,18 @@ static inline void BTS_runISR_ch1_4(void){
 #pragma FUNC_ALWAYS_INLINE(BTS_runISR_ch5_8)
 static inline void BTS_runISR_ch5_8(void){
 
-    BTS_ExAdcSendTxFrame();
+    BTS_ExAdcSendTxFrame_ch5_8();
 
-    BTS_ISR_SFRA();
+#if (BTS_SFRA_ENABLED == true) && ( BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_ADC) && ( BTS_SFRA_CHANNEL >= 5)
+        BTS_ISR_SFRA();
+#endif
 
 #if(BTS_SFRA_ENABLED ==(false))
 
 #if(BTS_ENABLE_CH5)
     BTS_storeValues(&BTS_measValues_ch5,BTS_ADC2.channel0, BTS_ADC2.channel1);
 #if(BTS_ENABLE_DETECT_CODE)
-    BTS_detectEnable(EPWM1_BASE,&BTS_ctrlLoopVariable_ch5 , &BTS_userInput_ch5);
+    BTS_detectEnable(EPWM5_BASE,&BTS_ctrlLoopVariable_ch5 , &BTS_userInput_ch5);
 #endif
     BTS_ctrlISR(&BTS_ctrl_cc_ch5,&BTS_ctrl_cv_ch5,EPWM5_BASE, &BTS_ctrlLoopVariable_ch5, BTS_ADC2.channel0, BTS_ADC2.channel1);
 #endif
@@ -703,7 +708,7 @@ static inline void BTS_runISR_ch5_8(void){
 #if(BTS_ENABLE_CH6)
     BTS_storeValues(&BTS_measValues_ch6,BTS_ADC2.channel2, BTS_ADC2.channel3);
 #if(BTS_ENABLE_DETECT_CODE)
-    BTS_detectEnable(EPWM2_BASE,&BTS_ctrlLoopVariable_ch6 , &BTS_userInput_ch6);
+    BTS_detectEnable(EPWM6_BASE,&BTS_ctrlLoopVariable_ch6 , &BTS_userInput_ch6);
 #endif
     BTS_ctrlISR(&BTS_ctrl_cc_ch6,&BTS_ctrl_cv_ch6,EPWM6_BASE, &BTS_ctrlLoopVariable_ch6, BTS_ADC2.channel2, BTS_ADC2.channel3);
 #endif
@@ -711,7 +716,7 @@ static inline void BTS_runISR_ch5_8(void){
 #if(BTS_ENABLE_CH7)
     BTS_storeValues(&BTS_measValues_ch7,BTS_ADC2.channel4, BTS_ADC2.channel5);
 #if(BTS_ENABLE_DETECT_CODE)
-    BTS_detectEnable(EPWM3_BASE,&BTS_ctrlLoopVariable_ch7 , &BTS_userInput_ch7);
+    BTS_detectEnable(EPWM7_BASE,&BTS_ctrlLoopVariable_ch7 , &BTS_userInput_ch7);
 #endif
     BTS_ctrlISR(&BTS_ctrl_cc_ch7,&BTS_ctrl_cv_ch7,EPWM7_BASE, &BTS_ctrlLoopVariable_ch7, BTS_ADC2.channel4, BTS_ADC2.channel5);
 #endif
@@ -719,7 +724,7 @@ static inline void BTS_runISR_ch5_8(void){
 #if(BTS_ENABLE_CH8)
     BTS_storeValues(&BTS_measValues_ch8,BTS_ADC2.channel6, BTS_ADC2.channel7);
 #if(BTS_ENABLE_DETECT_CODE)
-    BTS_detectEnable(EPWM4_BASE,&BTS_ctrlLoopVariable_ch8 , &BTS_userInput_ch8);
+    BTS_detectEnable(EPWM8_BASE,&BTS_ctrlLoopVariable_ch8 , &BTS_userInput_ch8);
 #endif
     BTS_ctrlISR(&BTS_ctrl_cc_ch8,&BTS_ctrl_cv_ch8,EPWM8_BASE, &BTS_ctrlLoopVariable_ch8, BTS_ADC2.channel6, BTS_ADC2.channel7);
 #endif

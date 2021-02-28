@@ -410,7 +410,7 @@ UniqueID=BD5D50CB-C4B8-458D-99DF-A84103E443B8
 Description=001
 AllowFabrication=0
 ParameterCount=1
-VariationCount=152
+VariationCount=168
 Variation1=Designator=FID1|UniqueId=\KGYILQJO\NECATVSL|Kind=1|AlternatePart= 
 Variation2=Designator=FID2|UniqueId=\KGYILQJO\ATOSVNME|Kind=1|AlternatePart= 
 Variation3=Designator=FID3|UniqueId=\KGYILQJO\BAKLYFNF|Kind=1|AlternatePart= 
@@ -563,7 +563,87 @@ Variation149=Designator=R314|UniqueId=\FVFUFPTR\QOJOUCBW\UQUKOKCV|Kind=1|Alterna
 Variation150=Designator=R307|UniqueId=\FVFUFPTR\QOJOUCBW\OBHIGKAB|Kind=1|AlternatePart= 
 Variation151=Designator=R308|UniqueId=\FVFUFPTR\QOJOUCBW\HCBNOGKB|Kind=1|AlternatePart= 
 Variation152=Designator=R309|UniqueId=\FVFUFPTR\QOJOUCBW\PQTLQNRV|Kind=1|AlternatePart= 
-ParamVariationCount=0
+Variation153=Designator=R217_Ch1|UniqueId=\FVFUFPTR\1CRJBAJRM\JSDWEIRD|Kind=0|AlternatePart= 
+ParamVariation1=ParameterName=Description|VariantValue=RES SMD 590 OHM 0.1% 1/10W 0603
+ParamDesignator1=R217_Ch1
+ParamVariation2=ParameterName=Manufacturer Part Number|VariantValue=RT0603BRD07590RL
+ParamDesignator2=R217_Ch1
+ParamVariation3=ParameterName=PartNumber|VariantValue=RT0603BRD07590RL
+ParamDesignator3=R217_Ch1
+ParamVariation4=ParameterName=Supplier Part Number 1|VariantValue=YAG4579CT-ND
+ParamDesignator4=R217_Ch1
+Variation154=Designator=R217_Ch6|UniqueId=\FVFUFPTR\6CRJBAJRM\JSDWEIRD|Kind=0|AlternatePart= 
+ParamVariation5=ParameterName=Description|VariantValue=RES SMD 590 OHM 0.1% 1/10W 0603
+ParamDesignator5=R217_Ch6
+ParamVariation6=ParameterName=Manufacturer Part Number|VariantValue=RT0603BRD07590RL
+ParamDesignator6=R217_Ch6
+ParamVariation7=ParameterName=PartNumber|VariantValue=RT0603BRD07590RL
+ParamDesignator7=R217_Ch6
+ParamVariation8=ParameterName=Supplier Part Number 1|VariantValue=YAG4579CT-ND
+ParamDesignator8=R217_Ch6
+Variation155=Designator=R217_Ch7|UniqueId=\FVFUFPTR\7CRJBAJRM\JSDWEIRD|Kind=0|AlternatePart= 
+ParamVariation9=ParameterName=Description|VariantValue=RES SMD 590 OHM 0.1% 1/10W 0603
+ParamDesignator9=R217_Ch7
+ParamVariation10=ParameterName=Manufacturer Part Number|VariantValue=RT0603BRD07590RL
+ParamDesignator10=R217_Ch7
+ParamVariation11=ParameterName=PartNumber|VariantValue=RT0603BRD07590RL
+ParamDesignator11=R217_Ch7
+ParamVariation12=ParameterName=Supplier Part Number 1|VariantValue=YAG4579CT-ND
+ParamDesignator12=R217_Ch7
+Variation156=Designator=R217_Ch3|UniqueId=\FVFUFPTR\3CRJBAJRM\JSDWEIRD|Kind=0|AlternatePart= 
+ParamVariation13=ParameterName=Description|VariantValue=RES SMD 590 OHM 0.1% 1/10W 0603
+ParamDesignator13=R217_Ch3
+ParamVariation14=ParameterName=Manufacturer Part Number|VariantValue=RT0603BRD07590RL
+ParamDesignator14=R217_Ch3
+ParamVariation15=ParameterName=PartNumber|VariantValue=RT0603BRD07590RL
+ParamDesignator15=R217_Ch3
+ParamVariation16=ParameterName=Supplier Part Number 1|VariantValue=YAG4579CT-ND
+ParamDesignator16=R217_Ch3
+Variation157=Designator=R217_Ch8|UniqueId=\FVFUFPTR\8CRJBAJRM\JSDWEIRD|Kind=0|AlternatePart= 
+ParamVariation17=ParameterName=Description|VariantValue=RES SMD 590 OHM 0.1% 1/10W 0603
+ParamDesignator17=R217_Ch8
+ParamVariation18=ParameterName=Manufacturer Part Number|VariantValue=RT0603BRD07590RL
+ParamDesignator18=R217_Ch8
+ParamVariation19=ParameterName=PartNumber|VariantValue=RT0603BRD07590RL
+ParamDesignator19=R217_Ch8
+ParamVariation20=ParameterName=Supplier Part Number 1|VariantValue=YAG4579CT-ND
+ParamDesignator20=R217_Ch8
+Variation158=Designator=R217_Ch2|UniqueId=\FVFUFPTR\2CRJBAJRM\JSDWEIRD|Kind=0|AlternatePart= 
+ParamVariation21=ParameterName=Description|VariantValue=RES SMD 590 OHM 0.1% 1/10W 0603
+ParamDesignator21=R217_Ch2
+ParamVariation22=ParameterName=Manufacturer Part Number|VariantValue=RT0603BRD07590RL
+ParamDesignator22=R217_Ch2
+ParamVariation23=ParameterName=PartNumber|VariantValue=RT0603BRD07590RL
+ParamDesignator23=R217_Ch2
+ParamVariation24=ParameterName=Supplier Part Number 1|VariantValue=YAG4579CT-ND
+ParamDesignator24=R217_Ch2
+Variation159=Designator=R217_Ch5|UniqueId=\FVFUFPTR\5CRJBAJRM\JSDWEIRD|Kind=0|AlternatePart= 
+ParamVariation25=ParameterName=Description|VariantValue=RES SMD 590 OHM 0.1% 1/10W 0603
+ParamDesignator25=R217_Ch5
+ParamVariation26=ParameterName=Manufacturer Part Number|VariantValue=RT0603BRD07590RL
+ParamDesignator26=R217_Ch5
+ParamVariation27=ParameterName=PartNumber|VariantValue=RT0603BRD07590RL
+ParamDesignator27=R217_Ch5
+ParamVariation28=ParameterName=Supplier Part Number 1|VariantValue=YAG4579CT-ND
+ParamDesignator28=R217_Ch5
+Variation160=Designator=R217_Ch4|UniqueId=\FVFUFPTR\4CRJBAJRM\JSDWEIRD|Kind=0|AlternatePart= 
+ParamVariation29=ParameterName=Description|VariantValue=RES SMD 590 OHM 0.1% 1/10W 0603
+ParamDesignator29=R217_Ch4
+ParamVariation30=ParameterName=Manufacturer Part Number|VariantValue=RT0603BRD07590RL
+ParamDesignator30=R217_Ch4
+ParamVariation31=ParameterName=PartNumber|VariantValue=RT0603BRD07590RL
+ParamDesignator31=R217_Ch4
+ParamVariation32=ParameterName=Supplier Part Number 1|VariantValue=YAG4579CT-ND
+ParamDesignator32=R217_Ch4
+Variation161=Designator=R290_Ch1|UniqueId=\FVFUFPTR\1CRJBAJRM\LMFPSEXX|Kind=1|AlternatePart= 
+Variation162=Designator=R290_Ch8|UniqueId=\FVFUFPTR\8CRJBAJRM\LMFPSEXX|Kind=1|AlternatePart= 
+Variation163=Designator=R290_Ch7|UniqueId=\FVFUFPTR\7CRJBAJRM\LMFPSEXX|Kind=1|AlternatePart= 
+Variation164=Designator=R290_Ch6|UniqueId=\FVFUFPTR\6CRJBAJRM\LMFPSEXX|Kind=1|AlternatePart= 
+Variation165=Designator=R290_Ch5|UniqueId=\FVFUFPTR\5CRJBAJRM\LMFPSEXX|Kind=1|AlternatePart= 
+Variation166=Designator=R290_Ch4|UniqueId=\FVFUFPTR\4CRJBAJRM\LMFPSEXX|Kind=1|AlternatePart= 
+Variation167=Designator=R290_Ch3|UniqueId=\FVFUFPTR\3CRJBAJRM\LMFPSEXX|Kind=1|AlternatePart= 
+Variation168=Designator=R290_Ch2|UniqueId=\FVFUFPTR\2CRJBAJRM\LMFPSEXX|Kind=1|AlternatePart= 
+ParamVariationCount=32
 
 [Parameter2_1]
 Name=EVM_Orderable
