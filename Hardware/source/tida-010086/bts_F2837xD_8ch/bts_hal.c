@@ -800,6 +800,93 @@ void BTS_HAL_setupAdcClock(uint32_t EPWM_BASE)
 
 }
 
+void BTS_HAL_SetupI2C_GPIO(void)
+{
+    // I2CA pins (SDA / SCL) - External
+    GPIO_setDirectionMode(BTS_I2C_EXT_PIN_SDA, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(BTS_I2C_EXT_PIN_SDA, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setMasterCore(BTS_I2C_EXT_PIN_SDA, GPIO_CORE_CPU1);
+    GPIO_setQualificationMode(BTS_I2C_EXT_PIN_SDA, GPIO_QUAL_ASYNC);
+
+    GPIO_setDirectionMode(BTS_I2C_EXT_PIN_SCL, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(BTS_I2C_EXT_PIN_SCL, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setMasterCore(BTS_I2C_EXT_PIN_SCL, GPIO_CORE_CPU1);
+    GPIO_setQualificationMode(BTS_I2C_EXT_PIN_SCL, GPIO_QUAL_ASYNC);
+
+    GPIO_setPinConfig(BTS_I2C_EXT_CFG_SDA);
+    GPIO_setPinConfig(BTS_I2C_EXT_CFG_SCL);
+
+    // I2CB pins (SDAA / SCLA) - Internal
+    GPIO_setDirectionMode(BTS_I2C_INT_PIN_SDA, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(BTS_I2C_INT_PIN_SDA, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setMasterCore(BTS_I2C_INT_PIN_SDA, GPIO_CORE_CPU1);
+    GPIO_setQualificationMode(BTS_I2C_INT_PIN_SDA, GPIO_QUAL_ASYNC);
+
+    GPIO_setDirectionMode(BTS_I2C_INT_PIN_SCL, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(BTS_I2C_INT_PIN_SCL, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setMasterCore(BTS_I2C_INT_PIN_SCL, GPIO_CORE_CPU1);
+    GPIO_setQualificationMode(BTS_I2C_INT_PIN_SCL, GPIO_QUAL_ASYNC);
+
+    GPIO_setPinConfig(BTS_I2C_INT_CFG_SDA);
+    GPIO_setPinConfig(BTS_I2C_INT_CFG_SCL);
+}
+
+void BTS_HAL_SetupI2C_Init()
+{
+    // External I2CA Base
+    I2C_disableModule(BTS_I2C_EXT_BASE);
+    I2C_initMaster(BTS_I2C_EXT_BASE, DEVICE_SYSCLK_FREQ, 100000, I2C_DUTYCYCLE_50);
+    I2C_setConfig(BTS_I2C_EXT_BASE, I2C_MASTER_SEND_MODE);
+    I2C_setSlaveAddress(BTS_I2C_EXT_BASE, 80);
+    I2C_setOwnSlaveAddress(BTS_I2C_EXT_BASE, 96); //I2CA address
+    I2C_disableLoopback(BTS_I2C_EXT_BASE);
+    I2C_setBitCount(BTS_I2C_EXT_BASE, I2C_BITCOUNT_8);
+    I2C_setDataCount(BTS_I2C_EXT_BASE, 2);
+    I2C_setAddressMode(BTS_I2C_EXT_BASE, I2C_ADDR_MODE_7BITS);
+    I2C_enableFIFO(BTS_I2C_EXT_BASE);
+    I2C_clearInterruptStatus(BTS_I2C_EXT_BASE, I2C_INT_ARB_LOST | I2C_INT_NO_ACK);
+    I2C_setFIFOInterruptLevel(BTS_I2C_EXT_BASE, I2C_FIFO_TXEMPTY, I2C_FIFO_RX2);
+    I2C_enableInterrupt(BTS_I2C_EXT_BASE, I2C_INT_ADDR_SLAVE | I2C_INT_ARB_LOST | I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION);
+    I2C_setEmulationMode(BTS_I2C_EXT_BASE, I2C_EMULATION_FREE_RUN);
+    I2C_enableModule(BTS_I2C_EXT_BASE);
+
+    // Internal I2CB - Internal
+    I2C_disableModule(BTS_I2C_INT_BASE);
+    I2C_initMaster(BTS_I2C_INT_BASE, DEVICE_SYSCLK_FREQ, 400000, I2C_DUTYCYCLE_50);
+    I2C_setConfig(BTS_I2C_INT_BASE, I2C_MASTER_SEND_MODE);
+    I2C_setSlaveAddress(BTS_I2C_INT_BASE, 80);
+    I2C_setOwnSlaveAddress(BTS_I2C_INT_BASE, 96); //I2CA address
+    I2C_disableLoopback(BTS_I2C_INT_BASE);
+    I2C_setBitCount(BTS_I2C_INT_BASE, I2C_BITCOUNT_8);
+    I2C_setDataCount(BTS_I2C_INT_BASE, 2);
+    I2C_setAddressMode(BTS_I2C_INT_BASE, I2C_ADDR_MODE_7BITS);
+    I2C_enableFIFO(BTS_I2C_INT_BASE);
+    I2C_clearInterruptStatus(BTS_I2C_INT_BASE, I2C_INT_ARB_LOST | I2C_INT_NO_ACK);
+    I2C_setFIFOInterruptLevel(BTS_I2C_INT_BASE, I2C_FIFO_TXEMPTY, I2C_FIFO_RX2);
+    I2C_enableInterrupt(BTS_I2C_INT_BASE, I2C_INT_ADDR_SLAVE | I2C_INT_ARB_LOST | I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION);
+    I2C_setEmulationMode(BTS_I2C_INT_BASE, I2C_EMULATION_FREE_RUN);
+    I2C_enableModule(BTS_I2C_INT_BASE);
+}
+
+
+void BTS_HAL_setupCanBus()
+{
+        GPIO_setPinConfig(BTS_CAN_PIN_CANRX);
+        GPIO_setPinConfig(BTS_CAN_PIN_CANTX);
+
+        //
+        // Initialize the CAN controllers
+        //
+        CAN_initModule(BTS_CAN_BASE);
+
+        //
+        // Set up the CAN bus bit rate to 500kHz for each module
+        // Refer to the Driver Library User Guide for information on how to set
+        // tighter timing control. Additionally, consult the device data sheet
+        // for more information about the CAN module clocking.
+        //
+        CAN_setBitRate(BTS_CAN_BASE, DEVICE_SYSCLK_FREQ, 500000, 16);
+}
 
 void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE)
 {
@@ -863,6 +950,25 @@ void BTS_HAL_setupInterrupt(void)
     EINT;  // Enable Global interrupt INTM
     ERTM;  // Enable Global real-time interrupt DBGM
     EDIS;
+}
+
+void BTS_HAS_setupInterrupt_I2c(void)
+{
+    //
+    // Set I2C use, initializing it for FIFO mode
+    //
+
+    Interrupt_register(INT_I2CA, &i2cAISR);
+    Interrupt_enable(INT_I2CA);
+
+    Interrupt_register(INT_I2CB, &i2cBISR);
+    Interrupt_enable(INT_I2CB);
+
+    Interrupt_register(INT_I2CA_FIFO, &i2cAFIFOISR);
+    Interrupt_enable(INT_I2CA_FIFO);
+
+    Interrupt_register(INT_I2CB_FIFO, &i2cBFIFOISR);
+    Interrupt_enable(INT_I2CB_FIFO);
 }
 
 void BTS_HAL_SetupSpi(uint32_t spiBase)

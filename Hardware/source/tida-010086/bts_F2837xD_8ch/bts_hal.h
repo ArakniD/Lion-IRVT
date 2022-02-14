@@ -33,6 +33,7 @@ extern "C" {
 #include "driverlib.h"
 #include "device.h"
 #include <bts_user_settings.h>
+#include "i2cLib_FIFO_master_slave_interrupt.h"
 //
 //=============================================================================
 // variables
@@ -92,10 +93,29 @@ void BTS_HAL_setupInterruptTrigger_Adc2(void);
 void BTS_HAL_setupInterrupt(void);
 void BTS_HAL_setupInterrupt_Adc1(void);
 void BTS_HAL_setupInterrupt_Adc2(void);
+void BTS_HAL_setupInterrupt_I2c(void);
 
 void BTS_HAL_SetupSpi(uint32_t base);
 void BTS_HAL_SetupSpiPinsGpio_Adc1(void);
 void BTS_HAL_SetupSpiPinsGpio_Adc2(void);
+
+void BTS_HAL_SetupI2C_GPIO(void);
+void BTS_HAL_SetupI2C_Init(void);
+
+__interrupt void ISR1(void);
+__interrupt void ISR2(void);
+__interrupt void ISR3(void);
+__interrupt void ISR4(void);
+__interrupt void epwm1ISR(void);
+
+//
+// Function Prototypes
+//
+__interrupt void i2cAISR(void);
+__interrupt void i2cAFIFOISR(void);
+
+__interrupt void i2cBISR(void);
+__interrupt void i2cBFIFOISR(void);
 
 static inline void BTS_HAL_ExAdcTxframe(uint32_t base){
     //set CS low before this function
@@ -147,12 +167,6 @@ static inline void BTS_HAL_ExAdcRxframe(adc_data *DataStruct, uint32_t base){
     DataStruct->crc=HWREGH(base + SPI_O_RXBUF);
 
 }
-
-interrupt void ISR1(void); // from buck_main.c
-interrupt void ISR2(void); // from buck_main.c
-interrupt void ISR3(void); // from buck_main.c
-interrupt void ISR4(void); // from buck_main.c
-interrupt void epwm1ISR(void); // from buck_main.c
 
 static inline void BTS_ExAdcSendTxFrame_ch1_4(void){
     if(BTS_ExAdcRxflag1==1)// data is available in the FIFO to read

@@ -31,6 +31,8 @@ libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPow
 libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/inc/hw_pie.h
 libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/cla.h
 libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/inc/hw_cla.h
+libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/clb.h
+libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/inc/hw_clb.h
 libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/cmpss.h
 libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/inc/hw_cmpss.h
 libraries/sfra/sfra_gui_scicomms_driverlib.obj: C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/cputimer.h
@@ -119,6 +121,8 @@ C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/dr
 C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/inc/hw_pie.h: 
 C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/cla.h: 
 C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/inc/hw_cla.h: 
+C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/clb.h: 
+C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/inc/hw_clb.h: 
 C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/cmpss.h: 
 C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/inc/hw_cmpss.h: 
 C:/ti/c2000/C2000Ware_DigitalPower_SDK_3_01_00_00/c2000ware/driverlib/f2837xd/driverlib/cputimer.h: 

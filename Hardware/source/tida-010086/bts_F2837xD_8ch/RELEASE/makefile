@@ -13,6 +13,7 @@ ORDERED_OBJS += \
 "./bts.obj" \
 "./bts_hal.obj" \
 "./bts_main.obj" \
+"./i2cLib_FIFO_master_slave_interrupt.obj" \
 "./device/F2837xD_CodeStartBranch.obj" \
 "./device/device.obj" \
 "./libraries/DCL/DCL_error.obj" \
@@ -174,17 +175,17 @@ bts_F2837xD_8ch.out: $(OBJS) $(CMD_SRCS) $(LIB_SRCS) $(GEN_CMDS)
 bts_F2837xD_8ch.hex: $(EXE_OUTPUTS)
 	@echo 'Building files: $(strip $(EXE_OUTPUTS__QUOTED))'
 	@echo 'Invoking: C2000 Hex Utility'
-	"C:/ti/ccs1011/ccs/tools/compiler/ti-cgt-c2000_20.2.4.LTS/bin/hex2000"  -o "bts_F2837xD_8ch.hex" $(EXE_OUTPUTS__QUOTED)
+	"C:/ti/ccs1011/ccs/tools/compiler/ti-cgt-c2000_20.2.4.LTS/bin/hex2000" --diag_wrap=off -o "bts_F2837xD_8ch.hex" $(EXE_OUTPUTS__QUOTED)
 	@echo 'Finished building: $(strip $(EXE_OUTPUTS__QUOTED))'
 	@echo ' '
 
 # Other Targets
 clean:
 	-$(RM) $(BIN_OUTPUTS__QUOTED)$(EXE_OUTPUTS__QUOTED)
-	-$(RM) "bts.lst" "bts_hal.lst" "bts_main.lst" "device/F2837xD_CodeStartBranch.lst" "device/device.lst" "libraries/DCL/DCL_error.lst" "libraries/sfra/sfra_gui_scicomms_driverlib.lst" 
-	-$(RM) "bts.obj" "bts_hal.obj" "bts_main.obj" "device\F2837xD_CodeStartBranch.obj" "device\device.obj" "libraries\DCL\DCL_error.obj" "libraries\sfra\sfra_gui_scicomms_driverlib.obj" 
-	-$(RM) "bts.d" "bts_hal.d" "bts_main.d" "device\device.d" "libraries\DCL\DCL_error.d" "libraries\sfra\sfra_gui_scicomms_driverlib.d" 
-	-$(RM) "bts.asm" "bts_hal.asm" "bts_main.asm" "device/F2837xD_CodeStartBranch.asm" "device/device.asm" "libraries/DCL/DCL_error.asm" "libraries/sfra/sfra_gui_scicomms_driverlib.asm" 
+	-$(RM) "bts.lst" "bts_hal.lst" "bts_main.lst" "i2cLib_FIFO_master_slave_interrupt.lst" "device/F2837xD_CodeStartBranch.lst" "device/device.lst" "libraries/DCL/DCL_error.lst" "libraries/sfra/sfra_gui_scicomms_driverlib.lst" 
+	-$(RM) "bts.obj" "bts_hal.obj" "bts_main.obj" "i2cLib_FIFO_master_slave_interrupt.obj" "device\F2837xD_CodeStartBranch.obj" "device\device.obj" "libraries\DCL\DCL_error.obj" "libraries\sfra\sfra_gui_scicomms_driverlib.obj" 
+	-$(RM) "bts.d" "bts_hal.d" "bts_main.d" "i2cLib_FIFO_master_slave_interrupt.d" "device\device.d" "libraries\DCL\DCL_error.d" "libraries\sfra\sfra_gui_scicomms_driverlib.d" 
+	-$(RM) "bts.asm" "bts_hal.asm" "bts_main.asm" "i2cLib_FIFO_master_slave_interrupt.asm" "device/F2837xD_CodeStartBranch.asm" "device/device.asm" "libraries/DCL/DCL_error.asm" "libraries/sfra/sfra_gui_scicomms_driverlib.asm" 
 	-$(RM) "device\F2837xD_CodeStartBranch.d" 
 	-@echo 'Finished clean'
 	-@echo ' '

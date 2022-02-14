@@ -1,0 +1,185 @@
+//#############################################################################
+//
+// FILE:   ttplpfc_clatask.cla
+//
+// TITLE:  CLA Task file
+//
+//#############################################################################
+// $TI Release: TIDM_1007 v1.00.02.00 $
+// $Release Date: Tue Mar 23 14:55:26 CDT 2021 $
+// $Copyright:
+// Copyright (C) 2021 Texas Instruments Incorporated - http://www.ti.com/
+//
+// ALL RIGHTS RESERVED
+// $
+//#############################################################################
+
+#include "ttplpfc.h"
+
+//
+// Task 1 - Title Here
+//
+// Description: Description/steps here.
+//
+//-----------------------------------------------------------------------------
+//
+__attribute__((interrupt))  void Cla1Task1 ( void )
+{
+	#if (CLA_DEBUG==1)
+	__mdebugstop();
+	#endif
+
+    //
+    // Increment the ISR1 Nest counter
+    //
+    TTPLPFC_ISR1_nestingCounter++;
+
+    #if TTPLPFC_CONTROL_RUNNING_ON==CLA_CORE
+    TTPLPFC_HAL_setProfilingGPIO();
+            #if TTPLPFC_LAB == 1
+                TTPLPFC_runISR1_lab1();
+            #elif TTPLPFC_LAB == 2
+                TTPLPFC_runISR1_lab2();
+            #elif TTPLPFC_LAB == 3
+                TTPLPFC_runISR1_lab3();
+            #elif TTPLPFC_LAB == 4
+                TTPLPFC_runISR1_lab4();
+            #elif TTPLPFC_LAB == 5
+                TTPLPFC_runISR1_lab5();
+            #elif TTPLPFC_LAB == 6
+                TTPLPFC_runISR1_lab6();
+            #elif TTPLPFC_LAB == 7
+                TTPLPFC_runISR1_lab7();
+            #elif TTPLPFC_LAB == 8
+                TTPLPFC_runISR1_lab8();
+            #elif TTPLPFC_LAB == 9
+                TTPLPFC_runISR1_lab9();
+            #else
+            #warning undefined lab
+            #endif
+        TTPLPFC_HAL_resetProfilingGPIO();
+    #endif
+
+	#if (CLA_DEBUG==1)
+	__mdebugstop();
+	#endif
+
+}
+
+//-----------------------------------------------------------------------------
+//
+// Task 2 - Title Here
+//
+// Description: Description/steps here.
+//
+//-----------------------------------------------------------------------------
+__attribute__((interrupt))  void Cla1Task2 ( void )
+{
+
+}
+
+//-----------------------------------------------------------------------------
+//
+// Task 3 - Title Here
+//
+// Description: Description/steps here.
+//
+//-----------------------------------------------------------------------------
+__attribute__((interrupt))  void Cla1Task3 ( void )
+{
+
+}
+
+//-----------------------------------------------------------------------------
+//
+// Task 4 - Title Here
+//
+// Description: Description/steps here.
+//
+//-----------------------------------------------------------------------------
+__attribute__((interrupt))  void Cla1Task4 ( void )
+{
+
+}
+
+//-----------------------------------------------------------------------------
+//
+// Task 5 - Title Here
+//
+// Description: Description/steps here.
+//
+//-----------------------------------------------------------------------------
+__attribute__((interrupt))  void Cla1Task5 ( void )
+{
+
+}
+
+//-----------------------------------------------------------------------------
+//
+// Task 6 - Title Here
+//
+// Description: Description/steps here.
+//
+//-----------------------------------------------------------------------------
+__attribute__((interrupt))  void Cla1Task6 ( void )
+{
+
+}
+
+//-----------------------------------------------------------------------------
+//
+// Task 7 - One Time Initialization Task
+//
+// Description:
+//
+//-----------------------------------------------------------------------------
+__attribute__((interrupt))  void Cla1Task7 ( void )
+{
+
+}
+
+//-----------------------------------------------------------------------------
+//
+// Background Task
+//
+// Description:
+//
+//-----------------------------------------------------------------------------
+__attribute__((interrupt("background")))  void Cla1BackgroundTask ( void )
+{
+    //
+    // Reset the ISR1 nesting counter to zero to log the number of nests
+    // of ISR1 from ISR2
+    //
+    TTPLPFC_ISR1_nestingCounter = 0;
+
+    #if (CLA_DEBUG==1)
+    __mdebugstop();
+    #endif
+#if TTPLPFC_INSTRUMENTATION_ISR_RUNNING_ON == CLA_CORE
+    TTPLPFC_runISR2();
+#endif
+
+    //
+    // Log the number of nests, the max and compute the average number of nests
+    //
+    TTPLPFC_ISR1_nests = TTPLPFC_ISR1_nestingCounter;
+
+    if(TTPLPFC_ISR1_nests > TTPLPFC_ISR1_nestsMax)
+    {
+        TTPLPFC_ISR1_nestsMax = TTPLPFC_ISR1_nests;
+    }
+
+    //
+    // Take nesting count average over 100 cycles
+    //
+    TTPLPFC_ISR1_nestsAvg = TTPLPFC_ISR1_nestsAvg +
+            0.01f * (float32_t)(TTPLPFC_ISR1_nests - TTPLPFC_ISR1_nestsAvg);
+
+    #if (CLA_DEBUG==1)
+    __mdebugstop();
+    #endif
+}
+//
+// End of File
+//

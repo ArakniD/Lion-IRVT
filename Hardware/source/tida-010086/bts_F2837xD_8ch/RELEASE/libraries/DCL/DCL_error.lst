@@ -1,11 +1,11 @@
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    1
 
        1              ;***************************************************************
        2              ;* TMS320C2000 G3 C/C++ Codegen                               PC v20.2.4.LTS *
-       3              ;* Date/Time created: Mon Jan 11 05:48:46 2021                 *
+       3              ;* Date/Time created: Tue Mar  2 07:21:44 2021                 *
        4              ;***************************************************************
        5                      .compiler_opts --abi=eabi --cla_support=cla1 --diag_wrap=off --float_support=fpu32 --hll_source=on --
        6                      .asg    XAR2, FP
@@ -58,7 +58,7 @@ DCL_error.asm                                                        PAGE    1
       53                      .dwattr $C$DW$3, DW_AT_location[DW_OP_reg12]
       54              
       55                      .dwcfi  cfa_offset, -2
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    2
@@ -118,7 +118,7 @@ DCL_error.asm                                                        PAGE    2
      103                      .dwattr $C$DW$6, DW_AT_linkage_name("__signbitf")
      104                      .dwattr $C$DW$6, DW_AT_external
      105                      .dwattr $C$DW$6, DW_AT_type(*$C$DW$T$10)
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    3
@@ -178,7 +178,7 @@ DCL_error.asm                                                        PAGE    3
      155                      .dwendtag $C$DW$6
      156              
      157 00000000               .sect   ".text:__signbit"
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    4
@@ -238,7 +238,7 @@ DCL_error.asm                                                        PAGE    4
      209 00000009 18AA          AND       PH,#0                 ; [CPU_ALU] |364| 
          0000000a 0000 
      210 0000000b 9000          ANDB      AL,#0                 ; [CPU_ALU] |364| 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    5
@@ -298,7 +298,7 @@ DCL_error.asm                                                        PAGE    5
      260              
      261              ;***************************************************************
      262              ;* FNAME: __relaxed_sqrtf               FR SIZE:   0           *
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    6
@@ -358,7 +358,7 @@ DCL_error.asm                                                        PAGE    6
      314              $C$DW$20        .dwtag  DW_TAG_formal_parameter
      315                      .dwattr $C$DW$20, DW_AT_name("x")
      316                      .dwattr $C$DW$20, DW_AT_type(*$C$DW$T$16)
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    7
@@ -418,7 +418,7 @@ DCL_error.asm                                                        PAGE    7
      367                      .dwattr $C$DW$23, DW_AT_decl_file("C:/ti/ccs1011/ccs/tools/compiler/ti-cgt-c2000_20.2.4.LTS/include/m
      368                      .dwattr $C$DW$23, DW_AT_decl_line(0xee)
      369                      .dwattr $C$DW$23, DW_AT_decl_column(0x10)
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    8
@@ -478,7 +478,7 @@ DCL_error.asm                                                        PAGE    8
      420              $C$DW$27        .dwtag  DW_TAG_subprogram
      421                      .dwattr $C$DW$27, DW_AT_name("__relaxed_atanf")
      422                      .dwattr $C$DW$27, DW_AT_low_pc(||__relaxed_atanf||)
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE    9
@@ -538,7 +538,7 @@ DCL_error.asm                                                        PAGE    9
      471 00000010 7700          NOP       ; [CPU_ALU] 
      472 00000011 E270          MPY2PIF32 R0H,R0H               ; [CPU_FPU] |245| 
          00000012 0000 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   10
@@ -598,7 +598,7 @@ DCL_error.asm                                                        PAGE   10
      525              ;* R0    assigned to y
      526              $C$DW$34        .dwtag  DW_TAG_variable
      527                      .dwattr $C$DW$34, DW_AT_name("y")
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   11
@@ -658,7 +658,7 @@ DCL_error.asm                                                        PAGE   11
      576                      .dwattr $C$DW$37, DW_AT_type(*$C$DW$T$10)
      577                      .dwattr $C$DW$37, DW_AT_decl_file("C:/ti/ccs1011/ccs/tools/compiler/ti-cgt-c2000_20.2.4.LTS/include/_
      578                      .dwattr $C$DW$37, DW_AT_decl_line(0x167)
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   12
@@ -718,7 +718,7 @@ DCL_error.asm                                                        PAGE   12
      628                      .dwattr $C$DW$40, DW_AT_low_pc(0x00)
      629                      .dwattr $C$DW$40, DW_AT_name("__c28xabi_cmpull")
      630                      .dwattr $C$DW$40, DW_AT_TI_call
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   13
@@ -778,7 +778,7 @@ DCL_error.asm                                                        PAGE   13
      678                      .dwattr $C$DW$42, DW_AT_TI_max_frame_size(-2)
      679                      .dwpsn  file "C:/ti/ccs1011/ccs/tools/compiler/ti-cgt-c2000_20.2.4.LTS/include/_defs.h",line 356,colu
      680              
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   14
@@ -838,7 +838,7 @@ DCL_error.asm                                                        PAGE   14
      728              
      729 00000013 0006          LRETR     ; [CPU_ALU] 
      730                      ; return occurs ; [] 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   15
@@ -898,7 +898,7 @@ DCL_error.asm                                                        PAGE   15
      783                      .dwpsn  file "C:/ti/ccs1011/ccs/tools/compiler/ti-cgt-c2000_20.2.4.LTS/include/_defs.h",line 352,colu
      784 00000001 83C4          MOVL      XAR5,*+XAR4[0]        ; [CPU_ALU] |352| 
      785 00000002 8AD4          MOVL      XAR4,*+XAR4[2]        ; [CPU_ALU] |352| 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   16
@@ -958,7 +958,7 @@ DCL_error.asm                                                        PAGE   16
      830                      .dwattr $C$DW$46, DW_AT_TI_end_line(0x161)
      831                      .dwattr $C$DW$46, DW_AT_TI_end_column(0x30)
      832                      .dwendentry
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   17
@@ -1018,7 +1018,7 @@ DCL_error.asm                                                        PAGE   17
          00000004 0030 
      885 00000005 8F40          MOVL      XAR5,#32752           ; [CPU_ARAU] |348| 
          00000006 7FF0 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   18
@@ -1078,7 +1078,7 @@ DCL_error.asm                                                        PAGE   18
      932                      .clink
      933                      .global ||__isnanf||
      934              
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   19
@@ -1138,7 +1138,7 @@ DCL_error.asm                                                        PAGE   19
      984                      ; branchcc occurs ; [] |345| 
      985 0000000b A9A9          MOVL      ACC,P                 ; [CPU_ALU] |345| 
      986 0000000c 917F          ANDB      AH,#127               ; [CPU_ALU] |345| 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   20
@@ -1198,7 +1198,7 @@ DCL_error.asm                                                        PAGE   20
     1038              ;* AR4   assigned to $O$S1
     1039              ;* AR4   assigned to d
     1040              $C$DW$62        .dwtag  DW_TAG_variable
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   21
@@ -1258,7 +1258,7 @@ DCL_error.asm                                                        PAGE   21
     1085                      .dwcfi  cfa_offset, -2
     1086 00000024 92A4          MOV       AL,AR4                ; [CPU_ALU] |342| 
     1087              $C$DW$64        .dwtag  DW_TAG_TI_branch
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   22
@@ -1318,7 +1318,7 @@ DCL_error.asm                                                        PAGE   22
     1140              
     1141                      .dwcfi  cfa_offset, -2
     1142                      .dwcfi  save_reg_to_mem, 26, 0
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   23
@@ -1378,7 +1378,7 @@ DCL_error.asm                                                        PAGE   23
     1187 00000025 0006          LRETR     ; [CPU_ALU] 
     1188                      ; return occurs ; [] 
     1189                      .dwattr $C$DW$65, DW_AT_TI_end_file("C:/ti/ccs1011/ccs/tools/compiler/ti-cgt-c2000_20.2.4.LTS/include
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   24
@@ -1438,7 +1438,7 @@ DCL_error.asm                                                        PAGE   24
     1241 00000002 CCAA          AND       AL,PH,#0x7f80         ; [CPU_ALU] |375| 
          00000003 7F80 
     1242 00000004 80A9          MOVZ      AR7,AL                ; [CPU_ALU] |375| 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   25
@@ -1498,7 +1498,7 @@ DCL_error.asm                                                        PAGE   25
     1293              ;*                                                             *
     1294              ;* FUNCTION ENVIRONMENT                                        *
     1295              ;*                                                             *
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   26
@@ -1558,7 +1558,7 @@ DCL_error.asm                                                        PAGE   26
     1342              
     1343 0000001e 7640!         LCR       #||__c28xabi_cmpull|| ; [CPU_ALU] |377| 
          0000001f 0000 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   27
@@ -1618,7 +1618,7 @@ DCL_error.asm                                                        PAGE   27
     1395              
     1396              ||__isfinitel||:
     1397              ;* AR4   assigned to e
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   28
@@ -1678,7 +1678,7 @@ DCL_error.asm                                                        PAGE   28
     1446              
     1447                      .dwfde $C$DW$CIE, ||__isfinitef||
     1448              $C$DW$84        .dwtag  DW_TAG_formal_parameter
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   29
@@ -1738,7 +1738,7 @@ DCL_error.asm                                                        PAGE   29
     1497              
     1498              $C$DW$87        .dwtag  DW_TAG_subprogram
     1499                      .dwattr $C$DW$87, DW_AT_name("__isfinite")
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   30
@@ -1798,7 +1798,7 @@ DCL_error.asm                                                        PAGE   30
     1548 0000000f 92A6          MOV       AL,AR6                ; [CPU_ALU] |335| 
     1549              $C$DW$90        .dwtag  DW_TAG_TI_branch
     1550                      .dwattr $C$DW$90, DW_AT_low_pc(0x00)
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   31
@@ -1858,7 +1858,7 @@ DCL_error.asm                                                        PAGE   31
     1603                      .dwattr $C$DW$94, DW_AT_name("e")
     1604                      .dwattr $C$DW$94, DW_AT_type(*$C$DW$T$48)
     1605                      .dwattr $C$DW$94, DW_AT_location[DW_OP_reg12]
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   32
@@ -1918,7 +1918,7 @@ DCL_error.asm                                                        PAGE   32
     1651 00000026 6F2D          B         ||$C$L14||,UNC        ; [CPU_ALU] |436| 
     1652                      ; branch occurs ; [] |436| 
     1653 00000027       ||$C$L10||:    
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   33
@@ -1978,7 +1978,7 @@ DCL_error.asm                                                        PAGE   33
     1698 0000004b 7640!         LCR       #||__c28xabi_cmpull|| ; [CPU_ALU] |436| 
          0000004c 0000 
     1699                      ; call occurs [#||__c28xabi_cmpull||] ; [] |436| 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   34
@@ -2038,7 +2038,7 @@ DCL_error.asm                                                        PAGE   34
     1751              ;*                                                             *
     1752              ;* FUNCTION PROPERTIES                                         *
     1753              ;*                            0 Parameter,  0 Auto,  0 SOE     *
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   35
@@ -2098,7 +2098,7 @@ DCL_error.asm                                                        PAGE   35
          00000014 0017 
     1803 00000015 5622          LSRL      ACC,T                 ; [CPU_ALU] |402| 
     1804 00000016 90FF          ANDB      AL,#0xff              ; [CPU_ALU] |402| 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   36
@@ -2158,7 +2158,7 @@ DCL_error.asm                                                        PAGE   36
     1855                      .dwattr $C$DW$107, DW_AT_type(*$C$DW$T$10)
     1856                      .dwattr $C$DW$107, DW_AT_decl_file("C:/ti/ccs1011/ccs/tools/compiler/ti-cgt-c2000_20.2.4.LTS/include/
     1857                      .dwattr $C$DW$107, DW_AT_decl_line(0x19d)
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   37
@@ -2218,7 +2218,7 @@ DCL_error.asm                                                        PAGE   37
     1908 0000000e 80AB          MOVZ      AR7,PL                ; [CPU_ALU] |419| 
     1909 0000000f 7680          MOVL      XAR6,#32752           ; [CPU_ARAU] |419| 
          00000010 7FF0 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   38
@@ -2278,7 +2278,7 @@ DCL_error.asm                                                        PAGE   38
     1955                      .dwattr $C$DW$112, DW_AT_low_pc(0x00)
     1956                      .dwattr $C$DW$112, DW_AT_name("__c28xabi_cmpull")
     1957                      .dwattr $C$DW$112, DW_AT_TI_call
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   39
@@ -2338,7 +2338,7 @@ DCL_error.asm                                                        PAGE   39
     2003                      .dwattr $C$DW$107, DW_AT_TI_end_column(0x01)
     2004                      .dwendentry
     2005                      .dwendtag $C$DW$107
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   40
@@ -2398,7 +2398,7 @@ DCL_error.asm                                                        PAGE   40
     2058              
     2059 00000004 0006          LRETR     ; [CPU_ALU] 
     2060                      ; return occurs ; [] 
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   41
@@ -2458,7 +2458,7 @@ DCL_error.asm                                                        PAGE   41
     2113                      .group    "__isnormalf", 1
     2114                      .gmember  ".text:__isnormalf"
     2115                      .endgroup
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   42
@@ -2518,7 +2518,7 @@ DCL_error.asm                                                        PAGE   42
     2168                      .dwcfi  same_value, 67
     2169                      .dwcfi  same_value, 71
     2170                      .dwendentry
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   43
@@ -2578,7 +2578,7 @@ DCL_error.asm                                                        PAGE   43
     2223                      .dwendtag $C$DW$T$22
     2224              
     2225                      .dwendtag $C$DW$TU$22
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   44
@@ -2638,7 +2638,7 @@ DCL_error.asm                                                        PAGE   44
     2278              
     2279              $C$DW$TU$4      .dwtag  DW_TAG_type_unit
     2280                      .dwmtype  $C$DW$T$4
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   45
@@ -2698,7 +2698,7 @@ DCL_error.asm                                                        PAGE   45
     2333                      .dwattr $C$DW$T$9, DW_AT_name("unsigned short")
     2334                      .dwattr $C$DW$T$9, DW_AT_byte_size(0x01)
     2335              
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   46
@@ -2758,7 +2758,7 @@ DCL_error.asm                                                        PAGE   46
     2388                      .dwendtag $C$DW$TU$26
     2389              
     2390              
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   47
@@ -2818,7 +2818,7 @@ DCL_error.asm                                                        PAGE   47
     2443              
     2444                      .dwendtag $C$DW$TU$21
     2445              
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   48
@@ -2878,7 +2878,7 @@ DCL_error.asm                                                        PAGE   48
     2498                      .dwattr $C$DW$T$44, DW_AT_address_class(0x20)
     2499              
     2500                      .dwendtag $C$DW$TU$44
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   49
@@ -2938,7 +2938,7 @@ DCL_error.asm                                                        PAGE   49
     2553                      .dwattr $C$DW$T$48, DW_AT_type(*$C$DW$127)
     2554              
     2555                      .dwendtag $C$DW$TU$48
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   50
@@ -2998,7 +2998,7 @@ DCL_error.asm                                                        PAGE   50
     2608                      .dwattr $C$DW$T$28, DW_AT_decl_file("..\libraries\DCL\DCL.h")
     2609                      .dwattr $C$DW$T$28, DW_AT_decl_line(0x90)
     2610                      .dwattr $C$DW$T$28, DW_AT_decl_column(0x19)
-TMS320C2000 Assembler PC v20.2.4 Mon Jan 11 05:48:46 2021
+TMS320C2000 Assembler PC v20.2.4 Tue Mar  2 07:21:44 2021
 
 Copyright (c) 1996-2018 Texas Instruments Incorporated
 DCL_error.asm                                                        PAGE   51

@@ -46,15 +46,6 @@ BTS_userInput BTS_userInput_ch6;
 BTS_userInput BTS_userInput_ch7;
 BTS_userInput BTS_userInput_ch8;
 
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch1;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch2;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch3;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch4;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch5;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch6;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch7;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch8;
-
 BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch1    = BTS_DCL_CTRL_DEFAULTS;
 BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch2    = BTS_DCL_CTRL_DEFAULTS;
 BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch3    = BTS_DCL_CTRL_DEFAULTS;
@@ -127,12 +118,50 @@ volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_ch8    = BTS_DCL_CTRL_DEFAULTS;
 //=====================================
 // DCL control variables
 //
+BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch1;
+BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch2;
+BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch3;
+BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch4;
+BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch5;
+BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch6;
+BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch7;
+BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch8;
 
 //
 //=====================================
-// DCL TCM datalog variables
+// I2C EEPROM and external control access vars
 //
+#define I2CA_ADDRESS   0x30
+#define I2CB_ADDRESS   0x40
 
+#define EEPROM_SLAVE_ADDRESS        0x50
+
+struct  I2CHandle EEPROM;
+struct I2CHandle I2CA;
+struct I2CHandle I2CB;
+
+//
+// Function Prototypes
+//
+__interrupt void i2cAISR(void);
+__interrupt void i2cAFIFOISR(void);
+
+__interrupt void i2cBISR(void);
+__interrupt void i2cBFIFOISR(void);
+
+struct I2CHandle *i2c_int_crnt_responderPtr;                   // Used in interrupt
+
+uint16_t AvailableI2C_slaves[MAX_I2C_IN_NETWORK];
+
+uint16_t I2CA_TXdata[MAX_BUFFER_SIZE];
+uint16_t I2CB_TXdata[MAX_BUFFER_SIZE];
+
+uint16_t I2CA_RXdata[MAX_BUFFER_SIZE];
+uint16_t I2CB_RXdata[MAX_BUFFER_SIZE];
+
+uint32_t I2CA_ControlAddr;
+uint32_t I2CB_ControlAddr;
+uint16_t status;
 
 //
 //=====================================
@@ -358,6 +387,51 @@ void BTS_initProgramVariables(void){
     BTS_measValues_ch8.VoutOffset_V =BTS_VoutOffset_ch8_V;
 }
 
+void BTS_readCalibration(void)
+{
+    BTS_channelCalibration  framData;
+
+    // Scan bus first, check fram is there
+    uint16_t *pAvailableI2C_slaves = AvailableI2C_slaves;
+        status = I2CBusScan(I2CA_BASE, pAvailableI2C_slaves);
+
+    uint16_t i;
+
+    EEPROM.currentHandlePtr     = &EEPROM;
+    EEPROM.SlaveAddr            = EEPROM_SLAVE_ADDRESS;
+    EEPROM.WriteCycleTime_in_us = 10000;    //6ms for EEPROM this code was tested
+    EEPROM.base                 = BTS_I2C_INT_BASE;
+    EEPROM.pControlAddr         = &ControlAddr;
+    EEPROM.NumOfAddrBytes       = 2;
+
+
+        // read fram one calibration slot at a time
+        //Example 2: EEPROM Byte Read
+           //Make sure 11 is written to EEPROM address 0x0
+           ControlAddr = 0;
+           EEPROM.pControlAddr   = &ControlAddr;
+           EEPROM.pRX_MsgBuffer  = RX_MsgBuffer;
+           EEPROM.NumOfDataBytes = 1;
+
+           status = I2C_MasterReceiver(&EEPROM);
+
+           while(I2C_getStatus(EEPROM.base) & I2C_STS_BUS_BUSY);
+
+
+
+        // checksum validation
+
+        // perform an in-place data upgrades
+
+        // Copy into user input and controller if valid
+
+
+
+
+
+}
+
+
 void BTS_initController(void)
 {
     /*
@@ -544,8 +618,197 @@ void BTS_setupSfraGui(void)
     #endif
 }
 
+//
+// Defines
+//
 
 
+
+//
+// I2CB ISR
+//
+#pragma CODE_SECTION(i2cBISR,"isrcodefuncs");
+#pragma INTERRUPT(i2cBISR, HPI)
+__interrupt void i2cBISR(void)
+{
+   uint16_t MasterSlave = I2C_getStatus(I2CB.base) & I2C_STS_ADDR_SLAVE;
+
+   if(MasterSlave)
+   {
+       //I2CB working as slave
+       //Disable I2CA FIFO interrupt to first trigger I2CB FIFO interrupt to read control address
+       I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
+   }
+
+
+   handleI2C_ErrorCondition(&I2CB);
+
+   Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
+}
+
+//
+// I2CB FIFO ISR
+//
+#pragma CODE_SECTION(i2cBFIFOISR,"isrcodefuncs");
+#pragma INTERRUPT(i2cBFIFOISR, HPI)
+__interrupt void i2cBFIFOISR(void)
+{
+    Write_Read_TX_RX_FIFO(&I2CB);
+
+    uint16_t MasterSlave = HWREGH(I2CB.base + I2C_O_MDR);
+
+    if(MasterSlave & I2C_MDR_MST)
+    {
+        //I2CB working in master configuration
+        if(MasterSlave & I2C_MDR_TRX)
+        {
+           //I2CB working as Master Transmitter
+           I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
+        }
+        else
+        {
+           //I2CB working as Master Receiver
+           I2C_enableInterrupt(I2CA.base, (I2C_INT_TXFF));
+           I2C_clearInterruptStatus(I2CA.base,(I2C_INT_TXFF));
+        }
+    }
+   else
+   {
+       //I2CB working in slave configuration
+       if(MasterSlave & I2C_MDR_TRX)
+       {
+           //I2CA = Master Receiver & I2CB = Slave Transmitter
+           //So, I2CA RXFIFO interrupt is enabled  &
+           //    I2CA TXFIFO interrupt is disabled
+           I2C_enableInterrupt(I2CA.base, (I2C_INT_RXFF));
+           I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
+           I2C_clearInterruptStatus(I2CA.base,(I2C_INT_RXFF));
+
+           I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
+       }
+       else
+       {
+           //I2CB working as slave receiver
+           if(HWREGH(I2CA.base + I2C_O_CNT) == I2CA.NumOfAddrBytes)
+           {
+               //Enable I2CA Register Access Ready interrupt to change
+               //to master receiver
+               I2C_enableInterrupt(I2CA.base, I2C_INT_REG_ACCESS_RDY);
+               if(I2CB.pTX_MsgBuffer == 0x0)
+               {
+                    I2CB.pTX_MsgBuffer = (uint16_t *)((uint32_t)(I2CB.pControlAddr) & 0x00FFFFFF);
+                    I2CB.pRX_MsgBuffer = (uint16_t *)0;
+               }
+           }
+           else
+           {
+               //Continue with I2CA master transmitter mode
+               I2C_enableInterrupt(I2CA.base, (I2C_INT_TXFF));
+               I2C_disableInterrupt(I2CA.base, (I2C_INT_RXFF));
+               I2C_clearInterruptStatus(I2CA.base,(I2C_INT_TXFF | I2C_INT_RXFF));
+               if(I2CB.pRX_MsgBuffer == 0x0)
+               {
+                   I2CB.pRX_MsgBuffer = (uint16_t *)((uint32_t)(I2CB.pControlAddr) & 0x00FFFFFF);
+                   I2CB.pTX_MsgBuffer = (uint16_t *)0;
+               }
+           }
+       }
+   }
+
+   Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
+}
+
+//
+// I2CA ISR
+//
+#pragma CODE_SECTION(i2cAISR,"isrcodefuncs");
+#pragma INTERRUPT(i2cAISR, HPI)
+__interrupt void i2cAISR(void)
+{
+    uint16_t MasterSlave = I2C_getStatus(I2CA.base) & I2C_STS_ADDR_SLAVE;
+
+    if(MasterSlave)
+    {
+        //I2CA working as slave
+        //Disable I2CB FIFO interrupt to first trigger I2CA FIFO interrupt to read control address
+        I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
+    }
+
+    handleI2C_ErrorCondition(&I2CA);
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
+}
+
+//
+// I2CA FIFO ISR
+//
+#pragma CODE_SECTION(i2cAFIFOISR,"isrcodefuncs");
+#pragma INTERRUPT(i2cAFIFOISR, HPI)
+__interrupt void i2cAFIFOISR(void)
+{
+    Write_Read_TX_RX_FIFO(&I2CA);
+
+    uint16_t MasterSlave = HWREGH(I2CA.base + I2C_O_MDR);
+
+    if(MasterSlave & I2C_MDR_MST)
+    {
+        //I2CA working in master configuration
+        if(MasterSlave & I2C_MDR_TRX)
+        {
+          //I2CA working as Master Transmitter
+          I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
+        }
+        else
+        {
+          //I2CA working as Master Receiver
+          I2C_enableInterrupt(I2CB.base, (I2C_INT_TXFF));
+          I2C_clearInterruptStatus(I2CB.base,(I2C_INT_TXFF));
+        }
+    }
+    else
+    {
+        //I2CA working in slave configuration
+        if(MasterSlave & I2C_MDR_TRX)
+        {
+            //I2CA = Slave Transmitter & I2CB = Master Receiver
+            //So, I2CB RXFIFO interrupt is enabled  &
+            //    I2CB TXFIFO interrupt is disabled
+            I2C_enableInterrupt(I2CB.base, (I2C_INT_RXFF));
+            I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
+            I2C_clearInterruptStatus(I2CB.base,(I2C_INT_RXFF));
+
+            I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
+        }
+       else
+       {
+           //I2CA working as slave receiver
+           if(HWREGH(I2CB.base + I2C_O_CNT) == I2CB.NumOfAddrBytes)
+           {
+               //Enable I2CB Register Access Ready interrupt to change
+               //to master receiver
+               I2C_enableInterrupt(I2CB.base, I2C_INT_REG_ACCESS_RDY);
+               if(I2CA.pTX_MsgBuffer == 0x0)
+               {
+                    I2CA.pTX_MsgBuffer = (uint16_t *)((uint32_t)(I2CA.pControlAddr) & 0x00FFFFFF);
+                    I2CA.pRX_MsgBuffer = (uint16_t *)0;
+               }
+           }
+           else
+           {
+               //Continue with I2CB master transmitter mode
+               I2C_enableInterrupt(I2CB.base, (I2C_INT_TXFF));
+               I2C_disableInterrupt(I2CB.base, (I2C_INT_RXFF));
+               I2C_clearInterruptStatus(I2CB.base,(I2C_INT_TXFF | I2C_INT_RXFF));
+               if(I2CA.pRX_MsgBuffer == 0x0)
+               {
+                   I2CA.pRX_MsgBuffer = (uint16_t *)((uint32_t)(I2CA.pControlAddr) & 0x00FFFFFF);
+                   I2CA.pTX_MsgBuffer = (uint16_t *)0;
+               }
+           }
+       }
+   }
+
+   Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
+}
 
 
 #pragma CODE_SECTION(BTS_updateReference,"ramfuncs");

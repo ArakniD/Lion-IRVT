@@ -5,10 +5,10 @@
 // TITLE:  C28x Driverlib Header File
 //
 //#############################################################################
-// $TI Release: HV_1PH_DCAC v3.00.01.00 $
-// $Release Date: Tue Nov  3 10:37:47 CST 2020 $
+// $TI Release: F2837xD Support Library v3.12.00.00 $
+// $Release Date: Fri Feb 12 19:03:23 IST 2021 $
 // $Copyright:
-// Copyright (C) 2013-2017 Texas Instruments Incorporated - http://www.ti.com/
+// Copyright (C) 2013-2021 Texas Instruments Incorporated - http://www.ti.com/
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -48,6 +48,7 @@
 #include "asysctl.h"
 #include "can.h"
 #include "cla.h"
+#include "clb.h"
 #include "cmpss.h"
 #include "cpu.h"
 #include "cputimer.h"
@@ -67,6 +68,7 @@
 #include "mcbsp.h"
 #include "memcfg.h"
 #include "pin_map.h"
+//#include "pin_map_legacy.h"
 #include "sci.h"
 #include "sdfm.h"
 #include "spi.h"

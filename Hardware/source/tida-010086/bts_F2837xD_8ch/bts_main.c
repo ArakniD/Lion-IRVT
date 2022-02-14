@@ -89,6 +89,12 @@ void main(void)
     //
     BTS_HAL_setupSyncBuckPinsGpio();
 
+    BTS_HAL_SetupI2C_GPIO();
+
+    BTS_HAL_SetupI2C_Init();
+
+    BTS_HAL_setupCanBus();
+
     //
     // Tasks State-machine initialization
     //
@@ -170,7 +176,11 @@ void main(void)
     BTS_HAL_setupInterrupt_Adc1();
     BTS_HAL_setupInterrupt_Adc2();
 
+    BTS_HAS_setupInterrupt_I2c();
+
     BTS_HAL_setupInterrupt();
+
+
 
     //
     // Switch actuation pins over to ePWM function
@@ -193,6 +203,7 @@ void main(void)
         (*Alpha_State_Ptr)();   // jump to an Alpha state (A0,B0,...)
     }
 } //END MAIN CODE
+
 
 //
 // ISR1() interrupt function

@@ -5,10 +5,10 @@
 // TITLE:  Device setup for examples.
 //
 //#############################################################################
-// $TI Release: F2837xD Support Library v3.11.00.00 $
-// $Release Date: Sun Oct  4 15:55:24 IST 2020 $
+// $TI Release: F2837xD Support Library v3.12.00.00 $
+// $Release Date: Fri Feb 12 19:03:23 IST 2021 $
 // $Copyright:
-// Copyright (C) 2013-2020 Texas Instruments Incorporated - http://www.ti.com/
+// Copyright (C) 2013-2021 Texas Instruments Incorporated - http://www.ti.com/
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -153,10 +153,10 @@ a single CPU should be defined."
                                      SYSCTL_PLL_ENABLE)
 
 //
-// 160MHz SYSCLK frequency based on the above DEVICE_SETCLOCK_CFG. Update the
+// 170MHz SYSCLK frequency based on the above DEVICE_SETCLOCK_CFG. Update the
 // code below if a different clock configuration is used!
 //
-#define DEVICE_SYSCLK_FREQ          ((DEVICE_OSCSRC_FREQ * 16 * 1) / 2)
+#define DEVICE_SYSCLK_FREQ          ((DEVICE_OSCSRC_FREQ * 17 * 1) / 2)
 
 #endif
 
@@ -240,16 +240,140 @@ extern uint32_t Example_Fail;
 // Function Prototypes
 //
 //*****************************************************************************
+//*****************************************************************************
+//
+//! \addtogroup device_api
+//! @{
+//
+//*****************************************************************************
+//*****************************************************************************
+//
+//! @brief Function to initialize the device. Primarily initializes system control to a
+//! known state by disabling the watchdog, setting up the SYSCLKOUT frequency,
+//! and enabling the clocks to the peripherals.
+//!
+//! \param None.
+//! \return None.
+//
+//*****************************************************************************
 extern void Device_init(void);
+//*****************************************************************************
+//!
+//!
+//! @brief Function to turn on all peripherals, enabling reads and writes to the
+//! peripherals' registers.
+//!
+//! Note that to reduce power, unused peripherals should be disabled.
+//!
+//! @param None
+//! @return None
+//
+//*****************************************************************************
 extern void Device_enableAllPeripherals(void);
+//*****************************************************************************
+//!
+//!
+//! @brief Function to disable pin locks on GPIOs.
+//!
+//! @param None
+//! @return None
+//
+//*****************************************************************************
 extern void Device_initGPIO(void);
+//*****************************************************************************
+//!
+//! @brief Function to enable pullups for the unbonded GPIOs on the 176PTP package:
+//! GPIOs     Grp Bits
+//! 95-132    C   31
+//!           D   31:0
+//!           E   4:0
+//! 134-168   E   31:6
+//!           F   8:0
+//!
+//! @param None
+//! @return None
+//
+//*****************************************************************************
 extern void Device_enableUnbondedGPIOPullupsFor176Pin(void);
+//*****************************************************************************
+//!
+//! @brief Function to enable pullups for the unbonded GPIOs on the 100PZ package:
+//! GPIOs     Grp Bits
+//! 0-1       A   1:0
+//! 5-9       A   9:5
+//! 22-40     A   31:22
+//!           B   8:0
+//! 44-57     B   25:12
+//! 67-68     C   4:3
+//! 74-77     C   13:10
+//! 79-83     C   19:15
+//! 93-168    C   31:29
+//!           D   31:0
+//!           E   31:0
+//!           F   8:0
+//! @param None
+//! @return None
+//
+//
+//*****************************************************************************
 extern void Device_enableUnbondedGPIOPullupsFor100Pin(void);
+//*****************************************************************************
+//!
+//! @brief Function to enable pullups for the unbonded GPIOs on the
+//! 176PTP package.
+//!
+//! @param None
+//! @return None
+//
+//*****************************************************************************
 extern void Device_enableUnbondedGPIOPullups(void);
 #ifdef CPU1
+//*****************************************************************************
+//!
+//! @brief Function to implement Analog trim of TMX devices
+//!
+//! @param None
+//! @return None
+//
+//*****************************************************************************
 extern void Device_configureTMXAnalogTrim(void);
+//*****************************************************************************
+//! @brief Executes a CPU02 control system bootloader.
+//!
+//! \param bootMode specifies which CPU02 control system boot mode to execute.
+//!
+//! This function will allow the CPU01 master system to boot the CPU02 control
+//! system via the following modes: Boot to RAM, Boot to Flash, Boot via SPI,
+//! SCI, I2C, or parallel I/O. This function blocks and waits until the
+//! control system boot ROM is configured and ready to receive CPU01 to CPU02
+//! IPC INT0 interrupts. It then blocks and waits until IPC INT0 and
+//! IPC FLAG31 are available in the CPU02 boot ROM prior to sending the
+//! command to execute the selected bootloader.
+//!
+//! The \e bootMode parameter accepts one of the following values:
+//!  - \b C1C2_BROM_BOOTMODE_BOOT_FROM_PARALLEL
+//!  - \b C1C2_BROM_BOOTMODE_BOOT_FROM_SCI
+//!  - \b C1C2_BROM_BOOTMODE_BOOT_FROM_SPI
+//!  - \b C1C2_BROM_BOOTMODE_BOOT_FROM_I2C
+//!  - \b C1C2_BROM_BOOTMODE_BOOT_FROM_CAN
+//!  - \b C1C2_BROM_BOOTMODE_BOOT_FROM_RAM
+//!  - \b C1C2_BROM_BOOTMODE_BOOT_FROM_FLASH
+//!
+//! \return 0 (success) if command is sent, or 1 (failure) if boot mode is
+//! invalid and command was not sent.
+//
+//*****************************************************************************
 extern uint16_t Device_bootCPU2(uint32_t ulBootMode);
 #endif
+//*****************************************************************************
+//!
+//! @brief Error handling function to be called when an ASSERT is violated
+//!
+//! @param *filename File name in which the error has occurred
+//! @param line Line number within the file
+//! @return None
+//
+//*****************************************************************************
 extern void __error__(char *filename, uint32_t line);
 extern void Example_setResultPass(void);
 extern void Example_setResultFail(void);

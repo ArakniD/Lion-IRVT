@@ -115,6 +115,33 @@ extern BTS_measValues BTS_measValues_ch6;
 extern BTS_measValues BTS_measValues_ch7;
 extern BTS_measValues BTS_measValues_ch8;
 
+typedef struct __attribute((packed)) _BTS_channelCalibration
+{
+    /* Header and checksum for forward persistent storage
+     * Compatibility and in-place upgrade pathway
+     */
+    uint8_t   header;
+    uint8_t   channel;
+    uint16_t  checksum;
+    uint32_t  dateTime;
+
+    float32_t IoutGain_pu;
+    float32_t IoutOffset_pu;
+    float32_t IoutGain_A;
+    float32_t IoutOffset_A;
+
+    float32_t VoutGain_pu;
+    float32_t VoutOffset_pu;
+    float32_t VoutGain_V;
+    float32_t VoutOffset_V;
+
+} BTS_channelCalibration;
+
+typedef union {
+    BTS_channelCalibration  calibration;
+    char                    buffer[64];
+};
+
 typedef struct
 {
     volatile float32_t iref_A;

@@ -111,7 +111,7 @@
 #define BTS_DRV_EPWM_HR_ENABLED           true
 #define BTS_EPWM_HR_ENABLED               true
 
-#define BTS_DRV_EPWM_BASE                 EPWM1_BASE //change here
+#define BTS_DRV_EPWM_BASE                 EPWM1_BASE
 #define BTS_DRV_EPWM_NUM                  ((uint16_t)1)
 #define BTS_DRV_EPWM_H_GPIO               ((uint16_t)1)
 #define BTS_DRV_EPWM_H_PIN_CONFIG_EPWM    GPIO_0_EPWM1A
@@ -254,7 +254,27 @@
 #define BTS_DRDY_ADC2                     ISR3
 #define BTS_RXFIFO_SPI2                   ISR4
 
-//
+
+// I2C Internal - Master Mode (FRAM/EEPROM)
+#define BTS_I2C_INT_BASE                   I2CB_BASE
+#define BTS_I2C_INT_SPEED                  400000
+#define BTS_I2C_INT_PIN_SDA                ((uint16_t)40)
+#define BTS_I2C_INT_PIN_SCL                ((uint16_t)41)
+#define BTS_I2C_INT_CFG_SDA                GPIO_40_SDAB
+#define BTS_I2C_INT_CFG_SCL                GPIO_41_SCLB
+
+// I2C External - Slave mode
+#define BTS_I2C_EXT_BASE                   I2CA_BASE
+#define BTS_I2C_EXT_SPEED                  400000
+#define BTS_I2C_EXT_PIN_SDA                ((uint16_t)32)
+#define BTS_I2C_EXT_PIN_SCL                ((uint16_t)33)
+#define BTS_I2C_EXT_CFG_SDA                GPIO_32_SDAA
+#define BTS_I2C_EXT_CFG_SCL                GPIO_33_SCLA
+
+// CAN External - CC/CV set-point and data stream
+#define BTS_CAN_BASE                        CANA_BASE
+#define BTS_CAN_PIN_CANRX                   GPIO_30_CANRXA
+#define BTS_CAN_PIN_CANTX                   GPIO_31_CANTXA
 
 
 #define BTS_senseAverageFactor 32 //32U
@@ -292,19 +312,19 @@
 #define BTS_DCL_CC_A2                ((float32_t) 0.9605802)
 #endif
 
+#if 0
 #define BTS_DCL_CV_KDC               ((float32_t)5000)
 #define BTS_DCL_CV_Z0                ((float32_t)0.100)
 #define BTS_DCL_CV_Z1                ((float32_t)1.000) // 2
 #define BTS_DCL_CV_P1                ((float32_t)1.000) // 2
 
-
-#if 0
 #define BTS_DCL_CV_B0                ((float32_t) 1.3718226)
 #define BTS_DCL_CV_B1                ((float32_t)-2.4455344)
 #define BTS_DCL_CV_B2                ((float32_t) 1.0831584)
 #define BTS_DCL_CV_A1                ((float32_t)-1.9244279)
 #define BTS_DCL_CV_A2                ((float32_t) 0.9244279)
 #else
+
 #define BTS_DCL_CV_KDC               ((float32_t)5000)
 #define BTS_DCL_CV_Z0                ((float32_t)0.100)
 #define BTS_DCL_CV_Z1                ((float32_t)2.000) // 2
@@ -427,7 +447,9 @@
 #define BTS_DRV_EPWM_DC_TRIP_OC           EPWM_DC_TRIP_TRIPIN4
 #define BTS_DRV_EPWM_DC_TRIP_PCMC         EPWM_DC_TRIP_TRIPIN5
 
-#define BTS_DRV_EPWM_SWITCHING_FREQUENCY  ((float32_t)100 * 1000)
+#define BTS_DRV_EPWM_SWITCHING_FREQUENCY  ((BTS_DRV_ADC_SWITCHING_FREQUENCY / (float32_t)2 / (float32_t)128 ) * (float32_t)3)
+
+// 99,609.375 Hz
 
 #define BTS_DRV_ADC_EPWMCLK_DIV          EPWM_CLOCK_DIVIDER_1
 #define BTS_DRV_ADC_HSCLK_DIV            EPWM_HSCLOCK_DIVIDER_1
@@ -442,7 +464,9 @@
 #define BTS_DRV_ADC_TBPRD                ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS - 1)
 #define BTS_DRV_ADC_PERIOD_SEC           ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS / BTS_EPWM_HZ / 2)
 
-#define BTS_DRV_ADC_SWITCHING_FREQUENCY  ((float32_t)8000 * 1000)
+#define BTS_DRV_ADC_SWITCHING_FREQUENCY  ((float32_t)8500 * 1000)
+
+// Sampling speed of 33,203.125 Hz
 
 #if(BTS_DRV_EPWM_HR_ENABLED == true)
     #define BTS_DRV_EPWM_CMPAHR_BITS          8

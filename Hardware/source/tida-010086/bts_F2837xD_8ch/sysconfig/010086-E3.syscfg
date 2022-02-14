@@ -1,0 +1,89 @@
+/**
+ * These arguments were used when this file was generated. They will be automatically applied on subsequent loads
+ * via the GUI or CLI. Run CLI with '--help' for additional information on how to override these arguments.
+ * @cliArgs --device "F2837xD" --package "F2837xD_337ZWT" --part "F2837xD_337ZWT"
+ * @versions {"data":"2020100914","timestamp":"2020100914","tool":"1.7.0+1616","templates":"2020100914"}
+ */
+
+/**
+ * These are the peripherals and settings in this configuration
+ */
+const iCAN1               = scripting.addPeripheral("CAN");
+iCAN1.$name               = "MyCAN1";
+iCAN1["CANRX@"].$assign   = "GPIO30";
+iCAN1["CANTX@"].$assign   = "GPIO31";
+const iGPIO1              = scripting.addPeripheral("GPIO");
+iGPIO1.$numPins           = 3;
+iGPIO1["0"].$assign       = "GPIO54";
+iGPIO1["1"].$assign       = "GPIO55";
+iGPIO1["2"].$assign       = "GPIO56";
+iGPIO1.$name              = "MODE";
+const iGPIO2              = scripting.addPeripheral("GPIO");
+iGPIO2.$numPins           = 3;
+iGPIO2["0"].$assign       = "GPIO57";
+iGPIO2["1"].$assign       = "GPIO58";
+iGPIO2["2"].$assign       = "GPIO59";
+iGPIO2.$name              = "EN";
+const iGPIO3              = scripting.addPeripheral("GPIO");
+iGPIO3.$numPins           = 8;
+iGPIO3["0"].$assign       = "GPIO34";
+iGPIO3["1"].$assign       = "GPIO39";
+iGPIO3["2"].$assign       = "GPIO44";
+iGPIO3["3"].$assign       = "GPIO45";
+iGPIO3["4"].$assign       = "GPIO46";
+iGPIO3["5"].$assign       = "GPIO47";
+iGPIO3["6"].$assign       = "GPIO26";
+iGPIO3["7"].$assign       = "GPIO27";
+iGPIO3.$name              = "extraGPIO";
+const iGPIO4              = scripting.addPeripheral("GPIO");
+iGPIO4.$name              = "MyGPIO1";
+const iI2C1               = scripting.addPeripheral("I2C");
+iI2C1.$name               = "MyI2C1";
+iI2C1["SDA@"].$assign     = "GPIO40";
+iI2C1["SCL@"].$assign     = "GPIO41";
+const iI2C2               = scripting.addPeripheral("I2C");
+iI2C2.$name               = "MyI2C2";
+iI2C2["SDA@"].$assign     = "GPIO32";
+iI2C2["SCL@"].$assign     = "GPIO33";
+const iSCI1               = scripting.addPeripheral("SCI");
+iSCI1.$useCase            = "TRANSMIT ONLY";
+iSCI1.$name               = "LEDSerial";
+iSCI1["SCITXD@"].$assign  = "GPIO29";
+const iSD1                = scripting.addPeripheral("SD");
+iSD1.$name                = "microSD";
+iSD1["SD#_C1"].$assign    = "GPIO123";
+iSD1["SD#_C2"].$assign    = "GPIO125";
+iSD1["SD#_D2"].$assign    = "GPIO124";
+iSD1["SD#_C3"].$used      = false;
+iSD1["SD#_D3"].$used      = false;
+iSD1["SD#_C4"].$used      = false;
+iSD1["SD#_D4"].$used      = false;
+const iSPI1               = scripting.addPeripheral("SPI");
+iSPI1.$name               = "ADC1";
+iSPI1["SPISTE@"].$used    = false;
+iSPI1["SPISOMI@"].$used   = true;
+const iSPI2               = scripting.addPeripheral("SPI");
+iSPI2.$name               = "ADC2";
+iSPI2.$assign             = "SPIC";
+iSPI2["SPISIMO@"].$assign = "GPIO50";
+iSPI2["SPICLK@"].$assign  = "GPIO52";
+iSPI2["SPISTE@"].$used    = false;
+iSPI2["SPISOMI@"].$assign = "GPIO51";
+iSPI2["SPISOMI@"].$used   = true;
+
+/**
+ * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
+ * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
+ * re-solve from scratch.
+ */
+iCAN1.$suggestSolution             = "CANA";
+iGPIO4["0"].$suggestSolution       = "GPIO0";
+iI2C1.$suggestSolution             = "I2CB";
+iI2C2.$suggestSolution             = "I2CA";
+iSCI1.$suggestSolution             = "SCIA";
+iSD1.$suggestSolution              = "SD1";
+iSD1["SD#_D1"].$suggestSolution    = "GPIO122";
+iSPI1.$suggestSolution             = "SPIA";
+iSPI1["SPISIMO@"].$suggestSolution = "GPIO16";
+iSPI1["SPICLK@"].$suggestSolution  = "GPIO18";
+iSPI1["SPISOMI@"].$suggestSolution = "GPIO17";
