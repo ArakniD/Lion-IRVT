@@ -1,0 +1,30 @@
+ANALOG
+Ch 1 Scale 1.00V/, Pos 20.0000V, Coup DC, BW Limit 20 MHz, Inv Off, Imp 1M Ohm
+     Probe 10.000000 : 1, Skew 0.0s
+Ch 2 Scale 1.00V/, Pos 20.0000V, Coup DC, BW Limit 20 MHz, Inv Off, Imp 1M Ohm
+     Probe 10.000000 : 1, Skew 0.0s
+
+MATH 2
+Ch 1-Ch 2, Scale 1.00V/, Offset 1.40625V
+
+TRIGGER
+Sweep Mode Normal, Coup DC, Noise Rej Off, HF Rej Off, Holdoff 40.0ns
+Mode OR, 1 REXX 4 D15 XXXX XXXX XXXX XXXX D0
+
+HORIZONTAL
+Mode Normal, Ref Center, Main Scale 20.00ms/, Main Delay 43.000000000ms
+
+ACQUISITION
+Mode Normal, Realtime, Vectors On, Persistence Off
+Antialiasing On
+
+MEASUREMENTS
+Frequency(1), Cur No edges, Mean 794.47kHz, Min 5Hz, Max 18.900MHz, Std Dev 1.8311MHz, Count 2.000k
+Pk-Pk(1), Cur 5.51V, Mean 2.16V, Min 320mV, Max 23.70V, Std Dev 2.89V, Count 2.000k
+Top(1), Cur 23.34V, Mean 8.09V, Min 30mV, Max 23.62V, Std Dev 9.60V, Count 2.000k
+Top(2), Cur 22.98V, Mean 22.95V, Min 19.26V, Max 23.40V, Std Dev 390mV, Count 238
+Minimum(1), Cur 17.83V, Mean 8.14V, Min -820mV, Max 21.82V, Std Dev 7.87V, Count 2.000k
+Maximum(1), Cur 23.34V, Mean 10.46V, Min 180mV, Max 23.66V, Std Dev 9.15V, Count 2.000k
+Maximum(2), Cur 22.98V, Mean 3.78V, Min 600mV, Max 23.40V, Std Dev 7.06V, Count 2.000k
+Minimum(2), Cur 17.75V, Mean 1.85V, Min -800mV, Max 19.20V, Std Dev 6.18V, Count 2.000k
+

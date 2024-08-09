@@ -1,0 +1,29 @@
+ANALOG
+Ch 1 Scale 5.00V/, Pos 17.7500V, Coup DC, BW Limit 20 MHz, Inv Off, Imp 1M Ohm
+     Probe 10.000000 : 1, Skew 0.0s
+Ch 3 Scale 100mV/, Pos -11.00mV, Coup DC, BW Limit Off, Inv Off, Imp 50 Ohm
+     Probe 10.000000 : 1, Skew 0.0s, Serial Number US49410155
+
+MATH 2
+smoothing(Ch 1), Scale 5.00V/, Offset 8.30276V
+
+TRIGGER
+Sweep Mode Normal, Coup DC, Noise Rej On, HF Rej 20 MHz, Holdoff 40.0ns
+Mode Edge, Source Ch 3, Slope Rising, Level 20.00mV
+
+HORIZONTAL
+Mode Normal, Ref Center, Main Scale 2.000ms/, Main Delay -2.140000000ms
+
+ACQUISITION
+Mode Normal, Realtime, Vectors On, Persistence Off
+Antialiasing On
+
+MEASUREMENTS
+Pk-Pk(1), Cur 18.5V, Mean 3.4V, Min 800mV, Max 19.7V, Std Dev 6.1V, Count 2.000k
+Period(1), Cur 3.4752ms, Mean 1.4125ms, Min 9.1us, Max 32.203ms, Std Dev 1.9177ms, Count 2.000k
+Frequency(1), Cur 287.75Hz, Mean 12.796kHz, Min 31.05Hz, Max 109.00kHz, Std Dev 9.8778kHz, Count 2.000k
+Amplitude(1), Cur 15.9V, Mean 15.1V, Min 1.4V, Max 16.1V, Std Dev 3.3V, Count 2.000k
+Amplitude(3), Cur 197mV, Mean 113mV, Min 32mV, Max 555mV, Std Dev 89mV, Count 2.000k
+Period(3), Cur 10.114ms, Mean , Min , Max , Std Dev , Count 0
+Phase(3-M2), Cur 149.83Degree, Mean 149.83Degree, Min 149.83Degree, Max 149.83Degree, Std Dev 0.0Degree, Count 1
+
