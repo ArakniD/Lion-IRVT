@@ -94,11 +94,10 @@ void BTS_HAL_setupInterrupt(void);
 void BTS_HAL_setupInterrupt_Adc1(void);
 void BTS_HAL_setupInterrupt_Adc2(void);
 void BTS_HAL_setupInterrupt_I2c(void);
-
 void BTS_HAL_SetupSpi(uint32_t base);
 void BTS_HAL_SetupSpiPinsGpio_Adc1(void);
 void BTS_HAL_SetupSpiPinsGpio_Adc2(void);
-
+void BTS_HAL_setupCanBus();
 void BTS_HAL_SetupI2C_GPIO(void);
 void BTS_HAL_SetupI2C_Init(void);
 

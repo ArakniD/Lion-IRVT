@@ -5,10 +5,10 @@
 // TITLE:  Device setup for examples.
 //
 //#############################################################################
-// $TI Release: F2837xD Support Library v3.12.00.00 $
-// $Release Date: Fri Feb 12 19:03:23 IST 2021 $
+//
+// $Release Date: $
 // $Copyright:
-// Copyright (C) 2013-2021 Texas Instruments Incorporated - http://www.ti.com/
+// Copyright (C) 2013-2024 Texas Instruments Incorporated - http://www.ti.com/
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -47,6 +47,10 @@
 #include "driverlib.h"
 #include "inc/hw_ipc.h"
 
+#ifdef CMDTOOL
+#include "device_cmd.h"
+#endif
+
 #ifdef __cplusplus
 using std::memcpy;
 #endif
@@ -72,7 +76,12 @@ void Device_init(void)
     //
     SysCtl_disableWatchdog();
 
+#ifdef CMDTOOL
+    CMD_init();
+#endif
+
 #ifdef _FLASH
+#ifndef CMDTOOL
     //
     // Copy time critical code and flash setup code to RAM. This includes the
     // following functions: InitFlash();
@@ -83,6 +92,7 @@ void Device_init(void)
     memcpy(&RamfuncsRunStart, &RamfuncsLoadStart, (size_t)&RamfuncsLoadSize);
     memcpy(&isrcodefuncsRunStart,&isrcodefuncsLoadStart,  (size_t)&isrcodefuncsLoadSize );
     memcpy(&Cla1ConstRunStart,&Cla1ConstLoadStart, (size_t)&Cla1ConstLoadSize );
+#endif
 
     //
     // Call Flash Initialization to setup flash waitstates. This function must
@@ -673,7 +683,7 @@ Device_bootCPU2(uint32_t bootMode)
 // Error handling function to be called when an ASSERT is violated
 //
 //*****************************************************************************
-void __error__(char *filename, uint32_t line)
+void __error__(const char *filename, uint32_t line)
 {
     //
     // An ASSERT condition was evaluated as false. You can use the filename and

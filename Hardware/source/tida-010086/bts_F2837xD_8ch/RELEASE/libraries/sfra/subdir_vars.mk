@@ -5,11 +5,8 @@
 SHELL = cmd.exe
 
 # Add inputs and outputs from these tool invocations to the build variables 
-LIB_SRCS += \
-../libraries/sfra/sfra_f32_tmu_eabi.lib 
-
 C_SRCS += \
-../libraries/sfra/sfra_gui_scicomms_driverlib.c 
+C:/ti/c2000/C2000Ware_DigitalPower_SDK_5_03_00_00/libraries/sfra/gui/source/sfra_gui_scicomms_driverlib.c 
 
 C_DEPS += \
 ./libraries/sfra/sfra_gui_scicomms_driverlib.d 
@@ -24,6 +21,6 @@ C_DEPS__QUOTED += \
 "libraries\sfra\sfra_gui_scicomms_driverlib.d" 
 
 C_SRCS__QUOTED += \
-"../libraries/sfra/sfra_gui_scicomms_driverlib.c" 
+"C:/ti/c2000/C2000Ware_DigitalPower_SDK_5_03_00_00/libraries/sfra/gui/source/sfra_gui_scicomms_driverlib.c" 
 
 

@@ -176,9 +176,13 @@ void main(void)
     BTS_HAL_setupInterrupt_Adc1();
     BTS_HAL_setupInterrupt_Adc2();
 
-    BTS_HAS_setupInterrupt_I2c();
+    BTS_HAL_setupInterrupt_I2c();
 
     BTS_HAL_setupInterrupt();
+
+    //
+    // Read in the calibration
+    BTS_readCalibration();
 
 
 
@@ -453,7 +457,11 @@ void C1(void)
 
 void C2(void)
 {
+    static uint16_t channel = 0;
 
+    channel = ++channel % 8;
+
+    BTS_monitor_program_update(&BTS_userInputs[channel], &BTS_measValues[channel]);
 
     //
     // Execute task C3 the next time CpuTimer2 decrements to 0

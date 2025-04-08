@@ -863,7 +863,7 @@ void BTS_HAL_SetupI2C_Init()
     I2C_enableFIFO(BTS_I2C_INT_BASE);
     I2C_clearInterruptStatus(BTS_I2C_INT_BASE, I2C_INT_ARB_LOST | I2C_INT_NO_ACK);
     I2C_setFIFOInterruptLevel(BTS_I2C_INT_BASE, I2C_FIFO_TXEMPTY, I2C_FIFO_RX2);
-    I2C_enableInterrupt(BTS_I2C_INT_BASE, I2C_INT_ADDR_SLAVE | I2C_INT_ARB_LOST | I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION);
+    I2C_enableInterrupt(BTS_I2C_INT_BASE, I2C_INT_ARB_LOST | I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION);
     I2C_setEmulationMode(BTS_I2C_INT_BASE, I2C_EMULATION_FREE_RUN);
     I2C_enableModule(BTS_I2C_INT_BASE);
 }
@@ -952,7 +952,7 @@ void BTS_HAL_setupInterrupt(void)
     EDIS;
 }
 
-void BTS_HAS_setupInterrupt_I2c(void)
+void BTS_HAL_setupInterrupt_I2c(void)
 {
     //
     // Set I2C use, initializing it for FIFO mode

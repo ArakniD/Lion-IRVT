@@ -80,6 +80,10 @@ struct I2CHandle
 
     uint16_t numofSixteenByte;
     uint16_t remainingBytes;
+
+    uint16_t WriteCycleTime_in_us;      //  Slave write cycle time. Depends on slave.
+                                            //  Please check slave device datasheet
+    uint16_t status;
 };
 
 uint16_t I2C_TransmitSlaveAddress_ControlBytes(struct I2CHandle *I2C_Params);
@@ -100,6 +104,9 @@ extern void Write_Read_TX_RX_FIFO(struct I2CHandle *I2C_Params);
 extern uint16_t status;
 
 extern struct I2CHandle *currentSlavePtr;
+
+// extern uint16_t TX_MsgBuffer[MAX_BUFFER_SIZE];
+// extern uint16_t RX_MsgBuffer[MAX_BUFFER_SIZE];
 
 #endif
 

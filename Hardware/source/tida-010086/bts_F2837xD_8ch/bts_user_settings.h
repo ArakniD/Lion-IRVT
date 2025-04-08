@@ -24,9 +24,14 @@
 #define BTS_TRIP_CODE   (true)
 #define BTS_OCP_TRIGGER (false)
 #define BTS_USER_DEFAULT_TRIP_A           ((float32_t)8)
+
 #define BTS_USER_DEFAULT_TRIP_pu (BTS_IoutGain_ch1_pu *BTS_USER_DEFAULT_TRIP_A +BTS_IoutOffset_ch1_pu)
 #define BTS_USER_DEFAULT_TRIP_16b ((int16_t)(BTS_USER_DEFAULT_TRIP_pu *(float32_t)32768.0))
 #define BTS_USER_DEFAULT_TRIP_N_16b (-1*BTS_USER_DEFAULT_TRIP_16b)
+
+#define BTS_USER_TRIP_pu(x)     (BTS_userInputs[i].IoutGain_pu *BTS_USER_DEFAULT_TRIP_A + BTS_userInputs[i].IoutOffset_pu)
+#define BTS_USER_TRIP_16b(x)    ((int16_t)(BTS_USER_TRIP_pu(x) *(float32_t)32768.0))
+#define BTS_USER_TRIP_N_16b(x)  (((int16_t)-1)*BTS_USER_TRIP_16b(x))
 
 #define BTS_SFRA_MODE_CC_PLANT  0
 #define BTS_SFRA_MODE_CC_CLOSED 1
@@ -262,6 +267,9 @@
 #define BTS_I2C_INT_PIN_SCL                ((uint16_t)41)
 #define BTS_I2C_INT_CFG_SDA                GPIO_40_SDAB
 #define BTS_I2C_INT_CFG_SCL                GPIO_41_SCLB
+#define BTS_I2C_INT_RXDATA                 I2CB_RXdata
+#define BTS_I2C_INT_TXDATA                 I2CB_TXdata
+#define BTS_I2C_INT_CNTADDR                I2CB_ControlAddr
 
 // I2C External - Slave mode
 #define BTS_I2C_EXT_BASE                   I2CA_BASE
@@ -270,12 +278,52 @@
 #define BTS_I2C_EXT_PIN_SCL                ((uint16_t)33)
 #define BTS_I2C_EXT_CFG_SDA                GPIO_32_SDAA
 #define BTS_I2C_EXT_CFG_SCL                GPIO_33_SCLA
+#define BTS_I2C_EXT_RXDATA                 I2CA_RXdata
+#define BTS_I2C_EXT_TXDATA                 I2CA_TXdata
+#define BTS_I2C_EXT_CNTADDR                I2CA_ControlAddr
 
 // CAN External - CC/CV set-point and data stream
 #define BTS_CAN_BASE                        CANA_BASE
 #define BTS_CAN_PIN_CANRX                   GPIO_30_CANRXA
 #define BTS_CAN_PIN_CANTX                   GPIO_31_CANTXA
 
+/*
+ *  volatile float32_t iref_A;
+    volatile float32_t vref_charge_V;
+    volatile float32_t vref_discharge_V;
+    volatile uint16_t  direction_logic;
+    volatile uint16_t  enable_logic;
+ */
+#define BTS_I2C_ADR_USER_CH1                0x0100
+#define BTS_I2C_ADR_USER_CH2                0x0200
+#define BTS_I2C_ADR_USER_CH3                0x0300
+#define BTS_I2C_ADR_USER_CH4                0x0400
+#define BTS_I2C_ADR_USER_CH5                0x0500
+#define BTS_I2C_ADR_USER_CH6                0x0600
+#define BTS_I2C_ADR_USER_CH7                0x0700
+#define BTS_I2C_ADR_USER_CH8                0x0800
+
+/*
+ *  float32_t IoutGain_pu;
+    float32_t IoutOffset_pu;
+    float32_t IoutGain_A;
+    float32_t IoutOffset_A;
+
+    float32_t VoutGain_pu;
+    float32_t VoutOffset_pu;
+    float32_t VoutGain_V;
+    float32_t VoutOffset_V;
+
+    uint16_t  pendingUpdate;
+ */
+#define BTS_I2C_ADR_CAL_CH1                0x1100
+#define BTS_I2C_ADR_CAL_CH2                0x1200
+#define BTS_I2C_ADR_CAL_CH3                0x1300
+#define BTS_I2C_ADR_CAL_CH4                0x1400
+#define BTS_I2C_ADR_CAL_CH5                0x1500
+#define BTS_I2C_ADR_CAL_CH6                0x1600
+#define BTS_I2C_ADR_CAL_CH7                0x1700
+#define BTS_I2C_ADR_CAL_CH8                0x1800
 
 #define BTS_senseAverageFactor 32 //32U
 

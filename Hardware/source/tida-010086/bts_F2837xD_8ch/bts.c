@@ -27,42 +27,21 @@
 // Global variables
 //=============================================================================
 //
+BTS_measValue BTS_measValues[PWM_CH_MAX];
 
-BTS_measValues BTS_measValues_ch1;
-BTS_measValues BTS_measValues_ch2;
-BTS_measValues BTS_measValues_ch3;
-BTS_measValues BTS_measValues_ch4;
-BTS_measValues BTS_measValues_ch5;
-BTS_measValues BTS_measValues_ch6;
-BTS_measValues BTS_measValues_ch7;
-BTS_measValues BTS_measValues_ch8;
+BTS_userInput BTS_userInputs[PWM_CH_MAX];
 
-BTS_userInput BTS_userInput_ch1;
-BTS_userInput BTS_userInput_ch2;
-BTS_userInput BTS_userInput_ch3;
-BTS_userInput BTS_userInput_ch4;
-BTS_userInput BTS_userInput_ch5;
-BTS_userInput BTS_userInput_ch6;
-BTS_userInput BTS_userInput_ch7;
-BTS_userInput BTS_userInput_ch8;
+BTS_DCL_CTRL_TYPE   BTS_ctrl_cc[PWM_CH_MAX]
+    = { BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,
+        BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,
+        BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,
+        BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS};
 
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch1    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch2    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch3    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch4    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch5    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch6    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch7    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch8    = BTS_DCL_CTRL_DEFAULTS;
-
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch1    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch2    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch3    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch4    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch5    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch6    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch7    = BTS_DCL_CTRL_DEFAULTS;
-BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch8    = BTS_DCL_CTRL_DEFAULTS;
+BTS_DCL_CTRL_TYPE   BTS_ctrl_cv[PWM_CH_MAX]
+    = {BTS_DCL_CTRL_DEFAULTS, BTS_DCL_CTRL_DEFAULTS,
+       BTS_DCL_CTRL_DEFAULTS, BTS_DCL_CTRL_DEFAULTS,
+       BTS_DCL_CTRL_DEFAULTS, BTS_DCL_CTRL_DEFAULTS,
+       BTS_DCL_CTRL_DEFAULTS, BTS_DCL_CTRL_DEFAULTS};
 
 //
 //=====================================
@@ -118,14 +97,7 @@ volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_ch8    = BTS_DCL_CTRL_DEFAULTS;
 //=====================================
 // DCL control variables
 //
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch1;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch2;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch3;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch4;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch5;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch6;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch7;
-BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch8;
+BTS_ctrlLoopVariable BTS_ctrlLoopVariables[PWM_CH_MAX];
 
 //
 //=====================================
@@ -149,6 +121,8 @@ __interrupt void i2cAFIFOISR(void);
 __interrupt void i2cBISR(void);
 __interrupt void i2cBFIFOISR(void);
 
+void BTS_readCalibration(void);
+
 struct I2CHandle *i2c_int_crnt_responderPtr;                   // Used in interrupt
 
 uint16_t AvailableI2C_slaves[MAX_I2C_IN_NETWORK];
@@ -161,7 +135,6 @@ uint16_t I2CB_RXdata[MAX_BUFFER_SIZE];
 
 uint32_t I2CA_ControlAddr;
 uint32_t I2CB_ControlAddr;
-uint16_t status;
 
 //
 //=====================================
@@ -188,6 +161,7 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch1.iref_A=1.0;
     BTS_userInput_ch1.vref_charge_V=3.7;
     BTS_userInput_ch1.vref_discharge_V=0.5;
+    BTS_userInput_ch1.pendingUpdate = 0;
 
     BTS_userInput_ch1.IoutGain_pu = BTS_IoutGain_ch1_pu;
     BTS_userInput_ch1.IoutOffset_pu = BTS_IoutOffset_ch1_pu;
@@ -205,6 +179,7 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch2.iref_A=1.0;
     BTS_userInput_ch2.vref_charge_V=3.7;
     BTS_userInput_ch2.vref_discharge_V=0.5;
+    BTS_userInput_ch2.pendingUpdate = 0;
 
     BTS_userInput_ch2.IoutGain_pu = BTS_IoutGain_ch2_pu;
     BTS_userInput_ch2.IoutOffset_pu = BTS_IoutOffset_ch2_pu;
@@ -222,6 +197,7 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch3.iref_A=1.0;
     BTS_userInput_ch3.vref_charge_V=3.7;
     BTS_userInput_ch3.vref_discharge_V=0.5;
+    BTS_userInput_ch3.pendingUpdate = 0;
 
     BTS_userInput_ch3.IoutGain_pu = BTS_IoutGain_ch3_pu;
     BTS_userInput_ch3.IoutOffset_pu = BTS_IoutOffset_ch3_pu;
@@ -239,6 +215,7 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch4.iref_A=1.0;
     BTS_userInput_ch4.vref_charge_V=3.7;
     BTS_userInput_ch4.vref_discharge_V=0.5;
+    BTS_userInput_ch4.pendingUpdate = 0;
 
     BTS_userInput_ch4.IoutGain_pu = BTS_IoutGain_ch4_pu;
     BTS_userInput_ch4.IoutOffset_pu = BTS_IoutOffset_ch4_pu;
@@ -256,6 +233,7 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch5.iref_A=1.0;
     BTS_userInput_ch5.vref_charge_V=3.7;
     BTS_userInput_ch5.vref_discharge_V=0.5;
+    BTS_userInput_ch5.pendingUpdate = 0;
 
     BTS_userInput_ch5.IoutGain_pu = BTS_IoutGain_ch5_pu;
     BTS_userInput_ch5.IoutOffset_pu = BTS_IoutOffset_ch5_pu;
@@ -273,6 +251,7 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch6.iref_A=1.0;
     BTS_userInput_ch6.vref_charge_V=3.7;
     BTS_userInput_ch6.vref_discharge_V=0.5;
+    BTS_userInput_ch6.pendingUpdate = 0;
 
     BTS_userInput_ch6.IoutGain_pu = BTS_IoutGain_ch6_pu;
     BTS_userInput_ch6.IoutOffset_pu = BTS_IoutOffset_ch6_pu;
@@ -290,6 +269,7 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch7.iref_A=1.0;
     BTS_userInput_ch7.vref_charge_V=3.7;
     BTS_userInput_ch7.vref_discharge_V=0.5;
+    BTS_userInput_ch7.pendingUpdate = 0;
 
     BTS_userInput_ch7.IoutGain_pu = BTS_IoutGain_ch7_pu;
     BTS_userInput_ch7.IoutOffset_pu = BTS_IoutOffset_ch7_pu;
@@ -307,6 +287,7 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch8.iref_A=1.0;
     BTS_userInput_ch8.vref_charge_V=3.7;
     BTS_userInput_ch8.vref_discharge_V=0.5;
+    BTS_userInput_ch8.pendingUpdate = 0;
 
     BTS_userInput_ch8.IoutGain_pu = BTS_IoutGain_ch8_pu;
     BTS_userInput_ch8.IoutOffset_pu = BTS_IoutOffset_ch8_pu;
@@ -320,115 +301,147 @@ void BTS_initUserVariables(void)
 
 }
 
-void BTS_initProgramVariables(void){
+void BTS_calcUserProgramVariables(uint16_t i)
+{
+    BTS_ctrlLoopVariables[i].ioutTrip_16b   = BTS_USER_TRIP_16b(i);
+    BTS_ctrlLoopVariables[i].ioutTrip_n_16b = BTS_USER_TRIP_N_16b(i);
 
-    BTS_ctrlLoopVariable_ch1.ioutTrip_16b =BTS_USER_DEFAULT_TRIP_16b;
-    BTS_ctrlLoopVariable_ch1.ioutTrip_n_16b =((int16_t)-1) * BTS_USER_DEFAULT_TRIP_16b;
+    BTS_measValues[i].IoutGain_A    = BTS_userInputs[i].IoutGain_A;
+    BTS_measValues[i].IoutOffset_A  = BTS_userInputs[i].IoutOffset_A;
+    BTS_measValues[i].VoutGain_V    = BTS_userInputs[i].VoutGain_V;
+    BTS_measValues[i].VoutOffset_V  = BTS_userInputs[i].VoutOffset_V;
+}
 
-    BTS_ctrlLoopVariable_ch2.ioutTrip_16b =BTS_USER_DEFAULT_TRIP_16b;
-    BTS_ctrlLoopVariable_ch2.ioutTrip_n_16b =((int16_t)-1) * BTS_USER_DEFAULT_TRIP_16b;
+// Initialise the program variables from the user input
+// call this routine to transfer user-input into running programme
+void BTS_initProgramVariables(void)
+{
+    uint16_t i;
 
-    BTS_ctrlLoopVariable_ch3.ioutTrip_16b =BTS_USER_DEFAULT_TRIP_16b;
-    BTS_ctrlLoopVariable_ch3.ioutTrip_n_16b =((int16_t)-1) * BTS_USER_DEFAULT_TRIP_16b;
+    for (i=0;i<8;i++)
+    {
+        BTS_calcUserProgramVariables(i);
+    }
+}
 
-    BTS_ctrlLoopVariable_ch4.ioutTrip_16b =BTS_USER_DEFAULT_TRIP_16b;
-    BTS_ctrlLoopVariable_ch4.ioutTrip_n_16b =((int16_t)-1) * BTS_USER_DEFAULT_TRIP_16b;
 
-    BTS_ctrlLoopVariable_ch5.ioutTrip_16b =BTS_USER_DEFAULT_TRIP_16b;
-    BTS_ctrlLoopVariable_ch5.ioutTrip_n_16b =((int16_t)-1) * BTS_USER_DEFAULT_TRIP_16b;
 
-    BTS_ctrlLoopVariable_ch6.ioutTrip_16b =BTS_USER_DEFAULT_TRIP_16b;
-    BTS_ctrlLoopVariable_ch6.ioutTrip_n_16b =((int16_t)-1) * BTS_USER_DEFAULT_TRIP_16b;
+/* This function checks if we can write calibration */
+void BTS_writeCalibration(uint16_t channel)
+{
+    uint16_t status;
+    uint16_t i;
+    BTS_channelCalibration data;
 
-    BTS_ctrlLoopVariable_ch7.ioutTrip_16b =BTS_USER_DEFAULT_TRIP_16b;
-    BTS_ctrlLoopVariable_ch7.ioutTrip_n_16b =((int16_t)-1) * BTS_USER_DEFAULT_TRIP_16b;
+    // Ensure the I2C Device had been found before
+    for (i=0,status=0;i<MAX_I2C_IN_NETWORK && status==0;i++){
+        if (AvailableI2C_slaves[i] == EEPROM_SLAVE_ADDRESS)
+        {
+            status = 1;
+        }
+    }
 
-    BTS_ctrlLoopVariable_ch8.ioutTrip_16b =BTS_USER_DEFAULT_TRIP_16b;
-    BTS_ctrlLoopVariable_ch8.ioutTrip_n_16b =((int16_t)-1) * BTS_USER_DEFAULT_TRIP_16b;
+    if (status) {
+        EEPROM.currentHandlePtr     = &EEPROM;
+        EEPROM.SlaveAddr            = EEPROM_SLAVE_ADDRESS;
+        EEPROM.WriteCycleTime_in_us = 10000;    //6ms for EEPROM this code was tested
+        EEPROM.base                 = BTS_I2C_INT_BASE;
+        EEPROM.pControlAddr         = &BTS_I2C_INT_CNTADDR;
+        EEPROM.NumOfAddrBytes       = 2;
 
-    BTS_measValues_ch1.IoutGain_A = BTS_IoutGain_ch1_A;
-    BTS_measValues_ch1.IoutOffset_A = BTS_IoutOffset_ch1_A;
-    BTS_measValues_ch1.VoutGain_V = BTS_VoutGain_ch1_V;
-    BTS_measValues_ch1.VoutOffset_V =BTS_VoutOffset_ch1_V;
+        BTS_I2C_INT_CNTADDR   = i * 64;
+        EEPROM.pControlAddr   = &BTS_I2C_INT_CNTADDR;
+        EEPROM.pRX_MsgBuffer  = BTS_I2C_INT_RXDATA;
+        EEPROM.NumOfDataBytes = sizeof(BTS_channelCalibration);
 
-    BTS_measValues_ch2.IoutGain_A = BTS_IoutGain_ch2_A;
-    BTS_measValues_ch2.IoutOffset_A = BTS_IoutOffset_ch2_A;
-    BTS_measValues_ch2.VoutGain_V = BTS_VoutGain_ch2_V;
-    BTS_measValues_ch2.VoutOffset_V =BTS_VoutOffset_ch2_V;
+        data.header  = (uint32_t)0x000000A5 << 24;
+        data.header |= ((uint32_t)channel + 1UL) << 16;
 
-    BTS_measValues_ch3.IoutGain_A = BTS_IoutGain_ch3_A;
-    BTS_measValues_ch3.IoutOffset_A = BTS_IoutOffset_ch3_A;
-    BTS_measValues_ch3.VoutGain_V = BTS_VoutGain_ch3_V;
-    BTS_measValues_ch3.VoutOffset_V =BTS_VoutOffset_ch3_V;
+        // Copy from USER INPUT data
+        data.IoutGain_pu    = BTS_userInputs[i].IoutGain_pu    ;
+        data.IoutOffset_pu  = BTS_userInputs[i].IoutOffset_pu  ;
+        data.IoutGain_A     = BTS_userInputs[i].IoutGain_A     ;
+        data.IoutOffset_A   = BTS_userInputs[i].IoutOffset_A   ;
+        data.VoutGain_pu    = BTS_userInputs[i].VoutGain_pu    ;
+        data.VoutOffset_pu  = BTS_userInputs[i].VoutOffset_pu  ;
+        data.VoutGain_V     = BTS_userInputs[i].VoutGain_V     ;
+        data.VoutOffset_V   = BTS_userInputs[i].VoutOffset_V   ;
 
-    BTS_measValues_ch4.IoutGain_A = BTS_IoutGain_ch4_A;
-    BTS_measValues_ch4.IoutOffset_A = BTS_IoutOffset_ch4_A;
-    BTS_measValues_ch4.VoutGain_V = BTS_VoutGain_ch4_V;
-    BTS_measValues_ch4.VoutOffset_V =BTS_VoutOffset_ch4_V;
+        // Write data out to the EEPROM
+        status = I2C_MasterTransmit(&EEPROM);
 
-    BTS_measValues_ch5.IoutGain_A = BTS_IoutGain_ch5_A;
-    BTS_measValues_ch5.IoutOffset_A = BTS_IoutOffset_ch5_A;
-    BTS_measValues_ch5.VoutGain_V = BTS_VoutGain_ch5_V;
-    BTS_measValues_ch5.VoutOffset_V =BTS_VoutOffset_ch5_V;
-
-    BTS_measValues_ch6.IoutGain_A = BTS_IoutGain_ch6_A;
-    BTS_measValues_ch6.IoutOffset_A = BTS_IoutOffset_ch6_A;
-    BTS_measValues_ch6.VoutGain_V = BTS_VoutGain_ch6_V;
-    BTS_measValues_ch6.VoutOffset_V =BTS_VoutOffset_ch6_V;
-
-    BTS_measValues_ch7.IoutGain_A = BTS_IoutGain_ch7_A;
-    BTS_measValues_ch7.IoutOffset_A = BTS_IoutOffset_ch7_A;
-    BTS_measValues_ch7.VoutGain_V = BTS_VoutGain_ch7_V;
-    BTS_measValues_ch7.VoutOffset_V =BTS_VoutOffset_ch7_V;
-
-    BTS_measValues_ch8.IoutGain_A = BTS_IoutGain_ch8_A;
-    BTS_measValues_ch8.IoutOffset_A = BTS_IoutOffset_ch8_A;
-    BTS_measValues_ch8.VoutGain_V = BTS_VoutGain_ch8_V;
-    BTS_measValues_ch8.VoutOffset_V =BTS_VoutOffset_ch8_V;
+        while(I2C_getStatus(EEPROM.base) & I2C_STS_BUS_BUSY);
+    }
 }
 
 void BTS_readCalibration(void)
 {
-    BTS_channelCalibration  framData;
-
-    // Scan bus first, check fram is there
-    uint16_t *pAvailableI2C_slaves = AvailableI2C_slaves;
-        status = I2CBusScan(I2CA_BASE, pAvailableI2C_slaves);
-
+    BTS_channelCalibration  * framData;
     uint16_t i;
+    uint16_t hdr;
+    uint16_t channel;
+    uint16_t checksum;
+    uint16_t status;
 
-    EEPROM.currentHandlePtr     = &EEPROM;
-    EEPROM.SlaveAddr            = EEPROM_SLAVE_ADDRESS;
-    EEPROM.WriteCycleTime_in_us = 10000;    //6ms for EEPROM this code was tested
-    EEPROM.base                 = BTS_I2C_INT_BASE;
-    EEPROM.pControlAddr         = &ControlAddr;
-    EEPROM.NumOfAddrBytes       = 2;
+    status = I2CBusScan(BTS_I2C_INT_BASE, AvailableI2C_slaves);
 
+    /* Check if the EEPROM has been found, otherwise dont load the settings */
+    if (status) {
+        //status = 0;
+        for (i=0,status=0;i<MAX_I2C_IN_NETWORK && status==0;i++){
+            if (AvailableI2C_slaves[i] == EEPROM_SLAVE_ADDRESS)
+            {
+                status = 1;
+            }
+        }
+    }
 
-        // read fram one calibration slot at a time
-        //Example 2: EEPROM Byte Read
-           //Make sure 11 is written to EEPROM address 0x0
-           ControlAddr = 0;
-           EEPROM.pControlAddr   = &ControlAddr;
-           EEPROM.pRX_MsgBuffer  = RX_MsgBuffer;
-           EEPROM.NumOfDataBytes = 1;
+    // If there is an EEPROM, then we attempt to read the data
+    if (status) {
+        EEPROM.currentHandlePtr     = &EEPROM;
+        EEPROM.SlaveAddr            = EEPROM_SLAVE_ADDRESS;
+        EEPROM.WriteCycleTime_in_us = 10000;    //6ms for EEPROM this code was tested
+        EEPROM.base                 = BTS_I2C_INT_BASE;
+        EEPROM.pControlAddr         = &BTS_I2C_INT_CNTADDR;
+        EEPROM.NumOfAddrBytes       = 2;
 
-           status = I2C_MasterReceiver(&EEPROM);
+        // Read channel calibration data out
+        // use 64 byte offsets per channel to account for data data
+        for (i=0;i<8;i++) {
 
-           while(I2C_getStatus(EEPROM.base) & I2C_STS_BUS_BUSY);
+            BTS_I2C_INT_CNTADDR   = i * 64;
+            EEPROM.pControlAddr   = &BTS_I2C_INT_CNTADDR;
+            EEPROM.pRX_MsgBuffer  = BTS_I2C_INT_RXDATA;
+            EEPROM.NumOfDataBytes = sizeof(BTS_channelCalibration);
 
+            status = I2C_MasterReceiver(&EEPROM);
 
+            while(I2C_getStatus(EEPROM.base) & I2C_STS_BUS_BUSY);
 
-        // checksum validation
+            // checksum validation
+            framData = (BTS_channelCalibration *) &BTS_I2C_INT_RXDATA;
+            hdr         = (framData->header >> 24) & 0xFF;
+            channel     = (framData->header >> 16) & 0xFF;
+            checksum    = (framData->header ) & 0xFFFF;
 
-        // perform an in-place data upgrades
+            // perform an in-place data upgrades
+            if (hdr == 0xA5 && channel == (i+1)) {
+                // Copy over the USER INPUT data
+                BTS_userInputs[i].IoutGain_pu    = framData->IoutGain_pu;
+                BTS_userInputs[i].IoutOffset_pu  = framData->IoutOffset_pu;
+                BTS_userInputs[i].IoutGain_A     = framData->IoutGain_A;
+                BTS_userInputs[i].IoutOffset_A   = framData->IoutOffset_A;
 
-        // Copy into user input and controller if valid
+                BTS_userInputs[i].VoutGain_pu    = framData->VoutGain_pu;
+                BTS_userInputs[i].VoutOffset_pu  = framData->VoutOffset_pu;
+                BTS_userInputs[i].VoutGain_V     = framData->VoutGain_V;
+                BTS_userInputs[i].VoutOffset_V   = framData->VoutOffset_V;
 
-
-
-
-
+                // Copy into user input and controller if valid
+                BTS_calcUserProgramVariables(i);
+            }
+        }
+    }
 }
 
 
@@ -633,14 +646,6 @@ __interrupt void i2cBISR(void)
 {
    uint16_t MasterSlave = I2C_getStatus(I2CB.base) & I2C_STS_ADDR_SLAVE;
 
-   if(MasterSlave)
-   {
-       //I2CB working as slave
-       //Disable I2CA FIFO interrupt to first trigger I2CB FIFO interrupt to read control address
-       I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
-   }
-
-
    handleI2C_ErrorCondition(&I2CB);
 
    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
@@ -648,6 +653,7 @@ __interrupt void i2cBISR(void)
 
 //
 // I2CB FIFO ISR
+// Internal I2C - FRAM and EEPROM access
 //
 #pragma CODE_SECTION(i2cBFIFOISR,"isrcodefuncs");
 #pragma INTERRUPT(i2cBFIFOISR, HPI)
@@ -657,84 +663,88 @@ __interrupt void i2cBFIFOISR(void)
 
     uint16_t MasterSlave = HWREGH(I2CB.base + I2C_O_MDR);
 
-    if(MasterSlave & I2C_MDR_MST)
+    //I2CB working in master configuration
+    if(MasterSlave & I2C_MDR_TRX)
     {
-        //I2CB working in master configuration
-        if(MasterSlave & I2C_MDR_TRX)
-        {
-           //I2CB working as Master Transmitter
-           I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
-        }
-        else
-        {
-           //I2CB working as Master Receiver
-           I2C_enableInterrupt(I2CA.base, (I2C_INT_TXFF));
-           I2C_clearInterruptStatus(I2CA.base,(I2C_INT_TXFF));
-        }
+       //I2CB working as Master Transmitter
+       I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
     }
-   else
-   {
-       //I2CB working in slave configuration
-       if(MasterSlave & I2C_MDR_TRX)
-       {
-           //I2CA = Master Receiver & I2CB = Slave Transmitter
-           //So, I2CA RXFIFO interrupt is enabled  &
-           //    I2CA TXFIFO interrupt is disabled
-           I2C_enableInterrupt(I2CA.base, (I2C_INT_RXFF));
-           I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
-           I2C_clearInterruptStatus(I2CA.base,(I2C_INT_RXFF));
-
-           I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
-       }
-       else
-       {
-           //I2CB working as slave receiver
-           if(HWREGH(I2CA.base + I2C_O_CNT) == I2CA.NumOfAddrBytes)
-           {
-               //Enable I2CA Register Access Ready interrupt to change
-               //to master receiver
-               I2C_enableInterrupt(I2CA.base, I2C_INT_REG_ACCESS_RDY);
-               if(I2CB.pTX_MsgBuffer == 0x0)
-               {
-                    I2CB.pTX_MsgBuffer = (uint16_t *)((uint32_t)(I2CB.pControlAddr) & 0x00FFFFFF);
-                    I2CB.pRX_MsgBuffer = (uint16_t *)0;
-               }
-           }
-           else
-           {
-               //Continue with I2CA master transmitter mode
-               I2C_enableInterrupt(I2CA.base, (I2C_INT_TXFF));
-               I2C_disableInterrupt(I2CA.base, (I2C_INT_RXFF));
-               I2C_clearInterruptStatus(I2CA.base,(I2C_INT_TXFF | I2C_INT_RXFF));
-               if(I2CB.pRX_MsgBuffer == 0x0)
-               {
-                   I2CB.pRX_MsgBuffer = (uint16_t *)((uint32_t)(I2CB.pControlAddr) & 0x00FFFFFF);
-                   I2CB.pTX_MsgBuffer = (uint16_t *)0;
-               }
-           }
-       }
-   }
 
    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
 }
 
 //
 // I2CA ISR
+// External I2c bus - Access control registers from outside program
+// Write ONLY for now..
+// Read items coming
 //
 #pragma CODE_SECTION(i2cAISR,"isrcodefuncs");
 #pragma INTERRUPT(i2cAISR, HPI)
 __interrupt void i2cAISR(void)
 {
     uint16_t MasterSlave = I2C_getStatus(I2CA.base) & I2C_STS_ADDR_SLAVE;
+    uint16_t channel;
 
-    if(MasterSlave)
+    /* External register access via STOP condition */
+    switch(handleI2C_ErrorCondition(&I2CA))
     {
-        //I2CA working as slave
-        //Disable I2CB FIFO interrupt to first trigger I2CA FIFO interrupt to read control address
-        I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
+        case I2C_INTSRC_STOP_CONDITION:
+        {
+            uint16_t channel = (I2CA.pControlAddr >> 8 ) & 0x0FUL;
+
+            /* Process stop condition here */
+            switch ((I2CA.pControlAddr) & 0x00FFFFFF)
+            {
+            case BTS_I2C_ADR_CAL_CH1:
+            case BTS_I2C_ADR_CAL_CH2:
+            case BTS_I2C_ADR_CAL_CH3:
+            case BTS_I2C_ADR_CAL_CH4:
+            case BTS_I2C_ADR_CAL_CH5:
+            case BTS_I2C_ADR_CAL_CH6:
+            case BTS_I2C_ADR_CAL_CH7:
+            case BTS_I2C_ADR_CAL_CH8:
+                if (I2CA.NumOfDataBytes == 34)
+                {
+                    BTS_userInputs[channel].IoutGain_pu     = (uint32_t)BTS_I2C_EXT_RXDATA[0] | (uint32_t)BTS_I2C_EXT_RXDATA[1] << 8 | (uint32_t)BTS_I2C_EXT_RXDATA[2] << 16 | (uint32_t)BTS_I2C_EXT_RXDATA[3] << 24;
+                    BTS_userInputs[channel].IoutOffset_pu   = (uint32_t)BTS_I2C_EXT_RXDATA[4] | (uint32_t)BTS_I2C_EXT_RXDATA[5] << 8 | (uint32_t)BTS_I2C_EXT_RXDATA[6] << 16 | (uint32_t)BTS_I2C_EXT_RXDATA[7] << 24;
+                    BTS_userInputs[channel].IoutGain_A      = (uint32_t)BTS_I2C_EXT_RXDATA[8] | (uint32_t)BTS_I2C_EXT_RXDATA[9] << 8 | (uint32_t)BTS_I2C_EXT_RXDATA[10]<< 16 | (uint32_t)BTS_I2C_EXT_RXDATA[11]<< 24;
+                    BTS_userInputs[channel].IoutOffset_A    = (uint32_t)BTS_I2C_EXT_RXDATA[12]| (uint32_t)BTS_I2C_EXT_RXDATA[13]<< 8 | (uint32_t)BTS_I2C_EXT_RXDATA[14]<< 16 | (uint32_t)BTS_I2C_EXT_RXDATA[15]<< 24;
+                    BTS_userInputs[channel].VoutGain_pu     = (uint32_t)BTS_I2C_EXT_RXDATA[16]| (uint32_t)BTS_I2C_EXT_RXDATA[17]<< 8 | (uint32_t)BTS_I2C_EXT_RXDATA[18]<< 16 | (uint32_t)BTS_I2C_EXT_RXDATA[19]<< 24;
+                    BTS_userInputs[channel].VoutOffset_pu   = (uint32_t)BTS_I2C_EXT_RXDATA[20]| (uint32_t)BTS_I2C_EXT_RXDATA[21]<< 8 | (uint32_t)BTS_I2C_EXT_RXDATA[22]<< 16 | (uint32_t)BTS_I2C_EXT_RXDATA[23]<< 24;
+                    BTS_userInputs[channel].VoutGain_V      = (uint32_t)BTS_I2C_EXT_RXDATA[24]| (uint32_t)BTS_I2C_EXT_RXDATA[25]<< 8 | (uint32_t)BTS_I2C_EXT_RXDATA[26]<< 16 | (uint32_t)BTS_I2C_EXT_RXDATA[27]<< 24;
+                    BTS_userInputs[channel].VoutOffset_V    = (uint32_t)BTS_I2C_EXT_RXDATA[28]| (uint32_t)BTS_I2C_EXT_RXDATA[29]<< 8 | (uint32_t)BTS_I2C_EXT_RXDATA[30]<< 16 | (uint32_t)BTS_I2C_EXT_RXDATA[31]<< 24;
+                    BTS_userInputs[channel].pendingUpdate   = (uint32_t)BTS_I2C_EXT_RXDATA[32]| (uint32_t)BTS_I2C_EXT_RXDATA[33]<< 8 ;
+                }
+                break;
+            case BTS_I2C_ADR_USER_CH1:
+            case BTS_I2C_ADR_USER_CH2:
+            case BTS_I2C_ADR_USER_CH3:
+            case BTS_I2C_ADR_USER_CH4:
+            case BTS_I2C_ADR_USER_CH5:
+            case BTS_I2C_ADR_USER_CH6:
+            case BTS_I2C_ADR_USER_CH7:
+            case BTS_I2C_ADR_USER_CH8:
+                if (I2CA.NumOfDataBytes == 14)
+                {
+                    BTS_userInputs[channel].iref_A             =  (uint32_t)BTS_I2C_EXT_RXDATA[0] | (uint32_t)BTS_I2C_EXT_RXDATA[1] << 8 | (uint32_t)BTS_I2C_EXT_RXDATA[2] << 16 | (uint32_t)BTS_I2C_EXT_RXDATA[3] << 24;
+                    BTS_userInputs[channel].vref_charge_V      =  (uint32_t)BTS_I2C_EXT_RXDATA[4] | (uint32_t)BTS_I2C_EXT_RXDATA[5] << 8 | (uint32_t)BTS_I2C_EXT_RXDATA[6] << 16 | (uint32_t)BTS_I2C_EXT_RXDATA[7] << 24;
+                    BTS_userInputs[channel].vref_discharge_V   =  (uint32_t)BTS_I2C_EXT_RXDATA[8] | (uint32_t)BTS_I2C_EXT_RXDATA[9] << 8 | (uint32_t)BTS_I2C_EXT_RXDATA[10]<< 16 | (uint32_t)BTS_I2C_EXT_RXDATA[11]<< 24;
+                    BTS_userInputs[channel].direction_logic    =  (uint32_t)BTS_I2C_EXT_RXDATA[12];
+                    BTS_userInputs[channel].enable_logic       =  (uint32_t)BTS_I2C_EXT_RXDATA[13];
+                }
+                break;
+            }
+
+            // Reset the receive buffer back to the origin
+            I2CA.pRX_MsgBuffer = BTS_I2C_EXT_RXDATA
+
+            break;
+        }
     }
 
-    handleI2C_ErrorCondition(&I2CA);
+
+
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
 }
 
@@ -749,65 +759,25 @@ __interrupt void i2cAFIFOISR(void)
 
     uint16_t MasterSlave = HWREGH(I2CA.base + I2C_O_MDR);
 
-    if(MasterSlave & I2C_MDR_MST)
+    //I2CB working in master configuration
+    if(MasterSlave & I2C_MDR_TRX)
     {
-        //I2CA working in master configuration
-        if(MasterSlave & I2C_MDR_TRX)
-        {
-          //I2CA working as Master Transmitter
-          I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
-        }
-        else
-        {
-          //I2CA working as Master Receiver
-          I2C_enableInterrupt(I2CB.base, (I2C_INT_TXFF));
-          I2C_clearInterruptStatus(I2CB.base,(I2C_INT_TXFF));
-        }
+       //I2CB working as Master Transmitter
+       I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
     }
-    else
+
+    // Check if we're in SLAVE mode and RECIEVE
+    // in which case;
+    if(MasterSlave & (I2C_MDR_MST | I2C_MDR_TRX) == 0)
     {
-        //I2CA working in slave configuration
-        if(MasterSlave & I2C_MDR_TRX)
-        {
-            //I2CA = Slave Transmitter & I2CB = Master Receiver
-            //So, I2CB RXFIFO interrupt is enabled  &
-            //    I2CB TXFIFO interrupt is disabled
-            I2C_enableInterrupt(I2CB.base, (I2C_INT_RXFF));
-            I2C_disableInterrupt(I2CB.base, (I2C_INT_TXFF));
-            I2C_clearInterruptStatus(I2CB.base,(I2C_INT_RXFF));
-
-            I2C_disableInterrupt(I2CA.base, (I2C_INT_TXFF));
-        }
-       else
+       if(I2CA.pRX_MsgBuffer == 0x0)
        {
-           //I2CA working as slave receiver
-           if(HWREGH(I2CB.base + I2C_O_CNT) == I2CB.NumOfAddrBytes)
-           {
-               //Enable I2CB Register Access Ready interrupt to change
-               //to master receiver
-               I2C_enableInterrupt(I2CB.base, I2C_INT_REG_ACCESS_RDY);
-               if(I2CA.pTX_MsgBuffer == 0x0)
-               {
-                    I2CA.pTX_MsgBuffer = (uint16_t *)((uint32_t)(I2CA.pControlAddr) & 0x00FFFFFF);
-                    I2CA.pRX_MsgBuffer = (uint16_t *)0;
-               }
-           }
-           else
-           {
-               //Continue with I2CB master transmitter mode
-               I2C_enableInterrupt(I2CB.base, (I2C_INT_TXFF));
-               I2C_disableInterrupt(I2CB.base, (I2C_INT_RXFF));
-               I2C_clearInterruptStatus(I2CB.base,(I2C_INT_TXFF | I2C_INT_RXFF));
-               if(I2CA.pRX_MsgBuffer == 0x0)
-               {
-                   I2CA.pRX_MsgBuffer = (uint16_t *)((uint32_t)(I2CA.pControlAddr) & 0x00FFFFFF);
-                   I2CA.pTX_MsgBuffer = (uint16_t *)0;
-               }
-           }
+          I2CA.pRX_MsgBuffer = (uint16_t *)((uint32_t)(I2CA.pControlAddr) & 0x00FFFFFF);
+          I2CA.pTX_MsgBuffer = (uint16_t *)0;
        }
-   }
+    }
 
-   Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
 }
 
 
@@ -861,9 +831,25 @@ void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoo
 
 }
 
+#pragma CODE_SECTION(BTS_monitor_program_update,"ramfuncs");
+void BTS_monitor_program_update(uint16_t channel)
+{
+    if ( BTS_userInputs[channel].pendingUpdate )
+    {
+        // Copy into user input and controller if valid
+        BTS_calcUserProgramVariables(channel);
+
+        // Write the settings into EEPROM to commit the data
+        if (BTS_userInputs[channel].pendingUpdate == 2) {
+            BTS_writeCalibration(channel);
+        }
+
+        BTS_userInputs[channel].pendingUpdate = 0;
+    }
+}
 
 #pragma CODE_SECTION(BTS_monitor_Iout_Vout,"ramfuncs");
-void BTS_monitor_Iout_Vout(BTS_measValues* measValues )
+void BTS_monitor_Iout_Vout(BTS_measValue* measValues )
 {
     measValues->Sum_I=0U;
     measValues->Sum_V=0U;

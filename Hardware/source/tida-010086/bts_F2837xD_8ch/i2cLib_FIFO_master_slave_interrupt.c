@@ -53,6 +53,7 @@ void Write_Read_TX_RX_FIFO(struct I2CHandle *I2C_Params);
 uint16_t I2CBusScan(uint32_t base, uint16_t *pAvailableI2C_slaves)
 {
     uint16_t probeSlaveAddress, i;
+    uint16_t status;
 
     //Disable interrupts on Stop condition, NACK and arbitration lost condition
     I2C_disableInterrupt(base, (I2C_INT_ADDR_SLAVE|I2C_INT_STOP_CONDITION | I2C_INT_ARB_LOST | I2C_INT_NO_ACK));
@@ -252,7 +253,7 @@ uint16_t handleNACK(uint32_t base)
     return SUCCESS;
 }
 
-void handleI2C_ErrorCondition(struct I2CHandle *I2C_Params)
+I2C_InterruptSource handleI2C_ErrorCondition(struct I2CHandle *I2C_Params)
 {
     uint32_t base = I2C_Params->base;
 
@@ -262,14 +263,14 @@ void handleI2C_ErrorCondition(struct I2CHandle *I2C_Params)
     {
         case I2C_INTSRC_ARB_LOST:
             //Report Arbitration lost failure
-            status = ERROR_ARBITRATION_LOST;
+            I2C_Params->status = ERROR_ARBITRATION_LOST;
             break;
 
         case I2C_INTSRC_NO_ACK:
             //Clear NACK flag and generate STOP condition on a NACK condition
             I2C_clearStatus(base, I2C_STS_NO_ACK);
             I2C_sendStopCondition(base);
-            status = ERROR_NACK_RECEIVED;
+            I2C_Params->status = ERROR_NACK_RECEIVED;
             break;
 
         case I2C_INTSRC_REG_ACCESS_RDY:
@@ -336,6 +337,8 @@ void handleI2C_ErrorCondition(struct I2CHandle *I2C_Params)
             }
             break;
     }
+
+    return I2C_InterruptSource;
 }
 
 void Write_Read_TX_RX_FIFO(struct I2CHandle *I2C_Params)

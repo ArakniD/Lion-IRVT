@@ -126,9 +126,6 @@ GEN_OPTS__QUOTED :=
 SUBDIRS := \
 . \
 device \
-device/driverlib \
 libraries/DCL \
-libraries/FPUfastRTS \
-libraries/SFO \
 libraries/sfra \
 

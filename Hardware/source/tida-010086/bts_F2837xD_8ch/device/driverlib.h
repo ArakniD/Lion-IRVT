@@ -5,10 +5,10 @@
 // TITLE:  C28x Driverlib Header File
 //
 //#############################################################################
-// $TI Release: F2837xD Support Library v3.12.00.00 $
-// $Release Date: Fri Feb 12 19:03:23 IST 2021 $
+//
+// $Release Date:  $
 // $Copyright:
-// Copyright (C) 2013-2021 Texas Instruments Incorporated - http://www.ti.com/
+// Copyright (C) 2013-2024 Texas Instruments Incorporated - http://www.ti.com/
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -65,10 +65,11 @@
 #include "hrpwm.h"
 #include "i2c.h"
 #include "interrupt.h"
+#include "ipc.h"
 #include "mcbsp.h"
 #include "memcfg.h"
 #include "pin_map.h"
-//#include "pin_map_legacy.h"
+#include "pin_map_legacy.h"
 #include "sci.h"
 #include "sdfm.h"
 #include "spi.h"
@@ -76,6 +77,8 @@
 #include "upp.h"
 #include "version.h"
 #include "xbar.h"
+
+#include "driver_inclusive_terminology_mapping.h"
 
 #endif  // end of DRIVERLIB_H definition
 

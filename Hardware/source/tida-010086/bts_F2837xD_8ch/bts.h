@@ -104,25 +104,25 @@ typedef struct
     float32_t VoutGain_V;
     float32_t VoutOffset_V;
 
-}BTS_measValues;
+}BTS_measValue;
 
-extern BTS_measValues BTS_measValues_ch1;
-extern BTS_measValues BTS_measValues_ch2;
-extern BTS_measValues BTS_measValues_ch3;
-extern BTS_measValues BTS_measValues_ch4;
-extern BTS_measValues BTS_measValues_ch5;
-extern BTS_measValues BTS_measValues_ch6;
-extern BTS_measValues BTS_measValues_ch7;
-extern BTS_measValues BTS_measValues_ch8;
 
-typedef struct __attribute((packed)) _BTS_channelCalibration
+extern BTS_measValue BTS_measValues[];
+#define BTS_measValues_ch1 BTS_measValues[0]
+#define BTS_measValues_ch2 BTS_measValues[1]
+#define BTS_measValues_ch3 BTS_measValues[2]
+#define BTS_measValues_ch4 BTS_measValues[3]
+#define BTS_measValues_ch5 BTS_measValues[4]
+#define BTS_measValues_ch6 BTS_measValues[5]
+#define BTS_measValues_ch7 BTS_measValues[6]
+#define BTS_measValues_ch8 BTS_measValues[7]
+
+typedef struct _BTS_channelCalibration
 {
     /* Header and checksum for forward persistent storage
      * Compatibility and in-place upgrade pathway
      */
-    uint8_t   header;
-    uint8_t   channel;
-    uint16_t  checksum;
+    uint32_t  header;
     uint32_t  dateTime;
 
     float32_t IoutGain_pu;
@@ -137,22 +137,19 @@ typedef struct __attribute((packed)) _BTS_channelCalibration
 
 } BTS_channelCalibration;
 
-typedef union {
-    BTS_channelCalibration  calibration;
-    char                    buffer[64];
-};
-
 typedef struct
 {
+    /* run-time set points and logic */
     volatile float32_t iref_A;
     volatile float32_t vref_charge_V;
     volatile float32_t vref_discharge_V;
-    volatile uint16_t direction_logic;
-    volatile uint16_t enable_logic;
+    volatile uint16_t  direction_logic;
+    volatile uint16_t  enable_logic;
     volatile float32_t dutyRef_pu;
     volatile float32_t ioutCal_pu;
     volatile float32_t voutCal_pu;
 
+    /* Calibration Data Entry */
     float32_t IoutGain_pu;
     float32_t IoutOffset_pu;
     float32_t IoutGain_A;
@@ -163,15 +160,21 @@ typedef struct
     float32_t VoutGain_V;
     float32_t VoutOffset_V;
 
+    /* Set to 1 to enforce updating of internal measurement data */
+    /* Set to 2 to enforce updating and save to EEPROM */
+    uint16_t  pendingUpdate;
+
 }BTS_userInput;
-extern BTS_userInput BTS_userInput_ch1;
-extern BTS_userInput BTS_userInput_ch2;
-extern BTS_userInput BTS_userInput_ch3;
-extern BTS_userInput BTS_userInput_ch4;
-extern BTS_userInput BTS_userInput_ch5;
-extern BTS_userInput BTS_userInput_ch6;
-extern BTS_userInput BTS_userInput_ch7;
-extern BTS_userInput BTS_userInput_ch8;
+
+extern BTS_userInput BTS_userInputs[];
+#define BTS_userInput_ch1 BTS_userInputs[0]
+#define BTS_userInput_ch2 BTS_userInputs[1]
+#define BTS_userInput_ch3 BTS_userInputs[2]
+#define BTS_userInput_ch4 BTS_userInputs[3]
+#define BTS_userInput_ch5 BTS_userInputs[4]
+#define BTS_userInput_ch6 BTS_userInputs[5]
+#define BTS_userInput_ch7 BTS_userInputs[6]
+#define BTS_userInput_ch8 BTS_userInputs[7]
 
 typedef struct
 {
@@ -203,33 +206,36 @@ typedef struct
     uint16_t tripFlag;
 
 }BTS_ctrlLoopVariable;
-extern BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch1;
-extern BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch2;
-extern BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch3;
-extern BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch4;
-extern BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch5;
-extern BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch6;
-extern BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch7;
-extern BTS_ctrlLoopVariable BTS_ctrlLoopVariable_ch8;
 
+extern BTS_ctrlLoopVariable BTS_ctrlLoopVariables[];
+#define BTS_ctrlLoopVariable_ch1 BTS_ctrlLoopVariables[0]
+#define BTS_ctrlLoopVariable_ch2 BTS_ctrlLoopVariables[1]
+#define BTS_ctrlLoopVariable_ch3 BTS_ctrlLoopVariables[2]
+#define BTS_ctrlLoopVariable_ch4 BTS_ctrlLoopVariables[3]
+#define BTS_ctrlLoopVariable_ch5 BTS_ctrlLoopVariables[4]
+#define BTS_ctrlLoopVariable_ch6 BTS_ctrlLoopVariables[5]
+#define BTS_ctrlLoopVariable_ch7 BTS_ctrlLoopVariables[6]
+#define BTS_ctrlLoopVariable_ch8 BTS_ctrlLoopVariables[7]
 
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch1;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch2;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch3;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch4;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch5;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch6;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch7;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc_ch8;
+extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cc[];
+#define   BTS_ctrl_cc_ch1 BTS_ctrl_cc[0]
+#define   BTS_ctrl_cc_ch2 BTS_ctrl_cc[1]
+#define   BTS_ctrl_cc_ch3 BTS_ctrl_cc[2]
+#define   BTS_ctrl_cc_ch4 BTS_ctrl_cc[3]
+#define   BTS_ctrl_cc_ch5 BTS_ctrl_cc[4]
+#define   BTS_ctrl_cc_ch6 BTS_ctrl_cc[5]
+#define   BTS_ctrl_cc_ch7 BTS_ctrl_cc[6]
+#define   BTS_ctrl_cc_ch8 BTS_ctrl_cc[7]
 
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch1;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch2;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch3;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch4;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch5;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch6;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch7;
-extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv_ch8;
+extern volatile BTS_DCL_CTRL_TYPE   BTS_ctrl_cv[];
+#define   BTS_ctrl_cv_ch1 BTS_ctrl_cv[0]
+#define   BTS_ctrl_cv_ch2 BTS_ctrl_cv[1]
+#define   BTS_ctrl_cv_ch3 BTS_ctrl_cv[2]
+#define   BTS_ctrl_cv_ch4 BTS_ctrl_cv[3]
+#define   BTS_ctrl_cv_ch5 BTS_ctrl_cv[4]
+#define   BTS_ctrl_cv_ch6 BTS_ctrl_cv[5]
+#define   BTS_ctrl_cv_ch7 BTS_ctrl_cv[6]
+#define   BTS_ctrl_cv_ch8 BTS_ctrl_cv[7]
 
 #if(BTS_SFRA_ENABLED)
 #if(BTS_SFRA_CH_SELECT == BTS_SFRA_CH1)
@@ -378,7 +384,7 @@ void BTS_updateReference(BTS_userInput *, BTS_ctrlLoopVariable *);
 void BTS_initUserVariables(void);
 void BTS_initProgramVariables(void);
 void BTS_initController(void);
-void BTS_monitor_Iout_Vout(BTS_measValues* );
+void BTS_monitor_Iout_Vout(BTS_measValue* );
 
 //
 //=============================================================================
@@ -432,14 +438,14 @@ static inline void BTS_tripEpwm(uint32_t EPWM_BASE, BTS_DCL_CTRL_TYPE* ctrl_cc, 
 
 
 #pragma FUNC_ALWAYS_INLINE(BTS_storeValues)
-static inline void BTS_storeValues(BTS_measValues* measValues, int16_t current_16b, int16_t voltage_16b){
-    if(measValues->Index<BTS_senseAverageFactor){
-        measValues->Isense_16b[measValues->Index]= current_16b;
-        measValues->Vsense_16b[measValues->Index]= voltage_16b;
-        measValues->Index =measValues->Index+1U;
+static inline void BTS_storeValues(BTS_measValue* measValue, int16_t current_16b, int16_t voltage_16b){
+    if(measValue->Index<BTS_senseAverageFactor){
+        measValue->Isense_16b[measValue->Index]= current_16b;
+        measValue->Vsense_16b[measValue->Index]= voltage_16b;
+        measValue->Index =measValue->Index+1U;
     }
     else{
-        measValues->Index=0U;
+        measValue->Index=0U;
     }
 
 }
@@ -451,7 +457,7 @@ static inline void BTS_ctrlDirection(uint32_t EPWM_BASE, BTS_ctrlLoopVariable *c
     if(ctrlLoopVariable->direction_logic){
         //charge mode
 
-        if(current_16b <((int16_t)BTS_USER_DEFAULT_TRIP_N_16b)){
+        if(current_16b < ((int16_t)ctrlLoopVariable->ioutTrip_n_16b)){
             EPWM_setActionQualifierContSWForceAction(EPWM_BASE,EPWM_AQ_OUTPUT_B,EPWM_AQ_SW_OUTPUT_HIGH);
             ctrlLoopVariable->dutyH_pu = ctrlLoopVariable->dutySet_pu;
             ctrlLoopVariable->dutyL_pu = 1.0;
@@ -465,7 +471,7 @@ static inline void BTS_ctrlDirection(uint32_t EPWM_BASE, BTS_ctrlLoopVariable *c
     else{
         //discharge mode
 
-        if(current_16b >((int16_t)BTS_USER_DEFAULT_TRIP_16b)){
+        if(current_16b >((int16_t)ctrlLoopVariable->ioutTrip_16b)){
             EPWM_setActionQualifierContSWForceAction(EPWM_BASE,EPWM_AQ_OUTPUT_A,EPWM_AQ_SW_OUTPUT_LOW);
             ctrlLoopVariable->dutyH_pu = 0;
             ctrlLoopVariable->dutyL_pu = ctrlLoopVariable->dutySet_pu;
