@@ -2,6 +2,8 @@
 /.jxbrowser-data/
 /.jxbrowser.userdata/
 */RELEASE/
+*/cpu1/
+*/cpu2/
 *.zip/
 *.zip
 bts_F2800x_4ch_v2_16thNov_zip_file/

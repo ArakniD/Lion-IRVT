@@ -126,7 +126,60 @@ void BTS_HAL_setupDevice(void)
     CPUTimer_startTimer(TASKC_CPUTIMER_BASE);
 }
 
+extern volatile uint32_t startup_mode;
+extern volatile uint32_t startup_enable;
 
+/* SN74HC148DR
+ * This is attached to the three inputs, so its a single select
+ * based on parity really */
+uint8_t truth_table[8] = {
+  7, // 0 Input 7=L
+  6, // 1 Input 6=L
+  5, // 2 Input 5=L
+  4, // 3 Input 4=L
+  3, // 4 Input 3=L
+  2, // 5 Input 2=L
+  1, // 6 Input 1=L
+  0  // 7 Input 0=L or ALL OFF
+};
+
+
+void BTS_HAL_setupGPIO(void)
+{
+    // Configure GPIOs Mode options
+    GPIO_setPinConfig(BTS_MODE_GPIO_CFG_0);
+    GPIO_setPinConfig(BTS_MODE_GPIO_CFG_1);
+    GPIO_setPinConfig(BTS_MODE_GPIO_CFG_2);
+    GPIO_setDirectionMode(BTS_MODE_GPIO_PIN_0, GPIO_DIR_MODE_IN);
+    GPIO_setDirectionMode(BTS_MODE_GPIO_PIN_1, GPIO_DIR_MODE_IN);
+    GPIO_setDirectionMode(BTS_MODE_GPIO_PIN_2, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(BTS_MODE_GPIO_PIN_0, GPIO_PIN_TYPE_STD);
+    GPIO_setPadConfig(BTS_MODE_GPIO_PIN_1, GPIO_PIN_TYPE_STD);
+    GPIO_setPadConfig(BTS_MODE_GPIO_PIN_2, GPIO_PIN_TYPE_STD);
+
+    // Configure GPIOs Enable options
+    GPIO_setPinConfig(BTS_EN_GPIO_CFG_0);
+    GPIO_setPinConfig(BTS_EN_GPIO_CFG_1);
+    GPIO_setPinConfig(BTS_EN_GPIO_CFG_2);
+    GPIO_setDirectionMode(BTS_EN_GPIO_PIN_0, GPIO_DIR_MODE_IN);
+    GPIO_setDirectionMode(BTS_EN_GPIO_PIN_1, GPIO_DIR_MODE_IN);
+    GPIO_setDirectionMode(BTS_EN_GPIO_PIN_2, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(BTS_EN_GPIO_PIN_0, GPIO_PIN_TYPE_STD);
+    GPIO_setPadConfig(BTS_EN_GPIO_PIN_1, GPIO_PIN_TYPE_STD);
+    GPIO_setPadConfig(BTS_EN_GPIO_PIN_2, GPIO_PIN_TYPE_STD);
+
+    // startup_enable
+    startup_enable  = (GPIO_readPin(BTS_EN_GPIO_PIN_0) ? 1 : 0) << 0;
+    startup_enable |= (GPIO_readPin(BTS_EN_GPIO_PIN_1) ? 1 : 0) << 1;
+    startup_enable |= (GPIO_readPin(BTS_EN_GPIO_PIN_2) ? 1 : 0) << 2;
+    startup_enable = truth_table[startup_enable];
+
+    // startup_mode
+    startup_mode  = (GPIO_readPin(BTS_MODE_GPIO_PIN_0) ? 1 : 0) << 0;
+    startup_mode |= (GPIO_readPin(BTS_MODE_GPIO_PIN_1) ? 1 : 0) << 1;
+    startup_mode |= (GPIO_readPin(BTS_MODE_GPIO_PIN_2) ? 1 : 0) << 2;
+    startup_mode = truth_table[startup_mode];
+}
 
 void BTS_HAL_setupExAdc_ch1_4(void)
 {
@@ -802,6 +855,7 @@ void BTS_HAL_setupAdcClock(uint32_t EPWM_BASE)
 
 void BTS_HAL_SetupI2C_GPIO(void)
 {
+#if 0
     // I2CA pins (SDA / SCL) - External
     GPIO_setDirectionMode(BTS_I2C_EXT_PIN_SDA, GPIO_DIR_MODE_IN);
     GPIO_setPadConfig(BTS_I2C_EXT_PIN_SDA, GPIO_PIN_TYPE_PULLUP);
@@ -815,7 +869,7 @@ void BTS_HAL_SetupI2C_GPIO(void)
 
     GPIO_setPinConfig(BTS_I2C_EXT_CFG_SDA);
     GPIO_setPinConfig(BTS_I2C_EXT_CFG_SCL);
-
+#endif
     // I2CB pins (SDAA / SCLA) - Internal
     GPIO_setDirectionMode(BTS_I2C_INT_PIN_SDA, GPIO_DIR_MODE_IN);
     GPIO_setPadConfig(BTS_I2C_INT_PIN_SDA, GPIO_PIN_TYPE_PULLUP);
@@ -833,6 +887,7 @@ void BTS_HAL_SetupI2C_GPIO(void)
 
 void BTS_HAL_SetupI2C_Init()
 {
+#if 0
     // External I2CA Base
     I2C_disableModule(BTS_I2C_EXT_BASE);
     I2C_initMaster(BTS_I2C_EXT_BASE, DEVICE_SYSCLK_FREQ, 100000, I2C_DUTYCYCLE_50);
@@ -849,7 +904,7 @@ void BTS_HAL_SetupI2C_Init()
     I2C_enableInterrupt(BTS_I2C_EXT_BASE, I2C_INT_ADDR_SLAVE | I2C_INT_ARB_LOST | I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION);
     I2C_setEmulationMode(BTS_I2C_EXT_BASE, I2C_EMULATION_FREE_RUN);
     I2C_enableModule(BTS_I2C_EXT_BASE);
-
+#endif
     // Internal I2CB - Internal
     I2C_disableModule(BTS_I2C_INT_BASE);
     I2C_initMaster(BTS_I2C_INT_BASE, DEVICE_SYSCLK_FREQ, 400000, I2C_DUTYCYCLE_50);
@@ -950,25 +1005,6 @@ void BTS_HAL_setupInterrupt(void)
     EINT;  // Enable Global interrupt INTM
     ERTM;  // Enable Global real-time interrupt DBGM
     EDIS;
-}
-
-void BTS_HAL_setupInterrupt_I2c(void)
-{
-    //
-    // Set I2C use, initializing it for FIFO mode
-    //
-
-    Interrupt_register(INT_I2CA, &i2cAISR);
-    Interrupt_enable(INT_I2CA);
-
-    Interrupt_register(INT_I2CB, &i2cBISR);
-    Interrupt_enable(INT_I2CB);
-
-    Interrupt_register(INT_I2CA_FIFO, &i2cAFIFOISR);
-    Interrupt_enable(INT_I2CA_FIFO);
-
-    Interrupt_register(INT_I2CB_FIFO, &i2cBFIFOISR);
-    Interrupt_enable(INT_I2CB_FIFO);
 }
 
 void BTS_HAL_SetupSpi(uint32_t spiBase)

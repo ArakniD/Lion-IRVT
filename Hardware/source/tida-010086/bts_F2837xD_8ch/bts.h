@@ -31,6 +31,7 @@ extern "C" {
 #include "bts_hal.h"
 #include "DCL_fdlog.h"
 #include "DCL_TCM.h"
+#include "registers.h"
 
 #if(BTS_DRV_EPWM_HR_ENABLED == true)
     #include "SFO_V8.h"
@@ -90,21 +91,7 @@ extern "C" {
 //
 
 
-typedef struct
-{
-    float32_t Isense_A;
-    float32_t Vsense_V;
-    int16_t Isense_16b[BTS_senseAverageFactor];
-    int16_t Vsense_16b[BTS_senseAverageFactor];
-    int32_t Sum_I;
-    int32_t Sum_V;
-    uint16_t Index;
-    float32_t IoutGain_A;
-    float32_t IoutOffset_A;
-    float32_t VoutGain_V;
-    float32_t VoutOffset_V;
 
-}BTS_measValue;
 
 
 extern BTS_measValue BTS_measValues[];
@@ -117,54 +104,7 @@ extern BTS_measValue BTS_measValues[];
 #define BTS_measValues_ch7 BTS_measValues[6]
 #define BTS_measValues_ch8 BTS_measValues[7]
 
-typedef struct _BTS_channelCalibration
-{
-    /* Header and checksum for forward persistent storage
-     * Compatibility and in-place upgrade pathway
-     */
-    uint32_t  header;
-    uint32_t  dateTime;
 
-    float32_t IoutGain_pu;
-    float32_t IoutOffset_pu;
-    float32_t IoutGain_A;
-    float32_t IoutOffset_A;
-
-    float32_t VoutGain_pu;
-    float32_t VoutOffset_pu;
-    float32_t VoutGain_V;
-    float32_t VoutOffset_V;
-
-} BTS_channelCalibration;
-
-typedef struct
-{
-    /* run-time set points and logic */
-    volatile float32_t iref_A;
-    volatile float32_t vref_charge_V;
-    volatile float32_t vref_discharge_V;
-    volatile uint16_t  direction_logic;
-    volatile uint16_t  enable_logic;
-    volatile float32_t dutyRef_pu;
-    volatile float32_t ioutCal_pu;
-    volatile float32_t voutCal_pu;
-
-    /* Calibration Data Entry */
-    float32_t IoutGain_pu;
-    float32_t IoutOffset_pu;
-    float32_t IoutGain_A;
-    float32_t IoutOffset_A;
-
-    float32_t VoutGain_pu;
-    float32_t VoutOffset_pu;
-    float32_t VoutGain_V;
-    float32_t VoutOffset_V;
-
-    /* Set to 1 to enforce updating of internal measurement data */
-    /* Set to 2 to enforce updating and save to EEPROM */
-    uint16_t  pendingUpdate;
-
-}BTS_userInput;
 
 extern BTS_userInput BTS_userInputs[];
 #define BTS_userInput_ch1 BTS_userInputs[0]
@@ -175,37 +115,6 @@ extern BTS_userInput BTS_userInputs[];
 #define BTS_userInput_ch6 BTS_userInputs[5]
 #define BTS_userInput_ch7 BTS_userInputs[6]
 #define BTS_userInput_ch8 BTS_userInputs[7]
-
-typedef struct
-{
-    float32_t dutySet_pu; // this variable is used in the open loop
-    float32_t dutySetRef_pu;
-
-    float32_t ioutRef_pu;
-    float32_t ioutSet_pu;
-    float32_t ioutSense_pu;
-
-    float32_t voutRef_pu;
-    float32_t voutSet_pu;
-    float32_t voutSense_pu;
-
-    float32_t uk_cc_pu;
-    float32_t ek_cc_pu;
-    float32_t uk_cv_pu;
-    float32_t ek_cv_pu;
-    float32_t direction_coeff;
-
-    float32_t dutyH_pu;
-    float32_t dutyL_pu;
-
-    uint16_t ctrlMode_logic;
-    uint16_t direction_logic;
-
-    int16_t ioutTrip_16b;
-    int16_t ioutTrip_n_16b;
-    uint16_t tripFlag;
-
-}BTS_ctrlLoopVariable;
 
 extern BTS_ctrlLoopVariable BTS_ctrlLoopVariables[];
 #define BTS_ctrlLoopVariable_ch1 BTS_ctrlLoopVariables[0]

@@ -287,6 +287,23 @@
 #define BTS_CAN_PIN_CANRX                   GPIO_30_CANRXA
 #define BTS_CAN_PIN_CANTX                   GPIO_31_CANTXA
 
+// MODE OPTIONS
+#define BTS_MODE_GPIO_CFG_0                     GPIO_54_GPIO54
+#define BTS_MODE_GPIO_CFG_1                     GPIO_55_GPIO55
+#define BTS_MODE_GPIO_CFG_2                     GPIO_56_GPIO56
+#define BTS_MODE_GPIO_PIN_0                     ((uint16_t)54)
+#define BTS_MODE_GPIO_PIN_1                     ((uint16_t)55)
+#define BTS_MODE_GPIO_PIN_2                     ((uint16_t)56)
+
+// ENABLE OPTIONS
+#define BTS_EN_GPIO_CFG_0                       GPIO_57_GPIO57
+#define BTS_EN_GPIO_CFG_1                       GPIO_58_GPIO58
+#define BTS_EN_GPIO_CFG_2                       GPIO_59_GPIO59
+#define BTS_EN_GPIO_PIN_0                       ((uint16_t)57)
+#define BTS_EN_GPIO_PIN_1                       ((uint16_t)58)
+#define BTS_EN_GPIO_PIN_2                       ((uint16_t)59)
+
+
 /*
  *  volatile float32_t iref_A;
     volatile float32_t vref_charge_V;
