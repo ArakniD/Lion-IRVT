@@ -71,6 +71,9 @@ void BTS_HAL_setupDevice(void)
     //
     Interrupt_initVectorTable();
 
+    // Setup trip system
+    BTS_HAL_setupTripSystem();
+
     //
     // Initialize CPU timers for task scheduling
     //
@@ -853,94 +856,186 @@ void BTS_HAL_setupAdcClock(uint32_t EPWM_BASE)
 
 }
 
-void BTS_HAL_SetupI2C_GPIO(void)
-{
-#if 0
-    // I2CA pins (SDA / SCL) - External
-    GPIO_setDirectionMode(BTS_I2C_EXT_PIN_SDA, GPIO_DIR_MODE_IN);
-    GPIO_setPadConfig(BTS_I2C_EXT_PIN_SDA, GPIO_PIN_TYPE_PULLUP);
-    GPIO_setMasterCore(BTS_I2C_EXT_PIN_SDA, GPIO_CORE_CPU1);
-    GPIO_setQualificationMode(BTS_I2C_EXT_PIN_SDA, GPIO_QUAL_ASYNC);
+// Function to configure CMPSS for current monitoring (COMPH and COMPL combined)
+void BTS_HAL_setupCMPSS(uint32_t cmpssBase, uint32_t adcPin) {
+    EALLOW;
+    // Configure high comparator (COMPH) for +10A
+    CMPSS_configHighComparator(cmpssBase, CMPSS_INSRC_PIN | adcPin);
+    CMPSS_configOutputsHigh(cmpssBase, CMPSS_TRIP_FILTER | CMPSS_TRIPOUT_LATCH);
+    CMPSS_configFilterHigh(cmpssBase, 0, 8, CMPSS_THRESHOLD_HIGH); // Prescale 0, window 8
 
-    GPIO_setDirectionMode(BTS_I2C_EXT_PIN_SCL, GPIO_DIR_MODE_IN);
-    GPIO_setPadConfig(BTS_I2C_EXT_PIN_SCL, GPIO_PIN_TYPE_PULLUP);
-    GPIO_setMasterCore(BTS_I2C_EXT_PIN_SCL, GPIO_CORE_CPU1);
-    GPIO_setQualificationMode(BTS_I2C_EXT_PIN_SCL, GPIO_QUAL_ASYNC);
+    // Configure low comparator (COMPL) for -10A
+    CMPSS_configLowComparator(cmpssBase, CMPSS_INSRC_PIN | adcPin);
+    CMPSS_configOutputsLow(cmpssBase, CMPSS_TRIP_FILTER | CMPSS_TRIPOUT_LATCH);
+    CMPSS_configFilterLow(cmpssBase, 0, 8, CMPSS_THRESHOLD_LOW);
 
-    GPIO_setPinConfig(BTS_I2C_EXT_CFG_SDA);
-    GPIO_setPinConfig(BTS_I2C_EXT_CFG_SCL);
-#endif
-    // I2CB pins (SDAA / SCLA) - Internal
-    GPIO_setDirectionMode(BTS_I2C_INT_PIN_SDA, GPIO_DIR_MODE_IN);
-    GPIO_setPadConfig(BTS_I2C_INT_PIN_SDA, GPIO_PIN_TYPE_PULLUP);
-    GPIO_setMasterCore(BTS_I2C_INT_PIN_SDA, GPIO_CORE_CPU1);
-    GPIO_setQualificationMode(BTS_I2C_INT_PIN_SDA, GPIO_QUAL_ASYNC);
+    // Enable OR of COMPH and COMPL outputs
+    HWREGH(cmpssBase + CMPSS_O_COMPSTS) |= CMPSS_COMPSTS_COMPHLATCH | CMPSS_COMPSTS_COMPLLATCH;
 
-    GPIO_setDirectionMode(BTS_I2C_INT_PIN_SCL, GPIO_DIR_MODE_IN);
-    GPIO_setPadConfig(BTS_I2C_INT_PIN_SCL, GPIO_PIN_TYPE_PULLUP);
-    GPIO_setMasterCore(BTS_I2C_INT_PIN_SCL, GPIO_CORE_CPU1);
-    GPIO_setQualificationMode(BTS_I2C_INT_PIN_SCL, GPIO_QUAL_ASYNC);
-
-    GPIO_setPinConfig(BTS_I2C_INT_CFG_SDA);
-    GPIO_setPinConfig(BTS_I2C_INT_CFG_SCL);
+    // Enable CMPSS module
+    CMPSS_enableModule(cmpssBase);
+    EDIS;
 }
 
-void BTS_HAL_SetupI2C_Init()
-{
-#if 0
-    // External I2CA Base
-    I2C_disableModule(BTS_I2C_EXT_BASE);
-    I2C_initMaster(BTS_I2C_EXT_BASE, DEVICE_SYSCLK_FREQ, 100000, I2C_DUTYCYCLE_50);
-    I2C_setConfig(BTS_I2C_EXT_BASE, I2C_MASTER_SEND_MODE);
-    I2C_setSlaveAddress(BTS_I2C_EXT_BASE, 80);
-    I2C_setOwnSlaveAddress(BTS_I2C_EXT_BASE, 96); //I2CA address
-    I2C_disableLoopback(BTS_I2C_EXT_BASE);
-    I2C_setBitCount(BTS_I2C_EXT_BASE, I2C_BITCOUNT_8);
-    I2C_setDataCount(BTS_I2C_EXT_BASE, 2);
-    I2C_setAddressMode(BTS_I2C_EXT_BASE, I2C_ADDR_MODE_7BITS);
-    I2C_enableFIFO(BTS_I2C_EXT_BASE);
-    I2C_clearInterruptStatus(BTS_I2C_EXT_BASE, I2C_INT_ARB_LOST | I2C_INT_NO_ACK);
-    I2C_setFIFOInterruptLevel(BTS_I2C_EXT_BASE, I2C_FIFO_TXEMPTY, I2C_FIFO_RX2);
-    I2C_enableInterrupt(BTS_I2C_EXT_BASE, I2C_INT_ADDR_SLAVE | I2C_INT_ARB_LOST | I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION);
-    I2C_setEmulationMode(BTS_I2C_EXT_BASE, I2C_EMULATION_FREE_RUN);
-    I2C_enableModule(BTS_I2C_EXT_BASE);
-#endif
-    // Internal I2CB - Internal
-    I2C_disableModule(BTS_I2C_INT_BASE);
-    I2C_initMaster(BTS_I2C_INT_BASE, DEVICE_SYSCLK_FREQ, 400000, I2C_DUTYCYCLE_50);
-    I2C_setConfig(BTS_I2C_INT_BASE, I2C_MASTER_SEND_MODE);
-    I2C_setSlaveAddress(BTS_I2C_INT_BASE, 80);
-    I2C_setOwnSlaveAddress(BTS_I2C_INT_BASE, 96); //I2CA address
-    I2C_disableLoopback(BTS_I2C_INT_BASE);
-    I2C_setBitCount(BTS_I2C_INT_BASE, I2C_BITCOUNT_8);
-    I2C_setDataCount(BTS_I2C_INT_BASE, 2);
-    I2C_setAddressMode(BTS_I2C_INT_BASE, I2C_ADDR_MODE_7BITS);
-    I2C_enableFIFO(BTS_I2C_INT_BASE);
-    I2C_clearInterruptStatus(BTS_I2C_INT_BASE, I2C_INT_ARB_LOST | I2C_INT_NO_ACK);
-    I2C_setFIFOInterruptLevel(BTS_I2C_INT_BASE, I2C_FIFO_TXEMPTY, I2C_FIFO_RX2);
-    I2C_enableInterrupt(BTS_I2C_INT_BASE, I2C_INT_ARB_LOST | I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION);
-    I2C_setEmulationMode(BTS_I2C_INT_BASE, I2C_EMULATION_FREE_RUN);
-    I2C_enableModule(BTS_I2C_INT_BASE);
+// Function to configure Input X-BAR for a given input line
+void BTS_HAL_setupInputXBAR(uint32_t inputXbarLine, uint32_t sourceType, uint32_t sourceId) {
+    EALLOW;
+    // Map sourceType: 0 for GPIO, 1 for CMPSS
+    if (sourceType == 0) {
+        // GPIO source
+        XBAR_setInputPin((XBAR_InputNum)(XBAR_INPUT1 + (inputXbarLine - 1)), sourceId);
+    } else {
+        // CMPSS source (sourceId is mux value: 0, 2, ..., 14)
+        XBAR_setInputPin((XBAR_InputNum)(XBAR_INPUT1 + (inputXbarLine - 1)), sourceId);
+    }
+    EDIS;
 }
 
+// Function to configure GPIO for trip input
+void BTS_HAL_setupTripGPIO(uint32_t gpioPin) {
+    GPIO_setPinConfig(gpioPin | GPIO_PIN_TYPE_STD);
+    GPIO_setDirectionMode(gpioPin, GPIO_DIR_MODE_IN);
+    GPIO_setQualificationMode(gpioPin, GPIO_QUAL_SYNC);
+}
 
-void BTS_HAL_setupCanBus()
+// Function to configure ePWM Trip Zone
+void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase) {
+    EALLOW;
+    // Enable TZ1 (CMPSS) and TZ2 (GPIO AND group trip)
+    EPWM_enableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_OSHT1 | EPWM_TZ_SIGNAL_OSHT2);
+
+    // Configure trip actions: force EPWMA and EPWMB low
+    EPWM_setTripZoneAction(epwmBase, EPWM_TZ_ACTION_EVENT_TZA, EPWM_TZ_ACTION_LOW);
+    EPWM_setTripZoneAction(epwmBase, EPWM_TZ_ACTION_EVENT_TZB, EPWM_TZ_ACTION_LOW);
+
+    // Enable trip zone interrupt
+    EPWM_enableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
+    EDIS;
+}
+
+// Function to configure all trip mechanisms
+void BTS_HAL_setupTripSystem(void) {
+    // Configure comparators (assuming COMP1-8 map to channels)
+    // Map: A2->COMP1A, B2->COMP2B, A4->COMP3A, IN14->COMP4A, D0->COMP5D, C2->COMP6C, D2->COMP7D, C4->COMP8C
+
+    // Configure CMPSS for each channel
+    BTS_HAL_setupCMPSS(CMPSS1_BASE, BTS_TRP_PIN_CONFIG_COMP_CH1); // Channel 1, ADCIN0
+    BTS_HAL_setupCMPSS(CMPSS2_BASE, BTS_TRP_PIN_CONFIG_COMP_CH2); // Channel 2, ADCIN2
+    BTS_HAL_setupCMPSS(CMPSS3_BASE, BTS_TRP_PIN_CONFIG_COMP_CH3); // Channel 3, ADCIN4
+    BTS_HAL_setupCMPSS(CMPSS4_BASE, BTS_TRP_PIN_CONFIG_COMP_CH4); // Channel 4, ADCIN6
+    BTS_HAL_setupCMPSS(CMPSS5_BASE, BTS_TRP_PIN_CONFIG_COMP_CH5); // Channel 5, ADCIN0 (ADC2)
+    BTS_HAL_setupCMPSS(CMPSS6_BASE, BTS_TRP_PIN_CONFIG_COMP_CH6); // Channel 6, ADCIN2 (ADC2)
+    BTS_HAL_setupCMPSS(CMPSS7_BASE, BTS_TRP_PIN_CONFIG_COMP_CH7); // Channel 7, ADCIN4 (ADC2)
+    BTS_HAL_setupCMPSS(CMPSS8_BASE, BTS_TRP_PIN_CONFIG_COMP_CH8); // Channel 8, ADCIN6 (ADC2)
+
+    // Configure Input X-BAR for CMPSS trips (INPUT1 to INPUT8)
+    BTS_HAL_setupInputXBAR(1, 1, XBAR_OUT_MUX00_CMPSS1_CTRIPOUTH_OR_L);  // INPUT1: CMPSS1.COMPH/COMPL
+    BTS_HAL_setupInputXBAR(2, 1, XBAR_OUT_MUX02_CMPSS2_CTRIPOUTH_OR_L);  // INPUT2: CMPSS2.COMPH/COMPL
+    BTS_HAL_setupInputXBAR(3, 1, XBAR_OUT_MUX04_CMPSS3_CTRIPOUTH_OR_L);  // INPUT3: CMPSS3.COMPH/COMPL
+    BTS_HAL_setupInputXBAR(4, 1, XBAR_OUT_MUX06_CMPSS4_CTRIPOUTH_OR_L);  // INPUT4: CMPSS4.COMPH/COMPL
+    BTS_HAL_setupInputXBAR(5, 1, XBAR_OUT_MUX08_CMPSS5_CTRIPOUTH_OR_L);  // INPUT5: CMPSS5.COMPH/COMPL
+    BTS_HAL_setupInputXBAR(6, 1, XBAR_OUT_MUX10_CMPSS6_CTRIPOUTH_OR_L);  // INPUT6: CMPSS6.COMPH/COMPL
+    BTS_HAL_setupInputXBAR(7, 1, XBAR_OUT_MUX12_CMPSS7_CTRIPOUTH_OR_L);  // INPUT7: CMPSS7.COMPH/COMPL
+    BTS_HAL_setupInputXBAR(8, 1, XBAR_OUT_MUX14_CMPSS8_CTRIPOUTH_OR_L);  // INPUT8: CMPSS8.COMPH/COMPL
+
+    // Configure GPIOs for individual trips, group trip, and AND gate outputs
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH1);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH2);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH3);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH4);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH5);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH6);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH7);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH8);
+
+    // Configure Input X-BAR for GPIO AND group trips (INPUT9 to INPUT16)
+    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH1);
+    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH2);
+    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH3);
+    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH4);
+    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH5);
+    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH6);
+    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH7);
+    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH8);
+
+    // Configure Trip Zones for all ePWM modules
+    for (uint16_t i = 1; i <= 8; i++) {
+        uint32_t epwmBase = EPWM1_BASE + (i - 1) * 0x1000;
+        BTS_HAL_setupEPWMTripZone(epwmBase);
+    }
+}
+
+// Update BTS_HAL_setupADC
+void BTS_HAL_setupADC(void)
 {
-        GPIO_setPinConfig(BTS_CAN_PIN_CANRX);
-        GPIO_setPinConfig(BTS_CAN_PIN_CANTX);
+    ADC_setPrescaler(ADCA_BASE, ADC_CLK_DIV_4_0);
+    ADC_setPrescaler(ADCB_BASE, ADC_CLK_DIV_4_0);
+    ADC_setPrescaler(ADCC_BASE, ADC_CLK_DIV_4_0);
+    ADC_setPrescaler(ADCD_BASE, ADC_CLK_DIV_4_0);
 
-        //
-        // Initialize the CAN controllers
-        //
-        CAN_initModule(BTS_CAN_BASE);
+    ADC_setMode(ADCA_BASE, ADC_RESOLUTION_12BIT, ADC_MODE_SINGLE_ENDED);
+    ADC_setMode(ADCB_BASE, ADC_RESOLUTION_12BIT, ADC_MODE_SINGLE_ENDED);
+    ADC_setMode(ADCC_BASE, ADC_RESOLUTION_12BIT, ADC_MODE_SINGLE_ENDED);
+    ADC_setMode(ADCD_BASE, ADC_RESOLUTION_12BIT, ADC_MODE_SINGLE_ENDED);
 
-        //
-        // Set up the CAN bus bit rate to 500kHz for each module
-        // Refer to the Driver Library User Guide for information on how to set
-        // tighter timing control. Additionally, consult the device data sheet
-        // for more information about the CAN module clocking.
-        //
-        CAN_setBitRate(BTS_CAN_BASE, DEVICE_SYSCLK_FREQ, 500000, 16);
+    ADC_setSOCPriority(ADCA_BASE, ADC_PRI_ALL_ROUND_ROBIN);
+    ADC_setSOCPriority(ADCB_BASE, ADC_PRI_ALL_ROUND_ROBIN);
+    ADC_setSOCPriority(ADCC_BASE, ADC_PRI_ALL_ROUND_ROBIN);
+    ADC_setSOCPriority(ADCD_BASE, ADC_PRI_ALL_ROUND_ROBIN);
+
+    // Cell voltage: Ch1=A3, Ch2=B3, Ch3=A5, Ch4=IN15, Ch5=D1, Ch6=C3, Ch7=D3, Ch8=C5
+    ADC_setupSOC(ADCA_BASE, ADC_SOC_NUMBER0, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN3, 15);
+    ADC_setupSOC(ADCB_BASE, ADC_SOC_NUMBER0, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN3, 15);
+    ADC_setupSOC(ADCA_BASE, ADC_SOC_NUMBER1, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN5, 15);
+    ADC_setupSOC(ADCA_BASE, ADC_SOC_NUMBER2, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN15, 15);
+    ADC_setupSOC(ADCD_BASE, ADC_SOC_NUMBER0, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN1, 15);
+    ADC_setupSOC(ADCC_BASE, ADC_SOC_NUMBER0, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN3, 15);
+    ADC_setupSOC(ADCD_BASE, ADC_SOC_NUMBER1, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN3, 15);
+    ADC_setupSOC(ADCC_BASE, ADC_SOC_NUMBER1, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN5, 15);
+
+    // Cell current: Ch1=A2, Ch2=B2, Ch3=A4, Ch4=IN14, Ch5=D0, Ch6=C2, Ch7=D2, Ch8=C4
+    ADC_setupSOC(ADCA_BASE, ADC_SOC_NUMBER3, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN2, 15);
+    ADC_setupSOC(ADCB_BASE, ADC_SOC_NUMBER3, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN2, 15);
+    ADC_setupSOC(ADCA_BASE, ADC_SOC_NUMBER4, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN4, 15);
+    ADC_setupSOC(ADCA_BASE, ADC_SOC_NUMBER5, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN14, 15);
+    ADC_setupSOC(ADCD_BASE, ADC_SOC_NUMBER2, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN0, 15); // Note: D0 used here
+    ADC_setupSOC(ADCC_BASE, ADC_SOC_NUMBER2, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN2, 15);
+    ADC_setupSOC(ADCD_BASE, ADC_SOC_NUMBER3, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN2, 15);
+    ADC_setupSOC(ADCC_BASE, ADC_SOC_NUMBER3, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN4, 15);
+
+    // Reference: A0
+    ADC_setupSOC(ADCA_BASE, ADC_SOC_NUMBER6, ADC_TRIGGER_EPWM1_SOCA, ADC_CH_ADCIN0, 15);
+
+    // B0, B1 (software triggered)
+    ADC_setupSOC(ADCB_BASE, ADC_SOC_NUMBER1, ADC_TRIGGER_SW_ONLY, ADC_CH_ADCIN0, 15);
+    ADC_setupSOC(ADCB_BASE, ADC_SOC_NUMBER2, ADC_TRIGGER_SW_ONLY, ADC_CH_ADCIN1, 15);
+
+    // ADC interrupt
+    ADC_enableInterrupt(ADCA_BASE, ADC_INT_NUMBER1);
+    ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
+    ADC_setInterruptSource(ADCA_BASE, ADC_INT_NUMBER1, ADC_SOC_NUMBER0);
+
+    ADC_enableConverter(ADCA_BASE);
+    ADC_enableConverter(ADCB_BASE);
+    ADC_enableConverter(ADCC_BASE);
+    ADC_enableConverter(ADCD_BASE);
+    DEVICE_DELAY_US(1000);
+}
+
+// Add ePWM trigger setup for 10kHz
+void BTS_HAL_setupAdcTrigger(uint32_t EPWM_BASE)
+{
+    // Configure ePWM1 for 10kHz trigger
+    EPWM_setClockPrescaler(EPWM_BASE, EPWM_CLOCK_DIVIDER_1, EPWM_HSCLOCK_DIVIDER_1);
+    EPWM_setTimeBasePeriod(EPWM_BASE, DEVICE_SYSCLK_FREQ / 10000 - 1); // 10kHz
+    EPWM_setTimeBaseCounterMode(EPWM_BASE, EPWM_COUNTER_MODE_UP);
+    EPWM_setPeriodLoadMode(EPWM_BASE, EPWM_PERIOD_SHADOW_LOAD);
+    EPWM_disablePhaseShiftLoad(EPWM_BASE);
+
+    // Trigger SOCA at counter zero
+    EPWM_enableADCTrigger(EPWM_BASE, EPWM_SOC_A);
+    EPWM_setADCTriggerSource(EPWM_BASE, EPWM_SOC_A, EPWM_SOC_TBCTR_ZERO);
+    EPWM_setADCTriggerEventPrescale(EPWM_BASE, EPWM_SOC_A, 1);
 }
 
 void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE)
@@ -997,11 +1092,16 @@ void BTS_HAL_setupInterrupt_Adc2(void)
 
 void BTS_HAL_setupInterrupt(void)
 {
-#if(BTS_SFRA_ENABLED == true) && (BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
+    EALLOW;
+    #if(BTS_SFRA_ENABLED == true) && (BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
     Interrupt_register(INT_EPWM1, &epwm1ISR);
     Interrupt_enable(INT_EPWM1);
 #endif
-    EALLOW;
+    // Register trip ISR for EPWM1 to EPWM8
+    for (uint16_t i = 1; i <= 8; i++) {
+        Interrupt_register(INT_EPWM1 + (i - 1), &epwmTripISR);
+        Interrupt_enable(INT_EPWM1 + (i - 1));
+    }
     EINT;  // Enable Global interrupt INTM
     ERTM;  // Enable Global real-time interrupt DBGM
     EDIS;

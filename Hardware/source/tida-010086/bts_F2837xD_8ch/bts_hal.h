@@ -98,11 +98,15 @@ void BTS_HAL_SetupSpi(uint32_t base);
 void BTS_HAL_SetupSpiPinsGpio_Adc1(void);
 void BTS_HAL_SetupSpiPinsGpio_Adc2(void);
 
+// Add function prototype for ePWM trigger setup
+void BTS_HAL_setupAdcTrigger(uint32_t EPWM_BASE);
+
 __interrupt void ISR1(void);
 __interrupt void ISR2(void);
 __interrupt void ISR3(void);
 __interrupt void ISR4(void);
 __interrupt void epwm1ISR(void);
+__interrupt void epwmTripISR(void);
 
 static inline void BTS_HAL_ExAdcTxframe(uint32_t base){
     //set CS low before this function

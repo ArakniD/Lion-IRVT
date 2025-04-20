@@ -5,6 +5,8 @@
  *      Author: lucas
  */
 
+
+
 #ifndef REGISTERS_H_
 #define REGISTERS_H_
 
@@ -20,9 +22,10 @@
 
 #define NUM_CHANNELS 8
 #define NUM_CONTROL_REGISTERS (NUM_CHANNELS * 10) // 80
-#define NUM_STATS_REGISTERS (NUM_CHANNELS * 4)    // 32
-#define NUM_CALIBRATION_REGISTERS (NUM_CHANNELS * 8 + 1) // 64 + 1
-#define TOTAL_REGISTERS (NUM_CONTROL_REGISTERS + NUM_STATS_REGISTERS + NUM_CALIBRATION_REGISTERS) // 177
+#define NUM_STATS_REGISTERS (NUM_CHANNELS * 6)    // 48 (voltage, current)
+#define NUM_CALIBRATION_REGISTERS (NUM_CHANNELS * 12 + 16 + 4) // 16 + 4 + 96 (min/max temp, F28V/I gains/offsets, Iout/Vout calibrations, global voltages, calibration mode)
+#define NUM_UNIT_REGISTERS (4)
+#define TOTAL_REGISTERS (NUM_CONTROL_REGISTERS + NUM_STATS_REGISTERS + NUM_CALIBRATION_REGISTERS + NUM_UNIT_REGISTERS) // 247
 
 // CAN bus configuration
 #define CAN_BITRATE 500000 // 500 kbps
@@ -116,105 +119,177 @@ typedef enum {
     eCh7_DischargeCurrentMin = 308,
     eCh7_DischargeCurrentMax = 312,
     eCh7_Status = 316,
-    // Stats Block (32 registers)
+    // Stats Block (48 registers)
     eCh0_CurrentAcc = 320,
     eCh0_MinVoltage = 324,
     eCh0_MaxVoltage = 328,
     eCh0_PowerAcc = 332,
-    eCh1_CurrentAcc = 336,
-    eCh1_MinVoltage = 340,
-    eCh1_MaxVoltage = 344,
-    eCh1_PowerAcc = 348,
-    eCh2_CurrentAcc = 352,
-    eCh2_MinVoltage = 356,
-    eCh2_MaxVoltage = 360,
-    eCh2_PowerAcc = 364,
-    eCh3_CurrentAcc = 368,
-    eCh3_MinVoltage = 372,
-    eCh3_MaxVoltage = 376,
-    eCh3_PowerAcc = 380,
-    eCh4_CurrentAcc = 384,
-    eCh4_MinVoltage = 388,
-    eCh4_MaxVoltage = 392,
-    eCh4_PowerAcc = 396,
-    eCh5_CurrentAcc = 400,
-    eCh5_MinVoltage = 404,
-    eCh5_MaxVoltage = 408,
-    eCh5_PowerAcc = 412,
-    eCh6_CurrentAcc = 416,
-    eCh6_MinVoltage = 420,
-    eCh6_MaxVoltage = 424,
-    eCh6_PowerAcc = 428,
-    eCh7_CurrentAcc = 432,
-    eCh7_MinVoltage = 436,
-    eCh7_MaxVoltage = 440,
-    eCh7_PowerAcc = 444,
-    // Calibration Block (64 + 1 registers)
-    eCh0_IoutGain_pu = 448,
-    eCh0_IoutOffset_pu = 452,
-    eCh0_IoutGain_A = 456,
-    eCh0_IoutOffset_A = 460,
-    eCh0_VoutGain_pu = 464,
-    eCh0_VoutOffset_pu = 468,
-    eCh0_VoutGain_V = 472,
-    eCh0_VoutOffset_V = 476,
-    eCh1_IoutGain_pu = 480,
-    eCh1_IoutOffset_pu = 484,
-    eCh1_IoutGain_A = 488,
-    eCh1_IoutOffset_A = 492,
-    eCh1_VoutGain_pu = 496,
-    eCh1_VoutOffset_pu = 500,
-    eCh1_VoutGain_V = 504,
-    eCh1_VoutOffset_V = 508,
-    eCh2_IoutGain_pu = 512,
-    eCh2_IoutOffset_pu = 516,
-    eCh2_IoutGain_A = 520,
-    eCh2_IoutOffset_A = 524,
-    eCh2_VoutGain_pu = 528,
-    eCh2_VoutOffset_pu = 532,
-    eCh2_VoutGain_V = 536,
-    eCh2_VoutOffset_V = 540,
-    eCh3_IoutGain_pu = 544,
-    eCh3_IoutOffset_pu = 548,
-    eCh3_IoutGain_A = 552,
-    eCh3_IoutOffset_A = 556,
-    eCh3_VoutGain_pu = 560,
-    eCh3_VoutOffset_pu = 564,
-    eCh3_VoutGain_V = 568,
-    eCh3_VoutOffset_V = 572,
-    eCh4_IoutGain_pu = 576,
-    eCh4_IoutOffset_pu = 580,
-    eCh4_IoutGain_A = 584,
-    eCh4_IoutOffset_A = 588,
-    eCh4_VoutGain_pu = 592,
-    eCh4_VoutOffset_pu = 596,
-    eCh4_VoutGain_V = 600,
-    eCh4_VoutOffset_V = 604,
-    eCh5_IoutGain_pu = 608,
-    eCh5_IoutOffset_pu = 612,
-    eCh5_IoutGain_A = 616,
-    eCh5_IoutOffset_A = 620,
-    eCh5_VoutGain_pu = 624,
-    eCh5_VoutOffset_pu = 628,
-    eCh5_VoutGain_V = 632,
-    eCh5_VoutOffset_V = 636,
-    eCh6_IoutGain_pu = 640,
-    eCh6_IoutOffset_pu = 644,
-    eCh6_IoutGain_A = 648,
-    eCh6_IoutOffset_A = 652,
-    eCh6_VoutGain_pu = 656,
-    eCh6_VoutOffset_pu = 660,
-    eCh6_VoutGain_V = 664,
-    eCh6_VoutOffset_V = 668,
-    eCh7_IoutGain_pu = 672,
-    eCh7_IoutOffset_pu = 676,
-    eCh7_IoutGain_A = 680,
-    eCh7_IoutOffset_A = 684,
-    eCh7_VoutGain_pu = 688,
-    eCh7_VoutOffset_pu = 692,
-    eCh7_VoutGain_V = 696,
-    eCh7_VoutOffset_V = 700,
-    eCalibrationMode = 704
+    eCh0_CellVoltage = 336,
+    eCh0_CellCurrent = 340,
+    eCh1_CurrentAcc = 344,
+    eCh1_MinVoltage = 348,
+    eCh1_MaxVoltage = 352,
+    eCh1_PowerAcc = 356,
+    eCh1_CellVoltage = 360,
+    eCh1_CellCurrent = 364,
+    eCh2_CurrentAcc = 368,
+    eCh2_MinVoltage = 372,
+    eCh2_MaxVoltage = 376,
+    eCh2_PowerAcc = 380,
+    eCh2_CellVoltage = 384,
+    eCh2_CellCurrent = 388,
+    eCh3_CurrentAcc = 392,
+    eCh3_MinVoltage = 396,
+    eCh3_MaxVoltage = 400,
+    eCh3_PowerAcc = 404,
+    eCh3_CellVoltage = 408,
+    eCh3_CellCurrent = 412,
+    eCh4_CurrentAcc = 416,
+    eCh4_MinVoltage = 420,
+    eCh4_MaxVoltage = 424,
+    eCh4_PowerAcc = 428,
+    eCh4_CellVoltage = 432,
+    eCh4_CellCurrent = 436,
+    eCh5_CurrentAcc = 440,
+    eCh5_MinVoltage = 444,
+    eCh5_MaxVoltage = 448,
+    eCh5_PowerAcc = 452,
+    eCh5_CellVoltage = 456,
+    eCh5_CellCurrent = 460,
+    eCh6_CurrentAcc = 464,
+    eCh6_MinVoltage = 468,
+    eCh6_MaxVoltage = 472,
+    eCh6_PowerAcc = 476,
+    eCh6_CellVoltage = 480,
+    eCh6_CellCurrent = 484,
+    eCh7_CurrentAcc = 488,
+    eCh7_MinVoltage = 492,
+    eCh7_MaxVoltage = 496,
+    eCh7_PowerAcc = 500,
+    eCh7_CellVoltage = 504,
+    eCh7_CellCurrent = 508,
+    // Calibration Block (116 registers)
+    eCh0_MinCellTemp = 512,
+    eCh0_MaxCellTemp = 516,
+    eCh1_MinCellTemp = 520,
+    eCh1_MaxCellTemp = 524,
+    eCh2_MinCellTemp = 528,
+    eCh2_MaxCellTemp = 532,
+    eCh3_MinCellTemp = 536,
+    eCh3_MaxCellTemp = 540,
+    eCh4_MinCellTemp = 544,
+    eCh4_MaxCellTemp = 548,
+    eCh5_MinCellTemp = 552,
+    eCh5_MaxCellTemp = 556,
+    eCh6_MinCellTemp = 560,
+    eCh6_MaxCellTemp = 564,
+    eCh7_MinCellTemp = 568,
+    eCh7_MaxCellTemp = 572,
+    eChargeDisableV = 576,
+    eChargeRestrictV = 580,
+    eDischargeRestrictV = 584,
+    eDischargeDisableV = 588,
+    eCh0_F28V_Gain = 592,
+    eCh0_F28V_Offset = 596,
+    eCh0_F28I_Gain = 600,
+    eCh0_F28I_Offset = 604,
+    eCh0_IoutGain_pu = 608,
+    eCh0_IoutOffset_pu = 612,
+    eCh0_IoutGain_A = 616,
+    eCh0_IoutOffset_A = 620,
+    eCh0_VoutGain_pu = 624,
+    eCh0_VoutOffset_pu = 628,
+    eCh0_VoutGain_V = 632,
+    eCh0_VoutOffset_V = 636,
+    eCh1_F28V_Gain = 640,
+    eCh1_F28V_Offset = 644,
+    eCh1_F28I_Gain = 648,
+    eCh1_F28I_Offset = 652,
+    eCh1_IoutGain_pu = 656,
+    eCh1_IoutOffset_pu = 660,
+    eCh1_IoutGain_A = 664,
+    eCh1_IoutOffset_A = 668,
+    eCh1_VoutGain_pu = 672,
+    eCh1_VoutOffset_pu = 676,
+    eCh1_VoutGain_V = 680,
+    eCh1_VoutOffset_V = 684,
+    eCh2_F28V_Gain = 688,
+    eCh2_F28V_Offset = 692,
+    eCh2_F28I_Gain = 696,
+    eCh2_F28I_Offset = 700,
+    eCh2_IoutGain_pu = 704,
+    eCh2_IoutOffset_pu = 708,
+    eCh2_IoutGain_A = 712,
+    eCh2_IoutOffset_A = 716,
+    eCh2_VoutGain_pu = 720,
+    eCh2_VoutOffset_pu = 724,
+    eCh2_VoutGain_V = 728,
+    eCh2_VoutOffset_V = 732,
+    eCh3_F28V_Gain = 736,
+    eCh3_F28V_Offset = 740,
+    eCh3_F28I_Gain = 744,
+    eCh3_F28I_Offset = 748,
+    eCh3_IoutGain_pu = 752,
+    eCh3_IoutOffset_pu = 756,
+    eCh3_IoutGain_A = 760,
+    eCh3_IoutOffset_A = 764,
+    eCh3_VoutGain_pu = 768,
+    eCh3_VoutOffset_pu = 772,
+    eCh3_VoutGain_V = 776,
+    eCh3_VoutOffset_V = 780,
+    eCh4_F28V_Gain = 784,
+    eCh4_F28V_Offset = 788,
+    eCh4_F28I_Gain = 792,
+    eCh4_F28I_Offset = 796,
+    eCh4_IoutGain_pu = 800,
+    eCh4_IoutOffset_pu = 804,
+    eCh4_IoutGain_A = 808,
+    eCh4_IoutOffset_A = 812,
+    eCh4_VoutGain_pu = 816,
+    eCh4_VoutOffset_pu = 820,
+    eCh4_VoutGain_V = 824,
+    eCh4_VoutOffset_V = 828,
+    eCh5_F28V_Gain = 832,
+    eCh5_F28V_Offset = 836,
+    eCh5_F28I_Gain = 840,
+    eCh5_F28I_Offset = 844,
+    eCh5_IoutGain_pu = 848,
+    eCh5_IoutOffset_pu = 852,
+    eCh5_IoutGain_A = 856,
+    eCh5_IoutOffset_A = 860,
+    eCh5_VoutGain_pu = 864,
+    eCh5_VoutOffset_pu = 868,
+    eCh5_VoutGain_V = 872,
+    eCh5_VoutOffset_V = 876,
+    eCh6_F28V_Gain = 880,
+    eCh6_F28V_Offset = 884,
+    eCh6_F28I_Gain = 888,
+    eCh6_F28I_Offset = 892,
+    eCh6_IoutGain_pu = 896,
+    eCh6_IoutOffset_pu = 900,
+    eCh6_IoutGain_A = 904,
+    eCh6_IoutOffset_A = 908,
+    eCh6_VoutGain_pu = 912,
+    eCh6_VoutOffset_pu = 916,
+    eCh6_VoutGain_V = 920,
+    eCh6_VoutOffset_V = 924,
+    eCh7_F28V_Gain = 928,
+    eCh7_F28V_Offset = 932,
+    eCh7_F28I_Gain = 936,
+    eCh7_F28I_Offset = 940,
+    eCh7_IoutGain_pu = 944,
+    eCh7_IoutOffset_pu = 948,
+    eCh7_IoutGain_A = 952,
+    eCh7_IoutOffset_A = 956,
+    eCh7_VoutGain_pu = 960,
+    eCh7_VoutOffset_pu = 964,
+    eCh7_VoutGain_V = 968,
+    eCh7_VoutOffset_V = 972,
+    // Unit Values (3 registers)
+    eCalibrationMode = 976,
+    eUnitState = 980,
+    eInputVoltage = 984,
+    eTripStatus = 988, // 32-bit bitfield for trip sources
 } RegisterAddress;
 
 typedef struct {
@@ -241,25 +316,91 @@ typedef struct {
     uint32_t constCurrent;
 } ChannelStatus;
 
+// Bitfield for eTripStatus register
+typedef struct {
+    uint32_t ch0_cmpss : 1; // Channel 0 CMPSS trip
+    uint32_t ch0_gpio  : 1; // Channel 0 GPIO trip
+    uint32_t ch1_cmpss : 1;
+    uint32_t ch1_gpio  : 1;
+    uint32_t ch2_cmpss : 1;
+    uint32_t ch2_gpio  : 1;
+    uint32_t ch3_cmpss : 1;
+    uint32_t ch3_gpio  : 1;
+    uint32_t ch4_cmpss : 1;
+    uint32_t ch4_gpio  : 1;
+    uint32_t ch5_cmpss : 1;
+    uint32_t ch5_gpio  : 1;
+    uint32_t ch6_cmpss : 1;
+    uint32_t ch6_gpio  : 1;
+    uint32_t ch7_cmpss : 1;
+    uint32_t ch7_gpio  : 1;
+    uint32_t reserved  : 16; // Padding to 32 bits
+} TripStatusBitfield;
+
 typedef struct _BTS_channelCalibration
 {
-    /* Header and checksum for forward persistent storage
-     * Compatibility and in-place upgrade pathway
-     */
-    uint32_t  header;
+    uint32_t  header;  // 0xA5CC for validation
     uint32_t  dateTime;
 
+    float32_t MinCellTemp;      // Minimum cell temperature 
+    float32_t MaxCellTemp;      // Maximum cell temperature
+    float32_t F28V_Gain;        // ADC gain for cell voltage
+    float32_t F28V_Offset;      // ADC offset for cell voltage
+    float32_t F28I_Gain;        // ADC gain for cell current
+    float32_t F28I_Offset;      // ADC offset for cell current
     float32_t IoutGain_pu;
     float32_t IoutOffset_pu;
     float32_t IoutGain_A;
     float32_t IoutOffset_A;
-
     float32_t VoutGain_pu;
     float32_t VoutOffset_pu;
     float32_t VoutGain_V;
     float32_t VoutOffset_V;
-
 } BTS_channelCalibration;
+
+typedef struct
+{
+    float32_t Isense_A;
+    float32_t Vsense_V;
+    float32_t CellVoltage_V;
+    float32_t CellCurrent_I;
+    int16_t Isense_16b[BTS_senseAverageFactor];
+    int16_t Vsense_16b[BTS_senseAverageFactor];
+    int16_t CellVoltage_16b[BTS_f28AverageFactor];
+    int16_t CellCurrent_16b[BTS_f28AverageFactor];
+    int32_t Sum_I;
+    int32_t Sum_V;
+    int32_t Sum_CellV;
+    int32_t Sum_CellI;
+    uint16_t Index;
+    uint16_t F28Index;
+    float32_t IoutGain_A;
+    float32_t IoutOffset_A;
+    float32_t VoutGain_V;
+    float32_t VoutOffset_V;
+    float32_t F28V_Gain;
+    float32_t F28V_Offset;
+    float32_t F28I_Gain;
+    float32_t F28I_Offset;
+} BTS_measValue;
+
+typedef struct {
+    uint16_t channel; // 0-7
+    float voltage;    // Volts
+    float current;    // Amps
+    float mAh;        // Milliamp-hours
+    float mWh;        // Milliwatt-hours
+} CAN_data;
+
+typedef enum {
+    eInputLow_ChargeDisabled,
+    eInputLow_ChargeRestricted,
+    eInputOK,
+    eInputHigh_DischargeRestricted,
+    eInputHigh_DischargeDisabled
+} UnitState;
+
+// Not auto generated below
 
 typedef struct
 {
@@ -284,6 +425,11 @@ typedef struct
     float32_t VoutOffset_pu;
     float32_t VoutGain_V;
     float32_t VoutOffset_V;
+
+    float32_t F28V_Gain;
+    float32_t F28V_Offset;
+    float32_t F28I_Gain;
+    float32_t F28I_Offset;
 
     /* Set to 1 to enforce updating of internal measurement data */
     /* Set to 2 to enforce updating and save to EEPROM */
@@ -322,29 +468,5 @@ typedef struct
 
 }BTS_ctrlLoopVariable;
 
-typedef struct
-{
-    float32_t Isense_A;
-    float32_t Vsense_V;
-    int16_t Isense_16b[BTS_senseAverageFactor];
-    int16_t Vsense_16b[BTS_senseAverageFactor];
-    int32_t Sum_I;
-    int32_t Sum_V;
-    uint16_t Index;
-    float32_t IoutGain_A;
-    float32_t IoutOffset_A;
-    float32_t VoutGain_V;
-    float32_t VoutOffset_V;
-
-}BTS_measValue;
-
-
-typedef struct {
-    uint16_t channel; // 0-7
-    float voltage;    // Volts
-    float current;    // Amps
-    float mAh;        // Milliamp-hours
-    float mWh;        // Milliwatt-hours
-} CAN_data;
 
 #endif /* REGISTERS_H_ */

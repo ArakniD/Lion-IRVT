@@ -31,6 +31,8 @@ BTS_measValue BTS_measValues[PWM_CH_MAX];
 
 BTS_userInput BTS_userInputs[PWM_CH_MAX];
 
+ChannelStatus status[PWM_CH_MAX];
+
 BTS_DCL_CTRL_TYPE   BTS_ctrl_cc[PWM_CH_MAX]
     = { BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,
         BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,
@@ -271,6 +273,10 @@ void BTS_calcUserProgramVariables(uint16_t i)
     BTS_measValues[i].IoutOffset_A  = BTS_userInputs[i].IoutOffset_A;
     BTS_measValues[i].VoutGain_V    = BTS_userInputs[i].VoutGain_V;
     BTS_measValues[i].VoutOffset_V  = BTS_userInputs[i].VoutOffset_V;
+    BTS_measValues[i].F28V_Gain     = BTS_userInputs[i].F28V_Gain;
+    BTS_measValues[i].F28V_Offset   = BTS_userInputs[i].F28V_Offset;
+    BTS_measValues[i].F28I_Gain     = BTS_userInputs[i].F28I_Gain;
+    BTS_measValues[i].F28I_Offset   = BTS_userInputs[i].F28I_Offset;
 }
 
 // Initialise the program variables from the user input
@@ -542,25 +548,6 @@ void BTS_monitor_program_update(uint16_t channel)
         BTS_userInputs[channel].pendingUpdate = 0;
     }
 }
-
-#pragma CODE_SECTION(BTS_monitor_Iout_Vout,"ramfuncs");
-void BTS_monitor_Iout_Vout(BTS_measValue* measValues )
-{
-    measValues->Sum_I=0U;
-    measValues->Sum_V=0U;
-    uint16_t index;
-    float32_t avgValue=0.0;
-    for(index=0U; index<BTS_senseAverageFactor; index++){
-        measValues->Sum_I += measValues->Isense_16b[index];
-        measValues->Sum_V+= measValues->Vsense_16b[index];
-    }
-    avgValue= (float32_t)measValues->Sum_I/((float32_t)BTS_senseAverageFactor* 32768.0);
-    measValues->Isense_A =measValues->IoutGain_A *avgValue +measValues->IoutOffset_A ;
-    avgValue= (float32_t)measValues->Sum_V/((float32_t)BTS_senseAverageFactor* 32768.0);
-    measValues->Vsense_V =measValues->VoutGain_V *avgValue  +measValues->VoutOffset_V;
-
-}
-
 
 
 //

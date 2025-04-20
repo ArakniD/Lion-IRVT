@@ -91,6 +91,7 @@ extern "C" {
 //
 
 
+extern ChannelStatus status[];
 
 
 
@@ -345,19 +346,32 @@ static inline void BTS_tripEpwm(uint32_t EPWM_BASE, BTS_DCL_CTRL_TYPE* ctrl_cc, 
 
 }
 
-
-#pragma FUNC_ALWAYS_INLINE(BTS_storeValues)
-static inline void BTS_storeValues(BTS_measValue* measValue, int16_t current_16b, int16_t voltage_16b){
-    if(measValue->Index<BTS_senseAverageFactor){
-        measValue->Isense_16b[measValue->Index]= current_16b;
-        measValue->Vsense_16b[measValue->Index]= voltage_16b;
-        measValue->Index =measValue->Index+1U;
+// Update BTS_storeValuesAds for cell current
+#pragma FUNC_ALWAYS_INLINE(BTS_storeValuesAds)
+static inline void BTS_storeValuesAds(BTS_measValue* measValue, int16_t current_16b, int16_t voltage_16b)
+{
+    if (measValue->Index < BTS_senseAverageFactor) {
+        measValue->Isense_16b[measValue->Index] = current_16b;
+        measValue->Vsense_16b[measValue->Index] = voltage_16b;
+        measValue->Index = measValue->Index + 1U;
+    } else {
+        measValue->Index = 0U;
     }
-    else{
-        measValue->Index=0U;
-    }
-
 }
+
+// Update BTS_storeValuesF28 for cell current
+#pragma FUNC_ALWAYS_INLINE(BTS_storeValuesF28)
+static inline void BTS_storeValuesF28(BTS_measValue* measValue, int16_t cell_voltage_16b, int16_t cell_current_16b)
+{
+    if (measValue->F28Index < BTS_f28AverageFactor) {
+        measValue->CellVoltage_16b[measValue->F28Index] = cell_voltage_16b;
+        measValue->CellCurrent_16b[measValue->F28Index] = cell_current_16b;
+        measValue->F28Index = measValue->F28Index + 1U;
+    } else {
+        measValue->F28Index = 0U;
+    }
+}
+
 static inline void BTS_ctrlDirection(uint32_t EPWM_BASE, BTS_ctrlLoopVariable *ctrlLoopVariable,int16_t current_16b){
 
     //In charge mode, check if current goes below negative trip value, then shutdown low side mosfet
@@ -556,7 +570,7 @@ static inline void BTS_ISR_SFRA(void){
     BTS_ctrlLoopVariable_chx.voutSet_pu = BTS_SFRA_INJECT(BTS_ctrlLoopVariable_chx.voutRef_pu);
 #endif
 
-    BTS_storeValues(&BTS_measValues_chx,BTS_ADC_current, BTS_ADC_voltage);
+    BTS_storeValuesAds(&BTS_measValues_chx,BTS_ADC_current, BTS_ADC_voltage);
 
 #if(BTS_ENABLE_SWITCH)
     BTS_detectEnable(EPWMx_BASE,&BTS_ctrlLoopVariable_chx , &BTS_userInput_chx);
@@ -591,7 +605,7 @@ static inline void BTS_runISR_ch1_4(void){
 #if(BTS_SFRA_ENABLED ==(false))
 
 #if(BTS_ENABLE_CH1)
-    BTS_storeValues(&BTS_measValues_ch1,BTS_ADC1.channel0, BTS_ADC1.channel1);
+    BTS_storeValuesAds(&BTS_measValues_ch1,BTS_ADC1.channel0, BTS_ADC1.channel1);
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM1_BASE,&BTS_ctrlLoopVariable_ch1 , &BTS_userInput_ch1);
 #endif
@@ -599,7 +613,7 @@ static inline void BTS_runISR_ch1_4(void){
 #endif
 
 #if(BTS_ENABLE_CH2)
-    BTS_storeValues(&BTS_measValues_ch2,BTS_ADC1.channel2, BTS_ADC1.channel3);
+    BTS_storeValuesAds(&BTS_measValues_ch2,BTS_ADC1.channel2, BTS_ADC1.channel3);
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM2_BASE,&BTS_ctrlLoopVariable_ch2 , &BTS_userInput_ch2);
 #endif
@@ -607,7 +621,7 @@ static inline void BTS_runISR_ch1_4(void){
 #endif
 
 #if(BTS_ENABLE_CH3)
-    BTS_storeValues(&BTS_measValues_ch3,BTS_ADC1.channel4, BTS_ADC1.channel5);
+    BTS_storeValuesAds(&BTS_measValues_ch3,BTS_ADC1.channel4, BTS_ADC1.channel5);
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM3_BASE,&BTS_ctrlLoopVariable_ch3 , &BTS_userInput_ch3);
 #endif
@@ -615,7 +629,7 @@ static inline void BTS_runISR_ch1_4(void){
 #endif
 
 #if(BTS_ENABLE_CH4)
-    BTS_storeValues(&BTS_measValues_ch4,BTS_ADC1.channel6, BTS_ADC1.channel7);
+    BTS_storeValuesAds(&BTS_measValues_ch4,BTS_ADC1.channel6, BTS_ADC1.channel7);
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM4_BASE,&BTS_ctrlLoopVariable_ch4 , &BTS_userInput_ch4);
 #endif
@@ -640,7 +654,7 @@ static inline void BTS_runISR_ch5_8(void){
 #if(BTS_SFRA_ENABLED ==(false))
 
 #if(BTS_ENABLE_CH5)
-    BTS_storeValues(&BTS_measValues_ch5,BTS_ADC2.channel0, BTS_ADC2.channel1);
+    BTS_storeValuesAds(&BTS_measValues_ch5,BTS_ADC2.channel0, BTS_ADC2.channel1);
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM5_BASE,&BTS_ctrlLoopVariable_ch5 , &BTS_userInput_ch5);
 #endif
@@ -648,7 +662,7 @@ static inline void BTS_runISR_ch5_8(void){
 #endif
 
 #if(BTS_ENABLE_CH6)
-    BTS_storeValues(&BTS_measValues_ch6,BTS_ADC2.channel2, BTS_ADC2.channel3);
+    BTS_storeValuesAds(&BTS_measValues_ch6,BTS_ADC2.channel2, BTS_ADC2.channel3);
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM6_BASE,&BTS_ctrlLoopVariable_ch6 , &BTS_userInput_ch6);
 #endif
@@ -656,7 +670,7 @@ static inline void BTS_runISR_ch5_8(void){
 #endif
 
 #if(BTS_ENABLE_CH7)
-    BTS_storeValues(&BTS_measValues_ch7,BTS_ADC2.channel4, BTS_ADC2.channel5);
+    BTS_storeValuesAds(&BTS_measValues_ch7,BTS_ADC2.channel4, BTS_ADC2.channel5);
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM7_BASE,&BTS_ctrlLoopVariable_ch7 , &BTS_userInput_ch7);
 #endif
@@ -664,7 +678,7 @@ static inline void BTS_runISR_ch5_8(void){
 #endif
 
 #if(BTS_ENABLE_CH8)
-    BTS_storeValues(&BTS_measValues_ch8,BTS_ADC2.channel6, BTS_ADC2.channel7);
+    BTS_storeValuesAds(&BTS_measValues_ch8,BTS_ADC2.channel6, BTS_ADC2.channel7);
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM8_BASE,&BTS_ctrlLoopVariable_ch8 , &BTS_userInput_ch8);
 #endif

@@ -1,36 +1,24 @@
-//#############################################################################
-//
-// FILE:   bts_cpu1.c (previously bts_main.c)
-//
-// TITLE:  This is the main file for the solution
-//         Additional solution support files are
-//             <solution>.c -> solution source file
-//             <solution>.h -> solution header file
-//             <solution>_settings.h -> powerSUITE generated settings
-//             <solution>_hal.c -> device drivers source file
-//             <solution>_hal.h -> device drivers header file
-//
-//#############################################################################
-// $TI Release:  $
-// $Release Date:  $
-// $Copyright:
-// Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
-//
-// ALL RIGHTS RESERVED
-// $
-//#############################################################################
-//*****************************************************************************
-// includes section
-//*****************************************************************************
-
-
+/*
+ * bts_cpu1.c (previously bts_main.c)
+ *
+ * TITLE: Main file for the solution
+ *        Additional solution support files are
+ *            <solution>.c -> solution source file
+ *            <solution>.h -> solution header file
+ *            <solution>_settings.h -> powerSUITE generated settings
+ *            <solution>_hal.c -> device drivers source file
+ *            <solution>_hal.h -> device drivers header file
+ *
+ * Copyright (C) 2020 Texas Instruments Incorporated - http://www.ti.com/
+ * ALL RIGHTS RESERVED
+ */
 
 #ifdef CPU1
 #include <bts.h>
 #include "registers.h"
 
 //
-//---  State Machine Related ---
+//--- State Machine Related ---
 //
 uint16_t vTimer0[4];         // Virtual Timers based on CPU Timer 0 (A events)
 uint16_t vTimer1[4];         // Virtual Timers based on CPU Timer 1 (B events)
@@ -43,6 +31,9 @@ void (*Alpha_State_Ptr)(void); // Base States pointer
 void (*A_Task_Ptr)(void);      // State pointer A branch
 void (*B_Task_Ptr)(void);      // State pointer B branch
 void (*C_Task_Ptr)(void);      // State pointer C branch
+
+
+__interrupt void adcCellVoltageISR(void);
 
 //
 // State Machine function prototypes
@@ -74,6 +65,9 @@ void C1(void);  //state C1
 void C2(void);  //state C2
 void C3(void);  //state C3
 
+// Global unit state
+volatile UnitState unitState = eInputOK;
+
 //
 // main() function
 //
@@ -96,6 +90,13 @@ void main(void)
 
     // Setup the GPIO for Mode Switches etc
     BTS_HAL_setupGPIO();
+
+    // Initialize ADC
+    BTS_HAL_setupADC();
+
+    // Setup ADC trigger for 10kHz sampling
+    BTS_HAL_setupAdcTrigger(EPWM1_BASE);
+
     //
     // Tasks State-machine initialization
     //
@@ -126,9 +127,8 @@ void main(void)
     BTS_HAL_setupAdcClock(BTS_EPWM_BASE_ADC1);
     BTS_HAL_setupAdcClock(BTS_EPWM_BASE_ADC2);
 
-#if BTS_SFRA_ENABLED && ( BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
+#if BTS_SFRA_ENABLED && (BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
     BTS_HAL_setupSfraClock(BTS_EPWM_BASE_CH1);
-
     Interrupt_enable(INT_EPWM1);
 #endif
 
@@ -142,7 +142,6 @@ void main(void)
     //
     // Configure the embedded ADC to sample Vin, Vout, ILFB, and ILFB_AVG
     //
-    // setup SPI
     BTS_HAL_SetupSpiPinsGpio_Adc1();
     BTS_HAL_SetupSpi(BTS_SPI_BASE_ADC1);
 
@@ -179,13 +178,16 @@ void main(void)
 
     BTS_HAL_setupInterrupt();
 
+    // Register ADC interrupt for cell voltages and currents
+    Interrupt_register(INT_ADCA1, &adcCellVoltageISR);
+    Interrupt_enable(INT_ADCA1);
+
     //
     // Switch actuation pins over to ePWM function
     //
     BTS_HAL_setupSyncBuckPinsEpwm();
 
     BTS_HAL_ExAdcTxframe(BTS_SPI_BASE_ADC1);
-
     BTS_HAL_ExAdcTxframe(BTS_SPI_BASE_ADC2);
 
 #ifdef _FLASH
@@ -207,11 +209,10 @@ void main(void)
     }
 } //END MAIN CODE
 
-
 //
 // ISR1() interrupt function
 //
-#pragma CODE_SECTION(ISR1,"isrcodefuncs");
+#pragma CODE_SECTION(ISR1, "isrcodefuncs")
 #pragma INTERRUPT(ISR1, HPI)
 interrupt void ISR1(void)
 {
@@ -222,10 +223,9 @@ interrupt void ISR1(void)
     //
 
     BTS_runISR_ch1_4();
-
-
 }
-#pragma CODE_SECTION(ISR3,"isrcodefuncs");
+
+#pragma CODE_SECTION(ISR3, "isrcodefuncs")
 #pragma INTERRUPT(ISR3, HPI)
 interrupt void ISR3(void)
 {
@@ -236,42 +236,37 @@ interrupt void ISR3(void)
     //
 
     BTS_runISR_ch5_8();
-
-
 }
 
-#pragma CODE_SECTION(ISR2,"isrcodefuncs");
+#pragma CODE_SECTION(ISR2, "isrcodefuncs")
 #pragma INTERRUPT(ISR2, HPI)
 interrupt void ISR2(void)
 {
     BTS_ExAdcRead_ch1_4();
-
 }
-#pragma CODE_SECTION(ISR4,"isrcodefuncs");
+
+#pragma CODE_SECTION(ISR4, "isrcodefuncs")
 #pragma INTERRUPT(ISR4, HPI)
 interrupt void ISR4(void)
 {
     BTS_ExAdcRead_ch5_8();
-
 }
 
-#if (BTS_SFRA_ENABLED == true) && ( BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
-#pragma CODE_SECTION(epwm1ISR,"isrcodefuncs");
+#if (BTS_SFRA_ENABLED == true) && (BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_PWM)
+#pragma CODE_SECTION(epwm1ISR, "isrcodefuncs")
 #pragma INTERRUPT(epwm1ISR, HPI)
 interrupt void epwm1ISR(void)
 {
     BTS_ISR_SFRA();
-
     EPWM_clearEventTriggerInterruptFlag(BTS_EPWM_BASE_CH1);
-
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP3);                    // Acknowledge the interrupt
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP3);
 }
 #endif
 
-
 extern volatile float registers[TOTAL_REGISTERS];
 
-void updateStatusRegisters(void) {
+void updateStatusRegisters(void)
+{
     uint16_t ch = 0;
     for (ch = 0; ch < NUM_CHANNELS; ch++) {
         uint32_t bitset = 0;
@@ -287,36 +282,51 @@ void updateStatusRegisters(void) {
     }
 }
 
-void modeCallback(float value, uint16_t channel) {
+void modeCallback(float value, uint16_t channel)
+{
     uint32_t mode = (uint32_t)value;
 
-    if(channel < NUM_CHANNELS) {
+    if (channel < NUM_CHANNELS) {
+        float chargeDisableV = registers[eChargeDisableV / 4];
+        float chargeRestrictV = registers[eChargeRestrictV / 4];
+        float dischargeRestrictV = registers[eDischargeRestrictV / 4];
+        float dischargeDisableV = registers[eDischargeDisableV / 4];
+
+        float inputV = registers[eInputVoltage / 4];
+        if ((mode & 0x02) && (inputV <= chargeRestrictV)) {
+            status[channel].running = 0;
+            status[channel].stopped = 1;
+            BTS_userInputs[channel].enable_logic = 0;
+            updateStatusRegisters();
+            return;
+        }
+        if (!(mode & 0x02) && (inputV >= dischargeRestrictV)) {
+            status[channel].running = 0;
+            status[channel].stopped = 1;
+            BTS_userInputs[channel].enable_logic = 0;
+            updateStatusRegisters();
+            return;
+        }
+
         status[channel].running = mode & 0x01;
         status[channel].stopped = !(mode & 0x01);
         status[channel].charging = (mode & 0x02) >> 1;
         status[channel].discharging = !((mode & 0x02) >> 1);
         if (mode & 0x01) {
-            uint16_t base = channel * 10;
-            float vMin = (mode & 0x02) ? registers[(eCh0_ChargeVoltageMin / 4) + base] : registers[(eCh0_DischargeVoltageMin / 4) + base];
-            float vMax = (mode & 0x02) ? registers[(eCh0_ChargeVoltageMax / 4) + base] : registers[(eCh0_DischargeVoltageMax / 4) + base];
-            float iMin = (mode & 0x02) ? registers[(eCh0_ChargeCurrentMin / 4) + base] : registers[(eCh0_DischargeCurrentMin / 4) + base];
-            float iMax = (mode & 0x02) ? registers[(eCh0_ChargeCurrentMax / 4) + base] : registers[(eCh0_DischargeCurrentMax / 4) + base];
+            uint16_t regBase = channel * 10;
+            float vMin = (mode & 0x02) ? registers[(eCh0_ChargeVoltageMin / 4) + regBase] : registers[(eCh0_DischargeVoltageMin / 4) + regBase];
+            float vMax = (mode & 0x02) ? registers[(eCh0_ChargeVoltageMax / 4) + regBase] : registers[(eCh0_DischargeVoltageMax / 4) + regBase];
+            float iMin = (mode & 0x02) ? registers[(eCh0_ChargeCurrentMin / 4) + regBase] : registers[(eCh0_DischargeCurrentMin / 4) + regBase];
+            float iMax = (mode & 0x02) ? registers[(eCh0_ChargeCurrentMax / 4) + regBase] : registers[(eCh0_DischargeCurrentMax / 4) + regBase];
 
-            /* transfer the operating conditions across */
             BTS_userInputs[channel].vref_charge_V = vMax;
             BTS_userInputs[channel].vref_discharge_V = vMin;
             BTS_userInputs[channel].iref_A = iMax;
             BTS_userInputs[channel].iref_cuttout_A = iMin;
-
-            /* Set the direction before the enable */
             BTS_userInputs[channel].direction_logic = status[channel].charging;
-
             BTS_userInputs[channel].enable_logic = 1;
-            //uint16_t duty = (uint16_t)(vMin * 100); // Placeholder
-            //EPWM_setCompareValue(EPWM1_BASE + channel * 0x40, EPWM_COUNTER_COMPARE_A, duty);
         } else {
             BTS_userInputs[channel].enable_logic = 0;
-            //EPWM_setCompareValue(EPWM1_BASE + channel * 0x40, EPWM_COUNTER_COMPARE_A, 0);
         }
         updateStatusRegisters();
     }
@@ -334,13 +344,50 @@ void BTS_HandleRegisterWrite(void)
             if (regAddr % 10 == 0) { // Mode register
                 modeCallback(ipcMsg.value, channel);
             }
+        } else if (regAddr >= eCh0_CellVoltage/4 && regAddr < (eCh0_CellVoltage/4 + NUM_CHANNELS)) {
+            registers[regAddr] = ipcMsg.value;
         }
         IPC_clearFlagRtoL(IPC_CPU1_L_CPU2_R, IPC_FLAG0);
     }
+    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, IPC_FLAG1)) {
+        uint16_t regIdx = ipcMsg.regAddr;
+        if (regIdx >= eCh0_CellVoltage/4 && regIdx < (eCh0_CellVoltage/4 + NUM_CHANNELS)) {
+            registers[regIdx] = ipcMsg.value;
+        }
+        IPC_clearFlagRtoL(IPC_CPU1_L_CPU2_R, IPC_FLAG1);
+    }
+}
+
+// Update BTS_monitor_Iout_Vout
+#pragma CODE_SECTION(BTS_monitor_Iout_Vout, "ramfuncs")
+void BTS_monitor_Iout_Vout(BTS_measValue* measValues)
+{
+    measValues->Sum_I = 0U;
+    measValues->Sum_V = 0U;
+    measValues->Sum_CellV = 0U;
+    measValues->Sum_CellI = 0U;
+    uint16_t index;
+    float32_t avgValue = 0.0;
+    for (index = 0U; index < BTS_senseAverageFactor; index++) {
+        measValues->Sum_I += measValues->Isense_16b[index];
+        measValues->Sum_V += measValues->Vsense_16b[index];
+    }
+    for (index = 0U; index < BTS_f28AverageFactor; index++) {
+        measValues->Sum_CellV += measValues->CellVoltage_16b[index];
+        measValues->Sum_CellI += measValues->CellCurrent_16b[index];
+    }
+    avgValue = (float32_t)measValues->Sum_I / ((float32_t)BTS_senseAverageFactor * 32768.0);
+    measValues->Isense_A = measValues->IoutGain_A * avgValue + measValues->IoutOffset_A;
+    avgValue = (float32_t)measValues->Sum_V / ((float32_t)BTS_senseAverageFactor * 32768.0);
+    measValues->Vsense_V = measValues->VoutGain_V * avgValue + measValues->VoutOffset_V;
+    avgValue = (float32_t)measValues->Sum_CellV / ((float32_t)BTS_f28AverageFactor * 4096.0);
+    measValues->CellVoltage_V = (avgValue * 2.5f) * measValues->F28V_Gain + measValues->F28V_Offset;
+    avgValue = (float32_t)measValues->Sum_CellI / ((float32_t)BTS_f28AverageFactor * 4096.0);
+    measValues->CellCurrent_I = (avgValue * 2.5f) * measValues->F28I_Gain + measValues->F28I_Offset;
 }
 //
 //=============================================================================
-//  STATE-MACHINE SEQUENCING AND SYNCRONIZATION FOR SLOW BACKGROUND TASKS
+// STATE-MACHINE SEQUENCING AND SYNCRONIZATION FOR SLOW BACKGROUND TASKS
 //=============================================================================
 //
 //
@@ -406,9 +453,7 @@ void C0(void)
 }
 
 //
-//=============================================================================
-//  A - TASKS (executed at 1kHz)
-//=============================================================================
+// A - TASKS (executed at 1kHz)
 //
 void A1(void)
 {
@@ -459,9 +504,7 @@ void A3(void)
 }
 
 //
-//=============================================================================
-//  B - TASKS (executed at 100Hz)
-//=============================================================================
+// B - TASKS (executed at 100Hz)
 //
 void B1(void)
 {
@@ -501,14 +544,10 @@ void B3(void)
 }
 
 //
-//=============================================================================
-//  C - TASKS (executed at 10Hz)
-//=============================================================================
+// C - TASKS (executed at 10Hz)
 //
 void C1(void)
 {
-
-
     BTS_monitor_Iout_Vout(&BTS_measValues_ch1);
     BTS_monitor_Iout_Vout(&BTS_measValues_ch2);
     BTS_monitor_Iout_Vout(&BTS_measValues_ch3);
@@ -518,7 +557,34 @@ void C1(void)
     BTS_monitor_Iout_Vout(&BTS_measValues_ch7);
     BTS_monitor_Iout_Vout(&BTS_measValues_ch8);
 
+    updateInputVoltage();
 
+    float chargeDisableV = registers[eChargeDisableV / 4];
+    float chargeRestrictV = registers[eChargeRestrictV / 4];
+    float dischargeRestrictV = registers[eDischargeRestrictV / 4];
+    float dischargeDisableV = registers[eDischargeDisableV / 4];
+
+    for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
+        uint16_t base = (eCh0_MinCellTemp / 4) + ch * 10;
+        float minTemp = registers[base + 0];
+        float maxTemp = registers[base + 1];
+
+        float inputV = registers[eInputVoltage / 4];
+        if (status[ch].running) {
+            if (status[ch].charging && inputV <= chargeRestrictV) {
+                status[ch].running = 0;
+                status[ch].stopped = 1;
+                BTS_userInputs[ch].enable_logic = 0;
+                updateStatusRegisters();
+            }
+            if (status[ch].discharging && inputV >= dischargeRestrictV) {
+                status[ch].running = 0;
+                status[ch].stopped = 1;
+                BTS_userInputs[ch].enable_logic = 0;
+                updateStatusRegisters();
+            }
+        }
+    }
     //
     // Execute task C2 the next time CpuTimer2 decrements to 0
     //
@@ -528,9 +594,7 @@ void C1(void)
 void C2(void)
 {
     static uint16_t channel = 0;
-
     channel = ++channel % 8;
-
     BTS_monitor_program_update(&BTS_userInputs[channel], &BTS_measValues[channel]);
 
     //
@@ -547,10 +611,142 @@ void C3(void)
     C_Task_Ptr = &C1;
 }
 
-//
-// End of buck_main.c
-//
+static void updateInputVoltage(void)
+{
+    ADC_forceSOC(ADCB_BASE, ADC_SOC_NUMBER1);
+    ADC_forceSOC(ADCB_BASE, ADC_SOC_NUMBER2);
+
+    while(ADC_getInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1) == 0);
+
+    uint16_t busVoltageRaw = ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER1);
+    uint16_t spareRaw = ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER2);
+
+    float busVoltage = (busVoltageRaw * 17.9f * 3.3f) / (4096.0f * 2.5f);
+    registers[eInputVoltage / 4] = busVoltage;
+
+    float chargeDisableV = registers[eChargeDisableV / 4];
+    float chargeRestrictV = registers[eChargeRestrictV / 4];
+    float dischargeRestrictV = registers[eDischargeRestrictV / 4];
+    float dischargeDisableV = registers[eDischargeDisableV / 4];
+
+    if (busVoltage <= chargeDisableV) {
+        if (unitState != eInputLow_ChargeDisabled) {
+            unitState = eInputLow_ChargeRestricted;
+        }
+        static uint16_t lowCount = 0;
+        if (unitState == eInputLow_ChargeRestricted && ++lowCount >= 10) {
+            unitState = eInputLow_ChargeDisabled;
+            lowCount = 0;
+        }
+    } else if (busVoltage <= chargeRestrictV) {
+        unitState = eInputLow_ChargeRestricted;
+    } else if (busVoltage >= dischargeDisableV) {
+        if (unitState != eInputHigh_DischargeDisabled) {
+            unitState = eInputHigh_DischargeRestricted;
+        }
+        static uint16_t highCount = 0;
+        if (unitState == eInputHigh_DischargeRestricted && ++highCount >= 10) {
+            unitState = eInputHigh_DischargeDisabled;
+            highCount = 0;
+        }
+    } else if (busVoltage >= dischargeRestrictV) {
+        unitState = eInputHigh_DischargeRestricted;
+    } else {
+        unitState = eInputOK;
+    }
+
+    registers[eUnitState / 4] = (float)unitState;
+}
+
+#pragma CODE_SECTION(adcCellVoltageISR, "isrcodefuncs")
+#pragma INTERRUPT(adcCellVoltageISR, HPI)
+__interrupt void adcCellVoltageISR(void)
+{
+    int16_t vRaw[8] = {
+        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER0), // Ch1: A3
+        ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER0), // Ch2: B3
+        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER1), // Ch3: A5
+        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER2), // Ch4: IN15
+        ADC_readResult(ADCD_BASE, ADC_SOC_NUMBER0), // Ch5: D1
+        ADC_readResult(ADCC_BASE, ADC_SOC_NUMBER0), // Ch6: C3
+        ADC_readResult(ADCD_BASE, ADC_SOC_NUMBER1), // Ch7: D3
+        ADC_readResult(ADCC_BASE, ADC_SOC_NUMBER1)  // Ch8: C5
+    };
+    int16_t iRaw[8] = {
+        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER3), // Ch1: A2
+        ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER3), // Ch2: B2
+        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER4), // Ch3: A4
+        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER5), // Ch4: IN14
+        ADC_readResult(ADCD_BASE, ADC_SOC_NUMBER2), // Ch5: D0
+        ADC_readResult(ADCC_BASE, ADC_SOC_NUMBER2), // Ch6: C2
+        ADC_readResult(ADCD_BASE, ADC_SOC_NUMBER3), // Ch7: D2
+        ADC_readResult(ADCC_BASE, ADC_SOC_NUMBER3)  // Ch8: C4
+    };
+    int16_t refRaw = ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER6); // A0
+
+    for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
+        int16_t cellCurrent = iRaw[ch] - refRaw;
+        BTS_storeValuesf28(&BTS_measValues[ch], vRaw[ch], cellCurrent);
+        registers[(eCh0_CellVoltage / 4) + ch] = BTS_measValues[ch].CellVoltage_V;
+        registers[(eCh0_CellCurrent / 4) + ch] = BTS_measValues[ch].CellCurrent_I;
+    }
+
+    ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
+}
+
+// Interrupt handler for ePWM Trip Zone
+#pragma CODE_SECTION(epwmTripISR, "isrcodefuncs")
+#pragma INTERRUPT(epwmTripISR, HPI)
+__interrupt void epwmTripISR(void) {
+    // Determine which ePWM module triggered
+    uint32_t intSource = Interrupt_getVectorNumber();
+    uint16_t epwmIndex = (intSource - INT_EPWM1) + 1;
+    uint32_t epwmBase = EPWM1_BASE + (epwmIndex - 1) * 0x1000;
+    uint16_t channel = epwmIndex - 1;
+
+    // Get trip zone status
+    uint32_t tzStatus = EPWM_getTripZoneFlagStatus(epwmBase);
+
+    if (tzStatus & EPWM_TZ_FLAG_OST) {
+        // Update existing status register (overCurrentTrip bit)
+        uint16_t statusReg = eCh0_Status / 4 + channel * 10;
+        //(uint32_t)registers[statusReg] = (uint32_t)registers[statusReg] | (uint32_t)(1 << 3);
+
+        // Update trip status register (eTripStatus)
+        TripStatusBitfield* tripStatus = (TripStatusBitfield*)&registers[eTripStatus / 4];
+        if (EPWM_getTripZoneFlagStatus(epwmBase) & EPWM_TZ_FLAG_DCAEVT1) {
+            // CMPSS trip (TZ1)
+            switch (channel) {
+                case 0: tripStatus->ch0_cmpss = 1; break;
+                case 1: tripStatus->ch1_cmpss = 1; break;
+                case 2: tripStatus->ch2_cmpss = 1; break;
+                case 3: tripStatus->ch3_cmpss = 1; break;
+                case 4: tripStatus->ch4_cmpss = 1; break;
+                case 5: tripStatus->ch5_cmpss = 1; break;
+                case 6: tripStatus->ch6_cmpss = 1; break;
+                case 7: tripStatus->ch7_cmpss = 1; break;
+            }
+        }
+        if (EPWM_getTripZoneFlagStatus(epwmBase) & EPWM_TZ_FLAG_DCAEVT2) {
+            // GPIO trip (TZ2)
+            switch (channel) {
+                case 0: tripStatus->ch0_gpio = 1; break;
+                case 1: tripStatus->ch1_gpio = 1; break;
+                case 2: tripStatus->ch2_gpio = 1; break;
+                case 3: tripStatus->ch3_gpio = 1; break;
+                case 4: tripStatus->ch4_gpio = 1; break;
+                case 5: tripStatus->ch5_gpio = 1; break;
+                case 6: tripStatus->ch6_gpio = 1; break;
+                case 7: tripStatus->ch7_gpio = 1; break;
+            }
+        }
+
+        // Clear trip flags
+        EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_OST | EPWM_TZ_FLAG_DCAEVT1 | EPWM_TZ_FLAG_DCAEVT2);
+    }
+
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP3);
+}
 
 #endif
-
-
