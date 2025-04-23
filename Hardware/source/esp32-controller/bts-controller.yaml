@@ -1,0 +1,248 @@
+esphome:
+  name: bts-controller
+
+esp32:
+  board: denky32
+  framework:
+    type: arduino
+
+# I2C configuration for BTS communication
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+
+# Bluetooth configuration
+#bluetooth_proxy:
+#  enabled: true
+
+# External components
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [bts_i2c]
+  - source:
+      type: local
+      path: components
+    components: [bluetooth_hid]
+
+# BTS I2C component
+bts_i2c:
+  id: bts
+
+# Bluetooth HID component for SR61B
+bluetooth_hid:
+  id: hid_scanner
+  mac_address: !secret scanner_mac
+  pairing_code: !secret scanner_pairing_code
+  on_text:
+    - lambda: |-
+        std::string data = x;
+        if (data.find("25R-") == 0) {  // Battery barcode
+          id(temp_barcode) = data;
+        } else if (data.find("CH") == 0) {  // Channel QR code
+          int channel = std::stoi(data.substr(2));
+          if (channel >= 0 && channel < 8 && !id(temp_barcode).empty()) {
+            id(channel_barcodes)[channel] = id(temp_barcode);
+            switch (channel) {
+              case 0: id(channel_0_barcode).publish_state(id(temp_barcode)); break;
+              // Add cases for channels 1-7
+            }
+            id(temp_barcode) = "";
+          }
+        }
+
+# Global variables for barcode management
+globals:
+  - id: temp_barcode
+    type: std::string
+    initial_value: '""'
+  - id: channel_barcodes
+    type: std::vector<std::string>
+    initial_value: 'std::vector<std::string>(8, "")'
+
+# Barcode storage
+text_sensor:
+  - platform: template
+    name: "Channel 0 Barcode"
+    id: channel_0_barcode
+
+# Time series sensors for Channel 0
+sensor:
+  # Voltage
+  - platform: template
+    name: "Channel 0 Voltage"
+    id: channel_0_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      ChannelStatus status = id(bts).read_status(0);
+      if (status.running && status.discharging) {
+        return id(bts).read_voltage(0);
+      }
+      return id(channel_0_voltage).state;
+
+  # Current
+  - platform: template
+    name: "Channel 0 Current"
+    id: channel_0_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      ChannelStatus status = id(bts).read_status(0);
+      if (status.running && status.discharging) {
+        return id(bts).read_current(0);
+      }
+      return id(channel_0_current).state;
+
+  # Temperature
+  - platform: template
+    name: "Channel 0 Temperature"
+    id: channel_0_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      ChannelStatus status = id(bts).read_status(0);
+      if (status.running && status.discharging) {
+        return id(bts).read_temperature(0);
+      }
+      return id(channel_0_temp).state;
+
+  # mAh
+  - platform: template
+    name: "Channel 0 mAh"
+    id: channel_0_mah
+    unit_of_measurement: "mAh"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      static float cumulative_mah = 0.0;
+      ChannelStatus status = id(bts).read_status(0);
+      if (status.running && status.discharging) {
+        float current = id(bts).read_current(0);
+        cumulative_mah += (current / 3600.0);
+        return cumulative_mah;
+      }
+      return cumulative_mah;
+
+  # mWh
+  - platform: template
+    name: "Channel 0 mWh"
+    id: channel_0_mwh
+    unit_of_measurement: "mWh"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      static float cumulative_mwh = 0.0;
+      ChannelStatus status = id(bts).read_status(0);
+      if (status.running && status.discharging) {
+        float voltage = id(bts).read_voltage(0);
+        float current = id(bts).read_current(0);
+        cumulative_mwh += (voltage * current / 3600.0);
+        return cumulative_mwh;
+      }
+      return cumulative_mwh;
+
+  # Summary sensor
+  - platform: template
+    name: "Channel 0 Summary"
+    id: channel_0_summary
+    update_interval: 1s
+    lambda: |-
+      static float initial_temp = 0.0;
+      static float total_current = 0.0;
+      static int sample_count = 0;
+      ChannelStatus status = id(bts).read_status(0);
+
+      if (status.running && status.discharging) {
+        if (sample_count == 0) {
+          initial_temp = id(bts).read_temperature(0);
+        }
+        float current = id(bts).read_current(0);
+        total_current += current;
+        sample_count++;
+        return 0.0;
+      } else if (status.finished && sample_count > 0) {
+        float final_mah = id(channel_0_mah).state;
+        float final_mwh = id(channel_0_mwh).state;
+        float final_temp = id(bts).read_temperature(0);
+        float delta_temp = final_temp - initial_temp;
+        float avg_current = total_current / sample_count;
+
+        initial_temp = 0.0;
+        total_current = 0.0;
+        sample_count = 0;
+
+        id(channel_0_summary_mah).publish_state(final_mah);
+        id(channel_0_summary_mwh).publish_state(final_mwh);
+        id(channel_0_summary_delta_temp).publish_state(delta_temp);
+        id(channel_0_summary_discharge_current).publish_state(avg_current);
+        return final_mah;
+      }
+      return id(channel_0_summary).state;
+
+  # Summary sub-sensors
+  - platform: template
+    name: "Channel 0 Summary mAh"
+    id: channel_0_summary_mah
+    unit_of_measurement: "mAh"
+    accuracy_decimals: 2
+  - platform: template
+    name: "Channel 0 Summary mWh"
+    id: channel_0_summary_mwh
+    unit_of_measurement: "mWh"
+    accuracy_decimals: 2
+  - platform: template
+    name: "Channel 0 Summary Delta Temp"
+    id: channel_0_summary_delta_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+  - platform: template
+    name: "Channel 0 Summary Discharge Current"
+    id: channel_0_summary_discharge_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+
+# Control switches
+switch:
+  - platform: template
+    name: "Channel 0 Enable"
+    id: ch0_enable
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(bts).set_mode(0, true, id(ch0_charge).state);
+    turn_off_action:
+      - lambda: |-
+          id(bts).set_mode(0, false, id(ch0_charge).state);
+  - platform: template
+    name: "Channel 0 Charge Mode"
+    id: ch0_charge
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(bts).set_mode(0, id(ch0_enable).state, true);
+    turn_off_action:
+      - lambda: |-
+          id(bts).set_mode(0, id(ch0_enable).state, false);
+
+# Battery profile selection
+select:
+  - platform: template
+    name: "Channel 0 Battery Profile"
+    options:
+      - "None"
+      - "Samsung 25R"
+      - "Samsung 20Q"
+    optimistic: true
+    on_value:
+      - lambda: |-
+          if (x == "Samsung 25R") {
+            id(bts).apply_samsung_25r_profile(0);
+          } else if (x == "Samsung 20Q") {
+            id(bts).apply_samsung_20q_profile(0);
+          }

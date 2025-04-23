@@ -1,0 +1,3 @@
+Use espHome to compile this application.
+
+Will update the how to later. components access a HID barcode scanner and a i2c interface to the C28 CPU

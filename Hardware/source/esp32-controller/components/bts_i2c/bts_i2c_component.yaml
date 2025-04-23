@@ -1,0 +1,8 @@
+esphome:
+  includes:
+    - bts_i2c.h
+    - bts_i2c.cpp
+    - bts_i2c_component.h
+
+bts_i2c:
+  id: bts

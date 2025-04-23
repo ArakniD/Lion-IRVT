@@ -1,0 +1,17 @@
+esphome:
+  includes:
+    - bluetooth_hid.h
+    - bluetooth_hid.cpp
+
+custom_component:
+  - lambda: |-
+      auto hid = new BluetoothHIDComponent();
+      App.register_component(hid);
+      return {hid};
+    components:
+      - id: hid_scanner
+        mac_address: !lambda 'return id(scanner_mac);'
+        pairing_code: !lambda 'return id(scanner_pairing_code);'
+        on_text:
+          - lambda: |-
+              id(hid_scanner_on_text)(x);
