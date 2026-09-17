@@ -532,19 +532,45 @@ void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoo
 
 }
 
+//
+// Pulls the calibration block CPU2 published in registers[] into this
+// channel's user input and marks it for recalculation. Called from the
+// CPU1 background task when CPU2 signals that calibration data changed.
+//
+void BTS_loadCalibrationFromRegisters(uint16_t channel)
+{
+    uint16_t base = BTS_CAL_BASE(channel);
+
+    BTS_userInputs[channel].F28V_Gain     = registers[base + BTS_CAL_F28V_GAIN];
+    BTS_userInputs[channel].F28V_Offset   = registers[base + BTS_CAL_F28V_OFFSET];
+    BTS_userInputs[channel].F28I_Gain     = registers[base + BTS_CAL_F28I_GAIN];
+    BTS_userInputs[channel].F28I_Offset   = registers[base + BTS_CAL_F28I_OFFSET];
+    BTS_userInputs[channel].IoutGain_pu   = registers[base + BTS_CAL_IOUT_GAIN_PU];
+    BTS_userInputs[channel].IoutOffset_pu = registers[base + BTS_CAL_IOUT_OFFSET_PU];
+    BTS_userInputs[channel].IoutGain_A    = registers[base + BTS_CAL_IOUT_GAIN_A];
+    BTS_userInputs[channel].IoutOffset_A  = registers[base + BTS_CAL_IOUT_OFFSET_A];
+    BTS_userInputs[channel].VoutGain_pu   = registers[base + BTS_CAL_VOUT_GAIN_PU];
+    BTS_userInputs[channel].VoutOffset_pu = registers[base + BTS_CAL_VOUT_OFFSET_PU];
+    BTS_userInputs[channel].VoutGain_V    = registers[base + BTS_CAL_VOUT_GAIN_V];
+    BTS_userInputs[channel].VoutOffset_V  = registers[base + BTS_CAL_VOUT_OFFSET_V];
+
+    BTS_userInputs[channel].pendingUpdate = 1;
+}
+
+//
+// Applies a pending calibration update to the running program.
+//
+// This updates in-memory program variables only. It is driven by the
+// communications CPU having changed the calibration registers; committing
+// those values to EEPROM is CPU2's job and is triggered separately by the
+// host writing eCalibrationMode, so there is no EEPROM access on this path.
+//
 #pragma CODE_SECTION(BTS_monitor_program_update,"ramfuncs");
 void BTS_monitor_program_update(uint16_t channel)
 {
-    if ( BTS_userInputs[channel].pendingUpdate )
+    if (BTS_userInputs[channel].pendingUpdate)
     {
-        // Copy into user input and controller if valid
         BTS_calcUserProgramVariables(channel);
-
-        // Write the settings into EEPROM to commit the data
-        if (BTS_userInputs[channel].pendingUpdate == 2) {
-            BTS_writeCalibration(channel);
-        }
-
         BTS_userInputs[channel].pendingUpdate = 0;
     }
 }

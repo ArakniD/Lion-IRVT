@@ -1097,10 +1097,12 @@ void BTS_HAL_setupInterrupt(void)
     Interrupt_register(INT_EPWM1, &epwm1ISR);
     Interrupt_enable(INT_EPWM1);
 #endif
-    // Register trip ISR for EPWM1 to EPWM8
+    // Register trip ISR for EPWM1 to EPWM8.
+    // Trip zones raise INT_EPWMx_TZ (PIE group 2), not INT_EPWMx (group 3,
+    // which is the counter/event interrupt used by epwm1ISR for SFRA).
     for (uint16_t i = 1; i <= 8; i++) {
-        Interrupt_register(INT_EPWM1 + (i - 1), &epwmTripISR);
-        Interrupt_enable(INT_EPWM1 + (i - 1));
+        Interrupt_register(INT_EPWM1_TZ + (i - 1), &epwmTripISR);
+        Interrupt_enable(INT_EPWM1_TZ + (i - 1));
     }
     EINT;  // Enable Global interrupt INTM
     ERTM;  // Enable Global real-time interrupt DBGM

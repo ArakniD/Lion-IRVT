@@ -36,6 +36,15 @@ void (*C_Task_Ptr)(void);      // State pointer C branch
 __interrupt void adcCellVoltageISR(void);
 
 //
+// Local helpers
+//
+static void updateInputVoltage(void);
+static void publishStatusToCpu2(void);
+void updateStatusRegisters(void);
+void modeCallback(float value, uint16_t channel);
+void BTS_HandleRegisterWrite(void);
+
+//
 // State Machine function prototypes
 //------------------------------------
 // Alpha states
@@ -263,11 +272,18 @@ interrupt void epwm1ISR(void)
 }
 #endif
 
-extern volatile float registers[TOTAL_REGISTERS];
-
-void updateStatusRegisters(void)
+//
+// Publishes the CPU1-owned status and measurements into the CPU1->CPU2
+// message RAM. CPU2 mirrors these into registers[] for the external
+// interfaces. seq is bumped either side of the payload so CPU2 can detect a
+// torn read.
+//
+static void publishStatusToCpu2(void)
 {
-    uint16_t ch = 0;
+    uint16_t ch;
+
+    cpu1Status.seq++;
+
     for (ch = 0; ch < NUM_CHANNELS; ch++) {
         uint32_t bitset = 0;
         bitset |= (status[ch].running & 0x1) << 0;
@@ -278,8 +294,24 @@ void updateStatusRegisters(void)
         bitset |= (status[ch].discharging & 0x1) << 5;
         bitset |= (status[ch].constVoltage & 0x1) << 6;
         bitset |= (status[ch].constCurrent & 0x1) << 7;
-        registers[eCh0_Status / 4 + ch * 10] = (float)bitset;
+        cpu1Status.statusBits[ch] = bitset;
+
+        cpu1Status.cellVoltage[ch] = BTS_measValues[ch].CellVoltage_V;
+        cpu1Status.cellCurrent[ch] = BTS_measValues[ch].CellCurrent_I;
+
+        canData[ch].channel = ch;
+        canData[ch].voltage = BTS_measValues[ch].CellVoltage_V;
+        canData[ch].current = BTS_measValues[ch].CellCurrent_I;
     }
+
+    cpu1Status.unitState = (uint32_t)unitState;
+
+    cpu1Status.seq++;
+}
+
+void updateStatusRegisters(void)
+{
+    publishStatusToCpu2();
 }
 
 void modeCallback(float value, uint16_t channel)
@@ -287,12 +319,10 @@ void modeCallback(float value, uint16_t channel)
     uint32_t mode = (uint32_t)value;
 
     if (channel < NUM_CHANNELS) {
-        float chargeDisableV = registers[eChargeDisableV / 4];
-        float chargeRestrictV = registers[eChargeRestrictV / 4];
-        float dischargeRestrictV = registers[eDischargeRestrictV / 4];
-        float dischargeDisableV = registers[eDischargeDisableV / 4];
+        float chargeRestrictV = registers[BTS_REG_IDX(eChargeRestrictV)];
+        float dischargeRestrictV = registers[BTS_REG_IDX(eDischargeRestrictV)];
 
-        float inputV = registers[eInputVoltage / 4];
+        float inputV = registers[BTS_REG_IDX(eInputVoltage)];
         if ((mode & 0x02) && (inputV <= chargeRestrictV)) {
             status[channel].running = 0;
             status[channel].stopped = 1;
@@ -313,18 +343,18 @@ void modeCallback(float value, uint16_t channel)
         status[channel].charging = (mode & 0x02) >> 1;
         status[channel].discharging = !((mode & 0x02) >> 1);
         if (mode & 0x01) {
-            uint16_t regBase = channel * 10;
-            float vMin = (mode & 0x02) ? registers[(eCh0_ChargeVoltageMin / 4) + regBase] : registers[(eCh0_DischargeVoltageMin / 4) + regBase];
-            float vMax = (mode & 0x02) ? registers[(eCh0_ChargeVoltageMax / 4) + regBase] : registers[(eCh0_DischargeVoltageMax / 4) + regBase];
-            float iMin = (mode & 0x02) ? registers[(eCh0_ChargeCurrentMin / 4) + regBase] : registers[(eCh0_DischargeCurrentMin / 4) + regBase];
-            float iMax = (mode & 0x02) ? registers[(eCh0_ChargeCurrentMax / 4) + regBase] : registers[(eCh0_DischargeCurrentMax / 4) + regBase];
+            uint16_t regBase = BTS_CTRL_BASE(channel);
+            uint16_t vMinIdx = (mode & 0x02) ? BTS_REG_IDX(eCh0_ChargeVoltageMin)  : BTS_REG_IDX(eCh0_DischargeVoltageMin);
+            uint16_t vMaxIdx = (mode & 0x02) ? BTS_REG_IDX(eCh0_ChargeVoltageMax)  : BTS_REG_IDX(eCh0_DischargeVoltageMax);
+            uint16_t iMinIdx = (mode & 0x02) ? BTS_REG_IDX(eCh0_ChargeCurrentMin)  : BTS_REG_IDX(eCh0_DischargeCurrentMin);
+            uint16_t iMaxIdx = (mode & 0x02) ? BTS_REG_IDX(eCh0_ChargeCurrentMax)  : BTS_REG_IDX(eCh0_DischargeCurrentMax);
 
-            BTS_userInputs[channel].vref_charge_V = vMax;
-            BTS_userInputs[channel].vref_discharge_V = vMin;
-            BTS_userInputs[channel].iref_A = iMax;
-            BTS_userInputs[channel].iref_cuttout_A = iMin;
-            BTS_userInputs[channel].direction_logic = status[channel].charging;
-            BTS_userInputs[channel].enable_logic = 1;
+            BTS_userInputs[channel].vref_charge_V    = registers[regBase + vMaxIdx];
+            BTS_userInputs[channel].vref_discharge_V = registers[regBase + vMinIdx];
+            BTS_userInputs[channel].iref_A           = registers[regBase + iMaxIdx];
+            BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + iMinIdx];
+            BTS_userInputs[channel].direction_logic  = status[channel].charging;
+            BTS_userInputs[channel].enable_logic     = 1;
         } else {
             BTS_userInputs[channel].enable_logic = 0;
         }
@@ -332,29 +362,61 @@ void modeCallback(float value, uint16_t channel)
     }
 }
 
-extern volatile struct { uint16_t regAddr; float value; } ipcMsg;
-
+//
+// Handles messages from the communications CPU.
+//
+//   BTS_IPC_FLAG_REG_WRITE   one register changed; ipcMsg carries the index
+//   BTS_IPC_FLAG_TEMP_UPDATE a cell temperature was refreshed
+//   BTS_IPC_FLAG_CAL_RELOAD  the whole calibration block was reloaded
+//
+// registers[] itself lives in CPU2's message RAM and has already been
+// updated by CPU2 before the flag was raised - CPU1 only reacts to the
+// change, it never writes the register file.
+//
 void BTS_HandleRegisterWrite(void)
 {
-    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, IPC_FLAG0)) {
-        uint16_t regAddr = ipcMsg.regAddr;
-        if (regAddr < NUM_CONTROL_REGISTERS) {
-            registers[regAddr] = ipcMsg.value;
-            uint16_t channel = regAddr / 10;
-            if (regAddr % 10 == 0) { // Mode register
+    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_REG_WRITE)) {
+        uint16_t regIdx = ipcMsg.regAddr;
+
+        if (regIdx < BTS_REG_IDX(eCh0_CurrentAcc)) {
+            //
+            // Control block: 10 registers per channel, mode is the first.
+            //
+            uint16_t channel = regIdx / BTS_CTRL_REGS_PER_CH;
+            if ((regIdx % BTS_CTRL_REGS_PER_CH) == 0) {
                 modeCallback(ipcMsg.value, channel);
             }
-        } else if (regAddr >= eCh0_CellVoltage/4 && regAddr < (eCh0_CellVoltage/4 + NUM_CHANNELS)) {
-            registers[regAddr] = ipcMsg.value;
+        } else if (regIdx >= BTS_CAL_BASE(0) &&
+                   regIdx <  BTS_CAL_BASE(0) + NUM_CHANNELS * BTS_CAL_REGS_PER_CH) {
+            //
+            // Calibration block: pull the whole channel in and schedule a
+            // recalculation on the next C2 task.
+            //
+            uint16_t channel = (regIdx - BTS_CAL_BASE(0)) / BTS_CAL_REGS_PER_CH;
+            BTS_loadCalibrationFromRegisters(channel);
         }
-        IPC_clearFlagRtoL(IPC_CPU1_L_CPU2_R, IPC_FLAG0);
+
+        IPC_ackFlagRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_REG_WRITE);
     }
-    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, IPC_FLAG1)) {
-        uint16_t regIdx = ipcMsg.regAddr;
-        if (regIdx >= eCh0_CellVoltage/4 && regIdx < (eCh0_CellVoltage/4 + NUM_CHANNELS)) {
-            registers[regIdx] = ipcMsg.value;
+
+    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_TEMP_UPDATE)) {
+        //
+        // Temperatures are advisory to the control loops; the value is
+        // already visible in registers[]. Nothing to recalculate.
+        //
+        IPC_ackFlagRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_TEMP_UPDATE);
+    }
+
+    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_CAL_RELOAD)) {
+        //
+        // CPU2 has reloaded every channel's calibration (boot, or a bulk
+        // host update). Re-derive the whole program.
+        //
+        uint16_t ch;
+        for (ch = 0; ch < NUM_CHANNELS; ch++) {
+            BTS_loadCalibrationFromRegisters(ch);
         }
-        IPC_clearFlagRtoL(IPC_CPU1_L_CPU2_R, IPC_FLAG1);
+        IPC_ackFlagRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_CAL_RELOAD);
     }
 }
 
@@ -559,17 +621,11 @@ void C1(void)
 
     updateInputVoltage();
 
-    float chargeDisableV = registers[eChargeDisableV / 4];
-    float chargeRestrictV = registers[eChargeRestrictV / 4];
-    float dischargeRestrictV = registers[eDischargeRestrictV / 4];
-    float dischargeDisableV = registers[eDischargeDisableV / 4];
+    float chargeRestrictV = registers[BTS_REG_IDX(eChargeRestrictV)];
+    float dischargeRestrictV = registers[BTS_REG_IDX(eDischargeRestrictV)];
+    float inputV = registers[BTS_REG_IDX(eInputVoltage)];
 
     for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
-        uint16_t base = (eCh0_MinCellTemp / 4) + ch * 10;
-        float minTemp = registers[base + 0];
-        float maxTemp = registers[base + 1];
-
-        float inputV = registers[eInputVoltage / 4];
         if (status[ch].running) {
             if (status[ch].charging && inputV <= chargeRestrictV) {
                 status[ch].running = 0;
@@ -585,6 +641,12 @@ void C1(void)
             }
         }
     }
+
+    //
+    // Publish this pass's measurements and status to CPU2.
+    //
+    publishStatusToCpu2();
+
     //
     // Execute task C2 the next time CpuTimer2 decrements to 0
     //
@@ -594,8 +656,14 @@ void C1(void)
 void C2(void)
 {
     static uint16_t channel = 0;
-    channel = ++channel % 8;
-    BTS_monitor_program_update(&BTS_userInputs[channel], &BTS_measValues[channel]);
+
+    //
+    // Service one channel's pending calibration update per pass. This only
+    // touches in-memory program variables; EEPROM persistence lives on CPU2.
+    //
+    BTS_monitor_program_update(channel);
+
+    channel = (channel + 1U) % NUM_CHANNELS;
 
     //
     // Execute task C3 the next time CpuTimer2 decrements to 0
@@ -619,43 +687,52 @@ static void updateInputVoltage(void)
     while(ADC_getInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1) == 0);
 
     uint16_t busVoltageRaw = ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER1);
-    uint16_t spareRaw = ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER2);
 
     float busVoltage = (busVoltageRaw * 17.9f * 3.3f) / (4096.0f * 2.5f);
-    registers[eInputVoltage / 4] = busVoltage;
 
-    float chargeDisableV = registers[eChargeDisableV / 4];
-    float chargeRestrictV = registers[eChargeRestrictV / 4];
-    float dischargeRestrictV = registers[eDischargeRestrictV / 4];
-    float dischargeDisableV = registers[eDischargeDisableV / 4];
+    //
+    // registers[] is CPU2-owned; publish through the CPU1->CPU2 block and
+    // let CPU2 mirror it into eInputVoltage / eUnitState.
+    //
+    cpu1Status.inputVoltage = busVoltage;
+
+    float chargeDisableV = registers[BTS_REG_IDX(eChargeDisableV)];
+    float chargeRestrictV = registers[BTS_REG_IDX(eChargeRestrictV)];
+    float dischargeRestrictV = registers[BTS_REG_IDX(eDischargeRestrictV)];
+    float dischargeDisableV = registers[BTS_REG_IDX(eDischargeDisableV)];
+
+    static uint16_t lowCount = 0;
+    static uint16_t highCount = 0;
 
     if (busVoltage <= chargeDisableV) {
         if (unitState != eInputLow_ChargeDisabled) {
             unitState = eInputLow_ChargeRestricted;
         }
-        static uint16_t lowCount = 0;
         if (unitState == eInputLow_ChargeRestricted && ++lowCount >= 10) {
             unitState = eInputLow_ChargeDisabled;
             lowCount = 0;
         }
     } else if (busVoltage <= chargeRestrictV) {
         unitState = eInputLow_ChargeRestricted;
+        lowCount = 0;
     } else if (busVoltage >= dischargeDisableV) {
         if (unitState != eInputHigh_DischargeDisabled) {
             unitState = eInputHigh_DischargeRestricted;
         }
-        static uint16_t highCount = 0;
         if (unitState == eInputHigh_DischargeRestricted && ++highCount >= 10) {
             unitState = eInputHigh_DischargeDisabled;
             highCount = 0;
         }
     } else if (busVoltage >= dischargeRestrictV) {
         unitState = eInputHigh_DischargeRestricted;
+        highCount = 0;
     } else {
         unitState = eInputOK;
+        lowCount = 0;
+        highCount = 0;
     }
 
-    registers[eUnitState / 4] = (float)unitState;
+    cpu1Status.unitState = (uint32_t)unitState;
 }
 
 #pragma CODE_SECTION(adcCellVoltageISR, "isrcodefuncs")
@@ -686,9 +763,7 @@ __interrupt void adcCellVoltageISR(void)
 
     for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
         int16_t cellCurrent = iRaw[ch] - refRaw;
-        BTS_storeValuesf28(&BTS_measValues[ch], vRaw[ch], cellCurrent);
-        registers[(eCh0_CellVoltage / 4) + ch] = BTS_measValues[ch].CellVoltage_V;
-        registers[(eCh0_CellCurrent / 4) + ch] = BTS_measValues[ch].CellCurrent_I;
+        BTS_storeValuesF28(&BTS_measValues[ch], vRaw[ch], cellCurrent);
     }
 
     ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
@@ -696,57 +771,64 @@ __interrupt void adcCellVoltageISR(void)
 }
 
 // Interrupt handler for ePWM Trip Zone
+//
+// All eight modules share this handler, so the source has to be identified
+// from the hardware rather than from the vector. driverlib has no
+// "get current vector" API - the supported mechanism is to read each
+// module's trip-zone flags (TZFLG) and service whichever have latched.
+//
+// EPWM_getTripZoneFlagStatus() reports *which kind* of trip fired
+// (EPWM_TZ_FLAG_OST for the one-shot inputs); EPWM_getOneShotTripZoneFlagStatus()
+// reports *which one-shot input* fired. BTS_HAL_setupEPWMTripZone() enables
+// OSHT1 (CMPSS via Input X-BAR) and OSHT2 (GPIO group trip), so those map to
+// EPWM_TZ_OST_FLAG_OST1 and EPWM_TZ_OST_FLAG_OST2 respectively.
+//
 #pragma CODE_SECTION(epwmTripISR, "isrcodefuncs")
 #pragma INTERRUPT(epwmTripISR, HPI)
 __interrupt void epwmTripISR(void) {
-    // Determine which ePWM module triggered
-    uint32_t intSource = Interrupt_getVectorNumber();
-    uint16_t epwmIndex = (intSource - INT_EPWM1) + 1;
-    uint32_t epwmBase = EPWM1_BASE + (epwmIndex - 1) * 0x1000;
-    uint16_t channel = epwmIndex - 1;
+    uint32_t tripBits = cpu1Status.tripStatus;
+    uint16_t channel;
 
-    // Get trip zone status
-    uint32_t tzStatus = EPWM_getTripZoneFlagStatus(epwmBase);
+    for (channel = 0; channel < NUM_CHANNELS; channel++) {
+        uint32_t epwmBase = EPWM1_BASE + (uint32_t)channel * (EPWM2_BASE - EPWM1_BASE);
+        uint16_t tzStatus = EPWM_getTripZoneFlagStatus(epwmBase);
 
-    if (tzStatus & EPWM_TZ_FLAG_OST) {
-        // Update existing status register (overCurrentTrip bit)
-        uint16_t statusReg = eCh0_Status / 4 + channel * 10;
-        //(uint32_t)registers[statusReg] = (uint32_t)registers[statusReg] | (uint32_t)(1 << 3);
-
-        // Update trip status register (eTripStatus)
-        TripStatusBitfield* tripStatus = (TripStatusBitfield*)&registers[eTripStatus / 4];
-        if (EPWM_getTripZoneFlagStatus(epwmBase) & EPWM_TZ_FLAG_DCAEVT1) {
-            // CMPSS trip (TZ1)
-            switch (channel) {
-                case 0: tripStatus->ch0_cmpss = 1; break;
-                case 1: tripStatus->ch1_cmpss = 1; break;
-                case 2: tripStatus->ch2_cmpss = 1; break;
-                case 3: tripStatus->ch3_cmpss = 1; break;
-                case 4: tripStatus->ch4_cmpss = 1; break;
-                case 5: tripStatus->ch5_cmpss = 1; break;
-                case 6: tripStatus->ch6_cmpss = 1; break;
-                case 7: tripStatus->ch7_cmpss = 1; break;
-            }
-        }
-        if (EPWM_getTripZoneFlagStatus(epwmBase) & EPWM_TZ_FLAG_DCAEVT2) {
-            // GPIO trip (TZ2)
-            switch (channel) {
-                case 0: tripStatus->ch0_gpio = 1; break;
-                case 1: tripStatus->ch1_gpio = 1; break;
-                case 2: tripStatus->ch2_gpio = 1; break;
-                case 3: tripStatus->ch3_gpio = 1; break;
-                case 4: tripStatus->ch4_gpio = 1; break;
-                case 5: tripStatus->ch5_gpio = 1; break;
-                case 6: tripStatus->ch6_gpio = 1; break;
-                case 7: tripStatus->ch7_gpio = 1; break;
-            }
+        if ((tzStatus & EPWM_TZ_FLAG_OST) == 0U) {
+            continue;
         }
 
-        // Clear trip flags
-        EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_OST | EPWM_TZ_FLAG_DCAEVT1 | EPWM_TZ_FLAG_DCAEVT2);
+        uint16_t ostStatus = EPWM_getOneShotTripZoneFlagStatus(epwmBase);
+
+        // TripStatusBitfield packs two bits per channel: cmpss then gpio.
+        if (ostStatus & EPWM_TZ_OST_FLAG_OST1) {   // CMPSS over-current trip
+            tripBits |= 1UL << (channel * 2U);
+        }
+        if (ostStatus & EPWM_TZ_OST_FLAG_OST2) {   // GPIO group trip
+            tripBits |= 1UL << (channel * 2U + 1U);
+        }
+
+        status[channel].overCurrentTrip = 1;
+        status[channel].running = 0;
+        status[channel].stopped = 1;
+        BTS_userInputs[channel].enable_logic = 0;
+        BTS_ctrlLoopVariables[channel].tripFlag = 1;
+
+        //
+        // Clear the latched one-shot sources, then the OST flag itself and
+        // the global trip-zone interrupt flag so the next trip can assert.
+        //
+        EPWM_clearOneShotTripZoneFlag(epwmBase,
+                                      EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2);
+        EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_OST | EPWM_TZ_INTERRUPT);
     }
 
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP3);
+    cpu1Status.tripStatus = tripBits;
+    updateStatusRegisters();
+
+    //
+    // The trip-zone interrupts (INT_EPWMx_TZ) are in PIE group 2.
+    //
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP2);
 }
 
 #endif

@@ -14,4 +14,5 @@
 	<filesToOpen value="main.syscfg"/>
 	<connection value="common/targetdb/connections/TIXDS100v2_Connection.xml"/>
 	<isTargetManual value="false"/>
+	<activeTargetConfiguration value="targetConfigs/TMS320F28379D.ccxml"/>
 </projectOptions>

@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ccs-debug",
+      "mcp__ccs-project",
+      "mcp__ccs-sysconfig",
+      "mcp__ccs-serial",
+      "Read(//C/ti/ccs2101/ccs/theia/resources/ai/**)",
+      "Read(//C/ti/c2000/C2000Ware_5_02_00_00/**)",
+      "Read(//C/ti/c2000/C2000Ware_DigitalPower_SDK_5_03_00_00/**)",
+      "Read(//C/ti/ccs1271/ccs/**)",
+      "Read(//C/ti/msp/MSP430Ware_3_80_06_03/driverlib/**)",
+      "Read(//C/ti/msp430_driverlib_2_91_08_00/**)",
+      "Read(//C/ti/msp/MSP430Ware_3_80_06_03/**)",
+      "Read(//C/ti/simplelink_academy_cc32xxsdk_3_20_02_00/**)",
+      "Read(//C/ti/simplelink_cc32xx_sdk_4_30_00_06/**)",
+      "Read(//C/ti/simplelink_cc32xx_sdk_3_20_00_06/**)",
+      "Read(//C/ti/simplelink_msp432e4_sdk_3_20_00_10/**)",
+      "Read(//C/ti/simplelink_msp432p4_sdk_3_20_00_06/**)",
+      "Read(//C/ti/simplelink_sdk_lvgl_plugin_3_20_00_19/**)",
+      "Read(//C/ti/simplelink_sdk_wifi_plugin_2_40_00_22/**)",
+      "Read(//C/ti/ccs2101/ccs/utils/sysconfig_1.28.1/**)",
+      "Read(//C/ti/tirtos_cc13xx_cc26xx_2_21_01_08/**)",
+      "Read(//C/ti/ccs1271/xdctools_3_62_01_16_core/**)",
+      "Read(//C/ti/xdctools_3_61_02_27_core/**)",
+      "Read(//C/ti/ccs910/xdctools_3_55_02_22_core/**)",
+      "Read(//C/ti/xdctools_3_51_03_28_core/**)",
+      "Read(//C/ti/xdctools_3_51_01_18_core/**)",
+      "Read(//C/ti/xdctools_3_32_02_25_core/**)",
+      "Read(//C/ti/xdctools_3_32_00_06_core/**)"
+    ],
+    "ask": [
+      "mcp__ccs-project__changeSysConfigVersion"
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"
+  }
+}

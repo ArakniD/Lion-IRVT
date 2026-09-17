@@ -12,17 +12,32 @@
 #include <string.h>
 #include <stdlib.h>
 
+//
+// Shared data placement. The F2837xD message RAMs are single-writer:
+// CPU2TOCPU1RAM is writable only by CPU2, CPU1TOCPU2RAM only by CPU1.
+//
+
+//
+// CPU2 -> CPU1. CPU2 owns the register file; CPU1 only ever reads it.
+//
 #pragma DATA_SECTION(registers, "CPU2TOCPU1RAM")
-volatile float registers[TOTAL_REGISTERS];
+volatile float32_t registers[TOTAL_REGISTERS];
 
 #pragma DATA_SECTION(ipcMsg, "CPU2TOCPU1RAM")
-volatile struct { uint16_t regAddr; float value; } ipcMsg;
+volatile BTS_ipcMessage ipcMsg;
 
 #pragma DATA_SECTION(calibrationData, "CPU2TOCPU1RAM")
 volatile BTS_channelCalibration calibrationData[NUM_CHANNELS];
 
+//
+// CPU1 -> CPU2. CPU1 publishes measurements and status here; CPU2 mirrors
+// them into registers[] for the external interfaces.
+//
 #pragma DATA_SECTION(canData, "CPU1TOCPU2RAM")
 volatile CAN_data canData[NUM_CHANNELS];
+
+#pragma DATA_SECTION(cpu1Status, "CPU1TOCPU2RAM")
+volatile BTS_cpu1Status cpu1Status;
 
 #pragma DATA_SECTION(startup_mode, "CPU1TOCPU2RAM")
 volatile uint32_t startup_mode;

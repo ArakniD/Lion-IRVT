@@ -101,6 +101,11 @@ void BTS_HAL_SetupSpiPinsGpio_Adc2(void);
 // Add function prototype for ePWM trigger setup
 void BTS_HAL_setupAdcTrigger(uint32_t EPWM_BASE);
 
+void BTS_HAL_setupADC(void);
+void BTS_HAL_setupTripSystem(void);
+void BTS_HAL_setupTripGPIO(uint32_t gpioPin);
+void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase);
+
 __interrupt void ISR1(void);
 __interrupt void ISR2(void);
 __interrupt void ISR3(void);

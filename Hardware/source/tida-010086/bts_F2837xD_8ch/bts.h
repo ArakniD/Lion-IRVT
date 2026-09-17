@@ -297,6 +297,25 @@ void BTS_initController(void);
 void BTS_monitor_Iout_Vout(BTS_measValue* );
 
 //
+// Recalculates the derived program variables (trip thresholds and the
+// measurement gains/offsets) for one channel from BTS_userInputs[channel].
+//
+void BTS_calcUserProgramVariables(uint16_t channel);
+
+//
+// Applies a pending calibration update for one channel. In-memory only -
+// CPU1 never writes EEPROM; persistence is CPU2's responsibility and is
+// triggered by the host writing eCalibrationMode.
+//
+void BTS_monitor_program_update(uint16_t channel);
+
+//
+// Copies the calibration registers published by CPU2 into BTS_userInputs[]
+// and flags the channel for recalculation.
+//
+void BTS_loadCalibrationFromRegisters(uint16_t channel);
+
+//
 //=============================================================================
 // static inline functions
 //=============================================================================

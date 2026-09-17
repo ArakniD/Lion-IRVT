@@ -25,5 +25,6 @@
 // Function prototypes
 void LEDDriver_init(void);
 void LEDDriver_update(void);
+__interrupt void ledTimerISR(void);
 
 #endif // LED_DRIVER_H

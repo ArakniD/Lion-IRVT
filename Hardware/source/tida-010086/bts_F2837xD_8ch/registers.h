@@ -392,6 +392,46 @@ typedef struct {
     float mWh;        // Milliwatt-hours
 } CAN_data;
 
+//
+//=============================================================================
+// Inter-processor messaging
+//=============================================================================
+//
+// The F2837xD message RAMs are single-writer: CPU2TOCPU1RAM may only be
+// written by CPU2 (CPU1 reads it), CPU1TOCPU2RAM may only be written by CPU1
+// (CPU2 reads it). The register file therefore lives in CPU2TOCPU1RAM and is
+// owned exclusively by CPU2 - CPU1 never writes registers[]. Measurements and
+// status produced on CPU1 travel the other way through cpu1Status and are
+// mirrored into registers[] by CPU2.
+//
+// IPC flag allocation (both directions use the same numbering):
+//   IPC_FLAG0  CPU2 -> CPU1  single register write, payload in ipcMsg
+//   IPC_FLAG1  CPU2 -> CPU1  cell temperature update, payload in ipcMsg
+//   IPC_FLAG2  CPU2 -> CPU1  whole calibration block reloaded, no payload
+//
+#define BTS_IPC_FLAG_REG_WRITE   IPC_FLAG0
+#define BTS_IPC_FLAG_TEMP_UPDATE IPC_FLAG1
+#define BTS_IPC_FLAG_CAL_RELOAD  IPC_FLAG2
+
+// CPU2 -> CPU1 single register mailbox. Lives in CPU2TOCPU1RAM.
+typedef struct {
+    uint16_t  regAddr;   // index into registers[], i.e. byte address / 4
+    float32_t value;
+} BTS_ipcMessage;
+
+// CPU1 -> CPU2 status and measurement block. Lives in CPU1TOCPU2RAM.
+// Single writer (CPU1), single reader (CPU2). seq is incremented after a
+// complete update so CPU2 can detect a torn read and retry.
+typedef struct {
+    uint32_t  seq;
+    uint32_t  statusBits[NUM_CHANNELS];  // mirrors eChX_Status
+    float32_t cellVoltage[NUM_CHANNELS]; // mirrors eChX_CellVoltage
+    float32_t cellCurrent[NUM_CHANNELS]; // mirrors eChX_CellCurrent
+    float32_t inputVoltage;              // mirrors eInputVoltage
+    uint32_t  unitState;                 // mirrors eUnitState
+    uint32_t  tripStatus;                // mirrors eTripStatus
+} BTS_cpu1Status;
+
 typedef enum {
     eInputLow_ChargeDisabled,
     eInputLow_ChargeRestricted,
@@ -468,5 +508,77 @@ typedef struct
 
 }BTS_ctrlLoopVariable;
 
+//
+//=============================================================================
+// Register map helpers
+//=============================================================================
+//
+// The register file is indexed by (byte address / 4). The blocks do NOT share
+// a stride, so always derive an index through these macros rather than
+// assuming 10 registers per channel:
+//
+//   control      10 regs/channel  eCh0_Mode        .. eCh7_Status
+//   stats         6 regs/channel  eCh0_CurrentAcc  .. eCh7_CellCurrent
+//   temperature   2 regs/channel  eCh0_MinCellTemp .. eCh7_MaxCellTemp
+//   global V      4 regs total    eChargeDisableV  .. eDischargeDisableV
+//   calibration  12 regs/channel  eCh0_F28V_Gain   .. eCh7_VoutOffset_V
+//
+#define BTS_REG_IDX(addr)           ((uint16_t)((addr) / 4U))
+
+#define BTS_CTRL_REGS_PER_CH        (10U)
+#define BTS_STATS_REGS_PER_CH       (6U)
+#define BTS_TEMP_REGS_PER_CH        (2U)
+#define BTS_CAL_REGS_PER_CH         (12U)
+
+#define BTS_CTRL_BASE(ch)   (BTS_REG_IDX(eCh0_Mode)         + (ch) * BTS_CTRL_REGS_PER_CH)
+#define BTS_STATS_BASE(ch)  (BTS_REG_IDX(eCh0_CurrentAcc)   + (ch) * BTS_STATS_REGS_PER_CH)
+#define BTS_TEMP_BASE(ch)   (BTS_REG_IDX(eCh0_MinCellTemp)  + (ch) * BTS_TEMP_REGS_PER_CH)
+#define BTS_CAL_BASE(ch)    (BTS_REG_IDX(eCh0_F28V_Gain)    + (ch) * BTS_CAL_REGS_PER_CH)
+
+// Offsets within the 12-register calibration block at BTS_CAL_BASE(ch).
+// Order must match BTS_channelCalibration's float members.
+#define BTS_CAL_F28V_GAIN      0U
+#define BTS_CAL_F28V_OFFSET    1U
+#define BTS_CAL_F28I_GAIN      2U
+#define BTS_CAL_F28I_OFFSET    3U
+#define BTS_CAL_IOUT_GAIN_PU   4U
+#define BTS_CAL_IOUT_OFFSET_PU 5U
+#define BTS_CAL_IOUT_GAIN_A    6U
+#define BTS_CAL_IOUT_OFFSET_A  7U
+#define BTS_CAL_VOUT_GAIN_PU   8U
+#define BTS_CAL_VOUT_OFFSET_PU 9U
+#define BTS_CAL_VOUT_GAIN_V    10U
+#define BTS_CAL_VOUT_OFFSET_V  11U
+
+// Offsets within the 2-register temperature block at BTS_TEMP_BASE(ch).
+#define BTS_TEMP_MIN           0U
+#define BTS_TEMP_MAX           1U
+
+// EEPROM validation header. The channel is carried in its own field rather
+// than OR-ed into the header, which would collide for channels >= 4.
+#define BTS_CAL_HEADER         0xA5CC0000UL
+#define BTS_CAL_HEADER_MASK    0xFFFF0000UL
+#define BTS_CAL_CHANNEL_MASK   0x0000FFFFUL
+#define BTS_CAL_MAKE_HEADER(ch)    (BTS_CAL_HEADER | ((uint32_t)(ch) & BTS_CAL_CHANNEL_MASK))
+
+//
+//=============================================================================
+// Shared data - defined in registers.c, placed in the message RAMs
+//=============================================================================
+//
+// Written by CPU2, read by CPU1 (CPU2TOCPU1RAM):
+extern volatile float32_t              registers[TOTAL_REGISTERS];
+extern volatile BTS_ipcMessage         ipcMsg;
+extern volatile BTS_channelCalibration calibrationData[NUM_CHANNELS];
+
+// Written by CPU1, read by CPU2 (CPU1TOCPU2RAM):
+extern volatile CAN_data               canData[NUM_CHANNELS];
+extern volatile BTS_cpu1Status         cpu1Status;
+extern volatile uint32_t               startup_mode;
+extern volatile uint32_t               startup_enable;
+
+// Access tables (in flash, compiled into both cores):
+extern const RegisterConfig     regConfig[TOTAL_REGISTERS];
+extern const UARTRegisterConfig uartRegConfig[TOTAL_REGISTERS];
 
 #endif /* REGISTERS_H_ */

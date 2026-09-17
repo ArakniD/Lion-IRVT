@@ -60,9 +60,6 @@ SECTIONS
    GROUP
     {
         .TI.ramfunc
-        {
-            -l sfra_f32_tmu_eabi.lib
-        }
         ramfuncs
     }
         LOAD = FLASHD,
@@ -74,7 +71,6 @@ SECTIONS
         RUN_SIZE(RamfuncsRunSize),
         RUN_END(RamfuncsRunEnd),
         PAGE = 0, ALIGN(4)
-
     GROUP
     {
         isrcodefuncs
@@ -133,6 +129,26 @@ SECTIONS
         GETWRITEIDX :  TYPE = DSECT
         PUTREADIDX :   TYPE = DSECT
     }
+
+   /*
+    * Application shared data.
+    *
+    * The F2837xD message RAMs are single-writer. From CPU1's point of view:
+    *   CPU1TOCPU2RAM  - CPU1 writes, CPU2 reads (canData, cpu1Status,
+    *                    startup_mode, startup_enable)
+    *   CPU2TOCPU1RAM  - CPU2 writes, CPU1 reads (registers, ipcMsg,
+    *                    calibrationData). Marked NOLOAD so CPU1's image does
+    *                    not initialise memory that CPU2 owns.
+    *
+    * Both cores must keep these origins/lengths identical - see
+    * 2837xD_RAM_lnk_cpu2.cmd.
+    */
+    CPU1TOCPU2RAM      : > CPU1TOCPU2RAM, PAGE = 1
+    CPU2TOCPU1RAM      : > CPU2TOCPU1RAM, PAGE = 1, TYPE = NOLOAD
+
+   /* IPC message-queue buffers used by the driverlib IPC message API */
+    MSGRAM_CPU1_TO_CPU2 : > CPU1TOCPU2RAM, PAGE = 1
+    MSGRAM_CPU2_TO_CPU1 : > CPU2TOCPU1RAM, PAGE = 1, TYPE = NOLOAD
 
    /* The following section definition are for SDFM examples */
    Filter1_RegsFile : > RAMGS6,	PAGE = 1, fill=0x1111
