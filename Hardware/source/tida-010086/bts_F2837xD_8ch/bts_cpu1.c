@@ -199,10 +199,109 @@ void main(void)
     BTS_HAL_ExAdcTxframe(BTS_SPI_BASE_ADC1);
     BTS_HAL_ExAdcTxframe(BTS_SPI_BASE_ADC2);
 
+    //
+    // Configure every pin CPU2's peripherals use, while CPU1 still owns the
+    // mux registers. This must precede both the peripheral (CPUSEL) and pin
+    // (GPxCSEL) handovers below, and CPU2 starting.
+    //
+    BTS_HAL_setupCpu2Pins();
+
+    //
+    // Assign the peripherals CPU2 drives over to CPU2.
+    //
+    // Like the GSx RAM, every peripheral belongs to CPU1 after reset and only
+    // CPU1 can reassign it. A core writing a peripheral it does not own has
+    // no effect - CAN_initRAM() in particular then spins forever waiting for
+    // a RAM_INIT that never completes.
+    //
+    // CPU2 owns: I2CA (GPIO32/33, the host register bus), I2CB (GPIO40/41,
+    // EEPROM + the two ADS1119 temperature ADCs), SCIA (GPIO29 - debug
+    // console or WS2812B LED string, per BTS_DEBUG_CONSOLE) and CANA.
+    // CPU1 keeps the ePWMs, ADCs, CMPSS and the SPI ports for the external
+    // ADCs.
+    //
+    SysCtl_selectCPUForPeripheral(SYSCTL_CPUSEL7_I2C, 1, SYSCTL_CPUSEL_CPU2); // I2CA
+    SysCtl_selectCPUForPeripheral(SYSCTL_CPUSEL7_I2C, 2, SYSCTL_CPUSEL_CPU2); // I2CB
+    SysCtl_selectCPUForPeripheral(SYSCTL_CPUSEL8_CAN, 1, SYSCTL_CPUSEL_CPU2); // CANA
+
+    //
+    // SCIA is contended: CPU2 uses it for the WS2812B LEDs, or for the debug
+    // console when BTS_DEBUG_CONSOLE is set. CPU1 needs it only for
+    // the SFRA GUI. They cannot both have it.
+    //
+#if (BTS_SFRA_ENABLED == true)
+    //
+    // Leave SCIA with CPU1 for the SFRA GUI. CPU2's LED driver and, if
+    // selected, its console will not function.
+    //
+#else
+    SysCtl_selectCPUForPeripheral(SYSCTL_CPUSEL5_SCI, 1, SYSCTL_CPUSEL_CPU2); // SCIA
+#endif
+
+    //
+    // Hand CPU2 the GPIO pins its peripherals use.
+    //
+    // Peripheral ownership (CPUSEL) and pin ownership (GPxCSEL) are separate.
+    // The GPIO mux registers belong to CPU1 after reset, so GPIO_setPinConfig
+    // on CPU2 is silently discarded until the pin is assigned here - the
+    // peripheral ends up configured but unable to reach any pin.
+    //
+    GPIO_setControllerCore(32, GPIO_CORE_CPU2);   // I2CA SDAA - register bus
+    GPIO_setControllerCore(33, GPIO_CORE_CPU2);   // I2CA SCLA
+    GPIO_setControllerCore(40, GPIO_CORE_CPU2);   // I2CB SDAB - EEPROM + ADS1119
+    GPIO_setControllerCore(41, GPIO_CORE_CPU2);   // I2CB SCLB
+    GPIO_setControllerCore(42, GPIO_CORE_CPU2);   // ADS1119 #1 DRDY
+    GPIO_setControllerCore(43, GPIO_CORE_CPU2);   // ADS1119 #2 DRDY
+    GPIO_setControllerCore(30, GPIO_CORE_CPU2);   // CANA RX
+    GPIO_setControllerCore(31, GPIO_CORE_CPU2);   // CANA TX
+
+    //
+    // GPIO29 is CPU2's in both modes: console TX when debugging, WS2812B LED
+    // output in production. GPIO28 is CPU2's console RX only in a debug
+    // build - in production it stays with CPU1 as channel 1's trip input.
+    //
+    GPIO_setControllerCore(29, GPIO_CORE_CPU2);
+#if (BTS_TRIP_GPIO_CH1_ENABLED == false)
+    GPIO_setControllerCore(28, GPIO_CORE_CPU2);
+#endif
+
+
+    //
+    // Hand the global-shared RAM blocks CPU2 uses over to CPU2.
+    //
+    // After reset every GSx block is owned by CPU1. CPU2 cannot write - or
+    // execute from - a block it does not own, and only CPU1 can change the
+    // ownership. CPU2's linker file places .bss/.sysmem in GS11-GS13 and its
+    // ramfuncs (including Flash_initModule) in GS14/GS15, so without this the
+    // memcpy in CPU2's Device_init silently fails, CPU2 executes zeros at
+    // 0x01A000 and traps into boot ROM at 0x3FE00A.
+    //
+    // Must happen before CPU2 starts running. CPU1 keeps GS0-GS10.
+    //
+    MemCfg_setGSRAMControllerSel(MEMCFG_SECT_GS11 | MEMCFG_SECT_GS12 |
+                                 MEMCFG_SECT_GS13 | MEMCFG_SECT_GS14 |
+                                 MEMCFG_SECT_GS15,
+                                 MEMCFG_GSRAMCONTROLLER_CPU2);
+
+    //
+    // Release CPU2.
+    //
+    // Only do this in a standalone (no-debugger) build. When running under
+    // CCS the debugger loads and starts CPU2 itself, and Device_bootCPU2()
+    // would block forever in its do/while waiting for the boot ROM to report
+    // C2_BOOTROM_BOOTSTS_SYSTEM_READY - leaving CPU1 stalled here and CPU2
+    // parked in boot ROM around 0x3FE00A.
+    //
+    // This mirrors TI's own project configurations, where _STANDALONE is a
+    // separate build config from plain _FLASH (see the C2000Ware dual-core
+    // examples, e.g. led_ex1_blinky.projectspec).
+    //
+#ifdef _STANDALONE
 #ifdef _FLASH
     Device_bootCPU2(C1C2_BROM_BOOTMODE_BOOT_FROM_FLASH);
 #else
     Device_bootCPU2(C1C2_BROM_BOOTMODE_BOOT_FROM_RAM);
+#endif
 #endif
 
     //
@@ -788,6 +887,13 @@ __interrupt void adcCellVoltageISR(void)
 __interrupt void epwmTripISR(void) {
     uint32_t tripBits = cpu1Status.tripStatus;
     uint16_t channel;
+    //
+    // Guards against a permanently-asserted trip source. If a channel keeps
+    // re-entering, its trip interrupt is masked so the background loop can
+    // still run - the trip action itself (PWM forced low) stays latched in
+    // hardware, so the channel remains safe.
+    //
+    static uint16_t reentryCount[NUM_CHANNELS] = {0};
 
     for (channel = 0; channel < NUM_CHANNELS; channel++) {
         uint32_t epwmBase = EPWM1_BASE + (uint32_t)channel * (EPWM2_BASE - EPWM1_BASE);
@@ -820,6 +926,19 @@ __interrupt void epwmTripISR(void) {
         EPWM_clearOneShotTripZoneFlag(epwmBase,
                                       EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2);
         EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_OST | EPWM_TZ_INTERRUPT);
+
+        //
+        // If the source re-asserts immediately the flag will still be set on
+        // the next pass. Mask this channel's trip interrupt after a burst so
+        // a stuck input cannot starve the background loop.
+        //
+        if (EPWM_getTripZoneFlagStatus(epwmBase) & EPWM_TZ_FLAG_OST) {
+            if (++reentryCount[channel] >= 16U) {
+                EPWM_disableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
+            }
+        } else {
+            reentryCount[channel] = 0;
+        }
     }
 
     cpu1Status.tripStatus = tripBits;

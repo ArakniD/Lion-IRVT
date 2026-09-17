@@ -153,10 +153,17 @@ a single CPU should be defined."
                                      SYSCTL_PLL_ENABLE)
 
 //
-// 170MHz SYSCLK frequency based on the above DEVICE_SETCLOCK_CFG. Update the
+// 160MHz SYSCLK frequency based on the above DEVICE_SETCLOCK_CFG. Update the
 // code below if a different clock configuration is used!
 //
-#define DEVICE_SYSCLK_FREQ          ((DEVICE_OSCSRC_FREQ * 17 * 1) / 2)
+//
+// NOTE: this previously read "* 17", contradicting the SYSCTL_IMULT(16) in
+// DEVICE_SETCLOCK_CFG above and the SYSPLLMULT=0x10 actually programmed into
+// the device. Everything derived from DEVICE_SYSCLK_FREQ was therefore 6.25%
+// high: the SCI baud divisor came out one count low, putting the console
+// 5.65% off 115200 - outside UART tolerance, so characters arrived corrupted.
+// The I2C and CAN bit rates were skewed by the same factor.
+#define DEVICE_SYSCLK_FREQ          ((DEVICE_OSCSRC_FREQ * 16 * 1) / 2)
 
 #endif
 

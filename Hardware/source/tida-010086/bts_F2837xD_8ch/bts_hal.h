@@ -103,7 +103,12 @@ void BTS_HAL_setupAdcTrigger(uint32_t EPWM_BASE);
 
 void BTS_HAL_setupADC(void);
 void BTS_HAL_setupTripSystem(void);
-void BTS_HAL_setupTripGPIO(uint32_t gpioPin);
+void BTS_HAL_setupTripGPIO(uint32_t pinConfig, uint32_t pin);
+void BTS_HAL_setupInputXBAR(uint32_t inputXbarLine, uint32_t sourceType, uint32_t sourceId);
+void BTS_HAL_setupCmpssEpwmXBAR(XBAR_TripNum trip, XBAR_EPWMMuxConfig muxConfig,
+                                uint32_t muxMask);
+void BTS_HAL_setupCMPSS(uint32_t cmpssBase);
+void BTS_HAL_setupCpu2Pins(void);
 void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase);
 
 __interrupt void ISR1(void);

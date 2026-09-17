@@ -28,6 +28,14 @@
 #define EEPROM_I2C_ADDR       0x50
 #define EEPROM_GLOBAL_V_ADDR  0x0100   // 16 bytes = 4 floats
 
+//
+// Polling bound for the blocking I2C helpers. At 160 MHz this is a few
+// hundred microseconds - long enough for a 400 kHz transfer to complete,
+// short enough that a DRDY ISR talking to an absent device does not stall
+// the console. (Was 1000000, i.e. milliseconds per failed attempt.)
+//
+#define BTS_I2C_TIMEOUT_ITERATIONS 20000UL
+
 // Validation limits
 #define MIN_VOLTAGE 8.0f
 #define MAX_VOLTAGE 16.8f
@@ -118,6 +126,16 @@ static volatile float channelTemps[NUM_CHANNELS];
 static volatile uint16_t currentAdsChannel[2] = {0, 0}; // Track channel for each ADS1119
 
 //
+// Consecutive I2C failures per converter. If an ADS1119 is absent or its
+// bus is wedged, every DRDY edge costs a full set of I2C timeouts; left
+// unchecked that starves the console and the register interfaces. After
+// this many failures the offending DRDY interrupt is masked and its
+// temperatures simply stop updating.
+//
+#define ADS1119_MAX_CONSECUTIVE_FAILURES 8U
+static volatile uint16_t adsFailCount[2] = {0, 0};
+
+//
 // Forward declarations - every ISR below is registered before it is defined.
 //
 __interrupt void i2cSlaveISR(void);
@@ -134,18 +152,18 @@ void saveCalibration(uint16_t channel);
 void loadCalibration(void);
 static void notifyCpu1RegisterWrite(uint16_t regIdx, float32_t value);
 static void notifyCpu1CalibrationReload(void);
+#if (BTS_CONSOLE_ENABLED == true)
 static void formatRegisterValue(char *out, uint16_t outSize,
                                 const char *name, float32_t value);
+#endif
 
 void initI2C_Slave(void)
 {
-    GPIO_setPinConfig(GPIO_32_SDAA);
-    GPIO_setPinConfig(GPIO_33_SCLA);
-    GPIO_setPadConfig(32, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
-    GPIO_setPadConfig(33, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
-    GPIO_setQualificationMode(32, GPIO_QUAL_ASYNC);
-    GPIO_setQualificationMode(33, GPIO_QUAL_ASYNC);
-
+    //
+    // I2CA (GPIO32/33) is the host register command bus; the unit is an I2C
+    // target at 0x50. The pins were muxed by CPU1 in BTS_HAL_setupCpu2Pins() -
+    // the mux registers are not writable from CPU2.
+    //
     I2C_disableModule(I2CA_BASE);
     I2C_setOwnAddress(I2CA_BASE, 0x50);
     I2C_setBitCount(I2CA_BASE, I2C_BITCOUNT_8);
@@ -161,13 +179,11 @@ void initI2C_Slave(void)
 
 void initI2C_Master(void)
 {
-    GPIO_setPinConfig(GPIO_34_SDAB);
-    GPIO_setPinConfig(GPIO_35_SCLB);
-    GPIO_setPadConfig(34, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
-    GPIO_setPadConfig(35, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
-    GPIO_setQualificationMode(34, GPIO_QUAL_ASYNC);
-    GPIO_setQualificationMode(35, GPIO_QUAL_ASYNC);
-
+    //
+    // I2CB (GPIO40/41) carries the calibration EEPROM (0x50) and the two
+    // ADS1119 temperature ADCs (0x40/0x41), whose DRDY lines are GPIO42/43.
+    // Pins muxed by CPU1 in BTS_HAL_setupCpu2Pins().
+    //
     I2C_disableModule(I2CB_BASE);
     I2C_initController(I2CB_BASE, DEVICE_SYSCLK_FREQ, 400000, I2C_DUTYCYCLE_50);
     I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
@@ -180,16 +196,26 @@ void initI2C_Master(void)
 // Blocking byte-level EEPROM/I2C helpers. These run only at boot and on an
 // explicit calibration save, so a polled implementation is appropriate.
 //
-static void i2cMasterWaitBusFree(void)
+static bool i2cMasterWaitBusFree(void)
 {
-    while (I2C_isBusBusy(I2CB_BASE)) { }
+    //
+    // Bounded: these helpers are also reached from the ADS1119 DRDY ISRs, so
+    // an absent or wedged device on the bus must not stall the CPU forever.
+    //
+    uint32_t guard = 0;
+    while (I2C_isBusBusy(I2CB_BASE)) {
+        if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool i2cMasterWaitReady(void)
 {
     uint32_t guard = 0;
     while ((I2C_getStatus(I2CB_BASE) & I2C_STS_REG_ACCESS_RDY) == 0U) {
-        if (++guard > 1000000UL) {
+        if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
             return false;
         }
         if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
@@ -208,7 +234,9 @@ static bool i2cWriteBlock(uint16_t devAddr, uint16_t memAddr,
 {
     uint16_t i;
 
-    i2cMasterWaitBusFree();
+    if (!i2cMasterWaitBusFree()) {
+        return false;
+    }
 
     I2C_setTargetAddress(I2CB_BASE, devAddr);
     I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
@@ -221,7 +249,7 @@ static bool i2cWriteBlock(uint16_t devAddr, uint16_t memAddr,
     for (i = 0; i < count; i++) {
         uint32_t guard = 0;
         while ((I2C_getStatus(I2CB_BASE) & I2C_STS_TX_DATA_RDY) == 0U) {
-            if (++guard > 1000000UL) {
+            if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
                 I2C_sendStopCondition(I2CB_BASE);
                 return false;
             }
@@ -242,7 +270,9 @@ static bool i2cReadBlock(uint16_t devAddr, uint16_t memAddr,
 {
     uint16_t i;
 
-    i2cMasterWaitBusFree();
+    if (!i2cMasterWaitBusFree()) {
+        return false;
+    }
 
     // Phase 1: write the memory address, no stop (repeated start follows).
     I2C_setTargetAddress(I2CB_BASE, devAddr);
@@ -265,7 +295,7 @@ static bool i2cReadBlock(uint16_t devAddr, uint16_t memAddr,
     for (i = 0; i < count; i++) {
         uint32_t guard = 0;
         while ((I2C_getStatus(I2CB_BASE) & I2C_STS_RX_DATA_RDY) == 0U) {
-            if (++guard > 1000000UL) {
+            if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
                 I2C_sendStopCondition(I2CB_BASE);
                 return false;
             }
@@ -572,10 +602,9 @@ static void saveAllCalibration(void)
 
 void initCAN(void)
 {
-    GPIO_setPinConfig(GPIO_31_CANTXA);
-    GPIO_setPinConfig(GPIO_30_CANRXA);
-    GPIO_setQualificationMode(30, GPIO_QUAL_ASYNC);
-
+    //
+    // CANA pins (GPIO30 = RX, GPIO31 = TX) muxed by CPU1.
+    //
     CAN_initModule(CANA_BASE);
     CAN_setBitRate(CANA_BASE, DEVICE_SYSCLK_FREQ, CAN_BITRATE, 16);
     CAN_enableInterrupt(CANA_BASE, CAN_INT_IE0 | CAN_INT_ERROR | CAN_INT_STATUS);
@@ -621,16 +650,41 @@ volatile uint16_t sfraEnabled = 0;
 
 void initUART(void)
 {
-    GPIO_setPinConfig(GPIO_18_SCITXDB);
-    GPIO_setPinConfig(GPIO_19_SCIRXDB);
-    SCI_setConfig(SCIB_BASE, DEVICE_LSPCLK_FREQ, 1000000, (SCI_CONFIG_WLEN_8 | SCI_CONFIG_STOP_ONE | SCI_CONFIG_PAR_NONE));
-    SCI_resetChannels(SCIB_BASE);
-    SCI_enableFIFO(SCIB_BASE);
-    SCI_enableModule(SCIB_BASE);
-    SCI_performSoftwareReset(SCIB_BASE);
-    SCI_enableInterrupt(SCIB_BASE, SCI_INT_RXRDY_BRKDT);
-    Interrupt_register(INT_SCIB_RX, &uartRxISR);
-    Interrupt_enable(INT_SCIB_RX);
+#if (BTS_CONSOLE_ENABLED == true)
+    //
+    // Present only in a debug build (BTS_DEBUG_CONSOLE): the AT console
+    // runs on SCIA (GPIO28/29), reaching the controlCARD's isolated FTDI
+    // backchannel over the same USB cable as the debug probe.
+    //
+    //
+    // Console pins (GPIO28/29) muxed by CPU1.
+    //
+    SCI_setConfig(BTS_CONSOLE_SCI_BASE, DEVICE_LSPCLK_FREQ, BTS_CONSOLE_BAUDRATE,
+                  (SCI_CONFIG_WLEN_8 | SCI_CONFIG_STOP_ONE | SCI_CONFIG_PAR_NONE));
+    SCI_resetChannels(BTS_CONSOLE_SCI_BASE);
+    SCI_enableFIFO(BTS_CONSOLE_SCI_BASE);
+    SCI_enableModule(BTS_CONSOLE_SCI_BASE);
+    SCI_performSoftwareReset(BTS_CONSOLE_SCI_BASE);
+
+    //
+    // With the FIFO enabled the receiver raises RXFFINT, not RXRDY - enabling
+    // SCI_INT_RXRDY_BRKDT here sets RXBKINTENA, which never fires in FIFO
+    // mode, so characters pile up until the FIFO overflows and no ISR runs.
+    // Interrupt after every character so AT commands are processed promptly.
+    //
+    SCI_setFIFOInterruptLevel(BTS_CONSOLE_SCI_BASE, SCI_FIFO_TX16, SCI_FIFO_RX1);
+    SCI_enableInterrupt(BTS_CONSOLE_SCI_BASE, SCI_INT_RXFF);
+    SCI_clearInterruptStatus(BTS_CONSOLE_SCI_BASE, SCI_INT_RXFF);
+
+    Interrupt_register(BTS_CONSOLE_RX_INT, &uartRxISR);
+    Interrupt_enable(BTS_CONSOLE_RX_INT);
+#else
+    //
+    // Production build: GPIO29 drives the WS2812B LED string and GPIO28 is
+    // channel 1's trip input, so no console port exists. The host talks to
+    // the unit over I2C or CAN instead.
+    //
+#endif
 }
 
 void initTimer(void)
@@ -647,31 +701,45 @@ void initADS1119(void)
 {
     uint16_t configData[3];
 
-    GPIO_setPinConfig(GPIO_42_GPIO42);
-    GPIO_setDirectionMode(ADS1119_DRDY_GPIO_1, GPIO_DIR_MODE_IN);
-    GPIO_setQualificationMode(ADS1119_DRDY_GPIO_1, GPIO_QUAL_SYNC);
+    //
+    // Pins and interrupt routing first, but the interrupts themselves stay
+    // masked: the DRDY ISRs perform blocking I2C transfers, so one firing
+    // during the configuration writes below would deadlock against the
+    // transfer already in progress.
+    //
+    //
+    // DRDY pins (GPIO42/43) are configured as GPIO inputs by CPU1. The XINT
+    // routing and edge selection are not pin-mux registers, so CPU2 sets
+    // those itself.
+    //
     GPIO_setInterruptPin(ADS1119_DRDY_GPIO_1, GPIO_INT_XINT1);
     GPIO_setInterruptType(GPIO_INT_XINT1, GPIO_INT_TYPE_FALLING_EDGE);
-    GPIO_enableInterrupt(GPIO_INT_XINT1);
-
-    GPIO_setPinConfig(GPIO_43_GPIO43);
-    GPIO_setDirectionMode(ADS1119_DRDY_GPIO_2, GPIO_DIR_MODE_IN);
-    GPIO_setQualificationMode(ADS1119_DRDY_GPIO_2, GPIO_QUAL_SYNC);
     GPIO_setInterruptPin(ADS1119_DRDY_GPIO_2, GPIO_INT_XINT2);
     GPIO_setInterruptType(GPIO_INT_XINT2, GPIO_INT_TYPE_FALLING_EDGE);
-    GPIO_enableInterrupt(GPIO_INT_XINT2);
 
     Interrupt_register(INT_XINT1, &ads1119Drdy1ISR);
     Interrupt_register(INT_XINT2, &ads1119Drdy2ISR);
-    Interrupt_enable(INT_XINT1);
-    Interrupt_enable(INT_XINT2);
 
+    //
+    // Put both converters into continuous-conversion mode.
+    //
     configData[0] = ADS1119_CONFIG_REG;
     configData[1] = (ADS1119_CONFIG_CONT >> 8) & 0xFFU;
     configData[2] = ADS1119_CONFIG_CONT & 0xFFU;
 
     i2cWriteBlock(ADS1119_ADDR_1, 0, configData, 3U);
     i2cWriteBlock(ADS1119_ADDR_2, 0, configData, 3U);
+
+    //
+    // Now the bus is idle, accept DRDY. Clear anything the PIE latched while
+    // the converters were being configured, otherwise a stale edge fires the
+    // ISR immediately and it contends with this still-unfinished init.
+    //
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
+    GPIO_enableInterrupt(GPIO_INT_XINT1);
+    GPIO_enableInterrupt(GPIO_INT_XINT2);
+    Interrupt_enable(INT_XINT1);
+    Interrupt_enable(INT_XINT2);
 }
 
 float mVToTemperature(float mV)
@@ -694,12 +762,26 @@ float readADS1119Data(uint16_t adsAddr, uint16_t channel)
     uint16_t data[2];
     int16_t raw;
     float mV;
+    uint16_t unit = (adsAddr == ADS1119_ADDR_1) ? 0U : 1U;
 
     (void)channel;
 
     if (!i2cReadBlock(adsAddr, ADS1119_DATA_REG, data, 2U)) {
+        //
+        // No response. Give up on this converter after a run of failures so a
+        // missing device cannot monopolise the CPU.
+        //
+        if (adsFailCount[unit] < ADS1119_MAX_CONSECUTIVE_FAILURES) {
+            adsFailCount[unit]++;
+            if (adsFailCount[unit] >= ADS1119_MAX_CONSECUTIVE_FAILURES) {
+                GPIO_disableInterrupt((unit == 0U) ? GPIO_INT_XINT1
+                                                   : GPIO_INT_XINT2);
+            }
+        }
         return 0.0f;
     }
+
+    adsFailCount[unit] = 0;
 
     raw = (int16_t)(((data[0] & 0xFFU) << 8) | (data[1] & 0xFFU));
     mV = ((float)raw * 2048.0f) / 32768.0f;
@@ -727,13 +809,13 @@ __interrupt void ads1119Drdy1ISR(void)
     float temp = readADS1119Data(ADS1119_ADDR_1, channel);
 
     //
-    // Measured temperature goes to the min-temp slot of the channel's
-    // 2-register temperature block.
+    // The register map's temperature block holds the configured min/max
+    // LIMITS, not a measurement - writing the reading into it would destroy
+    // the channel's configured trip window (and did: a failed read wrote 0.0
+    // over the 10.0 default). Keep the measurement local until the map gains
+    // a dedicated per-channel measured-temperature register.
     //
-    uint16_t regIdx = BTS_TEMP_BASE(channel) + BTS_TEMP_MIN;
     channelTemps[channel] = temp;
-    registers[regIdx] = temp;
-    notifyCpu1RegisterWrite(regIdx, temp);
 
     currentAdsChannel[0] = (currentAdsChannel[0] + 1) % 4;
     configureNextChannel(ADS1119_ADDR_1, currentAdsChannel[0]);
@@ -748,10 +830,8 @@ __interrupt void ads1119Drdy2ISR(void)
     uint16_t channel = currentAdsChannel[1];
     float temp = readADS1119Data(ADS1119_ADDR_2, channel);
 
-    uint16_t regIdx = BTS_TEMP_BASE(channel + 4) + BTS_TEMP_MIN;
+    // See ads1119Drdy1ISR: the temperature block is limits, not measurements.
     channelTemps[channel + 4] = temp;
-    registers[regIdx] = temp;
-    notifyCpu1RegisterWrite(regIdx, temp);
 
     currentAdsChannel[1] = (currentAdsChannel[1] + 1) % 4;
     configureNextChannel(ADS1119_ADDR_2, currentAdsChannel[1]);
@@ -1003,19 +1083,26 @@ void SFRA_startCalibration(void)
     uartSendResponse("SFRA Calibration Started");
 }
 
+#if (BTS_CONSOLE_ENABLED == true)
 #define UART_BUFFER_SIZE 64
 static char uartBuffer[UART_BUFFER_SIZE];
 static uint16_t uartBufIdx = 0;
+#endif
 
 void uartSendResponse(const char* response)
 {
+#if (BTS_CONSOLE_ENABLED == true)
     while (*response) {
-        SCI_writeCharBlockingFIFO(SCIB_BASE, (uint16_t)(*response++) & 0xFFU);
+        SCI_writeCharBlockingFIFO(BTS_CONSOLE_SCI_BASE, (uint16_t)(*response++) & 0xFFU);
     }
-    SCI_writeCharBlockingFIFO(SCIB_BASE, '\r');
-    SCI_writeCharBlockingFIFO(SCIB_BASE, '\n');
+    SCI_writeCharBlockingFIFO(BTS_CONSOLE_SCI_BASE, '\r');
+    SCI_writeCharBlockingFIFO(BTS_CONSOLE_SCI_BASE, '\n');
+#else
+    (void)response;
+#endif
 }
 
+#if (BTS_CONSOLE_ENABLED == true)
 //
 // Formats "+<name>=<value>" with two decimal places.
 //
@@ -1044,14 +1131,20 @@ static void formatRegisterValue(char *out, uint16_t outSize,
     snprintf(out, outSize, "+%s=%s%ld.%02ld",
              name, negative ? "-" : "", (long)whole, (long)frac);
 }
+#endif
 
 #pragma CODE_SECTION(uartRxISR, "isrcodefuncs")
 #pragma INTERRUPT(uartRxISR, HPI)
 __interrupt void uartRxISR(void)
 {
-    uint32_t intSource = SCI_getInterruptStatus(SCIB_BASE);
-    if (intSource & SCI_INT_RXRDY_BRKDT) {
-        char rxChar = (char)(SCI_readCharBlockingFIFO(SCIB_BASE) & 0xFFU);
+#if (BTS_CONSOLE_ENABLED == true)
+    uint32_t intSource = SCI_getInterruptStatus(BTS_CONSOLE_SCI_BASE);
+    //
+    // Drain everything the FIFO holds - more than one character can arrive
+    // between interrupts.
+    //
+    while (SCI_getRxFIFOStatus(BTS_CONSOLE_SCI_BASE) != SCI_FIFO_RX0) {
+        char rxChar = (char)(SCI_readCharNonBlocking(BTS_CONSOLE_SCI_BASE) & 0xFFU);
         if (rxChar == '\n' || rxChar == '\r') {
             uartBuffer[uartBufIdx] = '\0';
             if (strncmp(uartBuffer, "AT+", 3) == 0) {
@@ -1068,7 +1161,7 @@ __interrupt void uartRxISR(void)
                         uartSendResponse("ERROR: Invalid SFRA command");
                     }
                     uartBufIdx = 0;
-                    SCI_clearInterruptStatus(SCIB_BASE, intSource);
+                    SCI_clearInterruptStatus(BTS_CONSOLE_SCI_BASE, intSource);
                     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP9);
                     return;
                 }
@@ -1114,7 +1207,8 @@ __interrupt void uartRxISR(void)
             uartBuffer[uartBufIdx++] = rxChar;
         }
     }
-    SCI_clearInterruptStatus(SCIB_BASE, intSource);
+    SCI_clearInterruptStatus(BTS_CONSOLE_SCI_BASE, intSource);
+#endif
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP9);
 }
 
@@ -1146,10 +1240,36 @@ void main(void)
     initCAN();
     initTimer();
     LEDDriver_init();
-    initADS1119();
 
     EINT;
     ERTM;
+
+    //
+    // Boot banner - confirms init completed and the console is alive.
+    // Printed before any interrupt-driven work so it still appears if a
+    // peripheral on the I2C bus is absent or misbehaving.
+    //
+#if (BTS_CONSOLE_ENABLED == true)
+    uartSendResponse("");
+    uartSendResponse("BTS F2837xD CPU2 ready");
+    {
+        char line[48];
+        formatRegisterValue(line, sizeof(line), "ChargeDisableV",
+                            registers[BTS_REG_IDX(eChargeDisableV)]);
+        uartSendResponse(line);
+        formatRegisterValue(line, sizeof(line), "Ch0_F28V_Gain",
+                            registers[BTS_CAL_BASE(0) + BTS_CAL_F28V_GAIN]);
+        uartSendResponse(line);
+    }
+    uartSendResponse("OK");
+#endif
+
+    //
+    // Temperature acquisition last: its DRDY ISRs drive the I2CB bus, so the
+    // console and the register interfaces are already up before they start.
+    // If a converter is absent the bounded I2C helpers simply time out.
+    //
+    initADS1119();
 
     while (1) {
         IDLE;

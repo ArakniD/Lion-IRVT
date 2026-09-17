@@ -1,0 +1,11 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "TMS320F28379D.ccxml.ccxml",
+            "type": "ccs-debug",
+            "request": "launch",
+            "targetConfig": "/c:/Users/lucas/ti/CCSTargetConfigurations/TMS320F28379D.ccxml.ccxml"
+        }
+    ]
+}

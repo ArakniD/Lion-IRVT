@@ -433,8 +433,12 @@ void BTS_HAL_setupExAdcGpio_Adc1(void)
     GPIO_enableInterrupt(BTS_PSI_DRDY_XINT_GPIO1);
 
 
-    GPIO_setAnalogMode(BTS_SPI_RESET_GPIO_ADC1, GPIO_ANALOG_DISABLED);    //pin 24 digital mode
     // configure reset pin
+    //
+    // GPIO_setAnalogMode is not called here: on the F2837xD only GPIO42 and
+    // GPIO43 have an analog mux (driverlib asserts pin == 42 || pin == 43).
+    // GPIO24 is digital-only, so it needs no analog-mode selection.
+    //
     GPIO_setPadConfig(BTS_SPI_RESET_GPIO_ADC1, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO24
     GPIO_writePin(BTS_SPI_RESET_GPIO_ADC1, 1);                            // Load output latch
     GPIO_setPinConfig(BTS_SPI_RESET_PIN_CONFIG_ADC1);                     // GPIO24 = GPIO24
@@ -464,11 +468,13 @@ void BTS_HAL_setupExAdcGpio_Adc2(void)
     GPIO_enableInterrupt(BTS_PSI_DRDY_XINT_GPIO2);
 
 
-    GPIO_setAnalogMode(BTS_SPI_RESET_GPIO_ADC2, GPIO_ANALOG_DISABLED);    //pin 24 digital mode
     // configure reset pin
-    GPIO_setPadConfig(BTS_SPI_RESET_GPIO_ADC2, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO24
+    //
+    // As with ADC1: GPIO48 is digital-only, so no analog-mode call.
+    //
+    GPIO_setPadConfig(BTS_SPI_RESET_GPIO_ADC2, GPIO_PIN_TYPE_PULLUP);     // Enable pullup on GPIO48
     GPIO_writePin(BTS_SPI_RESET_GPIO_ADC2, 1);                            // Load output latch
-    GPIO_setPinConfig(BTS_SPI_RESET_PIN_CONFIG_ADC2);                     // GPIO24 = GPIO24
+    GPIO_setPinConfig(BTS_SPI_RESET_PIN_CONFIG_ADC2);                     // GPIO48 = GPIO48
     GPIO_setDirectionMode(BTS_SPI_RESET_GPIO_ADC2, GPIO_DIR_MODE_OUT);
 }
 
@@ -857,45 +863,174 @@ void BTS_HAL_setupAdcClock(uint32_t EPWM_BASE)
 }
 
 // Function to configure CMPSS for current monitoring (COMPH and COMPL combined)
-void BTS_HAL_setupCMPSS(uint32_t cmpssBase, uint32_t adcPin) {
+//
+// Configures one channel's over-current comparator.
+//
+// The current-sense signal arrives on a CMPSS input pin and is compared
+// against the module's internal 12-bit DAC. The high comparator trips above
+// +BTS_USER_DEFAULT_TRIP_A, the low comparator below -BTS_USER_DEFAULT_TRIP_A
+// (see the DAC count calculation in bts_user_settings.h).
+//
+// Note the negative input must be CMPSS_INSRC_DAC: with CMPSS_INSRC_PIN the
+// comparator ignores the DAC entirely and no threshold applies, which left
+// the trip asserted permanently.
+//
+void BTS_HAL_setupCMPSS(uint32_t cmpssBase) {
     EALLOW;
-    // Configure high comparator (COMPH) for +10A
-    CMPSS_configHighComparator(cmpssBase, CMPSS_INSRC_PIN | adcPin);
-    CMPSS_configOutputsHigh(cmpssBase, CMPSS_TRIP_FILTER | CMPSS_TRIPOUT_LATCH);
-    CMPSS_configFilterHigh(cmpssBase, 0, 8, CMPSS_THRESHOLD_HIGH); // Prescale 0, window 8
 
-    // Configure low comparator (COMPL) for -10A
-    CMPSS_configLowComparator(cmpssBase, CMPSS_INSRC_PIN | adcPin);
-    CMPSS_configOutputsLow(cmpssBase, CMPSS_TRIP_FILTER | CMPSS_TRIPOUT_LATCH);
-    CMPSS_configFilterLow(cmpssBase, 0, 8, CMPSS_THRESHOLD_LOW);
+    //
+    // DAC reference VDDA, shadow value loaded on system clock, value taken
+    // from the user-programmed shadow register rather than the ramp generator.
+    //
+    CMPSS_configDAC(cmpssBase,
+                    CMPSS_DACVAL_SYSCLK | CMPSS_DACREF_VDDA | CMPSS_DACSRC_SHDW);
 
-    // Enable OR of COMPH and COMPL outputs
-    HWREGH(cmpssBase + CMPSS_O_COMPSTS) |= CMPSS_COMPSTS_COMPHLATCH | CMPSS_COMPSTS_COMPLLATCH;
+    //
+    // High comparator: trips when the sense pin rises above +trip.
+    //
+    CMPSS_configHighComparator(cmpssBase, CMPSS_INSRC_DAC);
+    CMPSS_setDACValueHigh(cmpssBase, BTS_CMPSS_TRIP_HIGH);
+    CMPSS_configOutputsHigh(cmpssBase, CMPSS_TRIP_FILTER | CMPSS_TRIPOUT_FILTER);
+    CMPSS_configFilterHigh(cmpssBase, 0, 8, 5);
+    CMPSS_initFilterHigh(cmpssBase);
 
-    // Enable CMPSS module
+    //
+    // Low comparator: trips when the sense pin falls below -trip. The low
+    // comparator's output is inverted so that "below threshold" asserts.
+    //
+    CMPSS_configLowComparator(cmpssBase, CMPSS_INSRC_DAC | CMPSS_INV_INVERTED);
+    CMPSS_setDACValueLow(cmpssBase, BTS_CMPSS_TRIP_LOW);
+    CMPSS_configOutputsLow(cmpssBase, CMPSS_TRIP_FILTER | CMPSS_TRIPOUT_FILTER);
+    CMPSS_configFilterLow(cmpssBase, 0, 8, 5);
+    CMPSS_initFilterLow(cmpssBase);
+
+    //
+    // Clear any latch left over from before the thresholds were programmed.
+    //
+    CMPSS_clearFilterLatchHigh(cmpssBase);
+    CMPSS_clearFilterLatchLow(cmpssBase);
+
     CMPSS_enableModule(cmpssBase);
     EDIS;
 }
 
 // Function to configure Input X-BAR for a given input line
+//
+// Routes one channel's CMPSS trip output to an ePWM X-BAR trip signal.
+//
+// CMPSS comparator outputs do NOT go through the Input X-BAR - they reach the
+// ePWM trip zones via the ePWM X-BAR. Each TRIPn output selects among muxes;
+// CMPSSn occupies mux (n-1)*2. Configure the mux, then enable it.
+//
+void BTS_HAL_setupCmpssEpwmXBAR(XBAR_TripNum trip, XBAR_EPWMMuxConfig muxConfig,
+                                uint32_t muxMask) {
+    XBAR_setEPWMMuxConfig(trip, muxConfig);
+    XBAR_enableEPWMMux(trip, muxMask);
+}
+
 void BTS_HAL_setupInputXBAR(uint32_t inputXbarLine, uint32_t sourceType, uint32_t sourceId) {
-    EALLOW;
-    // Map sourceType: 0 for GPIO, 1 for CMPSS
-    if (sourceType == 0) {
-        // GPIO source
-        XBAR_setInputPin((XBAR_InputNum)(XBAR_INPUT1 + (inputXbarLine - 1)), sourceId);
-    } else {
-        // CMPSS source (sourceId is mux value: 0, 2, ..., 14)
-        XBAR_setInputPin((XBAR_InputNum)(XBAR_INPUT1 + (inputXbarLine - 1)), sourceId);
-    }
-    EDIS;
+    //
+    // Input X-BAR inputs select a GPIO by bare pin number. sourceType is
+    // retained for call-site clarity but both branches are identical - the
+    // Input X-BAR has no other source.
+    //
+    (void)sourceType;
+    XBAR_setInputPin((XBAR_InputNum)(XBAR_INPUT1 + (inputXbarLine - 1)),
+                     (uint16_t)sourceId);
+}
+
+//
+// Configures every pin that CPU2's peripherals use.
+//
+// The GPIO mux registers (GPyMUX/GPyGMUX), pad config and qualification are
+// writable only from CPU1 - a GPIO_setPinConfig() executed on CPU2 is
+// silently discarded. GPIO_setControllerCore() hands over pin *data*
+// ownership, not the right to mux. So CPU1 establishes the full pin
+// configuration here, before releasing CPU2, and CPU2 then touches only its
+// peripheral registers.
+//
+// Must be called before the GPxCSEL assignments and before CPU2 runs.
+//
+void BTS_HAL_setupCpu2Pins(void)
+{
+    //
+    // I2CA (GPIO32/33) - host register command bus, unit is a target at 0x50.
+    // Open-drain with pull-up and asynchronous qualification, as I2C requires.
+    //
+    GPIO_setPinConfig(GPIO_32_SDAA);
+    GPIO_setPadConfig(32, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
+    GPIO_setQualificationMode(32, GPIO_QUAL_ASYNC);
+    GPIO_setPinConfig(GPIO_33_SCLA);
+    GPIO_setPadConfig(33, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
+    GPIO_setQualificationMode(33, GPIO_QUAL_ASYNC);
+
+    //
+    // I2CB (GPIO40/41) - calibration EEPROM at 0x50 plus the two ADS1119
+    // temperature ADCs at 0x40 and 0x41.
+    //
+    GPIO_setPinConfig(GPIO_40_SDAB);
+    GPIO_setPadConfig(40, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
+    GPIO_setQualificationMode(40, GPIO_QUAL_ASYNC);
+    GPIO_setPinConfig(GPIO_41_SCLB);
+    GPIO_setPadConfig(41, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
+    GPIO_setQualificationMode(41, GPIO_QUAL_ASYNC);
+
+    //
+    // ADS1119 DRDY inputs (GPIO42/43). Plain GPIO inputs - GPIO_42_GPIO42
+    // and GPIO_43_GPIO43 select MUX=0/GMUX=0, which is GPIO mode. Routed to
+    // XINT1/XINT2; CPU2 enables the interrupts once its I2C bus is idle.
+    //
+    GPIO_setPinConfig(GPIO_42_GPIO42);
+    GPIO_setDirectionMode(42, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(42, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setQualificationMode(42, GPIO_QUAL_SYNC);
+
+    GPIO_setPinConfig(GPIO_43_GPIO43);
+    GPIO_setDirectionMode(43, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(43, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setQualificationMode(43, GPIO_QUAL_SYNC);
+
+    //
+    // CANA (GPIO30 = CANRXA, GPIO31 = CANTXA) - telemetry and register access.
+    // Both are MUX=1/GMUX=0 in GPAMUX2. RX is asynchronous; TX gets a pull-up
+    // so the bus idles recessive before the transceiver is driven.
+    //
+    GPIO_setPinConfig(GPIO_30_CANRXA);
+    GPIO_setPadConfig(30, GPIO_PIN_TYPE_STD);
+    GPIO_setQualificationMode(30, GPIO_QUAL_ASYNC);
+
+    GPIO_setPinConfig(GPIO_31_CANTXA);
+    GPIO_setPadConfig(31, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setQualificationMode(31, GPIO_QUAL_ASYNC);
+
+    //
+    // SCIA on GPIO29. In a debug build this is the AT console TX and GPIO28
+    // is its RX; in production GPIO29 drives the WS2812B LED string and
+    // GPIO28 belongs to CPU1 as channel 1's trip input.
+    //
+    GPIO_setPinConfig(GPIO_29_SCITXDA);
+    GPIO_setPadConfig(29, GPIO_PIN_TYPE_STD);
+    GPIO_setQualificationMode(29, GPIO_QUAL_ASYNC);
+
+#if (BTS_CONSOLE_ENABLED == true)
+    GPIO_setPinConfig(GPIO_28_SCIRXDA);
+    GPIO_setPadConfig(28, GPIO_PIN_TYPE_PULLUP);
+    GPIO_setQualificationMode(28, GPIO_QUAL_ASYNC);
+#endif
 }
 
 // Function to configure GPIO for trip input
-void BTS_HAL_setupTripGPIO(uint32_t gpioPin) {
-    GPIO_setPinConfig(gpioPin | GPIO_PIN_TYPE_STD);
-    GPIO_setDirectionMode(gpioPin, GPIO_DIR_MODE_IN);
-    GPIO_setQualificationMode(gpioPin, GPIO_QUAL_SYNC);
+//
+// pinConfig is the packed mux encoding (e.g. GPIO_28_GPIO28) for
+// GPIO_setPinConfig; pin is the bare pin number (e.g. 28) that every other
+// GPIO API expects. Passing the encoding where a pin number is required
+// trips driverlib's ASSERT(pin <= 168).
+//
+void BTS_HAL_setupTripGPIO(uint32_t pinConfig, uint32_t pin) {
+    GPIO_setPinConfig(pinConfig);
+    GPIO_setDirectionMode(pin, GPIO_DIR_MODE_IN);
+    GPIO_setPadConfig(pin, GPIO_PIN_TYPE_STD);
+    GPIO_setQualificationMode(pin, GPIO_QUAL_SYNC);
 }
 
 // Function to configure ePWM Trip Zone
@@ -908,6 +1043,15 @@ void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase) {
     EPWM_setTripZoneAction(epwmBase, EPWM_TZ_ACTION_EVENT_TZA, EPWM_TZ_ACTION_LOW);
     EPWM_setTripZoneAction(epwmBase, EPWM_TZ_ACTION_EVENT_TZB, EPWM_TZ_ACTION_LOW);
 
+    //
+    // Clear anything latched while the trip sources were still being
+    // configured, so a stale flag cannot re-enter the ISR the moment the
+    // interrupt is enabled.
+    //
+    EPWM_clearOneShotTripZoneFlag(epwmBase,
+                                  EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2);
+    EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_OST | EPWM_TZ_INTERRUPT);
+
     // Enable trip zone interrupt
     EPWM_enableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
     EDIS;
@@ -918,45 +1062,70 @@ void BTS_HAL_setupTripSystem(void) {
     // Configure comparators (assuming COMP1-8 map to channels)
     // Map: A2->COMP1A, B2->COMP2B, A4->COMP3A, IN14->COMP4A, D0->COMP5D, C2->COMP6C, D2->COMP7D, C4->COMP8C
 
-    // Configure CMPSS for each channel
-    BTS_HAL_setupCMPSS(CMPSS1_BASE, BTS_TRP_PIN_CONFIG_COMP_CH1); // Channel 1, ADCIN0
-    BTS_HAL_setupCMPSS(CMPSS2_BASE, BTS_TRP_PIN_CONFIG_COMP_CH2); // Channel 2, ADCIN2
-    BTS_HAL_setupCMPSS(CMPSS3_BASE, BTS_TRP_PIN_CONFIG_COMP_CH3); // Channel 3, ADCIN4
-    BTS_HAL_setupCMPSS(CMPSS4_BASE, BTS_TRP_PIN_CONFIG_COMP_CH4); // Channel 4, ADCIN6
-    BTS_HAL_setupCMPSS(CMPSS5_BASE, BTS_TRP_PIN_CONFIG_COMP_CH5); // Channel 5, ADCIN0 (ADC2)
-    BTS_HAL_setupCMPSS(CMPSS6_BASE, BTS_TRP_PIN_CONFIG_COMP_CH6); // Channel 6, ADCIN2 (ADC2)
-    BTS_HAL_setupCMPSS(CMPSS7_BASE, BTS_TRP_PIN_CONFIG_COMP_CH7); // Channel 7, ADCIN4 (ADC2)
-    BTS_HAL_setupCMPSS(CMPSS8_BASE, BTS_TRP_PIN_CONFIG_COMP_CH8); // Channel 8, ADCIN6 (ADC2)
+    // Configure CMPSS for each channel. The comparator input pin is fixed by
+    // the device pinout; the trip level comes from the internal DAC.
+    BTS_HAL_setupCMPSS(CMPSS1_BASE); // Channel 1
+    BTS_HAL_setupCMPSS(CMPSS2_BASE); // Channel 2
+    BTS_HAL_setupCMPSS(CMPSS3_BASE); // Channel 3
+    BTS_HAL_setupCMPSS(CMPSS4_BASE); // Channel 4
+    BTS_HAL_setupCMPSS(CMPSS5_BASE); // Channel 5
+    BTS_HAL_setupCMPSS(CMPSS6_BASE); // Channel 6
+    BTS_HAL_setupCMPSS(CMPSS7_BASE); // Channel 7
+    BTS_HAL_setupCMPSS(CMPSS8_BASE); // Channel 8
 
-    // Configure Input X-BAR for CMPSS trips (INPUT1 to INPUT8)
-    BTS_HAL_setupInputXBAR(1, 1, XBAR_OUT_MUX00_CMPSS1_CTRIPOUTH_OR_L);  // INPUT1: CMPSS1.COMPH/COMPL
-    BTS_HAL_setupInputXBAR(2, 1, XBAR_OUT_MUX02_CMPSS2_CTRIPOUTH_OR_L);  // INPUT2: CMPSS2.COMPH/COMPL
-    BTS_HAL_setupInputXBAR(3, 1, XBAR_OUT_MUX04_CMPSS3_CTRIPOUTH_OR_L);  // INPUT3: CMPSS3.COMPH/COMPL
-    BTS_HAL_setupInputXBAR(4, 1, XBAR_OUT_MUX06_CMPSS4_CTRIPOUTH_OR_L);  // INPUT4: CMPSS4.COMPH/COMPL
-    BTS_HAL_setupInputXBAR(5, 1, XBAR_OUT_MUX08_CMPSS5_CTRIPOUTH_OR_L);  // INPUT5: CMPSS5.COMPH/COMPL
-    BTS_HAL_setupInputXBAR(6, 1, XBAR_OUT_MUX10_CMPSS6_CTRIPOUTH_OR_L);  // INPUT6: CMPSS6.COMPH/COMPL
-    BTS_HAL_setupInputXBAR(7, 1, XBAR_OUT_MUX12_CMPSS7_CTRIPOUTH_OR_L);  // INPUT7: CMPSS7.COMPH/COMPL
-    BTS_HAL_setupInputXBAR(8, 1, XBAR_OUT_MUX14_CMPSS8_CTRIPOUTH_OR_L);  // INPUT8: CMPSS8.COMPH/COMPL
+    //
+    // Route each channel's CMPSS trip to an ePWM X-BAR trip signal.
+    //
+    // The previous code pushed XBAR_OUT_MUX* constants into the *Input*
+    // X-BAR, which interprets its argument as a GPIO pin number - so those
+    // calls silently selected GPIO1, GPIO5, GPIO9, ... instead of wiring up
+    // any comparator.
+    //
+    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP4,  XBAR_EPWM_MUX00_CMPSS1_CTRIPH_OR_L, XBAR_MUX00);
+    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP5,  XBAR_EPWM_MUX02_CMPSS2_CTRIPH_OR_L, XBAR_MUX02);
+    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP7,  XBAR_EPWM_MUX04_CMPSS3_CTRIPH_OR_L, XBAR_MUX04);
+    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP8,  XBAR_EPWM_MUX06_CMPSS4_CTRIPH_OR_L, XBAR_MUX06);
+    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP9,  XBAR_EPWM_MUX08_CMPSS5_CTRIPH_OR_L, XBAR_MUX08);
+    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP10, XBAR_EPWM_MUX10_CMPSS6_CTRIPH_OR_L, XBAR_MUX10);
+    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP11, XBAR_EPWM_MUX12_CMPSS7_CTRIPH_OR_L, XBAR_MUX12);
+    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP12, XBAR_EPWM_MUX14_CMPSS8_CTRIPH_OR_L, XBAR_MUX14);
 
     // Configure GPIOs for individual trips, group trip, and AND gate outputs
-    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH1);
-    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH2);
-    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH3);
-    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH4);
-    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH5);
-    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH6);
-    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH7);
-    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH8);
+#if (BTS_TRIP_GPIO_CH1_ENABLED == true)
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH1, BTS_TRP_PIN_GPIO_CH1);
+#else
+    //
+    // GPIO28 is the debug console RX in this build - leave it to SCIA.
+    // Channel 1 keeps its CMPSS over-current trip; only the GPIO trip
+    // input is unavailable, and it is not physically connected here.
+    //
+#endif
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH2, BTS_TRP_PIN_GPIO_CH2);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH3, BTS_TRP_PIN_GPIO_CH3);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH4, BTS_TRP_PIN_GPIO_CH4);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH5, BTS_TRP_PIN_GPIO_CH5);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH6, BTS_TRP_PIN_GPIO_CH6);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH7, BTS_TRP_PIN_GPIO_CH7);
+    BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH8, BTS_TRP_PIN_GPIO_CH8);
 
-    // Configure Input X-BAR for GPIO AND group trips (INPUT9 to INPUT16)
-    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH1);
-    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH2);
-    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH3);
-    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH4);
-    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH5);
-    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH6);
-    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH7);
-    BTS_HAL_setupInputXBAR(9, 0, BTS_TRP_PIN_CONFIG_GPIO_CH8);
+    //
+    // Configure Input X-BAR for the GPIO trips.
+    //
+    // XBAR_setInputPin takes a bare pin number. Each X-BAR input can select
+    // exactly one pin, so the eight trips need eight separate inputs -
+    // INPUT9..INPUT16. The previous code assigned all eight to INPUT9, where
+    // each call simply overwrote the last and only channel 8 survived.
+    //
+#if (BTS_TRIP_GPIO_CH1_ENABLED == true)
+    BTS_HAL_setupInputXBAR(9,  0, BTS_TRP_PIN_GPIO_CH1);
+#endif
+    BTS_HAL_setupInputXBAR(10, 0, BTS_TRP_PIN_GPIO_CH2);
+    BTS_HAL_setupInputXBAR(11, 0, BTS_TRP_PIN_GPIO_CH3);
+    BTS_HAL_setupInputXBAR(12, 0, BTS_TRP_PIN_GPIO_CH4);
+    BTS_HAL_setupInputXBAR(13, 0, BTS_TRP_PIN_GPIO_CH5);
+    BTS_HAL_setupInputXBAR(14, 0, BTS_TRP_PIN_GPIO_CH6);
+    BTS_HAL_setupInputXBAR(15, 0, BTS_TRP_PIN_GPIO_CH7);
+    BTS_HAL_setupInputXBAR(16, 0, BTS_TRP_PIN_GPIO_CH8);
 
     // Configure Trip Zones for all ePWM modules
     for (uint16_t i = 1; i <= 8; i++) {

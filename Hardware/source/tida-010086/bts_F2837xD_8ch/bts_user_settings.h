@@ -11,6 +11,63 @@
 
 #include "bts_user_calibration.h"
 
+//
+//=============================================================================
+// Build mode: GPIO28/29 role selection
+//=============================================================================
+//
+// GPIO28 and GPIO29 are physically shared between three functions, so the
+// build has to choose. BTS_DEBUG_CONSOLE selects which:
+//
+//   BTS_DEBUG_CONSOLE == true   (bench debug)
+//     GPIO28 = SCIRXDA, GPIO29 = SCITXDA. The AT command console runs on
+//     SCIA, reachable over the TMDSCNCD28379D's isolated FTDI backchannel -
+//     the COM port that enumerates on the same USB cable as the XDS100v2.
+//     Channel 1's GPIO trip input shares GPIO28 and is therefore disabled;
+//     it is not physically connected in this configuration. The WS2812B
+//     LED string is disabled too, as it needs GPIO29.
+//
+//   BTS_DEBUG_CONSOLE == false  (production)
+//     GPIO28 = channel 1 GPIO trip input (digital in).
+//     GPIO29 = SCITXDA, transmit-only, driving the WS2812B LED string at
+//     800 kbaud. The AT command console is not available in this build -
+//     there is no free SCI port for it, so the host uses I2C or CAN.
+//
+// SCIB is not an alternative: GPIO18 is SPICLKA and GPIO19 is the ADC1 chip
+// select for the external 24-bit SPI ADCs.
+//
+// Channel 1 keeps its CMPSS over-current trip in both modes. Only the
+// separate GPIO trip input is affected.
+//
+#define BTS_DEBUG_CONSOLE (true)
+
+#if (BTS_DEBUG_CONSOLE == true)
+    //
+    // Bench debug: SCIA carries the AT console on the FTDI backchannel.
+    //
+    #define BTS_CONSOLE_ENABLED       (true)
+    #define BTS_CONSOLE_SCI_BASE      SCIA_BASE
+    #define BTS_CONSOLE_TX_PINCONFIG  GPIO_29_SCITXDA
+    #define BTS_CONSOLE_RX_PINCONFIG  GPIO_28_SCIRXDA
+    #define BTS_CONSOLE_RX_INT        INT_SCIA_RX
+    // The FTDI backchannel is a standard 115200 8N1 port.
+    #define BTS_CONSOLE_BAUDRATE      ((uint32_t)115200)
+
+    // GPIO29 is the console TX, so the LED string cannot have it.
+    #define BTS_LED_DRIVER_ENABLED    (false)
+
+    // GPIO28 is the console RX, so channel 1's GPIO trip cannot have it.
+    #define BTS_TRIP_GPIO_CH1_ENABLED (false)
+#else
+    //
+    // Production: no console. GPIO29 is transmit-only for the LED string and
+    // GPIO28 returns to channel 1's trip input.
+    //
+    #define BTS_CONSOLE_ENABLED       (false)
+    #define BTS_LED_DRIVER_ENABLED    (true)
+    #define BTS_TRIP_GPIO_CH1_ENABLED (true)
+#endif
+
 #define BTS_ENABLE_DETECT_CODE (false)
 #define BTS_ENABLE_CH1 (true)
 #define BTS_ENABLE_CH2 (false)
@@ -24,6 +81,50 @@
 #define BTS_TRIP_CODE   (true)
 #define BTS_OCP_TRIGGER (false)
 #define BTS_USER_DEFAULT_TRIP_A           ((float32_t)8)
+
+//
+//=============================================================================
+// CMPSS over-current trip thresholds
+//=============================================================================
+//
+// Each channel's current-sense signal is presented to a CMPSS comparator on
+// an ADC input pin. The comparator compares that pin against the module's
+// internal 12-bit DAC, so the trip level is expressed as a DAC count.
+//
+// Signal scaling: the sense chain is bipolar and spans approximately +/-10 A
+// across the full input range, centred at mid-scale (0 A sits at VDDA/2).
+// With a 12-bit DAC referenced to VDDA:
+//
+//   count(I) = 2048 + I * (2048 / 10 A)
+//
+// so +8 A -> 2048 + 1638 = 3686 and -8 A -> 2048 - 1638 = 410.
+//
+// The high comparator trips above the positive threshold and the low
+// comparator below the negative one, giving symmetric protection in both
+// charge and discharge directions.
+//
+#define BTS_CMPSS_DAC_MAX                 ((float32_t)4095)
+#define BTS_CMPSS_DAC_MIDSCALE            ((float32_t)2048)
+// Full-scale current at either extreme of the sense range.
+#define BTS_CMPSS_FULLSCALE_A             ((float32_t)10)
+// DAC counts per amp.
+#define BTS_CMPSS_COUNTS_PER_A            (BTS_CMPSS_DAC_MIDSCALE / BTS_CMPSS_FULLSCALE_A)
+
+// Clamp so an over-large trip setting cannot wrap the 12-bit field.
+#define BTS_CMPSS_CLAMP(x)                                                    \
+    ((x) < (float32_t)0 ? (float32_t)0 :                                      \
+    ((x) > BTS_CMPSS_DAC_MAX ? BTS_CMPSS_DAC_MAX : (x)))
+
+#define BTS_CMPSS_DAC_HIGH_COUNT(amps)                                        \
+    ((uint16_t)BTS_CMPSS_CLAMP(BTS_CMPSS_DAC_MIDSCALE +                       \
+                               (amps) * BTS_CMPSS_COUNTS_PER_A))
+#define BTS_CMPSS_DAC_LOW_COUNT(amps)                                         \
+    ((uint16_t)BTS_CMPSS_CLAMP(BTS_CMPSS_DAC_MIDSCALE -                       \
+                               (amps) * BTS_CMPSS_COUNTS_PER_A))
+
+// Default trip levels: +/-8 A  ->  3686 / 410 counts.
+#define BTS_CMPSS_TRIP_HIGH               BTS_CMPSS_DAC_HIGH_COUNT(BTS_USER_DEFAULT_TRIP_A)
+#define BTS_CMPSS_TRIP_LOW                BTS_CMPSS_DAC_LOW_COUNT(BTS_USER_DEFAULT_TRIP_A)
 
 // Add new averaging factor for F28 ADC
 #define BTS_f28AverageFactor 8  // Smaller factor for faster response
@@ -120,7 +221,7 @@
 #define CLEAR_TASKC_TIMER_OVERFLOW_FLAG CPUTimer_clearOverflowFlag(TASKC_CPUTIMER_BASE)
 
 // GPIO assignments
-// CMPSS thresholds for ±10A
+// CMPSS thresholds for ï¿½10A
 #define CMPSS_THRESHOLD_HIGH 836  // 2.45V (+10A) = 836 counts
 #define CMPSS_THRESHOLD_LOW 17    // 0.05V (-10A) = 17 counts
 
@@ -132,6 +233,23 @@
 #define BTS_TRP_PIN_CONFIG_GPIO_CH6     GPIO_44_GPIO44
 #define BTS_TRP_PIN_CONFIG_GPIO_CH7     GPIO_45_GPIO45
 #define BTS_TRP_PIN_CONFIG_GPIO_CH8     GPIO_46_GPIO46
+
+//
+// The bare pin numbers for the trip inputs above.
+//
+// GPIO_setPinConfig() takes the packed mux encoding (GPIO_28_GPIO28 ==
+// 0x00081800), but GPIO_setDirectionMode(), GPIO_setQualificationMode(),
+// GPIO_setPadConfig() and XBAR_setInputPin() all take a plain pin number.
+// Passing the encoding to those trips driverlib's ASSERT(pin <= 168).
+//
+#define BTS_TRP_PIN_GPIO_CH1            28U
+#define BTS_TRP_PIN_GPIO_CH2            26U
+#define BTS_TRP_PIN_GPIO_CH3            27U
+#define BTS_TRP_PIN_GPIO_CH4            34U
+#define BTS_TRP_PIN_GPIO_CH5            39U
+#define BTS_TRP_PIN_GPIO_CH6            44U
+#define BTS_TRP_PIN_GPIO_CH7            45U
+#define BTS_TRP_PIN_GPIO_CH8            46U
 
 
  // Map: A2->COMP1A, B2->COMP2B, A4->COMP3A, IN14->COMP4A, D0->COMP5D, C2->COMP6C, D2->COMP7D, C4->COMP8C

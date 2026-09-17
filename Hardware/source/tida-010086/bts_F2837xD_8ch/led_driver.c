@@ -10,6 +10,7 @@
 #include "device.h"
 
 #ifdef CPU2
+#if (BTS_LED_DRIVER_ENABLED == true)
 
 // LED colour tables (GRB order for WS2812B)
 static const uint16_t colorRed[3]   = COLOR_RED;
@@ -22,9 +23,10 @@ static uint16_t ledBuffer[LED_BUFFER_SIZE];
 
 // UART initialization for WS2812B
 void LEDDriver_init(void) {
-    // Configure GPIO for SCIA_TX (GPIO_29)
-    GPIO_setPinConfig(GPIO_29_SCITXDA);
-    GPIO_setDirectionMode(29, GPIO_DIR_MODE_OUT);
+    //
+    // GPIO29 is muxed to SCITXDA by CPU1 in BTS_HAL_setupCpu2Pins(); the mux
+    // registers are not writable from CPU2.
+    //
 
     // UART config: 800 kbps (WS2812B timing), 8-bit, no parity
     SCI_setConfig(SCIA_BASE, DEVICE_LSPCLK_FREQ, 800000, (SCI_CONFIG_WLEN_8 | SCI_CONFIG_STOP_ONE | SCI_CONFIG_PAR_NONE));
@@ -99,4 +101,20 @@ __interrupt void ledTimerISR(void) {
     CPUTimer_clearOverflowFlag(CPUTIMER0_BASE);
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
 }
+
+#else  /* BTS_LED_DRIVER_ENABLED == false */
+
+//
+// The WS2812B driver bit-bangs on SCIA, which the debug console takes over
+// when BTS_CONSOLE_ON_BACKCHANNEL is set. Provide no-op stubs so main() does
+// not need conditional compilation.
+//
+void LEDDriver_init(void) { }
+void LEDDriver_update(void) { }
+__interrupt void ledTimerISR(void) {
+    CPUTimer_clearOverflowFlag(CPUTIMER0_BASE);
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
+}
+
+#endif /* BTS_LED_DRIVER_ENABLED */
 #endif
