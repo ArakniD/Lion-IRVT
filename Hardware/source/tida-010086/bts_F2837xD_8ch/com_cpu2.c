@@ -56,10 +56,20 @@
 #define ADS1119_MUX_SHIFT       5U
 #define ADS1119_MUX_AIN0_AGND   3U     // 011; +channel selects AIN1..AIN3
 #define ADS1119_CFG_GAIN_1      0x00U
-#define ADS1119_CFG_DR_90SPS    0x04U  // DR = 01
+//
+// Data rate. The part offers 20, 90, 330 and 1000 SPS only - there is no
+// slower setting. 20 SPS is the one to use here: cell temperature moves
+// slowly, and it is the rate at which the digital filter gives 16-bit
+// noise-free resolution with simultaneous 50/60 Hz mains rejection.
+//
+// It also keeps the DRDY interrupt load down. Each conversion drives a
+// blocking I2C read from the ISR, so at 8 channels across two devices
+// this is 40 transfers a second rather than 180.
+//
+#define ADS1119_CFG_DR_20SPS    0x00U  // DR = 00
 #define ADS1119_CFG_CM_CONT     0x02U  // CM = 1
 #define ADS1119_CFG_VREF_EXT    0x01U  // VREF = 1, external
-#define ADS1119_CFG_BASE        (ADS1119_CFG_GAIN_1 | ADS1119_CFG_DR_90SPS |                                  ADS1119_CFG_CM_CONT | ADS1119_CFG_VREF_EXT)
+#define ADS1119_CFG_BASE        (ADS1119_CFG_GAIN_1 | ADS1119_CFG_DR_20SPS |                                  ADS1119_CFG_CM_CONT | ADS1119_CFG_VREF_EXT)
 
 // Configuration byte selecting single-ended AIN<ch> for ch = 0..3.
 #define ADS1119_CFG_FOR_CH(ch)  ((uint16_t)ADS1119_CFG_BASE |                                                  (uint16_t)(((ADS1119_MUX_AIN0_AGND + (ch)) &                                              0x07U) << ADS1119_MUX_SHIFT))
@@ -155,23 +165,36 @@ static const float32_t defaultVoutOffset_V[NUM_CHANNELS] = {
     BTS_VoutOffset_ch5_V, BTS_VoutOffset_ch6_V, BTS_VoutOffset_ch7_V, BTS_VoutOffset_ch8_V
 };
 
-// mV to Temperature lookup table (placeholder)
-static const struct {
-    float mV;
-    float tempC;
-} mvToTempTable[] = {
-    {500.0f, 0.0f},
-    {600.0f, 10.0f},
-    {700.0f, 20.0f},
-    {800.0f, 30.0f},
-    {900.0f, 40.0f},
-    {1000.0f, 50.0f},
-    {1100.0f, 60.0f},
-    {1200.0f, 70.0f},
-    {1300.0f, 80.0f},
-    {1400.0f, 90.0f}
-};
-#define MV_TO_TEMP_TABLE_SIZE (sizeof(mvToTempTable) / sizeof(mvToTempTable[0]))
+//
+// Signal-conditioned thermistor response.
+//
+// The NTC does not reach the converter directly - it goes through the board
+// amplifier stage first, so the useful curve is of the amplifier output, not
+// of the raw divider. This fourth-order fit was measured on the hardware and
+// covers roughly 20 C to 100 C over 0.1 V to 2.9 V in:
+//
+//   degC = 0.4038*V^4 - 0.2199*V^3 - 3.2834*V^2 + 28.366*V + 18.323
+//
+// The curve is well behaved below that: it bottoms out at +18.3 C for 0 V
+// in, so a low reading is a cold sensor, never a missing one. There is no
+// input this conditioning can produce that maps to an implausible value.
+//
+// At the other end the converter full scale is the 2.50 V reference, so the
+// top of the amplifier range is not reachable - readings saturate near
+// 81 C. That is a property of the analogue front end, not of this code.
+//
+#define BTS_NTC_POLY_C4   ((float)0.4038)
+#define BTS_NTC_POLY_C3   ((float)-0.2199)
+#define BTS_NTC_POLY_C2   ((float)-3.2834)
+#define BTS_NTC_POLY_C1   ((float)28.366)
+#define BTS_NTC_POLY_C0   ((float)18.323)
+
+//
+// Upper end of the fitted range. The curve bottoms out at +18.3 C for
+// 0 V in, so only the top needs bounding.
+//
+#define BTS_NTC_V_MAX     ((float)2.95)
+
 
 //
 // Measured temperatures live in registers[BTS_CELLTEMP_IDX(ch)] - there is no
@@ -200,6 +223,12 @@ __interrupt void uartRxISR(void);
 __interrupt void timerISR(void);
 __interrupt void ads1119Drdy1ISR(void);
 __interrupt void ads1119Drdy2ISR(void);
+
+//
+// Background tasks, driven from the idle loop in main().
+//
+void BTS_serviceADS1119(void);
+void BTS_serviceDeferredWork(void);
 
 void uartSendResponse(const char* response);
 void saveCalibration(uint16_t channel);
@@ -433,56 +462,91 @@ static bool i2cReadBlock(uint16_t devAddr, uint16_t memAddr,
 //
 
 //
-// Sends a bare single-byte command (RESET, START/SYNC, POWERDOWN).
+// Writes a command, and optionally its data byte, then stops.
 //
-static bool ads1119Command(uint16_t devAddr, uint16_t cmd)
+//   S  ADDR W A  CMD A  [DATA A]  P
+//
+// Used for the bare commands (RESET, START/SYNC, POWERDOWN) and for WREG,
+// which is the same frame with one payload byte appended.
+//
+static bool ads1119Write(uint16_t devAddr, uint16_t cmd,
+                         const uint16_t *data)
 {
+    uint16_t count = (data != 0) ? 2U : 1U;
+    uint32_t guard;
+
     if (!i2cMasterWaitBusFree()) {
         return false;
     }
 
+    //
+    // One atomic write to I2CMDR starts the frame with the stop already
+    // armed, so the module emits it once the byte count reaches zero.
+    //
+    // The driverlib sequence cannot be used here. It needs three separate
+    // writes to get a frame moving, and setting STP in a later one races the
+    // transfer: on a one-byte command the frame is torn down before the
+    // eighth falling edge of SCL, which is exactly where the ADS1119 latches
+    // a command, so the part never sees it. Arming the stop up front is safe
+    // because the module honours the byte count first.
+    //
     I2C_setTargetAddress(I2CB_BASE, devAddr);
-    I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
-    I2C_setDataCount(I2CB_BASE, 1U);
-    I2C_putData(I2CB_BASE, cmd & 0xFFU);
-    I2C_sendStartCondition(I2CB_BASE);
+    HWREGH(I2CB_BASE + I2C_O_CNT) = count;
 
     //
-    // Wait for the command byte to leave the transmit register before
-    // asking for the stop. Setting STP in the same breath as STT tears
-    // the transfer down before the byte has been clocked out, so the
-    // part never sees the command - it is latched on the eighth falling
-    // edge of SCL - and the transaction never completes. The EEPROM
-    // helpers above get this right, which is why they worked while every
-    // ADS1119 access failed.
+    // The first byte goes in before the frame starts so it is ready the
+    // moment the address has been acknowledged.
     //
-    {
-        uint32_t guard = 0;
+    I2C_putData(I2CB_BASE, cmd & 0xFFU);
+
+    HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                    I2C_MDR_STP  | I2C_MDR_MST |
+                                    I2C_MDR_TRX  | I2C_MDR_IRS;
+
+    //
+    // I2CB runs without its transmit FIFO, so I2CDXR holds exactly one byte:
+    // the second one can only be handed over once the first has been taken.
+    //
+    if (data != 0) {
+        guard = 0;
         while ((I2C_getStatus(I2CB_BASE) & I2C_STS_TX_DATA_RDY) == 0U) {
             if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
-                I2C_sendStopCondition(I2CB_BASE);
+                i2cMasterWaitStopComplete();
                 return false;
             }
             if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
                 I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
-                I2C_sendStopCondition(I2CB_BASE);
+                i2cMasterWaitStopComplete();
                 return false;
             }
         }
-    }
-
-    I2C_sendStopCondition(I2CB_BASE);
-
-    if (!i2cMasterWaitReady()) {
-        return false;
+        I2C_putData(I2CB_BASE, *data & 0xFFU);
     }
 
     //
-    // ARDY only says the module finished its own work; the stop still
-    // has to land before the bus belongs to anyone else.
+    // Wait for the stop the module was told to send. Neither XRDY nor ARDY
+    // can stand in for this: XRDY is already high at the start because
+    // I2CDXR is empty, and ARDY is latched and self-clearing, so on frames
+    // this short it can set and clear again before the first poll.
     //
     i2cMasterWaitStopComplete();
-    return true;
+
+    //
+    // The part latches a command on the eighth falling edge of SCL and then
+    // acts on it; starting the next frame immediately can arrive while it is
+    // still doing so.
+    //
+    DEVICE_DELAY_US(50);
+
+    return (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) == 0U;
+}
+
+//
+// Sends a bare single-byte command (RESET, START/SYNC, POWERDOWN).
+//
+static bool ads1119Command(uint16_t devAddr, uint16_t cmd)
+{
+    return ads1119Write(devAddr, cmd, 0);
 }
 
 //
@@ -492,129 +556,107 @@ static bool ads1119Command(uint16_t devAddr, uint16_t cmd)
 //
 static bool ads1119WriteConfig(uint16_t devAddr, uint16_t cfg)
 {
-    if (!i2cMasterWaitBusFree()) {
-        return false;
-    }
+    uint16_t value = cfg & 0xFFU;
 
-    I2C_setTargetAddress(I2CB_BASE, devAddr);
-    I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
-    I2C_setDataCount(I2CB_BASE, 2U);
-    I2C_putData(I2CB_BASE, ADS1119_CMD_WREG);
-    I2C_putData(I2CB_BASE, cfg & 0xFFU);
-    I2C_sendStartCondition(I2CB_BASE);
-
-    //
-    // Both bytes have to clear the transmit register before the stop is
-    // requested - see the note in ads1119Command().
-    //
-    {
-        uint16_t sent;
-        for (sent = 0; sent < 2U; sent++) {
-            uint32_t guard = 0;
-            while ((I2C_getStatus(I2CB_BASE) & I2C_STS_TX_DATA_RDY) == 0U) {
-                if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
-                    I2C_sendStopCondition(I2CB_BASE);
-                    return false;
-                }
-                if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
-                    I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
-                    I2C_sendStopCondition(I2CB_BASE);
-                    return false;
-                }
-            }
-        }
-    }
-
-    I2C_sendStopCondition(I2CB_BASE);
-
-    if (!i2cMasterWaitReady()) {
-        return false;
-    }
-
-    //
-    // ARDY only says the module finished its own work; the stop still
-    // has to land before the bus belongs to anyone else.
-    //
-    i2cMasterWaitStopComplete();
-    return true;
+    return ads1119Write(devAddr, ADS1119_CMD_WREG, &value);
 }
 
 //
-// Issues a command byte, then a repeated start into a read of count bytes.
-// Shared by RREG (1 byte) and RDATA (2 bytes).
+// Issues a command and reads its response after a repeated start.
+//
+//   S  ADDR W A  CMD A  Sr  ADDR R A  DATA ... P
+//
+// Used by RREG (configuration or status) and RDATA.
 //
 static bool ads1119ReadAfterCommand(uint16_t devAddr, uint16_t cmd,
                                     uint16_t *bytes, uint16_t count)
 {
     uint16_t i;
+    uint32_t guard;
 
     if (!i2cMasterWaitBusFree()) {
         return false;
     }
 
     //
-    // Phase 1: the command byte, with no stop - a repeated start follows.
+    // Both phases drive I2CMDR with a single write rather than going through
+    // I2C_setConfig() / I2C_sendStartCondition() separately.
+    //
+    // The driverlib helpers issue three writes to get a frame moving, and
+    // I2C_setConfig() preserves STT and STP while it does so. On frames this
+    // short the transfer can complete between those writes, so the sequence
+    // has to be committed atomically or the repeated start below lands on a
+    // transaction the module has already finished. These are the exact mode
+    // words that were verified working against both converters by hand.
+    //
+    //   MST | TRX | IRS | FREE | STT        - write phase, no stop
+    //   MST |       IRS | FREE | STT | STP  - read phase, stop after N bytes
+    //
+
+    //
+    // Phase 1: the command byte. No stop - a repeated start follows.
     //
     I2C_setTargetAddress(I2CB_BASE, devAddr);
-    I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
-    I2C_setDataCount(I2CB_BASE, 1U);
+    HWREGH(I2CB_BASE + I2C_O_CNT) = 1U;
     I2C_putData(I2CB_BASE, cmd & 0xFFU);
-    I2C_sendStartCondition(I2CB_BASE);
+    HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                    I2C_MDR_MST  | I2C_MDR_TRX |
+                                    I2C_MDR_IRS;
 
-    if (!i2cMasterWaitReady()) {
-        I2C_sendStopCondition(I2CB_BASE);
-        return false;
+    //
+    // The command has to be on the wire before the repeated start. ARDY is
+    // the module's own "ready for the next phase" signal and is the right
+    // one here precisely because no stop is involved.
+    //
+    guard = 0;
+    while ((I2C_getStatus(I2CB_BASE) & I2C_STS_REG_ACCESS_RDY) == 0U) {
+        if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
+            I2C_sendStopCondition(I2CB_BASE);
+            i2cMasterWaitStopComplete();
+            return false;
+        }
+        if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
+            I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
+            I2C_sendStopCondition(I2CB_BASE);
+            i2cMasterWaitStopComplete();
+            return false;
+        }
     }
 
     //
-    // Phase 2: repeated start, then read the response.
+    // Phase 2: repeated start into a read, with the stop already armed so
+    // the module releases the bus itself once the last byte has come in.
     //
-    I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_RECEIVE_MODE);
-    I2C_setDataCount(I2CB_BASE, count);
-    I2C_sendStartCondition(I2CB_BASE);
+    HWREGH(I2CB_BASE + I2C_O_CNT) = count;
+    HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                    I2C_MDR_STP  | I2C_MDR_MST |
+                                    I2C_MDR_IRS;
 
     for (i = 0; i < count; i++) {
-        uint32_t guard = 0;
+        guard = 0;
         while ((I2C_getStatus(I2CB_BASE) & I2C_STS_RX_DATA_RDY) == 0U) {
             if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
                 I2C_sendStopCondition(I2CB_BASE);
+                i2cMasterWaitStopComplete();
                 return false;
             }
             if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
                 I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
                 I2C_sendStopCondition(I2CB_BASE);
+                i2cMasterWaitStopComplete();
                 return false;
             }
         }
         bytes[i] = I2C_getData(I2CB_BASE) & 0xFFU;
     }
 
-    I2C_sendStopCondition(I2CB_BASE);
-
     //
-    // Let the stop reach the wire before handing the bus on. Returning
-    // the moment STP is requested leaves BB set for the next caller,
-    // whose setTargetAddress() is then ignored - which is how a
-    // perfectly healthy device ends up looking absent.
+    // The stop was armed with the read, so just wait for it to land before
+    // handing the bus on - leaving BB set makes the next caller's target
+    // address write silently ignored.
     //
     i2cMasterWaitStopComplete();
     return true;
-}
-
-//
-// Identifies a converter. The ADS1119 has no device-ID register, so the only
-// available check is that it acknowledges its address and reads back the
-// configuration byte just written to it.
-//
-static bool ads1119Identify(uint16_t devAddr, uint16_t expectedCfg)
-{
-    uint16_t readback = 0;
-
-    if (!ads1119ReadAfterCommand(devAddr, ADS1119_CMD_RREG_CFG, &readback, 1U)) {
-        return false;
-    }
-
-    return ((readback & 0xFFU) == (expectedCfg & 0xFFU));
 }
 
 //
@@ -1015,26 +1057,53 @@ void initTimer(void)
 static bool ads1119Start(uint16_t devAddr)
 {
     uint16_t cfg = ADS1119_CFG_FOR_CH(0U);
+    uint16_t readback = 0;
 
     //
     // Reset first so the part is in a known state regardless of what the
-    // shared RESET1/RESET2 line did earlier. No delay is required after the
-    // RESET command latches.
+    // shared RESET1/RESET2 line did earlier.
     //
     if (!ads1119Command(devAddr, ADS1119_CMD_RESET)) {
         return false;
     }
+
+    //
+    // The datasheet gives no explicit recovery time for the RESET command,
+    // but the power-on reset takes around 500 us to release. Give the part
+    // the same margin before configuring it: a WREG that lands while the
+    // reset is still settling is accepted on the bus and then discarded,
+    // which reads back as 00h and looks exactly like a missing device.
+    //
+    DEVICE_DELAY_US(1000);
 
     if (!ads1119WriteConfig(devAddr, cfg)) {
         return false;
     }
 
     //
-    // The part has no ID register, so this read-back is the identification:
-    // it proves both that the address ACKed and that the configuration took.
+    // The part has no ID register, so reading the configuration back is the
+    // identification. Distinguish the two ways this can fail, because they
+    // mean very different things on the bench.
     //
-    if (!ads1119Identify(devAddr, cfg)) {
+    if (!ads1119ReadAfterCommand(devAddr, ADS1119_CMD_RREG_CFG, &readback, 1U)) {
         return false;
+    }
+
+    if ((readback & 0xFFU) != (cfg & 0xFFU)) {
+        //
+        // It answered but did not keep the configuration. Retry once: the
+        // usual cause is a WREG that raced the reset above.
+        //
+        if (!ads1119WriteConfig(devAddr, cfg)) {
+            return false;
+        }
+        if (!ads1119ReadAfterCommand(devAddr, ADS1119_CMD_RREG_CFG,
+                                     &readback, 1U)) {
+            return false;
+        }
+        if ((readback & 0xFFU) != (cfg & 0xFFU)) {
+            return false;
+        }
     }
 
     //
@@ -1046,6 +1115,18 @@ static bool ads1119Start(uint16_t devAddr)
 
 void initADS1119(void)
 {
+    //
+    // Free-running timebase for the settling delay between channels.
+    //
+    // CPU timer 0 is otherwise only started by the WS2812B driver, which
+    // is compiled out in a console build, so start it here and let it run
+    // with no interrupt. Only the counter is read.
+    //
+    CPUTimer_setPeriod(CPUTIMER0_BASE, 0xFFFFFFFFUL);
+    CPUTimer_setPreScaler(CPUTIMER0_BASE, 0U);
+    CPUTimer_disableInterrupt(CPUTIMER0_BASE);
+    CPUTimer_startTimer(CPUTIMER0_BASE);
+
     bool ok1;
     bool ok2;
 
@@ -1106,17 +1187,43 @@ void initADS1119(void)
 
 float mVToTemperature(float mV)
 {
-    if (mV <= mvToTempTable[0].mV) return mvToTempTable[0].tempC;
-    if (mV >= mvToTempTable[MV_TO_TEMP_TABLE_SIZE-1].mV) return mvToTempTable[MV_TO_TEMP_TABLE_SIZE-1].tempC;
+    float v = mV * (float)0.001;
+    float t;
 
-    for (uint16_t i = 0; i < MV_TO_TEMP_TABLE_SIZE-1; i++) {
-        if (mV >= mvToTempTable[i].mV && mV < mvToTempTable[i+1].mV) {
-            float mVRange = mvToTempTable[i+1].mV - mvToTempTable[i].mV;
-            float tempRange = mvToTempTable[i+1].tempC - mvToTempTable[i].tempC;
-            return mvToTempTable[i].tempC + (mV - mvToTempTable[i].mV) * tempRange / mVRange;
-        }
+    //
+    // No low-end rejection. The amplifier holds its output above ground, so
+    // the fit bottoms out at +18.3 C for 0 V in - there is no input voltage
+    // that produces a nonsensically low temperature, and a reading of a few
+    // tens of millivolts is a genuine measurement just under 19 C rather
+    // than a sign of a missing sensor.
+    //
+    // Negative inputs are the one exception: the converter is bipolar, so a
+    // negative code means the input went below AGND, which the conditioning
+    // cannot legitimately produce.
+    //
+    if (v < (float)0.0) {
+        v = (float)0.0;
     }
-    return 0.0f;
+
+    //
+    // The top of the amplifier range sits above the converter full scale, so
+    // a reading cannot legitimately exceed it. Clamp rather than reject:
+    // this end is a genuine over-temperature, not a wiring fault.
+    //
+    if (v > BTS_NTC_V_MAX) {
+        v = BTS_NTC_V_MAX;
+    }
+
+    //
+    // Horner's method - four multiply-adds rather than building the powers.
+    //
+    t = BTS_NTC_POLY_C4;
+    t = t * v + BTS_NTC_POLY_C3;
+    t = t * v + BTS_NTC_POLY_C2;
+    t = t * v + BTS_NTC_POLY_C1;
+    t = t * v + BTS_NTC_POLY_C0;
+
+    return t;
 }
 
 float readADS1119Data(uint16_t adsAddr, uint16_t channel)
@@ -1197,18 +1304,83 @@ static void publishCellTemp(uint16_t channel, float temp, bool valid)
     }
 }
 
+//
+//=============================================================================
+// Background temperature acquisition
+//=============================================================================
+//
+// The converters are serviced from the main loop, not from the DRDY
+// interrupts. An I2C transfer at 400 kHz takes tens of microseconds, and the
+// old code ran a whole RDATA frame plus a reconfiguration write inside the
+// ISR with spin-waits throughout. That starved everything else on this core:
+// the AT console dropped characters and the I2CA slave could not answer the
+// host while a conversion was being collected.
+//
+// Now a DRDY edge only records that a result is waiting. BTS_serviceADS1119()
+// performs one short, non-blocking step per call from the idle loop, so the
+// bus is driven continuously in the background while the interrupts stay
+// trivially short.
+//
+typedef enum {
+    eAdsIdle = 0,       // waiting for DRDY
+    eAdsReadCmd,        // RDATA command frame issued
+    eAdsReadData,       // collecting the two result bytes
+    eAdsSetMux,         // starting the WREG frame for the next channel
+    eAdsMuxDone,        // waiting for the WREG frame to complete
+    eAdsStart,          // re-arming conversions after the mux change
+    eAdsStartDone,      // waiting for the START/SYNC frame to finish
+    eAdsSettle,         // letting the new channel settle
+} BTS_adsState;
+
+static volatile BTS_adsState adsState[2]   = {eAdsIdle, eAdsIdle};
+static volatile uint16_t     adsPending[2] = {0U, 0U};
+static uint16_t              adsRxBytes[2][2];
+static uint16_t              adsRxCount[2] = {0U, 0U};
+static uint32_t              adsGuard[2]   = {0U, 0U};
+static uint32_t              adsDwellStart[2] = {0U, 0U};
+static uint16_t              adsSampleCh[2] = {0U, 0U};
+
+//
+// Bound on how many service calls one transfer phase may occupy before it is
+// abandoned. The idle loop calls in continuously, so this is a generous
+// ceiling that only trips on genuinely stuck hardware.
+//
+#define ADS1119_PHASE_MAX_POLLS  2000UL
+
+//
+// Poll bound for the one byte handed over inside the WREG frame. A byte
+// at 400 kHz is about 22 us, so this is generous while staying far
+// below the 55 ms interface timeout of the part.
+//
+#define ADS1119_WREG_BYTE_TIMEOUT  20000UL
+
+//
+// Service calls to dwell on a channel after switching the mux. The idle
+// loop calls in continuously, so this is a coarse delay rather than a
+// calibrated one - it only has to be long enough that the reading
+// belongs to the new channel.
+//
+//
+// Settling time after a mux change, in SYSCLK counts.
+//
+// This has to outlast one full conversion so the result that follows was
+// started on the new input. At 20 SPS a conversion is 50 ms, so allow 60.
+// Counting service calls instead of time does not work: a call is a few
+// instructions at 160 MHz, so the loop races the converter and publishes
+// whatever was already in the output register.
+//
+#define ADS1119_SETTLE_US        (60000UL)
+#define ADS1119_SETTLE_COUNTS    ((uint32_t)(ADS1119_SETTLE_US) * (uint32_t)(DEVICE_SYSCLK_FREQ / 1000000U))
+
 #pragma CODE_SECTION(ads1119Drdy1ISR, "isrcodefuncs")
 #pragma INTERRUPT(ads1119Drdy1ISR, HPI)
 __interrupt void ads1119Drdy1ISR(void)
 {
-    uint16_t channel = currentAdsChannel[0];
-    float temp = readADS1119Data(ADS1119_ADDR_1, channel);
-
-    publishCellTemp(channel, temp, (adsFailCount[0] == 0U));
-
-    currentAdsChannel[0] = (currentAdsChannel[0] + 1U) % ADS1119_CHANNELS_PER_DEV;
-    configureNextChannel(ADS1119_ADDR_1, currentAdsChannel[0]);
-
+    //
+    // Record the edge and leave. All bus activity happens in the background
+    // service routine.
+    //
+    adsPending[0] = 1U;
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
 }
 
@@ -1216,16 +1388,386 @@ __interrupt void ads1119Drdy1ISR(void)
 #pragma INTERRUPT(ads1119Drdy2ISR, HPI)
 __interrupt void ads1119Drdy2ISR(void)
 {
-    uint16_t channel = currentAdsChannel[1];
-    float temp = readADS1119Data(ADS1119_ADDR_2, channel);
-
-    publishCellTemp(channel + ADS1119_CHANNELS_PER_DEV, temp,
-                    (adsFailCount[1] == 0U));
-
-    currentAdsChannel[1] = (currentAdsChannel[1] + 1U) % ADS1119_CHANNELS_PER_DEV;
-    configureNextChannel(ADS1119_ADDR_2, currentAdsChannel[1]);
-
+    adsPending[1] = 1U;
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
+}
+
+//
+// Abandons the transfer in progress on one converter and counts the failure.
+//
+static void ads1119Abort(uint16_t unit)
+{
+    uint32_t guard = 0;
+
+    //
+    // Get the bus back, not just the state machine.
+    //
+    // An abort happens mid-frame, so the module is part way through
+    // clocking a byte and is holding SCL low. Requesting a stop and
+    // walking away leaves it that way: SCL never returns high, every
+    // later transfer finds the bus busy, and both converters go quiet
+    // with nothing in the status register to say why. Reset the module
+    // through nIRS if the stop does not complete promptly.
+    //
+    I2C_sendStopCondition(I2CB_BASE);
+
+    while (I2C_isBusBusy(I2CB_BASE)) {
+        if (++guard > ADS1119_PHASE_MAX_POLLS) {
+            I2C_disableModule(I2CB_BASE);
+            SysCtl_delay(100U);
+            I2C_enableModule(I2CB_BASE);
+            break;
+        }
+    }
+
+    I2C_clearStatus(I2CB_BASE,
+                    I2C_STS_NO_ACK | I2C_STS_ARB_LOST |
+                    I2C_STS_REG_ACCESS_RDY | I2C_STS_STOP_CONDITION);
+
+    adsState[unit]   = eAdsIdle;
+    adsRxCount[unit] = 0U;
+    adsGuard[unit]   = 0U;
+
+    if (adsFailCount[unit] < ADS1119_MAX_CONSECUTIVE_FAILURES) {
+        adsFailCount[unit]++;
+        if (adsFailCount[unit] >= ADS1119_MAX_CONSECUTIVE_FAILURES) {
+            //
+            // Persistently unreachable: stop taking its interrupts so a dead
+            // converter cannot keep occupying the bus.
+            //
+            GPIO_disableInterrupt((unit == 0U) ? GPIO_INT_XINT1
+                                               : GPIO_INT_XINT2);
+        }
+    }
+}
+
+//
+// Advances one converter by a single step. Returns immediately whenever the
+// hardware is not ready yet, so no call blocks.
+//
+static void ads1119Service(uint16_t unit)
+{
+    uint16_t devAddr = (unit == 0U) ? ADS1119_ADDR_1 : ADS1119_ADDR_2;
+    uint16_t status  = I2C_getStatus(I2CB_BASE);
+
+    switch (adsState[unit]) {
+
+    case eAdsIdle:
+        //
+        // Only start once DRDY has fired and the bus is genuinely free - the
+        // other converter, the F-RAM, or a calibration save may be using it.
+        //
+        if ((adsPending[unit] == 0U) || I2C_isBusBusy(I2CB_BASE)) {
+            return;
+        }
+
+        adsPending[unit] = 0U;
+        adsRxCount[unit] = 0U;
+        adsGuard[unit]   = 0U;
+
+        //
+        // Phase 1 of RDATA: the command byte, no stop, repeated start to
+        // follow. Committed as a single write to I2CMDR for the reason given
+        // in ads1119Write().
+        //
+        I2C_setTargetAddress(I2CB_BASE, devAddr);
+        HWREGH(I2CB_BASE + I2C_O_CNT) = 1U;
+        I2C_putData(I2CB_BASE, ADS1119_CMD_RDATA);
+        HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                        I2C_MDR_MST  | I2C_MDR_TRX |
+                                        I2C_MDR_IRS;
+        adsState[unit] = eAdsReadCmd;
+        return;
+
+    case eAdsReadCmd:
+        if (status & I2C_STS_NO_ACK) {
+            I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
+            ads1119Abort(unit);
+            return;
+        }
+        if ((status & I2C_STS_REG_ACCESS_RDY) == 0U) {
+            if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
+                ads1119Abort(unit);
+            }
+            return;
+        }
+
+        //
+        // Phase 2: repeated start into a read, with the stop pre-armed so the
+        // module releases the bus itself after the second byte.
+        //
+        adsGuard[unit] = 0U;
+        HWREGH(I2CB_BASE + I2C_O_CNT) = 2U;
+        HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                        I2C_MDR_STP  | I2C_MDR_MST |
+                                        I2C_MDR_IRS;
+        adsState[unit] = eAdsReadData;
+        return;
+
+    case eAdsReadData:
+        if (status & I2C_STS_NO_ACK) {
+            I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
+            ads1119Abort(unit);
+            return;
+        }
+        if ((status & I2C_STS_RX_DATA_RDY) == 0U) {
+            if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
+                ads1119Abort(unit);
+            }
+            return;
+        }
+
+        adsGuard[unit] = 0U;
+        adsRxBytes[unit][adsRxCount[unit]] = I2C_getData(I2CB_BASE) & 0xFFU;
+        adsRxCount[unit]++;
+
+        if (adsRxCount[unit] < 2U) {
+            return;             // second byte still to come
+        }
+
+        //
+        // Both bytes in. Convert and publish, then point the mux at the next
+        // thermistor - the configuration write restarts conversion by itself.
+        //
+        {
+            uint16_t channel = adsSampleCh[unit];
+            int16_t  raw = (int16_t)(((adsRxBytes[unit][0] & 0xFFU) << 8) |
+                                      (adsRxBytes[unit][1] & 0xFFU));
+            float    mV  = ((float)raw * ADS1119_VREF_MV) / ADS1119_FULL_SCALE;
+
+            adsFailCount[unit] = 0U;
+
+            //
+            // The first result after a mux change belongs to the old
+            // input: the conversion was already in flight when the
+            // configuration was written, and at 20 SPS that is a whole
+            // 50 ms of stale charge on the new channel. Publishing it
+            // smears one thermistor onto its neighbour - a hot sensor
+            // shows up on the channel next to it, then vanishes.
+            //
+            //
+            // No discard is needed here. The channel is latched when the
+            // read starts, and the dwell after each mux change already
+            // drops any conversion left over from the previous input, so
+            // whatever arrives now genuinely belongs to this channel.
+            //
+            publishCellTemp(channel + (unit * ADS1119_CHANNELS_PER_DEV),
+                            mVToTemperature(mV), true);
+        }
+
+        //
+        // A real sample was published for this channel, so move on.
+        //
+        // currentAdsChannel now names the input the mux is about to be
+        // pointed at, and adsSampleCh keeps naming the one currently
+        // selected - which is what the next conversion will return.
+        //
+        currentAdsChannel[unit] =
+            (currentAdsChannel[unit] + 1U) % ADS1119_CHANNELS_PER_DEV;
+        adsState[unit] = eAdsSetMux;
+        return;
+
+    case eAdsSetMux:
+        //
+        // The read armed its own stop, so wait for the bus to clear before
+        // starting the configuration frame.
+        //
+        if (I2C_isBusBusy(I2CB_BASE)) {
+            if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
+                ads1119Abort(unit);
+            }
+            return;
+        }
+
+        adsGuard[unit] = 0U;
+
+        //
+        // WREG is command byte plus data byte, and both have to go out inside
+        // one frame without a gap.
+        //
+        // The part resets its own I2C interface if a host starts a command
+        // and then stalls for 14000 tMOD - about 55 ms at the 256 kHz
+        // modulator. It also NACKs the trailing byte when that happens. So
+        // the two bytes are pushed back to back here, with only the short
+        // wait for I2CDXR to drain in between, rather than being split
+        // across service calls where an interrupt could open a gap.
+        //
+        // The wait is for one byte at 400 kHz, roughly 22 us. That is long
+        // by ISR standards but trivial next to the 50 ms budget, and it is
+        // the only way to keep the frame contiguous without a transmit FIFO.
+        //
+        {
+            uint16_t cfg = ADS1119_CFG_FOR_CH(currentAdsChannel[unit]);
+            uint32_t guard = 0;
+
+            I2C_setTargetAddress(I2CB_BASE, devAddr);
+            HWREGH(I2CB_BASE + I2C_O_CNT) = 2U;
+            I2C_putData(I2CB_BASE, ADS1119_CMD_WREG);
+            HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                            I2C_MDR_STP  | I2C_MDR_MST |
+                                            I2C_MDR_TRX  | I2C_MDR_IRS;
+
+            while ((I2C_getStatus(I2CB_BASE) & I2C_STS_TX_DATA_RDY) == 0U) {
+                if (++guard > ADS1119_WREG_BYTE_TIMEOUT) {
+                    ads1119Abort(unit);
+                    return;
+                }
+                if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
+                    I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
+                    ads1119Abort(unit);
+                    return;
+                }
+            }
+
+            I2C_putData(I2CB_BASE, cfg & 0xFFU);
+        }
+
+        //
+        // Let the WREG frame finish before anything else touches the bus.
+        //
+        // The stop was armed with the frame, so the module emits it once
+        // the byte count reaches zero. Moving straight on would start the
+        // next frame on top of this one: the START/SYNC that follows
+        // truncates the configuration write, the MUX field never takes
+        // effect, and every channel keeps sampling AIN0 while the code
+        // believes it is cycling.
+        //
+        adsState[unit] = eAdsMuxDone;
+        return;
+
+    case eAdsMuxDone:
+        if (I2C_isBusBusy(I2CB_BASE)) {
+            if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
+                ads1119Abort(unit);
+            }
+            return;
+        }
+
+        if (status & I2C_STS_NO_ACK) {
+            I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
+            ads1119Abort(unit);
+            return;
+        }
+
+        adsGuard[unit] = 0U;
+
+        adsState[unit] = eAdsStart;
+        return;
+
+    case eAdsStart:
+        //
+        // Re-arm conversions after the mux change.
+        //
+        // Writing the configuration register restarts an ongoing
+        // conversion by itself, so in steady state this is redundant.
+        // It matters on the edges: if the part has fallen back to its
+        // reset defaults - single-shot mode - nothing else would ever
+        // start it converting again, and the channel would read zero
+        // forever with no error anywhere to show why.
+        //
+        if (I2C_isBusBusy(I2CB_BASE)) {
+            if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
+                ads1119Abort(unit);
+            }
+            return;
+        }
+
+        adsGuard[unit] = 0U;
+
+        I2C_setTargetAddress(I2CB_BASE, devAddr);
+        HWREGH(I2CB_BASE + I2C_O_CNT) = 1U;
+        I2C_putData(I2CB_BASE, ADS1119_CMD_START);
+        HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                        I2C_MDR_STP  | I2C_MDR_MST |
+                                        I2C_MDR_TRX  | I2C_MDR_IRS;
+
+        //
+        // Like the WREG above, this frame has to be allowed to finish.
+        // The dwell that follows is counted in service calls, not bus
+        // time, so without waiting here the next read would start on top
+        // of this one.
+        //
+        adsState[unit] = eAdsStartDone;
+        return;
+
+    case eAdsStartDone:
+        if (I2C_isBusBusy(I2CB_BASE)) {
+            if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
+                ads1119Abort(unit);
+            }
+            return;
+        }
+
+        if (status & I2C_STS_NO_ACK) {
+            I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
+            ads1119Abort(unit);
+            return;
+        }
+
+        adsGuard[unit] = 0U;
+
+        //
+        // Hold this channel for a while before moving on. The conversion
+        // itself settles in one 20 SPS period, but the analogue front end
+        // is slower than the converter and cell temperature does not move
+        // quickly - dwelling here gives the reading time to be real rather
+        // than a smear of the previous channel.
+        //
+        adsDwellStart[unit] = CPUTimer_getTimerCount(CPUTIMER0_BASE);
+        adsState[unit]  = eAdsSettle;
+        return;
+
+    case eAdsSettle:
+        //
+        // Wait out the dwell, then require a completely fresh conversion.
+        //
+        // The dwell alone is not enough: DRDY keeps asserting throughout it,
+        // so whatever is pending the moment it expires may still be the
+        // conversion that was already in flight when the mux moved. Clearing
+        // the pending flag at the end and waiting for the next edge
+        // guarantees the sample that gets published started after the new
+        // channel was selected.
+        //
+        // START/SYNC restarted the converter, so the first result arrives one
+        // conversion period later - 50 ms at 20 SPS.
+        //
+        {
+            //
+            // CPU timer 0 counts down, so elapsed time is start - now,
+            // and the subtraction wraps correctly on reload.
+            //
+            uint32_t now     = CPUTimer_getTimerCount(CPUTIMER0_BASE);
+            uint32_t elapsed = adsDwellStart[unit] - now;
+
+            if (elapsed < ADS1119_SETTLE_COUNTS) {
+                adsPending[unit] = 0U;  // ignore results from the old input
+                return;
+            }
+        }
+
+        //
+        // Settled. The mux now points at currentAdsChannel, so that is
+        // the input the next conversion measures - record it as the
+        // channel this result will be credited to.
+        //
+        adsSampleCh[unit] = currentAdsChannel[unit];
+        adsState[unit]    = eAdsIdle;
+        return;
+
+    default:
+        adsState[unit] = eAdsIdle;
+        return;
+    }
+}
+
+//
+// Drives both converters. Called from the idle loop; performs at most one
+// step per converter per call and never waits on the bus.
+//
+void BTS_serviceADS1119(void)
+{
+    ads1119Service(0U);
+    ads1119Service(1U);
 }
 
 //
@@ -1323,14 +1865,40 @@ static volatile uint16_t bufferValid = 0;
 // Writes the register file, notifies CPU1, and handles the eCalibrationMode
 // commit trigger.
 //
+//
+// Set when a host asks for a calibration commit. The save writes the
+// whole image to the F-RAM, far too long to run inside the I2C slave
+// interrupt where the request arrives - doing so held off the host
+// mid-transaction. Recorded here, carried out from the idle loop.
+//
+static volatile uint16_t calibrationSavePending = 0U;
+
 static void applyHostRegisterWrite(uint16_t regIdx, float32_t value)
 {
     registers[regIdx] = value;
     notifyCpu1RegisterWrite(regIdx, value);
 
     if (regIdx == BTS_REG_IDX(eCalibrationMode) && value == 2.0f) {
-        saveAllCalibration();
+        calibrationSavePending = 1U;
     }
+}
+
+//
+// Runs work that interrupt handlers deferred. Called from the idle
+// loop, where a long F-RAM transfer costs nothing.
+//
+void BTS_serviceDeferredWork(void)
+{
+    if (calibrationSavePending == 0U) {
+        return;
+    }
+
+    //
+    // Cleared first so a request arriving during the save queues another
+    // pass rather than being lost.
+    //
+    calibrationSavePending = 0U;
+    saveAllCalibration();
 }
 
 //
@@ -1681,7 +2249,13 @@ void main(void)
     initADS1119();
 
     while (1) {
-        IDLE;
+        //
+        // Background work. Both perform at most one short, non-blocking
+        // step per pass, so the console, the I2CA slave and CAN stay
+        // responsive while I2CB is driven continuously.
+        //
+        BTS_serviceADS1119();
+        BTS_serviceDeferredWork();
     }
 }
 
