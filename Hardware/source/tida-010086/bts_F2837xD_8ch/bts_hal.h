@@ -30,6 +30,7 @@ extern "C" {
 // includes
 //=============================================================================
 //
+#include <stdbool.h>
 #include "driverlib.h"
 #include "device.h"
 #include <bts_user_settings.h>
@@ -116,7 +117,7 @@ void BTS_HAL_setupCmpssEpwmXBAR(XBAR_TripNum trip, XBAR_EPWMMuxConfig muxConfig,
                                 uint32_t muxMask);
 void BTS_HAL_setupCMPSS(uint32_t cmpssBase);
 void BTS_HAL_setupCpu2Pins(void);
-void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase);
+void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase, uint16_t channel);
 
 __interrupt void ISR1(void);
 __interrupt void ISR2(void);

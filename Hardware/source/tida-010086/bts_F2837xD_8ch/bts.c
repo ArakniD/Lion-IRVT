@@ -307,6 +307,33 @@ void BTS_initUserVariables(void)
     BTS_userInput_ch8.VoutGain_V = BTS_VoutGain_ch8_V;
     BTS_userInput_ch8.VoutOffset_V = BTS_VoutOffset_ch8_V;
 
+    //
+    // Internal-ADC (C2000) cell voltage and current calibration.
+    //
+    // Unlike the Iout/Vout pairs above, these have no per-channel compiled-in
+    // constant - the real values are meant to arrive from EEPROM, which CPU2
+    // publishes into registers[] and signals with BTS_IPC_FLAG_CAL_RELOAD.
+    // That notification is a single one-shot raised during CPU2's boot, so if
+    // CPU1 is not yet polling IPC when it lands the gains are never copied and
+    // stay at their zero-initialised value. A zero gain silently multiplies
+    // every cell-voltage reading to 0.0 V - the measurement looks dead while
+    // the ADC is in fact sampling correctly.
+    //
+    // Seeding unity gain here makes the reading correct-by-default and means a
+    // missed or late calibration reload degrades to raw scaling rather than to
+    // zero. A subsequent BTS_loadCalibrationFromRegisters() still overwrites
+    // these with the stored calibration.
+    //
+    {
+        uint16_t ch;
+        for (ch = 0; ch < NUM_CHANNELS; ch++) {
+            BTS_userInputs[ch].F28V_Gain   = BTS_F28V_GAIN_DEFAULT;
+            BTS_userInputs[ch].F28V_Offset = BTS_F28V_OFFSET_DEFAULT;
+            BTS_userInputs[ch].F28I_Gain   = BTS_F28I_GAIN_DEFAULT;
+            BTS_userInputs[ch].F28I_Offset = BTS_F28I_OFFSET_DEFAULT;
+        }
+    }
+
 }
 
 void BTS_calcUserProgramVariables(uint16_t i)

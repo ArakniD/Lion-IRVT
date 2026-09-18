@@ -79,6 +79,19 @@ void C3(void);  //state C3
 volatile UnitState unitState = eInputOK;
 
 //
+// Bound on the ADCB end-of-conversion poll in updateInputVoltage(). The
+// conversion itself is sub-microsecond; this only has to be large enough
+// not to false-trip, and finite so a dead flag cannot wedge the task loop.
+//
+#define BTS_ADCB_EOC_MAX_POLLS ((uint16_t)2000)
+
+//
+// Diagnostic counter: non-zero means the input-voltage read timed out and
+// the guard is running on a substituted 0 V rather than a live measurement.
+//
+volatile uint32_t adcbEocTimeouts = 0;
+
+//
 // main() function
 //
 void main(void)
@@ -957,9 +970,31 @@ static void updateInputVoltage(void)
     ADC_forceSOC(ADCB_BASE, ADC_SOC_NUMBER1);
     ADC_forceSOC(ADCB_BASE, ADC_SOC_NUMBER2);
 
-    while(ADC_getInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1) == 0);
+    //
+    // Bounded wait. A conversion at ADCCLK/4 with a 15-cycle S+H takes well
+    // under a microsecond, so this budget is generous; the point is that a
+    // misconfigured or disabled ADCBINT1 must never wedge the task loop the
+    // way an unguarded spin does - that would silently disable the input
+    // voltage guard and every other supervisory check in C1().
+    //
+    uint16_t adcWait = 0U;
+    while ((ADC_getInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1) == 0) &&
+           (adcWait < BTS_ADCB_EOC_MAX_POLLS)) {
+        adcWait++;
+    }
 
-    uint16_t busVoltageRaw = ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER1);
+    if (adcWait >= BTS_ADCB_EOC_MAX_POLLS) {
+        //
+        // Treat a timeout as "input voltage unknown", which is the safe
+        // reading: 0 V drives unitState to charge-disabled below rather
+        // than leaving a stale value that looks healthy.
+        //
+        adcbEocTimeouts++;
+        ADC_clearInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1);
+    }
+
+    uint16_t busVoltageRaw = (adcWait >= BTS_ADCB_EOC_MAX_POLLS) ? 0U :
+                             ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER1);
 
     float busVoltage = (busVoltageRaw * 17.9f * 3.3f) / (4096.0f * 2.5f);
 

@@ -935,6 +935,18 @@ void BTS_HAL_setupInputXBAR(uint32_t inputXbarLine, uint32_t sourceType, uint32_
     // Input X-BAR has no other source.
     //
     (void)sourceType;
+
+    //
+    // This device has INPUT1..INPUT14 only (XBAR_O_INPUT1SELECT 0x0 ..
+    // XBAR_O_INPUT14SELECT 0xD; the next register is INPUTSELECTLOCK at
+    // 0x1E). Calls above 14 would compute an address past the last select
+    // register and write into reserved space, so they are rejected here
+    // rather than silently corrupting the X-BAR.
+    //
+    if ((inputXbarLine < 1U) || (inputXbarLine > 14U)) {
+        return;
+    }
+
     XBAR_setInputPin((XBAR_InputNum)(XBAR_INPUT1 + (inputXbarLine - 1)),
                      (uint16_t)sourceId);
 }
@@ -1034,10 +1046,36 @@ void BTS_HAL_setupTripGPIO(uint32_t pinConfig, uint32_t pin) {
 }
 
 // Function to configure ePWM Trip Zone
-void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase) {
+//
+// channel is 0-based and selects that slot's BTS_TRIP_HW_CHn_ENABLED setting.
+// When a slot's hardware trip is disabled the trip SIGNALS are left masked,
+// so neither the CMPSS comparator nor the GPIO input can reach this ePWM's
+// one-shot latch. The trip ACTIONS are still programmed, because the software
+// over-current path (BTS_tripEpwm) forces a trip through the same trip zone
+// and must still bring the outputs low.
+//
+void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase, uint16_t channel) {
+    static const bool tripHwEnabled[8] = {
+        BTS_TRIP_HW_CH1_ENABLED, BTS_TRIP_HW_CH2_ENABLED,
+        BTS_TRIP_HW_CH3_ENABLED, BTS_TRIP_HW_CH4_ENABLED,
+        BTS_TRIP_HW_CH5_ENABLED, BTS_TRIP_HW_CH6_ENABLED,
+        BTS_TRIP_HW_CH7_ENABLED, BTS_TRIP_HW_CH8_ENABLED,
+    };
+    bool hwTrip = (channel < 8U) ? tripHwEnabled[channel] : false;
+
     EALLOW;
-    // Enable TZ1 (CMPSS) and TZ2 (GPIO AND group trip)
-    EPWM_enableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_OSHT1 | EPWM_TZ_SIGNAL_OSHT2);
+    if (hwTrip) {
+        // Enable TZ1 (CMPSS) and TZ2 (GPIO AND group trip)
+        EPWM_enableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_OSHT1 | EPWM_TZ_SIGNAL_OSHT2);
+    } else {
+        //
+        // Trip links are not wired on this slot. Mask both one-shot sources
+        // so an unpowered, floating sense chain cannot latch a spurious
+        // over-current at boot. See BTS_TRIP_HW_CHn_ENABLED in
+        // bts_user_settings.h for what protection this gives up.
+        //
+        EPWM_disableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_OSHT1 | EPWM_TZ_SIGNAL_OSHT2);
+    }
 
     // Configure trip actions: force EPWMA and EPWMB low
     EPWM_setTripZoneAction(epwmBase, EPWM_TZ_ACTION_EVENT_TZA, EPWM_TZ_ACTION_LOW);
@@ -1052,8 +1090,17 @@ void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase) {
                                   EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2);
     EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_OST | EPWM_TZ_INTERRUPT);
 
-    // Enable trip zone interrupt
-    EPWM_enableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
+    //
+    // The trip-zone interrupt is only useful when a hardware source can
+    // raise it. The software trip path sets the flags itself and does not
+    // rely on this ISR.
+    //
+    if (hwTrip) {
+        // Enable trip zone interrupt
+        EPWM_enableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
+    } else {
+        EPWM_disableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
+    }
     EDIS;
 }
 
@@ -1081,17 +1128,37 @@ void BTS_HAL_setupTripSystem(void) {
     // calls silently selected GPIO1, GPIO5, GPIO9, ... instead of wiring up
     // any comparator.
     //
+    // Each route is gated on its slot's BTS_TRIP_HW_CHn_ENABLED. A slot whose
+    // trip links are not wired leaves its X-BAR mux unconfigured, so nothing
+    // drives the ePWM trip input even if the comparator itself latches.
+    //
+#if (BTS_TRIP_HW_CH1_ENABLED == true)
     BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP4,  XBAR_EPWM_MUX00_CMPSS1_CTRIPH_OR_L, XBAR_MUX00);
+#endif
+#if (BTS_TRIP_HW_CH2_ENABLED == true)
     BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP5,  XBAR_EPWM_MUX02_CMPSS2_CTRIPH_OR_L, XBAR_MUX02);
+#endif
+#if (BTS_TRIP_HW_CH3_ENABLED == true)
     BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP7,  XBAR_EPWM_MUX04_CMPSS3_CTRIPH_OR_L, XBAR_MUX04);
+#endif
+#if (BTS_TRIP_HW_CH4_ENABLED == true)
     BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP8,  XBAR_EPWM_MUX06_CMPSS4_CTRIPH_OR_L, XBAR_MUX06);
+#endif
+#if (BTS_TRIP_HW_CH5_ENABLED == true)
     BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP9,  XBAR_EPWM_MUX08_CMPSS5_CTRIPH_OR_L, XBAR_MUX08);
+#endif
+#if (BTS_TRIP_HW_CH6_ENABLED == true)
     BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP10, XBAR_EPWM_MUX10_CMPSS6_CTRIPH_OR_L, XBAR_MUX10);
+#endif
+#if (BTS_TRIP_HW_CH7_ENABLED == true)
     BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP11, XBAR_EPWM_MUX12_CMPSS7_CTRIPH_OR_L, XBAR_MUX12);
+#endif
+#if (BTS_TRIP_HW_CH8_ENABLED == true)
     BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP12, XBAR_EPWM_MUX14_CMPSS8_CTRIPH_OR_L, XBAR_MUX14);
+#endif
 
     // Configure GPIOs for individual trips, group trip, and AND gate outputs
-#if (BTS_TRIP_GPIO_CH1_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH1_ENABLED == true) && (BTS_TRIP_HW_CH1_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH1, BTS_TRP_PIN_GPIO_CH1);
 #else
     //
@@ -1100,13 +1167,27 @@ void BTS_HAL_setupTripSystem(void) {
     // input is unavailable, and it is not physically connected here.
     //
 #endif
+#if (BTS_TRIP_HW_CH2_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH2, BTS_TRP_PIN_GPIO_CH2);
+#endif
+#if (BTS_TRIP_HW_CH3_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH3, BTS_TRP_PIN_GPIO_CH3);
+#endif
+#if (BTS_TRIP_HW_CH4_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH4, BTS_TRP_PIN_GPIO_CH4);
+#endif
+#if (BTS_TRIP_HW_CH5_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH5, BTS_TRP_PIN_GPIO_CH5);
+#endif
+#if (BTS_TRIP_HW_CH6_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH6, BTS_TRP_PIN_GPIO_CH6);
+#endif
+#if (BTS_TRIP_HW_CH7_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH7, BTS_TRP_PIN_GPIO_CH7);
+#endif
+#if (BTS_TRIP_HW_CH8_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH8, BTS_TRP_PIN_GPIO_CH8);
+#endif
 
     //
     // Configure Input X-BAR for the GPIO trips.
@@ -1116,21 +1197,52 @@ void BTS_HAL_setupTripSystem(void) {
     // INPUT9..INPUT16. The previous code assigned all eight to INPUT9, where
     // each call simply overwrote the last and only channel 8 survived.
     //
-#if (BTS_TRIP_GPIO_CH1_ENABLED == true)
+    // WARNING - this routing does not actually trip anything as written, and
+    // is retained only so the pin assignments are not lost:
+    //
+    //   * The ePWM one-shot trip zones read TZ1/TZ2, which are hardwired to
+    //     Input X-BAR INPUT1/INPUT2 - not INPUT9..16. Reaching the one-shot
+    //     from INPUT9..12 (TRIPIN9..12) requires the Digital Compare
+    //     submodule (DCTRIPSEL + setTripZoneDigitalCompareEventCondition),
+    //     which this project never configures.
+    //   * INPUT15 and INPUT16 do not exist on this device - it has INPUT1..14
+    //     only. Those two calls are now rejected by the bounds check in
+    //     BTS_HAL_setupInputXBAR() instead of writing past the register file.
+    //
+    // All of this is currently inert because every BTS_TRIP_HW_CHn_ENABLED is
+    // false. Before re-enabling a hardware trip, wire TZ1/TZ2 (INPUT1/INPUT2)
+    // or set up the Digital Compare path - and note INPUT1/INPUT2 default to
+    // GPIO0, which is EPWM1A on this board.
+    //
+#if (BTS_TRIP_GPIO_CH1_ENABLED == true) && (BTS_TRIP_HW_CH1_ENABLED == true)
     BTS_HAL_setupInputXBAR(9,  0, BTS_TRP_PIN_GPIO_CH1);
 #endif
+#if (BTS_TRIP_HW_CH2_ENABLED == true)
     BTS_HAL_setupInputXBAR(10, 0, BTS_TRP_PIN_GPIO_CH2);
+#endif
+#if (BTS_TRIP_HW_CH3_ENABLED == true)
     BTS_HAL_setupInputXBAR(11, 0, BTS_TRP_PIN_GPIO_CH3);
+#endif
+#if (BTS_TRIP_HW_CH4_ENABLED == true)
     BTS_HAL_setupInputXBAR(12, 0, BTS_TRP_PIN_GPIO_CH4);
+#endif
+#if (BTS_TRIP_HW_CH5_ENABLED == true)
     BTS_HAL_setupInputXBAR(13, 0, BTS_TRP_PIN_GPIO_CH5);
+#endif
+#if (BTS_TRIP_HW_CH6_ENABLED == true)
     BTS_HAL_setupInputXBAR(14, 0, BTS_TRP_PIN_GPIO_CH6);
+#endif
+#if (BTS_TRIP_HW_CH7_ENABLED == true)
     BTS_HAL_setupInputXBAR(15, 0, BTS_TRP_PIN_GPIO_CH7);
+#endif
+#if (BTS_TRIP_HW_CH8_ENABLED == true)
     BTS_HAL_setupInputXBAR(16, 0, BTS_TRP_PIN_GPIO_CH8);
+#endif
 
     // Configure Trip Zones for all ePWM modules
     for (uint16_t i = 1; i <= 8; i++) {
         uint32_t epwmBase = EPWM1_BASE + (i - 1) * 0x1000;
-        BTS_HAL_setupEPWMTripZone(epwmBase);
+        BTS_HAL_setupEPWMTripZone(epwmBase, i - 1U);
     }
 }
 
@@ -1183,6 +1295,17 @@ void BTS_HAL_setupADC(void)
     ADC_enableInterrupt(ADCA_BASE, ADC_INT_NUMBER1);
     ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
     ADC_setInterruptSource(ADCA_BASE, ADC_INT_NUMBER1, ADC_SOC_NUMBER0);
+
+    //
+    // ADCB end-of-conversion flag for the software-triggered input-voltage
+    // reads. updateInputVoltage() spins on this flag, so without a source
+    // selected it can never assert and CPU1's whole background task loop
+    // wedges on the first pass - taking the input-voltage guard, reverse
+    // polarity check and group supervision down with it.
+    //
+    ADC_enableInterrupt(ADCB_BASE, ADC_INT_NUMBER1);
+    ADC_clearInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1);
+    ADC_setInterruptSource(ADCB_BASE, ADC_INT_NUMBER1, ADC_SOC_NUMBER2);
 
     ADC_enableConverter(ADCA_BASE);
     ADC_enableConverter(ADCB_BASE);

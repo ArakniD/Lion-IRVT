@@ -69,6 +69,91 @@
 #endif
 
 #define BTS_ENABLE_DETECT_CODE (false)
+
+//
+//=============================================================================
+// Hardware trip lines (per slot)
+//=============================================================================
+//
+// Each slot has two independent hardware trip paths into its ePWM trip zone:
+//
+//   OST1 - the CMPSS over-current comparator, tripping outside
+//          +/-BTS_USER_DEFAULT_TRIP_A via the ePWM X-BAR.
+//   OST2 - the external GPIO trip input, via the Input X-BAR.
+//
+// Both are DISABLED here because the trip links are not physically wired on
+// this board yet.
+//
+// There is a second, sharper reason to mask them. TZ1 and TZ2 are hardwired
+// to Input X-BAR INPUT1 and INPUT2 (see XBAR_InputNum in xbar.h), and nothing
+// in this project ever writes INPUT1SELECT/INPUT2SELECT - so both sit at
+// their reset default of GPIO0, which this board muxes as EPWM1A
+// (BTS_EPWM_H_PIN_CONFIG_EPWM_CH1). Channel 1's trip zones were therefore
+// watching channel 1's own high-side gate drive, and latched OST1+OST2 the
+// instant the converter switched. That is the observed EPwm1Regs_TZOSTFLG =
+// 0x0003 which re-asserted immediately after every TZCLR write.
+//
+// WHAT PROTECTION REMAINS WHILE THESE ARE false:
+//   - The software over-current limit in BTS_tripEpwm(), which compares each
+//     control pass against +/-BTS_USER_DEFAULT_TRIP_A and pulls the PWM down
+//     via the trip zone. This requires BTS_OCP_TRIGGER to be true - it is
+//     enabled below precisely because it is the ONLY over-current protection
+//     left once the hardware trips are masked. It acts within a control
+//     period rather than within a switching cycle.
+//   - BTS_ctrlDirection() clamps at the same thresholds, but note it only
+//     reshapes which FET conducts - it does not stop the converter.
+//   - The unit-level input-voltage guard and the group-integrity check in
+//     C1() are unaffected.
+//
+// What is lost is the cycle-by-cycle hardware backstop, which is the only
+// thing fast enough to catch a genuine short. Do NOT run an unattended
+// high-current test in this configuration, and set these back to true - and
+// fix the INPUT1/INPUT2 routing above - once the trip links are wired.
+//
+#define BTS_TRIP_HW_CH1_ENABLED (false)
+#define BTS_TRIP_HW_CH2_ENABLED (false)
+#define BTS_TRIP_HW_CH3_ENABLED (false)
+#define BTS_TRIP_HW_CH4_ENABLED (false)
+#define BTS_TRIP_HW_CH5_ENABLED (false)
+#define BTS_TRIP_HW_CH6_ENABLED (false)
+#define BTS_TRIP_HW_CH7_ENABLED (false)
+#define BTS_TRIP_HW_CH8_ENABLED (false)
+
+//
+// True when at least one slot still wants a hardware trip. Used to decide
+// whether the trip ISR and the shared X-BAR plumbing are worth configuring.
+//
+#define BTS_TRIP_HW_ANY_ENABLED                                           \
+    (BTS_TRIP_HW_CH1_ENABLED || BTS_TRIP_HW_CH2_ENABLED ||                \
+     BTS_TRIP_HW_CH3_ENABLED || BTS_TRIP_HW_CH4_ENABLED ||                \
+     BTS_TRIP_HW_CH5_ENABLED || BTS_TRIP_HW_CH6_ENABLED ||                \
+     BTS_TRIP_HW_CH7_ENABLED || BTS_TRIP_HW_CH8_ENABLED)
+//
+//=============================================================================
+// Internal-ADC (C2000) cell voltage / current calibration defaults
+//=============================================================================
+//
+// These seed BTS_userInputs[].F28*_Gain/Offset at init so a cell-voltage
+// reading is never silently multiplied by a zero gain while waiting for the
+// EEPROM calibration to arrive over IPC.
+//
+// Keep these in step with DEFAULT_F28V_GAIN / DEFAULT_F28V_OFFSET /
+// DEFAULT_F28I_GAIN / DEFAULT_F28I_OFFSET in com_cpu2.c, which are what CPU2
+// writes into registers[] when a channel has no valid stored calibration.
+// Unity gain means the reading is the raw ADC scaling with no correction
+// applied: BTS_monitor_Iout_Vout() already converts counts to volts via
+// (sum / (avgFactor * 4096)) * 2.5, so a gain of 1.0 yields the uncorrected
+// sense-chain voltage rather than zero.
+//
+// Note validateCalibration() in com_cpu2.c rejects an F28V_Gain outside
+// 0.5..2.0, so 0.0 is an invalid value there too - these defaults sit inside
+// that accepted band.
+//
+#define BTS_F28V_GAIN_DEFAULT             ((float32_t)1.0)
+#define BTS_F28V_OFFSET_DEFAULT           ((float32_t)0.0)
+#define BTS_F28I_GAIN_DEFAULT             ((float32_t)1.0)
+#define BTS_F28I_OFFSET_DEFAULT           ((float32_t)0.0)
+
 //
 // All eight control blocks are compiled in. Which slots actually run is a
 // runtime decision taken from the ENABLE dip switch (see startup_enable and
@@ -111,7 +196,17 @@
 #define BTS_REVERSE_POLARITY_V            ((float32_t)-0.10)
 
 #define BTS_TRIP_CODE   (true)
-#define BTS_OCP_TRIGGER (false)
+//
+// Software over-current trip, evaluated in BTS_tripEpwm() every control pass
+// against ioutTrip_16b / ioutTrip_n_16b (+/-BTS_USER_DEFAULT_TRIP_A).
+//
+// This MUST stay true while any BTS_TRIP_HW_CHn_ENABLED is false: with the
+// hardware trip signals masked, this is the only over-current protection
+// left on that slot. It acts within a control period rather than within a
+// switching cycle, so it is a weaker backstop than the CMPSS - but it is the
+// difference between a soft limit and none at all.
+//
+#define BTS_OCP_TRIGGER (true)
 #define BTS_USER_DEFAULT_TRIP_A           ((float32_t)8)
 
 //
