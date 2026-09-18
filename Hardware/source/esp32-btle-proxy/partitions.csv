@@ -1,0 +1,24 @@
+# Partition table for the BTS BLE/WiFi proxy. 4 MB flash.
+#
+# Two OTA slots so the proxy can be updated over WiFi without pulling the
+# unit out of the rack. There is deliberately no factory partition: with a
+# blank otadata the bootloader runs ota_0, so a factory slot would only cost
+# a third of the flash to hold a copy of the same image.
+#
+# `results` is a second NVS partition, separate from the default one, so
+# filling it with test history cannot displace the chemistry overrides or
+# the WiFi credentials. 0x20000 holds the per-slot latest results plus the
+# 64-entry rolling history in result_store.c.
+#
+# Layout uses the whole 4 MB exactly:
+#   0x020000 + 0x1E0000 = 0x200000   ota_0
+#   0x200000 + 0x1E0000 = 0x3E0000   ota_1
+#   0x3E0000 + 0x020000 = 0x400000   results
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  0x1E0000,
+ota_1,      app,  ota_1,    0x200000, 0x1E0000,
+results,    data, nvs,      0x3E0000, 0x20000,

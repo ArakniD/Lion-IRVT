@@ -1,0 +1,48 @@
+# Defaults for the BTS BLE/WiFi proxy on LiLion32 v1.0.0 (ESP-WROOM-32).
+#
+# Regenerate sdkconfig from these with `idf.py fullclean` or by deleting
+# sdkconfig; do not hand-edit sdkconfig, edit this file instead.
+
+CONFIG_IDF_TARGET="esp32"
+
+# 4 MB flash on the WROOM-32; custom table gives us dual OTA + a results NVS.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# NimBLE rather than Bluedroid: this is a BLE-only peripheral and NimBLE
+# costs roughly 100 kB less flash, which matters with two OTA slots.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+
+# The GATT table advertises 8 slots' worth of notifiable characteristics.
+CONFIG_BT_NIMBLE_GATT_MAX_PROCS=8
+
+# HTTP server headroom for the JSON API. The largest response is
+# GET /api/v1/slots, which carries all 8 slots' live state.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+
+# The backup battery keeps the proxy alive through a rack power cut, so the
+# brownout detector must not reset us while the main rail collapses - the
+# test engine needs to reach a safe stop and persist state first.
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
+
+# Main task needs room for the JSON encoder used by the web API.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# Keep a usable log level on the console; the proxy is a bench instrument.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Flash/monitor defaults for the CP210x bridge on this unit.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
