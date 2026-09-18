@@ -11,6 +11,13 @@ PAGE 0 :  /* Program Memory */
    RAMGS0      		: origin = 0x00C000, length = 0x001000
    RAMGS1      		: origin = 0x00D000, length = 0x001000
    RAMGS2      		: origin = 0x00E000, length = 0x001000
+   /* RAMGS9+RAMGS10 are contiguous and are combined into one 0x2000
+      region for the ISR code group. With all eight control loops
+      compiled in, isrcodefuncs+dclfuncs no longer fits in a single
+      0x1000 block. The Filter4/Difference_RegsFile sections that
+      nominally sat here are unreferenced leftovers from the
+      reference design. */
+   RAMGS9_10   		: origin = 0x015000, length = 0x002000
    RESET           	: origin = 0x3FFFC0, length = 0x000002
 
    /* Flash sectors */
@@ -39,8 +46,6 @@ PAGE 1 : /* Data Memory */
    RAMGS6     		: origin = 0x012000, length = 0x001000
    RAMGS7      		: origin = 0x013000, length = 0x001000
    RAMGS8      		: origin = 0x014000, length = 0x001000
-   RAMGS9      		: origin = 0x015000, length = 0x001000
-   RAMGS10     		: origin = 0x016000, length = 0x001000
 
    CPU2TOCPU1RAM   : origin = 0x03F800, length = 0x000400
    CPU1TOCPU2RAM   : origin = 0x03FC00, length = 0x000400
@@ -76,7 +81,7 @@ SECTIONS
         isrcodefuncs
         dclfuncs
     }    LOAD = FLASHC,
-         RUN =  RAMGS1,
+         RUN =  RAMGS9_10,
          LOAD_START(isrcodefuncsLoadStart),
          LOAD_SIZE(isrcodefuncsLoadSize),
          LOAD_END(isrcodefuncsLoadEnd),
@@ -154,8 +159,6 @@ SECTIONS
    Filter1_RegsFile : > RAMGS6,	PAGE = 1, fill=0x1111
    Filter2_RegsFile : > RAMGS7,	PAGE = 1, fill=0x2222
    Filter3_RegsFile : > RAMGS8,	PAGE = 1, fill=0x3333
-   Filter4_RegsFile : > RAMGS9,	PAGE = 1, fill=0x4444
-   Difference_RegsFile : >RAMGS10, 	PAGE = 1, fill=0x3333
 
 
     SFRA_F32_Data : > RAMGS4, ALIGN = 64, PAGE = 1

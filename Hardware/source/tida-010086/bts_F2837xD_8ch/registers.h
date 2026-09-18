@@ -25,7 +25,21 @@
 #define NUM_STATS_REGISTERS (NUM_CHANNELS * 6)    // 48 (voltage, current)
 #define NUM_CALIBRATION_REGISTERS (NUM_CHANNELS * 12 + 16 + 4) // 16 + 4 + 96 (min/max temp, F28V/I gains/offsets, Iout/Vout calibrations, global voltages, calibration mode)
 #define NUM_UNIT_REGISTERS (4)
-#define TOTAL_REGISTERS (NUM_CONTROL_REGISTERS + NUM_STATS_REGISTERS + NUM_CALIBRATION_REGISTERS + NUM_UNIT_REGISTERS) // 247
+//
+// Measured cell temperature, one per channel, from the two ADS1119
+// converters on I2CB. These are appended after the unit block rather than
+// folded into the stats block on purpose: external hosts (see the ESP32
+// bridge in esp32-controller/components/bts_i2c) hard-code the byte
+// addresses of every block from 336 upward, so inserting a register
+// mid-map would shift them all and change the stats stride.
+//
+#define NUM_TEMP_MEAS_REGISTERS (NUM_CHANNELS * 1) // 8
+//
+// Slot grouping, read back from the MODE/ENABLE dip switches. Appended for
+// the same reason as the block above - never inserted mid-map.
+//
+#define NUM_GROUP_REGISTERS (3)
+#define TOTAL_REGISTERS (NUM_CONTROL_REGISTERS + NUM_STATS_REGISTERS + NUM_CALIBRATION_REGISTERS + NUM_UNIT_REGISTERS + NUM_TEMP_MEAS_REGISTERS + NUM_GROUP_REGISTERS) // 259
 
 // CAN bus configuration
 #define CAN_BITRATE 500000 // 500 kbps
@@ -290,6 +304,28 @@ typedef enum {
     eUnitState = 980,
     eInputVoltage = 984,
     eTripStatus = 988, // 32-bit bitfield for trip sources
+    // Measured Cell Temperatures (8 registers, RO, degrees C)
+    //
+    // The measurement, NOT the configured trip window - the min/max pair in
+    // the calibration block at 512 holds the limits and is mirrored into the
+    // F-RAM image. Written by CPU2 from the ADS1119 DRDY ISRs.
+    //
+    eCh0_CellTemp = 992,
+    eCh1_CellTemp = 996,
+    eCh2_CellTemp = 1000,
+    eCh3_CellTemp = 1004,
+    eCh4_CellTemp = 1008,
+    eCh5_CellTemp = 1012,
+    eCh6_CellTemp = 1016,
+    eCh7_CellTemp = 1020,
+    //
+    // Slot grouping (3 registers, RO). Latched from the MODE/ENABLE dip
+    // switches by CPU1 at boot and mirrored here so a host can see how the
+    // unit is strapped without reading the switches itself.
+    //
+    eSlotMode = 1024,
+    eSlotEnable = 1028,
+    eGroupSize = 1032,
 } RegisterAddress;
 
 typedef struct {
@@ -314,7 +350,37 @@ typedef struct {
     uint32_t discharging;
     uint32_t constVoltage;
     uint32_t constCurrent;
+    //
+    // Grouping state. Packed into bits 8-11 of the published status word.
+    // The word is carried to the host as a float32, whose 24-bit significand
+    // makes integers exact only to bit 23 - do not extend past that.
+    //
+    uint32_t slaveMode;        // slot follows a lower-numbered leader
+    uint32_t groupDisconnect;  // a member of this slot's group fell out of sync
+    uint32_t reversePolarity;  // measured cell voltage is negative
+    uint32_t slotDisabled;     // masked off by the ENABLE dip switch
 } ChannelStatus;
+
+//
+//=============================================================================
+// Status word bit positions
+//=============================================================================
+//
+// Bits 0-7 are consumed by the ESP32 bridge; it masks each bit individually
+// and ignores the rest, so bits 8+ are additive rather than breaking.
+//
+#define BTS_STATUS_RUNNING            0U
+#define BTS_STATUS_STOPPED            1U
+#define BTS_STATUS_FINISHED           2U
+#define BTS_STATUS_OVERCURRENT_TRIP   3U
+#define BTS_STATUS_CHARGING           4U
+#define BTS_STATUS_DISCHARGING        5U
+#define BTS_STATUS_CONST_VOLTAGE      6U
+#define BTS_STATUS_CONST_CURRENT      7U
+#define BTS_STATUS_SLAVE_MODE         8U
+#define BTS_STATUS_GROUP_DISCONNECT   9U
+#define BTS_STATUS_REVERSE_POLARITY  10U
+#define BTS_STATUS_SLOT_DISABLED     11U
 
 // Bitfield for eTripStatus register
 typedef struct {
@@ -430,6 +496,17 @@ typedef struct {
     float32_t inputVoltage;              // mirrors eInputVoltage
     uint32_t  unitState;                 // mirrors eUnitState
     uint32_t  tripStatus;                // mirrors eTripStatus
+    //
+    // Dip-switch straps, latched by CPU1 in BTS_HAL_setupGPIO(). Carried
+    // inside this struct rather than read from the bare globals so they
+    // inherit the seq guard: the two cores boot independently and
+    // CPU1TOCPU2RAM is NOLOAD from CPU2's side, so its power-up contents
+    // are not guaranteed zero. strapsValid stays 0 until CPU1 has latched.
+    //
+    uint32_t  strapsValid;               // 1 once the straps below are real
+    uint32_t  slotMode;                  // mirrors eSlotMode,   0-7
+    uint32_t  slotEnable;                // mirrors eSlotEnable, 0-7
+    uint32_t  groupSize;                 // mirrors eGroupSize,  1/2/4/8
 } BTS_cpu1Status;
 
 typedef enum {
@@ -522,6 +599,8 @@ typedef struct
 //   temperature   2 regs/channel  eCh0_MinCellTemp .. eCh7_MaxCellTemp
 //   global V      4 regs total    eChargeDisableV  .. eDischargeDisableV
 //   calibration  12 regs/channel  eCh0_F28V_Gain   .. eCh7_VoutOffset_V
+//   unit          4 regs total    eCalibrationMode .. eTripStatus
+//   cell temp     1 reg/channel   eCh0_CellTemp    .. eCh7_CellTemp
 //
 #define BTS_REG_IDX(addr)           ((uint16_t)((addr) / 4U))
 
@@ -534,6 +613,53 @@ typedef struct
 #define BTS_STATS_BASE(ch)  (BTS_REG_IDX(eCh0_CurrentAcc)   + (ch) * BTS_STATS_REGS_PER_CH)
 #define BTS_TEMP_BASE(ch)   (BTS_REG_IDX(eCh0_MinCellTemp)  + (ch) * BTS_TEMP_REGS_PER_CH)
 #define BTS_CAL_BASE(ch)    (BTS_REG_IDX(eCh0_F28V_Gain)    + (ch) * BTS_CAL_REGS_PER_CH)
+
+// Measured cell temperature is one register per channel, so the index is the
+// block base plus the channel. Distinct from BTS_TEMP_BASE(), which is the
+// configured min/max limit pair.
+#define BTS_CELLTEMP_IDX(ch) (BTS_REG_IDX(eCh0_CellTemp)     + (ch))
+
+//
+//=============================================================================
+// Slot grouping - MODE / ENABLE dip switches
+//=============================================================================
+//
+// Both straps arrive through an SN74HC148 8:3 priority encoder and are
+// decoded to 0-7 by CPU1 in BTS_HAL_setupGPIO().
+//
+// MODE selects how slots are grouped, and whether the control loop takes its
+// voltage feedback from the external ADS131M08 (modes 0-3) or the C2000's
+// own ADC (modes 4-7). The low two bits are the group size and bit 2 selects
+// the converter, so the two halves of the table are deliberately parallel.
+//
+// ENABLE is the index of the highest enabled slot: 0 enables slot 1 alone,
+// 7 enables all eight.
+//
+typedef enum {
+    eModeIndependent       = 0,  // 8 independent slots
+    eModePairs             = 1,  // 1+2, 3+4, 5+6, 7+8
+    eModeQuads             = 2,  // 1-4, 5-8
+    eModeOctet             = 3,  // 1-8 as one group
+    eModeIndependentIntAdc = 4,  // as above, internal ADC voltage control
+    eModePairsIntAdc       = 5,
+    eModeQuadsIntAdc       = 6,
+    eModeOctetIntAdc       = 7,
+} BTS_SlotMode;
+
+// Slots per group: 1, 2, 4 or 8.
+#define BTS_MODE_GROUP_SIZE(m)      ((uint16_t)1U << ((uint16_t)(m) & 0x3U))
+
+// Modes 4-7 close the voltage loop on the C2000's internal ADC instead of
+// the ADS131M08.
+#define BTS_MODE_USES_INT_ADC(m)    ((((uint16_t)(m)) & 0x4U) != 0U)
+
+// The group leader is the lowest-numbered slot in the group. Group sizes are
+// powers of two, so masking off the low bits of the channel index gives it.
+#define BTS_GROUP_LEADER(ch, m)     ((uint16_t)(ch) & (uint16_t)~(BTS_MODE_GROUP_SIZE(m) - 1U))
+#define BTS_IS_GROUP_LEADER(ch, m)  ((uint16_t)(ch) == BTS_GROUP_LEADER((ch), (m)))
+
+// ENABLE holds the highest enabled slot index, so this is a direct compare.
+#define BTS_SLOT_ENABLED(ch, en)    ((uint16_t)(ch) <= (uint16_t)(en))
 
 // Offsets within the 12-register calibration block at BTS_CAL_BASE(ch).
 // Order must match BTS_channelCalibration's float members.

@@ -173,7 +173,15 @@ const RegisterConfig regConfig[TOTAL_REGISTERS] = {
     {eCalibrationMode, REG_ACCESS_RW, 4},
     {eUnitState, REG_ACCESS_RO, 4},
     {eInputVoltage, REG_ACCESS_RO, 4},
-    {eTripStatus, REG_ACCESS_RO, 4}
+    {eTripStatus, REG_ACCESS_RO, 4},
+    // Measured Cell Temperatures
+    {eCh0_CellTemp, REG_ACCESS_RO, 4}, {eCh1_CellTemp, REG_ACCESS_RO, 4},
+    {eCh2_CellTemp, REG_ACCESS_RO, 4}, {eCh3_CellTemp, REG_ACCESS_RO, 4},
+    {eCh4_CellTemp, REG_ACCESS_RO, 4}, {eCh5_CellTemp, REG_ACCESS_RO, 4},
+    {eCh6_CellTemp, REG_ACCESS_RO, 4}, {eCh7_CellTemp, REG_ACCESS_RO, 4},
+    // Slot grouping (MODE / ENABLE dip switches)
+    {eSlotMode, REG_ACCESS_RO, 4}, {eSlotEnable, REG_ACCESS_RO, 4},
+    {eGroupSize, REG_ACCESS_RO, 4}
 };
 
 const UARTRegisterConfig uartRegConfig[TOTAL_REGISTERS] = {
@@ -434,5 +442,18 @@ const UARTRegisterConfig uartRegConfig[TOTAL_REGISTERS] = {
     {eCalibrationMode, "CALM", "CalibrationMode", REG_ACCESS_RW},
     {eUnitState, "UNITST", "UnitState", REG_ACCESS_RO},
     {eInputVoltage, "VIN", "InputVoltage", REG_ACCESS_RO},
-    {eTripStatus, "TRIPS", "TripStatus", REG_ACCESS_RO}
+    {eTripStatus, "TRIPS", "TripStatus", REG_ACCESS_RO},
+    // Measured Cell Temperatures
+    {eCh0_CellTemp, "C0TEMP", "Ch0_CellTemp", REG_ACCESS_RO},
+    {eCh1_CellTemp, "C1TEMP", "Ch1_CellTemp", REG_ACCESS_RO},
+    {eCh2_CellTemp, "C2TEMP", "Ch2_CellTemp", REG_ACCESS_RO},
+    {eCh3_CellTemp, "C3TEMP", "Ch3_CellTemp", REG_ACCESS_RO},
+    {eCh4_CellTemp, "C4TEMP", "Ch4_CellTemp", REG_ACCESS_RO},
+    {eCh5_CellTemp, "C5TEMP", "Ch5_CellTemp", REG_ACCESS_RO},
+    {eCh6_CellTemp, "C6TEMP", "Ch6_CellTemp", REG_ACCESS_RO},
+    {eCh7_CellTemp, "C7TEMP", "Ch7_CellTemp", REG_ACCESS_RO},
+    // Slot grouping (MODE / ENABLE dip switches)
+    {eSlotMode, "SMD", "SlotMode", REG_ACCESS_RO},
+    {eSlotEnable, "SEN", "SlotEnable", REG_ACCESS_RO},
+    {eGroupSize, "SGS", "GroupSize", REG_ACCESS_RO}
 };

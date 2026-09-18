@@ -1215,6 +1215,74 @@ void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE)
     EPWM_setInterruptEventCount(EPWM_BASE, 1U);
 }
 
+//
+// Configures the ePWM sync chain so that grouped slots interleave.
+//
+// Must run with TBCLKSYNC off - i.e. between BTS_HAL_setupSyncBuckPwm() for
+// all eight modules and BTS_HAL_enableEpwmCounting() - because the phase
+// registers are only safely written while the time bases are stopped.
+//
+// On F2837xD the sync path is a hardwired daisy chain, EPWM1 -> 2 -> 3 ...,
+// with no general crossbar. Rather than trying to make each group leader a
+// sync source (which the chain cannot express for arbitrary groupings),
+// EPWM1 is always the single master and every other module passes the pulse
+// along. Group membership then only decides each module's phase offset.
+//
+// Phase is a plain fraction of the period: slot i of a group of k sits at
+// i/k of a switching cycle, so a pair runs 180 degrees apart, a quad 90, and
+// an octet 45. That is true interleaving rather than simply alternating.
+//
+// groupSize is passed in rather than derived from the mode so this stays a
+// HAL function, with no knowledge of the register map.
+//
+void BTS_HAL_setupGroupPhase(uint16_t groupSize)
+{
+    uint16_t ch;
+
+    if (groupSize == 0U) {
+        groupSize = 1U;
+    }
+
+    for (ch = 0; ch < BTS_HAL_NUM_PWM_CHANNELS; ch++) {
+        uint32_t epwmBase = EPWM1_BASE + (uint32_t)ch * (EPWM2_BASE - EPWM1_BASE);
+        uint16_t idx      = (uint16_t)(ch % groupSize);
+        uint16_t phase    = (uint16_t)(((uint32_t)BTS_DRV_EPWM_PERIOD_TICKS *
+                                        (uint32_t)idx) / (uint32_t)groupSize);
+
+        if (ch == 0U) {
+            //
+            // The master. It takes no phase of its own and generates the
+            // pulse the rest of the chain follows.
+            //
+            EPWM_disablePhaseShiftLoad(epwmBase);
+            EPWM_setSyncOutPulseMode(epwmBase,
+                                     EPWM_SYNC_OUT_PULSE_ON_COUNTER_ZERO);
+            continue;
+        }
+
+        //
+        // Everything downstream forwards the master's pulse, so a module
+        // late in the chain still sees it.
+        //
+        EPWM_setSyncOutPulseMode(epwmBase, EPWM_SYNC_OUT_PULSE_ON_EPWMxSYNCIN);
+
+        if (groupSize == 1U) {
+            //
+            // Independent slots keep the original free-running behaviour;
+            // mode 0 must remain identical to how the unit ran before
+            // grouping existed.
+            //
+            EPWM_disablePhaseShiftLoad(epwmBase);
+            continue;
+        }
+
+        EPWM_setPhaseShift(epwmBase, phase);
+        EPWM_setTimeBaseCounter(epwmBase, phase);
+        EPWM_setCountModeAfterSync(epwmBase, EPWM_COUNT_MODE_UP_AFTER_SYNC);
+        EPWM_enablePhaseShiftLoad(epwmBase);
+    }
+}
+
 void BTS_HAL_enableEpwmCounting(void)
 {
     SysCtl_enablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);

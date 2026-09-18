@@ -39,6 +39,7 @@ __interrupt void adcCellVoltageISR(void);
 // Local helpers
 //
 static void updateInputVoltage(void);
+static void checkGroupIntegrity(void);
 static void publishStatusToCpu2(void);
 void updateStatusRegisters(void);
 void modeCallback(float value, uint16_t channel);
@@ -142,6 +143,15 @@ void main(void)
 #endif
 
     BTS_setupHrpwmMepScaleFactor();
+
+    //
+    // Resolve the MODE/ENABLE straps into the per-slot grouping tables, then
+    // phase the ePWMs to match. Both have to happen here: the straps were
+    // latched in BTS_HAL_setupGPIO() above, and the phase registers may only
+    // be written while the time bases are still stopped.
+    //
+    BTS_initSlotGrouping((uint16_t)startup_mode, (uint16_t)startup_enable);
+    BTS_HAL_setupGroupPhase(BTS_MODE_GROUP_SIZE((uint16_t)startup_mode));
 
     //
     // Start ePWM clocks
@@ -393,6 +403,10 @@ static void publishStatusToCpu2(void)
         bitset |= (status[ch].discharging & 0x1) << 5;
         bitset |= (status[ch].constVoltage & 0x1) << 6;
         bitset |= (status[ch].constCurrent & 0x1) << 7;
+        bitset |= (status[ch].slaveMode & 0x1) << BTS_STATUS_SLAVE_MODE;
+        bitset |= (status[ch].groupDisconnect & 0x1) << BTS_STATUS_GROUP_DISCONNECT;
+        bitset |= (status[ch].reversePolarity & 0x1) << BTS_STATUS_REVERSE_POLARITY;
+        bitset |= (status[ch].slotDisabled & 0x1) << BTS_STATUS_SLOT_DISABLED;
         cpu1Status.statusBits[ch] = bitset;
 
         cpu1Status.cellVoltage[ch] = BTS_measValues[ch].CellVoltage_V;
@@ -404,6 +418,16 @@ static void publishStatusToCpu2(void)
     }
 
     cpu1Status.unitState = (uint32_t)unitState;
+
+    //
+    // Dip-switch straps. Carried inside the seq guard so CPU2 never mirrors
+    // them before they have been latched - the message RAM is NOLOAD from
+    // CPU2's side, so its power-up contents are not guaranteed to be zero.
+    //
+    cpu1Status.slotMode    = startup_mode;
+    cpu1Status.slotEnable  = startup_enable;
+    cpu1Status.groupSize   = BTS_MODE_GROUP_SIZE((uint16_t)startup_mode);
+    cpu1Status.strapsValid = 1U;
 
     cpu1Status.seq++;
 }
@@ -418,6 +442,16 @@ void modeCallback(float value, uint16_t channel)
     uint32_t mode = (uint32_t)value;
 
     if (channel < NUM_CHANNELS) {
+        //
+        // A slot the ENABLE strap masked off does not run, and a slot that
+        // follows a leader has no control loop of its own - in a group the
+        // leader speaks for every member. Reject writes to either rather
+        // than let a host half-start a group.
+        //
+        if ((btsSlotEnabled[channel] == 0U) || (btsSlotIsLeader[channel] == 0U)) {
+            return;
+        }
+
         float chargeRestrictV = registers[BTS_REG_IDX(eChargeRestrictV)];
         float dischargeRestrictV = registers[BTS_REG_IDX(eDischargeRestrictV)];
 
@@ -457,6 +491,47 @@ void modeCallback(float value, uint16_t channel)
         } else {
             BTS_userInputs[channel].enable_logic = 0;
         }
+
+        //
+        // Carry the leader's transition across its group. Followers take the
+        // same run/direction state and the same references, since they track
+        // the leader's duty and have to agree about which way it is driving.
+        //
+        {
+            uint16_t m;
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if ((m == channel) || (btsSlotLeader[m] != channel)) {
+                    continue;
+                }
+                if (btsSlotEnabled[m] == 0U) {
+                    continue;
+                }
+
+                status[m].running     = status[channel].running;
+                status[m].stopped     = status[channel].stopped;
+                status[m].charging    = status[channel].charging;
+                status[m].discharging = status[channel].discharging;
+
+                BTS_userInputs[m].vref_charge_V    = BTS_userInputs[channel].vref_charge_V;
+                BTS_userInputs[m].vref_discharge_V = BTS_userInputs[channel].vref_discharge_V;
+                BTS_userInputs[m].iref_A           = BTS_userInputs[channel].iref_A;
+                BTS_userInputs[m].iref_cuttout_A   = BTS_userInputs[channel].iref_cuttout_A;
+                BTS_userInputs[m].direction_logic  = BTS_userInputs[channel].direction_logic;
+                BTS_userInputs[m].enable_logic     = BTS_userInputs[channel].enable_logic;
+
+                //
+                // A fresh start clears a stale group fault; otherwise one
+                // disconnection would keep the group latched off forever.
+                //
+                if (status[channel].running) {
+                    status[m].groupDisconnect = 0;
+                }
+            }
+            if (status[channel].running) {
+                status[channel].groupDisconnect = 0;
+            }
+        }
+
         updateStatusRegisters();
     }
 }
@@ -742,6 +817,25 @@ void C1(void)
     }
 
     //
+    // Reverse polarity. A cell wired backwards reads negative on the
+    // external converter; stop the slot rather than try to regulate it.
+    //
+    for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
+        if (BTS_measValues[ch].CellVoltage_V < BTS_REVERSE_POLARITY_V) {
+            status[ch].reversePolarity = 1;
+            if (status[ch].running) {
+                status[ch].running = 0;
+                status[ch].stopped = 1;
+                BTS_userInputs[ch].enable_logic = 0;
+            }
+        } else {
+            status[ch].reversePolarity = 0;
+        }
+    }
+
+    checkGroupIntegrity();
+
+    //
     // Publish this pass's measurements and status to CPU2.
     //
     publishStatusToCpu2();
@@ -776,6 +870,86 @@ void C3(void)
     // Execute task C1 the next time CpuTimer2 decrements to 0
     //
     C_Task_Ptr = &C1;
+}
+
+//
+// Watches the slots in each group for one that has fallen out of step.
+//
+// In a grouped mode only the leader regulates; the followers copy its duty
+// blindly. If a follower's cell is disconnected, or simply drifting, nothing
+// in the control path notices - so compare each follower's own internal-ADC
+// voltage against the leader's, and shut the whole group down if one strays.
+//
+// The tolerance is a fraction of the leader's voltage with an absolute
+// floor, so it stays meaningful at both ends of the range. A disagreement
+// has to persist for several passes before it counts, which rejects a single
+// noisy sample without meaningfully delaying a real disconnection.
+//
+static void checkGroupIntegrity(void)
+{
+    static uint16_t vdiffCount[NUM_CHANNELS] = {0};
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        uint16_t leader = btsSlotLeader[ch];
+        float32_t leaderV;
+        float32_t limit;
+
+        //
+        // Ungrouped, disabled, or not running: nothing to compare against.
+        //
+        if ((btsSlotIsLeader[ch] != 0U) || (btsSlotEnabled[ch] == 0U) ||
+            (status[ch].running == 0U)) {
+            vdiffCount[ch] = 0U;
+            continue;
+        }
+
+        leaderV = BTS_measValues[leader].CellVoltage_V;
+
+        limit = leaderV * BTS_GROUP_VDIFF_PCT;
+        if (limit < (float32_t)0.0) {
+            limit = -limit;
+        }
+        if (limit < BTS_GROUP_VDIFF_FLOOR_V) {
+            limit = BTS_GROUP_VDIFF_FLOOR_V;
+        }
+
+        float32_t diff = BTS_measValues[ch].CellVoltage_V - leaderV;
+        if (diff < (float32_t)0.0) {
+            diff = -diff;
+        }
+
+        if (diff > limit) {
+            vdiffCount[ch]++;
+        } else {
+            vdiffCount[ch] = 0U;
+            continue;
+        }
+
+        if (vdiffCount[ch] < BTS_GROUP_VDIFF_DEBOUNCE) {
+            continue;
+        }
+
+        //
+        // Confirmed. The group shares one control loop and one load, so a
+        // member that is no longer tracking makes the others unsafe too -
+        // stop every slot in the group, not just the one that strayed.
+        //
+        {
+            uint16_t m;
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if (btsSlotLeader[m] != leader) {
+                    continue;
+                }
+                status[m].groupDisconnect = 1;
+                status[m].running = 0;
+                status[m].stopped = 1;
+                BTS_userInputs[m].enable_logic = 0;
+                BTS_ctrlLoopVariables[m].tripFlag = 1;
+                vdiffCount[m] = 0U;
+            }
+        }
+    }
 }
 
 static void updateInputVoltage(void)
@@ -918,6 +1092,32 @@ __interrupt void epwmTripISR(void) {
         status[channel].stopped = 1;
         BTS_userInputs[channel].enable_logic = 0;
         BTS_ctrlLoopVariables[channel].tripFlag = 1;
+
+        //
+        // Slots sharing a group share a load, so one tripping makes the
+        // rest unsafe. Raising each peer's tripFlag brings its PWM down
+        // through BTS_tripEpwm() on its next control pass, within a few
+        // switching periods.
+        //
+        // Their trip zones are deliberately not forced here: that sets
+        // the same OST flag a genuine fault raises, and this handler
+        // would then read it back and report an over-current against a
+        // slot whose only problem was its group-mate.
+        //
+        {
+            uint16_t m;
+            uint16_t leader = btsSlotLeader[channel];
+
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if ((m == channel) || (btsSlotLeader[m] != leader)) {
+                    continue;
+                }
+                status[m].running = 0;
+                status[m].stopped = 1;
+                BTS_userInputs[m].enable_logic = 0;
+                BTS_ctrlLoopVariables[m].tripFlag = 1;
+            }
+        }
 
         //
         // Clear the latched one-shot sources, then the OST flag itself and

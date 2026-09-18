@@ -51,12 +51,15 @@ void LEDDriver_init(void) {
 }
 
 // Update LED states based on status registers
+//
+// Priority is deliberately safety-first: a fault is shown even though the
+// slot is also, necessarily, not running. The previous ordering tested
+// "not running" first, which meant a trip looked identical to an idle slot.
+//
 void LEDDriver_update(void) {
-    static uint32_t toggle = 0;
-    static uint32_t strobe = 0;
+    static uint32_t tick = 0;
 
-    toggle = (toggle + 1) % 40;  // 2 Hz at an 80 Hz update rate
-    strobe = (strobe + 1) % 8;   // 10 Hz at an 80 Hz update rate
+    tick++;
 
     for (uint16_t ch = 0; ch < NUM_LEDS; ch++) {
         // Status registers are 10 per channel, not one per LED.
@@ -65,14 +68,27 @@ void LEDDriver_update(void) {
         uint16_t* ledData = &ledBuffer[ch * 3]; // GRB order
         const uint16_t* color = 0;
 
-        if (!(status & (1 << 0))) {            // Not running
+        if (status & (1UL << BTS_STATUS_SLOT_DISABLED)) {
+            // Masked off by the ENABLE strap - never going to run.
             color = colorRed;
-        } else if (status & (1 << 4)) {        // Charging - flashing green
-            color = (toggle < 20) ? colorGreen : 0;
-        } else if (status & (1 << 5)) {        // Discharging - strobing blue
-            color = (strobe < 4) ? colorBlue : 0;
-        } else if (status & (1 << 2)) {        // Finished
+        } else if (status & (1UL << BTS_STATUS_OVERCURRENT_TRIP)) {
+            color = ((tick % LED_TRIP_PERIOD) < LED_TRIP_ON) ? colorRed : 0;
+        } else if (status & (1UL << BTS_STATUS_REVERSE_POLARITY)) {
+            color = ((tick % LED_REVERSE_PERIOD) < LED_REVERSE_ON) ? colorRed : 0;
+        } else if (status & (1UL << BTS_STATUS_GROUP_DISCONNECT)) {
+            color = ((tick % LED_DISCONNECT_PERIOD) < LED_DISCONNECT_ON) ? colorRed : 0;
+        } else if (status & ((1UL << BTS_STATUS_CHARGING) |
+                             (1UL << BTS_STATUS_DISCHARGING))) {
+            if (status & (1UL << BTS_STATUS_RUNNING)) {
+                color = colorBlue;
+            } else {
+                color = colorGreen;
+            }
+        } else if (status & (1UL << BTS_STATUS_FINISHED)) {
             color = colorWhite;
+        } else {
+            // Idle, or simply not under control.
+            color = colorGreen;
         }
 
         if (color) {
@@ -106,7 +122,7 @@ __interrupt void ledTimerISR(void) {
 
 //
 // The WS2812B driver bit-bangs on SCIA, which the debug console takes over
-// when BTS_CONSOLE_ON_BACKCHANNEL is set. Provide no-op stubs so main() does
+// when BTS_DEBUG_CONSOLE is set. Provide no-op stubs so main() does
 // not need conditional compilation.
 //
 void LEDDriver_init(void) { }

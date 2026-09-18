@@ -15,3 +15,7 @@ Hardware/schematics/TIDA-010086/__Previews/*
 Hardware/schematics/TIDA-010086/Project Outputs/*
 *.SchDocPreview
 *.bak
+
+# CMake build output (ESP-IDF and other CMake projects)
+build/
+cmake-build-*/

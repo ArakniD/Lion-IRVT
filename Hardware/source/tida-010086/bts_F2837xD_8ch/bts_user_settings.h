@@ -69,14 +69,46 @@
 #endif
 
 #define BTS_ENABLE_DETECT_CODE (false)
+//
+// All eight control blocks are compiled in. Which slots actually run is a
+// runtime decision taken from the ENABLE dip switch (see startup_enable and
+// BTS_SLOT_ENABLED in registers.h) - a slot the strap masks off is held with
+// its PWM down rather than being absent from the binary.
+//
 #define BTS_ENABLE_CH1 (true)
-#define BTS_ENABLE_CH2 (false)
-#define BTS_ENABLE_CH3 (false)
-#define BTS_ENABLE_CH4 (false)
-#define BTS_ENABLE_CH5 (false)
-#define BTS_ENABLE_CH6 (false)
-#define BTS_ENABLE_CH7 (false)
-#define BTS_ENABLE_CH8 (false)
+#define BTS_ENABLE_CH2 (true)
+#define BTS_ENABLE_CH3 (true)
+#define BTS_ENABLE_CH4 (true)
+#define BTS_ENABLE_CH5 (true)
+#define BTS_ENABLE_CH6 (true)
+#define BTS_ENABLE_CH7 (true)
+#define BTS_ENABLE_CH8 (true)
+
+//
+//=============================================================================
+// Slot grouping supervision
+//=============================================================================
+//
+// In a grouped mode only the lowest-numbered slot closes the control loop;
+// the rest mirror its duty. Each follower's own internal-ADC voltage is
+// compared against the leader's, so a cell that falls out of the group -
+// disconnected, or simply drifting - is caught and the whole group stopped.
+//
+// The tolerance is a percentage of the leader's voltage with an absolute
+// floor, because a pure percentage collapses to nothing near 0 V.
+//
+#define BTS_GROUP_VDIFF_PCT               ((float32_t)0.10)   // 10 % of leader
+#define BTS_GROUP_VDIFF_FLOOR_V           ((float32_t)0.20)   // never tighter than this
+//
+// Consecutive C1 passes out of tolerance before the group is faulted. C1
+// runs every third 20 Hz tick, so 5 passes is roughly 750 ms.
+//
+#define BTS_GROUP_VDIFF_DEBOUNCE          ((uint16_t)5)
+//
+// A cell voltage below this is wired backwards. Negative enough to be
+// unambiguous rather than measurement noise around zero.
+//
+#define BTS_REVERSE_POLARITY_V            ((float32_t)-0.10)
 
 #define BTS_TRIP_CODE   (true)
 #define BTS_OCP_TRIGGER (false)

@@ -1,7 +1,7 @@
 # This is an auto-generated file - do not add it to source-control
 
 CompileFlags:
-   CompilationDatabase: cpu2/.clangd
+   CompilationDatabase: cpu1/.clangd
 
 Diagnostics:
    Suppress: '*'

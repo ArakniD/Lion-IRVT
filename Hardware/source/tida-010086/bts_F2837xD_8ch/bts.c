@@ -33,6 +33,17 @@ BTS_userInput BTS_userInputs[PWM_CH_MAX];
 
 ChannelStatus status[PWM_CH_MAX];
 
+//
+// Slot grouping, resolved once at init from the MODE dip switch by
+// BTS_initSlotGrouping(). The control ISR runs at the switching frequency,
+// so it reads these tables rather than recomputing a group membership on
+// every pass.
+//
+uint16_t btsSlotLeader[PWM_CH_MAX]     = {0, 1, 2, 3, 4, 5, 6, 7};
+uint16_t btsSlotIsLeader[PWM_CH_MAX]   = {1, 1, 1, 1, 1, 1, 1, 1};
+uint16_t btsSlotEnabled[PWM_CH_MAX]    = {1, 1, 1, 1, 1, 1, 1, 1};
+uint16_t btsSlotUsesIntAdc[PWM_CH_MAX] = {0, 0, 0, 0, 0, 0, 0, 0};
+
 BTS_DCL_CTRL_TYPE   BTS_ctrl_cc[PWM_CH_MAX]
     = { BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,
         BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,
@@ -115,6 +126,40 @@ BTS_SfraDataType    BTS_sfraData;
 // solution functions
 //=============================================================================
 //
+
+//
+// Resolves the MODE/ENABLE straps into the per-slot lookup tables the control
+// ISR uses. Call once, after CPU1 has latched the straps in
+// BTS_HAL_setupGPIO() and before the ePWM counters are released.
+//
+// mode   0-7 from the MODE switch   (grouping + which ADC closes the loop)
+// enable 0-7 from the ENABLE switch (index of the highest enabled slot)
+//
+void BTS_initSlotGrouping(uint16_t mode, uint16_t enable)
+{
+    uint16_t ch;
+
+    for (ch = 0; ch < PWM_CH_MAX; ch++) {
+        btsSlotLeader[ch]     = BTS_GROUP_LEADER(ch, mode);
+        btsSlotIsLeader[ch]   = BTS_IS_GROUP_LEADER(ch, mode) ? 1U : 0U;
+        btsSlotEnabled[ch]    = BTS_SLOT_ENABLED(ch, enable) ? 1U : 0U;
+        btsSlotUsesIntAdc[ch] = BTS_MODE_USES_INT_ADC(mode) ? 1U : 0U;
+
+        //
+        // A follower is never independently startable, and a masked-off slot
+        // never runs at all. Publish both through the status word so the
+        // host and the LEDs agree with what the straps actually selected.
+        //
+        status[ch].slaveMode    = (btsSlotIsLeader[ch] == 0U) ? 1U : 0U;
+        status[ch].slotDisabled = (btsSlotEnabled[ch] == 0U) ? 1U : 0U;
+
+        if (btsSlotEnabled[ch] == 0U) {
+            status[ch].running = 0;
+            status[ch].stopped = 1;
+            BTS_userInputs[ch].enable_logic = 0;
+        }
+    }
+}
 
 void BTS_initUserVariables(void)
 {

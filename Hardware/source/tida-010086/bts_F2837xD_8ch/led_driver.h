@@ -17,10 +17,28 @@
 #define LED_BUFFER_SIZE (NUM_LEDS * BITS_PER_LED / 8) // 24 bytes
 
 // LED color definitions (GRB order for WS2812B)
-#define COLOR_RED   {0, 255, 0}    // Solid Red for below min voltage
-#define COLOR_GREEN {255, 0, 0}    // Flashing Green for charging
-#define COLOR_BLUE  {0, 0, 255}    // Strobing Blue for discharging
-#define COLOR_WHITE {255, 255, 255} // Solid White for complete
+#define COLOR_RED   {0, 255, 0}     // Fault, or a slot the straps disabled
+#define COLOR_GREEN {255, 0, 0}     // Idle / not under control
+#define COLOR_BLUE  {0, 0, 255}     // Charging or discharging
+#define COLOR_WHITE {255, 255, 255} // Test complete
+
+//
+// Flash timing, in 12.5 ms ticks of the 80 Hz update.
+//
+// Each pattern is a period and the portion of it the LED is lit, so a
+// duty other than half is expressible - the trip pattern is deliberately
+// long-on/short-off to read differently from the faster faults.
+//
+#define LED_TICK_HZ             80U
+
+#define LED_TRIP_PERIOD        200U   // 2500 ms
+#define LED_TRIP_ON            160U   // 2000 ms on, 500 ms off
+
+#define LED_REVERSE_PERIOD      20U   // 250 ms
+#define LED_REVERSE_ON          10U
+
+#define LED_DISCONNECT_PERIOD   40U   // 500 ms
+#define LED_DISCONNECT_ON       20U
 
 // Function prototypes
 void LEDDriver_init(void);

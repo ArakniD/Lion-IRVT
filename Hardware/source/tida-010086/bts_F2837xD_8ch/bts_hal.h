@@ -86,6 +86,13 @@ void BTS_HAL_setupSyncBuckPwm(uint32_t);
 void BTS_HAL_setupAdcClock(uint32_t EPWM_BASE);
 
 void BTS_HAL_disableEpwmCounting(void);
+//
+// Number of buck channels the HAL drives. Kept local so the HAL does not
+// have to include the register map for a channel count.
+//
+#define BTS_HAL_NUM_PWM_CHANNELS  8U
+
+void BTS_HAL_setupGroupPhase(uint16_t groupSize);
 void BTS_HAL_enableEpwmCounting(void);
 void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE);
 void BTS_HAL_setupInterruptTrigger_Adc1(void);

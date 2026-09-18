@@ -93,6 +93,22 @@ extern "C" {
 
 extern ChannelStatus status[];
 
+//
+// Slot grouping tables, filled in by BTS_initSlotGrouping() from the MODE and
+// ENABLE dip switches. Indexed by channel:
+//
+//   btsSlotLeader     channel that closes the loop for this slot's group
+//   btsSlotIsLeader   1 if this slot is its own leader
+//   btsSlotEnabled    1 if the ENABLE strap selected this slot
+//   btsSlotUsesIntAdc 1 if the voltage loop reads the C2000's internal ADC
+//
+extern uint16_t btsSlotLeader[];
+extern uint16_t btsSlotIsLeader[];
+extern uint16_t btsSlotEnabled[];
+extern uint16_t btsSlotUsesIntAdc[];
+
+void BTS_initSlotGrouping(uint16_t mode, uint16_t enable);
+
 
 
 extern BTS_measValue BTS_measValues[];
@@ -391,6 +407,65 @@ static inline void BTS_storeValuesF28(BTS_measValue* measValue, int16_t cell_vol
     }
 }
 
+//
+// Presents the C2000's own cell-voltage reading in the domain the control
+// loop actually compares against.
+//
+// BTS_ctrlISR() computes voutSense_pu as voltage_16b / 32768, and the CV
+// error subtracts that from voutSet_pu - which BTS_updateReference() derives
+// using VoutGain_pu / VoutOffset_pu, the *external* converter's per-unit
+// calibration. The internal ADC therefore cannot simply be substituted: its
+// own calibration pair (F28V_Gain / F28V_Offset) yields volts, not per-unit,
+// so feeding its counts in raw would compare two different quantities.
+//
+// Both calibrations are composed here - counts to volts, then volts to the
+// same per-unit scale the setpoint uses - and the result is re-expressed as
+// the signed 16-bit quantity BTS_ctrlISR() expects.
+//
+// Note the internal ADC is 12-bit against a 2.5 V reference where the
+// ADS131M08 is 16-bit, so in these modes the voltage loop quantises on the
+// sensor rather than on the actuator.
+//
+#pragma FUNC_ALWAYS_INLINE(BTS_cellVoltageAsCtrl16b)
+static inline int16_t BTS_cellVoltageAsCtrl16b(const BTS_measValue* measValue,
+                                               const BTS_userInput* userInput)
+{
+    float32_t volts;
+    float32_t pu;
+
+    //
+    // Newest sample rather than the ring-buffer average: averaging
+    // BTS_f28AverageFactor samples would add phase lag the CV loop cannot
+    // tolerate. F28Index has already advanced past the most recent write.
+    //
+    uint16_t idx = (measValue->F28Index == 0U)
+                 ? (uint16_t)(BTS_f28AverageFactor - 1U)
+                 : (uint16_t)(measValue->F28Index - 1U);
+
+    //
+    // Counts to volts, matching how BTS_monitor_Iout_Vout() scales the same
+    // reading: 12-bit unsigned against the 2.5 V reference.
+    //
+    volts = (((float32_t)measValue->CellVoltage_16b[idx] / (float32_t)4096.0)
+             * (float32_t)2.5) * measValue->F28V_Gain + measValue->F28V_Offset;
+
+    //
+    // Volts to the setpoint's per-unit domain.
+    //
+    pu = volts * userInput->VoutGain_pu + userInput->VoutOffset_pu;
+
+    pu = pu * (float32_t)32768.0;
+
+    if (pu > (float32_t)32767.0) {
+        pu = (float32_t)32767.0;
+    } else if (pu < (float32_t)-32768.0) {
+        pu = (float32_t)-32768.0;
+    }
+
+    return (int16_t)pu;
+}
+
+
 static inline void BTS_ctrlDirection(uint32_t EPWM_BASE, BTS_ctrlLoopVariable *ctrlLoopVariable,int16_t current_16b){
 
     //In charge mode, check if current goes below negative trip value, then shutdown low side mosfet
@@ -405,7 +480,7 @@ static inline void BTS_ctrlDirection(uint32_t EPWM_BASE, BTS_ctrlLoopVariable *c
             ctrlLoopVariable->dutyL_pu = 1.0;
         }
         else{
-            EPWM_setActionQualifierContSWForceAction(BTS_DRV_EPWM_BASE,EPWM_AQ_OUTPUT_B,EPWM_AQ_SW_DISABLED);
+            EPWM_setActionQualifierContSWForceAction(EPWM_BASE,EPWM_AQ_OUTPUT_B,EPWM_AQ_SW_DISABLED);
             ctrlLoopVariable->dutyH_pu = ctrlLoopVariable->dutySet_pu;
             ctrlLoopVariable->dutyL_pu = ctrlLoopVariable->dutySet_pu;
         }
@@ -419,7 +494,7 @@ static inline void BTS_ctrlDirection(uint32_t EPWM_BASE, BTS_ctrlLoopVariable *c
             ctrlLoopVariable->dutyL_pu = ctrlLoopVariable->dutySet_pu;
         }
         else{
-            EPWM_setActionQualifierContSWForceAction(BTS_DRV_EPWM_BASE,EPWM_AQ_OUTPUT_A,EPWM_AQ_SW_DISABLED);
+            EPWM_setActionQualifierContSWForceAction(EPWM_BASE,EPWM_AQ_OUTPUT_A,EPWM_AQ_SW_DISABLED);
             ctrlLoopVariable->dutyH_pu = ctrlLoopVariable->dutySet_pu;
             ctrlLoopVariable->dutyL_pu = ctrlLoopVariable->dutySet_pu;
         }
@@ -576,6 +651,55 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
 
 
 
+//
+// Runs one slot's share of the control ISR.
+//
+// A disabled slot is held down. A group leader closes its loop as usual. A
+// follower does not run a controller at all - it mirrors whatever duty its
+// leader just computed, which is what makes the group act as one converter.
+// The interleave between them comes from the ePWM phase configured at init,
+// not from anything done here.
+//
+#pragma FUNC_ALWAYS_INLINE(BTS_runSlot)
+static inline void BTS_runSlot(uint16_t ch, BTS_DCL_CTRL_TYPE* ctrl_cc,
+                               BTS_DCL_CTRL_TYPE* ctrl_cv, uint32_t EPWM_BASE,
+                               BTS_ctrlLoopVariable *ctrlLoopVariable,
+                               int16_t current_16b, int16_t voltage_16b)
+{
+    if (btsSlotEnabled[ch] == 0U) {
+        BTS_HAL_updateDuty(EPWM_BASE, (float32_t)0.0, (float32_t)0.0);
+        return;
+    }
+
+    if (btsSlotIsLeader[ch] != 0U) {
+        if (btsSlotUsesIntAdc[ch] != 0U) {
+            voltage_16b = BTS_cellVoltageAsCtrl16b(&BTS_measValues[ch],
+                                                   &BTS_userInputs[ch]);
+        }
+        BTS_ctrlISR(ctrl_cc, ctrl_cv, EPWM_BASE, ctrlLoopVariable,
+                    current_16b, voltage_16b);
+    } else {
+        const BTS_ctrlLoopVariable *leader =
+            &BTS_ctrlLoopVariables[btsSlotLeader[ch]];
+
+        //
+        // Follow the leader's duty, but keep this slot's own trip logic live
+        // so its over-current protection still bites independently.
+        //
+#if(BTS_TRIP_CODE)
+        BTS_tripEpwm(EPWM_BASE, ctrl_cc, ctrlLoopVariable, current_16b);
+#endif
+        ctrlLoopVariable->ioutSense_pu = (float32_t)current_16b / (float32_t)32768.0;
+        ctrlLoopVariable->voutSense_pu = (float32_t)voltage_16b / (float32_t)32768.0;
+        ctrlLoopVariable->dutySet_pu   = leader->dutySet_pu;
+        ctrlLoopVariable->dutyH_pu     = leader->dutyH_pu;
+        ctrlLoopVariable->dutyL_pu     = leader->dutyL_pu;
+
+        if (ctrlLoopVariable->tripFlag == 0U) {
+            BTS_HAL_updateDuty(EPWM_BASE, leader->dutyH_pu, leader->dutyL_pu);
+        }
+    }
+}
 #pragma FUNC_ALWAYS_INLINE(BTS_ISR_SFRA)
 static inline void BTS_ISR_SFRA(void){
 
@@ -628,7 +752,7 @@ static inline void BTS_runISR_ch1_4(void){
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM1_BASE,&BTS_ctrlLoopVariable_ch1 , &BTS_userInput_ch1);
 #endif
-    BTS_ctrlISR(&BTS_ctrl_cc_ch1,&BTS_ctrl_cv_ch1,EPWM1_BASE, &BTS_ctrlLoopVariable_ch1, BTS_ADC1.channel0, BTS_ADC1.channel1);
+    BTS_runSlot(0, &BTS_ctrl_cc_ch1, &BTS_ctrl_cv_ch1, EPWM1_BASE, &BTS_ctrlLoopVariable_ch1, BTS_ADC1.channel0, BTS_ADC1.channel1);
 #endif
 
 #if(BTS_ENABLE_CH2)
@@ -636,7 +760,7 @@ static inline void BTS_runISR_ch1_4(void){
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM2_BASE,&BTS_ctrlLoopVariable_ch2 , &BTS_userInput_ch2);
 #endif
-    BTS_ctrlISR(&BTS_ctrl_cc_ch2,&BTS_ctrl_cv_ch2,EPWM2_BASE, &BTS_ctrlLoopVariable_ch2, BTS_ADC1.channel2, BTS_ADC1.channel3);
+    BTS_runSlot(1, &BTS_ctrl_cc_ch2, &BTS_ctrl_cv_ch2, EPWM2_BASE, &BTS_ctrlLoopVariable_ch2, BTS_ADC1.channel2, BTS_ADC1.channel3);
 #endif
 
 #if(BTS_ENABLE_CH3)
@@ -644,7 +768,7 @@ static inline void BTS_runISR_ch1_4(void){
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM3_BASE,&BTS_ctrlLoopVariable_ch3 , &BTS_userInput_ch3);
 #endif
-    BTS_ctrlISR(&BTS_ctrl_cc_ch3,&BTS_ctrl_cv_ch3,EPWM3_BASE, &BTS_ctrlLoopVariable_ch3, BTS_ADC1.channel4, BTS_ADC1.channel5);
+    BTS_runSlot(2, &BTS_ctrl_cc_ch3, &BTS_ctrl_cv_ch3, EPWM3_BASE, &BTS_ctrlLoopVariable_ch3, BTS_ADC1.channel4, BTS_ADC1.channel5);
 #endif
 
 #if(BTS_ENABLE_CH4)
@@ -652,7 +776,7 @@ static inline void BTS_runISR_ch1_4(void){
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM4_BASE,&BTS_ctrlLoopVariable_ch4 , &BTS_userInput_ch4);
 #endif
-    BTS_ctrlISR(&BTS_ctrl_cc_ch4,&BTS_ctrl_cv_ch4,EPWM4_BASE, &BTS_ctrlLoopVariable_ch4, BTS_ADC1.channel6, BTS_ADC1.channel7);
+    BTS_runSlot(3, &BTS_ctrl_cc_ch4, &BTS_ctrl_cv_ch4, EPWM4_BASE, &BTS_ctrlLoopVariable_ch4, BTS_ADC1.channel6, BTS_ADC1.channel7);
 #endif
 
 #endif
@@ -677,7 +801,7 @@ static inline void BTS_runISR_ch5_8(void){
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM5_BASE,&BTS_ctrlLoopVariable_ch5 , &BTS_userInput_ch5);
 #endif
-    BTS_ctrlISR(&BTS_ctrl_cc_ch5,&BTS_ctrl_cv_ch5,EPWM5_BASE, &BTS_ctrlLoopVariable_ch5, BTS_ADC2.channel0, BTS_ADC2.channel1);
+    BTS_runSlot(4, &BTS_ctrl_cc_ch5, &BTS_ctrl_cv_ch5, EPWM5_BASE, &BTS_ctrlLoopVariable_ch5, BTS_ADC2.channel0, BTS_ADC2.channel1);
 #endif
 
 #if(BTS_ENABLE_CH6)
@@ -685,7 +809,7 @@ static inline void BTS_runISR_ch5_8(void){
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM6_BASE,&BTS_ctrlLoopVariable_ch6 , &BTS_userInput_ch6);
 #endif
-    BTS_ctrlISR(&BTS_ctrl_cc_ch6,&BTS_ctrl_cv_ch6,EPWM6_BASE, &BTS_ctrlLoopVariable_ch6, BTS_ADC2.channel2, BTS_ADC2.channel3);
+    BTS_runSlot(5, &BTS_ctrl_cc_ch6, &BTS_ctrl_cv_ch6, EPWM6_BASE, &BTS_ctrlLoopVariable_ch6, BTS_ADC2.channel2, BTS_ADC2.channel3);
 #endif
 
 #if(BTS_ENABLE_CH7)
@@ -693,7 +817,7 @@ static inline void BTS_runISR_ch5_8(void){
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM7_BASE,&BTS_ctrlLoopVariable_ch7 , &BTS_userInput_ch7);
 #endif
-    BTS_ctrlISR(&BTS_ctrl_cc_ch7,&BTS_ctrl_cv_ch7,EPWM7_BASE, &BTS_ctrlLoopVariable_ch7, BTS_ADC2.channel4, BTS_ADC2.channel5);
+    BTS_runSlot(6, &BTS_ctrl_cc_ch7, &BTS_ctrl_cv_ch7, EPWM7_BASE, &BTS_ctrlLoopVariable_ch7, BTS_ADC2.channel4, BTS_ADC2.channel5);
 #endif
 
 #if(BTS_ENABLE_CH8)
@@ -701,7 +825,7 @@ static inline void BTS_runISR_ch5_8(void){
 #if(BTS_ENABLE_DETECT_CODE)
     BTS_detectEnable(EPWM8_BASE,&BTS_ctrlLoopVariable_ch8 , &BTS_userInput_ch8);
 #endif
-    BTS_ctrlISR(&BTS_ctrl_cc_ch8,&BTS_ctrl_cv_ch8,EPWM8_BASE, &BTS_ctrlLoopVariable_ch8, BTS_ADC2.channel6, BTS_ADC2.channel7);
+    BTS_runSlot(7, &BTS_ctrl_cc_ch8, &BTS_ctrl_cv_ch8, EPWM8_BASE, &BTS_ctrlLoopVariable_ch8, BTS_ADC2.channel6, BTS_ADC2.channel7);
 #endif
 
 #endif
