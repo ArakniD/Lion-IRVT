@@ -1,10 +1,9 @@
 {
+  "env": {
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"
+  },
   "permissions": {
     "allow": [
-      "mcp__ccs-debug",
-      "mcp__ccs-project",
-      "mcp__ccs-sysconfig",
-      "mcp__ccs-serial",
       "Read(//C/ti/ccs2101/ccs/theia/resources/ai/**)",
       "Read(//C/ti/c2000/C2000Ware_5_02_00_00/**)",
       "Read(//C/ti/c2000/C2000Ware_DigitalPower_SDK_5_03_00_00/**)",
@@ -27,13 +26,17 @@
       "Read(//C/ti/xdctools_3_51_03_28_core/**)",
       "Read(//C/ti/xdctools_3_51_01_18_core/**)",
       "Read(//C/ti/xdctools_3_32_02_25_core/**)",
-      "Read(//C/ti/xdctools_3_32_00_06_core/**)"
+      "Read(//C/ti/xdctools_3_32_00_06_core/**)",
+      "mcp__ccs-debug",
+      "mcp__ccs-project",
+      "mcp__ccs-sysconfig",
+      "mcp__ccs-serial",
+      "Bash(grep -rn \"EPWM4SYNCIN\\\\|EPWM7SYNCIN\\\\|EPWM10SYNCIN\" /c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/common/include/*.h 2>/dev/null | head -10; echo \"====\"; grep -rn -i \"syncin\" /c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/headers/include/f2837xd_syscommon.h 2>/dev/null | head)",
+      "Read(//c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/common/include/**)",
+      "Read(//c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/headers/include/**)"
     ],
     "ask": [
       "mcp__ccs-project__changeSysConfigVersion"
     ]
-  },
-  "env": {
-    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"
   }
 }

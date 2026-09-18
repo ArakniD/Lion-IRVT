@@ -26,6 +26,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_lcd_panel_io.h"
@@ -37,6 +38,7 @@
 #include "test_engine.h"
 #include "bts_link.h"
 #include "web_api.h"
+#include "input.h"
 
 static const char *TAG = "display";
 
@@ -58,26 +60,75 @@ static const char *TAG = "display";
  */
 #define UI_BAND_H           24
 
+/* Input-servicing cadence; the data refresh is much slower. */
+#define UI_TICK_MS          20
+
 #define TASK_STACK          4096
 #define TASK_PRIO           3
 
 /* RGB565. */
-#define C_BLACK     0x0000
-#define C_WHITE     0xFFFF
-#define C_GREY      0x8410
-#define C_DIM       0x4208
-#define C_RED       0xF800
-#define C_GREEN     0x07E0
-#define C_BLUE      0x001F
-#define C_YELLOW    0xFFE0
-#define C_CYAN      0x07FF
-#define C_ORANGE    0xFD20
-#define C_HEADER_BG 0x18E3
+/*
+ * Colours are written here in natural RGB565 (red in the high bits) and
+ * byte-swapped on the way to the panel by RGB565().
+ *
+ * WHY NOT data_endian
+ * -------------------
+ * esp_lcd_panel_dev_config_t has a data_endian field, and setting it to
+ * BIG looks like the right fix, but on this driver it only selects a bit in
+ * the ST7789's RAMCTRL register - which the controller applies to its
+ * parallel/RGB interfaces, not to SPI. Over SPI the panel always consumes
+ * the most significant byte first, so the swap has to happen in the data.
+ *
+ * Getting this wrong is not a colour cast but a scramble: yellow (31,63,0)
+ * becomes (28,7,31), which reads as purple, and green becomes red. The
+ * giveaway is that white, black and grey look right, because their two
+ * bytes are equal or near-equal.
+ */
+#define RGB565(c)   ((uint16_t)((((c) & 0x00FF) << 8) | (((c) & 0xFF00) >> 8)))
+
+#define C_BLACK     RGB565(0x0000)
+#define C_WHITE     RGB565(0xFFFF)
+#define C_GREY       RGB565(0x8410)
+#define C_DIM        RGB565(0x4208)
+#define C_RED        RGB565(0xF800)
+#define C_GREEN     RGB565(0x07E0)
+#define C_BLUE       RGB565(0x001F)
+#define C_YELLOW     RGB565(0xFFE0)
+#define C_CYAN       RGB565(0x07FF)
+#define C_ORANGE     RGB565(0xFD20)
+#define C_HEADER_BG RGB565(0x18E3)
+#define C_SELECT_BG RGB565(0x2124)   /* selected row tint */
+
+/*
+ * Input feedback border.
+ *
+ * The encoder is the only control on the unit, so it has to feel connected:
+ * a flash confirms the firmware saw the event even when the consequence is
+ * off-screen or subtle. Rotation and press flash different colours so they
+ * are distinguishable without reading the row.
+ */
+#define BORDER_W            3
+#define FLASH_MS            90
+#define C_FLASH_ROTATE      C_CYAN
+#define C_FLASH_PRESS       C_GREEN
+#define C_FLASH_LONG        C_ORANGE
 
 static esp_lcd_panel_handle_t s_panel;
 static uint16_t              *s_band;
 static display_config_t       s_cfg;
 static bool                   s_ble_connected;
+/*
+ * Slot the encoder currently points at, 0-based. The menu system will build
+ * on this; for now turning the encoder moves the highlight and the button
+ * is acknowledged in the log, so the hardware can be verified before any
+ * action is wired to it.
+ */
+static int                    s_selected_slot;
+static int64_t                s_flash_until_us;
+static uint16_t               s_flash_colour;
+/* Whether a coloured border is currently on the glass, so it is only
+ * redrawn on a transition rather than every pass. */
+static bool                   s_border_lit;
 
 void display_set_ble_connected(bool connected)
 {
@@ -176,6 +227,53 @@ static void push_band(int band_y)
                               s_cfg.x_offset + s_cfg.width,
                               s_cfg.y_offset + band_y + h,
                               s_band);
+}
+
+/*
+ * Fills an arbitrary screen rectangle in one transfer.
+ *
+ * Uses the band buffer as scratch, so w*h must not exceed its capacity.
+ * This is how the border is drawn without repainting the whole screen: four
+ * thin edges total about 5.7 kB, roughly 5 ms on the bus, against ~92 ms
+ * for a full 240x240 repaint. That difference is what makes the flash feel
+ * immediate rather than laggy.
+ */
+static void fill_screen_rect(int x, int y, int w, int h, uint16_t colour)
+{
+    const size_t n = (size_t)w * (size_t)h;
+    if (n == 0 || n > (size_t)s_cfg.width * UI_BAND_H) {
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        s_band[i] = colour;
+    }
+    esp_lcd_panel_draw_bitmap(s_panel,
+                              s_cfg.x_offset + x,
+                              s_cfg.y_offset + y,
+                              s_cfg.x_offset + x + w,
+                              s_cfg.y_offset + y + h,
+                              s_band);
+}
+
+/* Draws the four edges. C_BLACK erases. */
+static void draw_border(uint16_t colour)
+{
+    const int w = s_cfg.width;
+    const int h = s_cfg.height;
+
+    fill_screen_rect(0, 0, w, BORDER_W, colour);                  /* top    */
+    fill_screen_rect(0, h - BORDER_W, w, BORDER_W, colour);       /* bottom */
+    fill_screen_rect(0, 0, BORDER_W, h, colour);                  /* left   */
+    fill_screen_rect(w - BORDER_W, 0, BORDER_W, h, colour);       /* right  */
+}
+
+/* Starts a flash; the task turns it off once it has run its course. */
+static void flash_border(uint16_t colour)
+{
+    s_flash_colour   = colour;
+    s_flash_until_us = esp_timer_get_time() + (FLASH_MS * 1000LL);
+    draw_border(colour);
+    s_border_lit = true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -333,10 +431,17 @@ static void draw_slot_row(uint8_t slot)
     slot_status_t st;
     test_engine_get_status(slot, &st);
 
-    band_clear(C_BLACK);
+    const bool selected = ((int)slot == s_selected_slot);
+    band_clear(selected ? C_SELECT_BG : C_BLACK);
 
     uint16_t sc;
     const char letter = state_letter(st.state, &sc);
+
+    /* A caret in the left margin, so the selection survives a colour-blind
+     * reading of the background tint. */
+    if (selected) {
+        band_text(0, y + 7, y, ">", C_WHITE, 1);
+    }
 
     /* State badge. */
     char badge[2] = { letter, '\0' };
@@ -363,11 +468,12 @@ static void draw_slot_row(uint8_t slot)
 
     /* Fault reason replaces the numbers - it is what the operator needs. */
     if (st.state == SLOT_STATE_FAULT) {
-        band_fill_rect(40, y + 2, s_cfg.width - 42, ROW_H - 4, y, C_BLACK);
+        band_fill_rect(40, y + 2, s_cfg.width - 42, ROW_H - 4, y,
+                       selected ? C_SELECT_BG : C_BLACK);
         band_text(44, y + 7, y, slot_fault_name(st.fault), C_RED, 1);
     }
 
-    band_fill_rect(0, y + ROW_H - 1, s_cfg.width, 1, y, 0x1082);
+    band_fill_rect(0, y + ROW_H - 1, s_cfg.width, 1, y, RGB565(0x1082));
     push_band(y);
 }
 
@@ -459,7 +565,67 @@ static void display_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(4000));
     }
 
+    /*
+     * The loop ticks far faster than it repaints.
+     *
+     * Input has to be serviced within a few tens of milliseconds or the
+     * encoder feels dead, and the flash is only 90 ms long - both need finer
+     * granularity than the 500 ms data refresh. So the tick is short, input
+     * and the flash are handled every pass, and the panel contents are
+     * redrawn only when refresh_ms has elapsed or an event changed something.
+     */
+    int64_t next_refresh_us = 0;
+
     for (;;) {
+        const int64_t now = esp_timer_get_time();
+        bool need_redraw = (now >= next_refresh_us);
+
+        input_event_t ev;
+        while (input_wait_event(&ev, 0)) {
+            switch (ev.type) {
+            case INPUT_EVENT_ROTATE_CW:
+                s_selected_slot += ev.steps;
+                flash_border(C_FLASH_ROTATE);
+                need_redraw = true;
+                break;
+            case INPUT_EVENT_ROTATE_CCW:
+                s_selected_slot -= ev.steps;
+                flash_border(C_FLASH_ROTATE);
+                need_redraw = true;
+                break;
+            case INPUT_EVENT_PRESS:
+                flash_border(C_FLASH_PRESS);
+                ESP_LOGI(TAG, "select: slot %d", s_selected_slot + 1);
+                break;
+            case INPUT_EVENT_LONG_PRESS:
+                flash_border(C_FLASH_LONG);
+                ESP_LOGI(TAG, "menu request on slot %d", s_selected_slot + 1);
+                break;
+            default:
+                break;
+            }
+            /* Clamp rather than wrap: an operator scrolling to the end of a
+             * short list should stop there, not jump to the other end. */
+            if (s_selected_slot < 0) {
+                s_selected_slot = 0;
+            }
+            if (s_selected_slot >= SLOT_COUNT) {
+                s_selected_slot = SLOT_COUNT - 1;
+            }
+        }
+
+        /* Expire a finished flash. */
+        if (s_border_lit && esp_timer_get_time() >= s_flash_until_us) {
+            draw_border(C_BLACK);
+            s_border_lit = false;
+        }
+
+        if (!need_redraw) {
+            vTaskDelay(pdMS_TO_TICKS(UI_TICK_MS));
+            continue;
+        }
+        next_refresh_us = esp_timer_get_time() + (int64_t)s_cfg.refresh_ms * 1000;
+
         bts_snapshot_t snap;
         bts_link_get_snapshot(&snap);
 
@@ -478,7 +644,17 @@ static void display_task(void *arg)
             showed_table = false;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(s_cfg.refresh_ms));
+        /*
+         * Bands span the full width, so a repaint wipes the left and right
+         * edges of a lit border. Put it back rather than waiting for the
+         * flash to expire, otherwise a redraw that lands mid-flash leaves
+         * the border half-drawn.
+         */
+        if (s_border_lit) {
+            draw_border(s_flash_colour);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(UI_TICK_MS));
     }
 }
 
@@ -545,7 +721,13 @@ esp_err_t display_init(const display_config_t *config)
 
     const esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = s_cfg.reset_gpio,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .rgb_ele_order = s_cfg.bgr_order ? LCD_RGB_ELEMENT_ORDER_BGR
+                                         : LCD_RGB_ELEMENT_ORDER_RGB,
+        /*
+         * Byte order is handled by RGB565() at the colour definitions, not
+         * here: this driver's data_endian only sets a RAMCTRL bit that the
+         * ST7789 applies to its parallel interface, not to SPI.
+         */
         .bits_per_pixel = 16,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io, &panel_cfg, &s_panel),

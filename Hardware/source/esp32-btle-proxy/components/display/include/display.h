@@ -58,6 +58,13 @@ typedef struct {
     int y_offset;
     bool invert_colour;     /* most IPS ST7789 panels need this true */
     /*
+     * Set when red and blue come out transposed - some modules wire the
+     * panel's colour filter in BGR order. This is a hue swap only; text
+     * appearing purple with dim greys is a byte-order problem instead, and
+     * is handled by data_endian in display.c.
+     */
+    bool bgr_order;
+    /*
      * SPI mode 0 (CPOL=0, CPHA=0) is what the ST7789 datasheet specifies and
      * what most modules want. Some breakout boards latch on the opposite
      * clock edge and need mode 2 (CPOL=1, CPHA=0); a mismatch shows as a

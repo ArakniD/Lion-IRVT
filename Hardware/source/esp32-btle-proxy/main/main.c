@@ -38,6 +38,7 @@
 #include "ble_svc.h"
 #include "web_api.h"
 #include "display.h"
+#include "input.h"
 
 static const char *TAG = "main";
 
@@ -57,6 +58,14 @@ static const char *TAG = "main";
 #define LCD_RESET_GPIO      17
 #define LCD_DC_GPIO         16
 #define LCD_BACKLIGHT_GPIO  4
+
+/*
+ * Rotary encoder with push switch. See input.h for the strapping-pin
+ * caveats on GPIO15 and GPIO2 - neither affects normal running.
+ */
+#define ENC_A_GPIO          15
+#define ENC_B_GPIO          13
+#define ENC_SW_GPIO         2
 
 #define BLE_DEVICE_NAME     "BTS-Tester"
 #define AP_SSID             "BTS-Tester"
@@ -153,6 +162,20 @@ void app_main(void)
     if (err != ESP_OK) {
         /* A tester with no panel is still a working tester over BLE. */
         ESP_LOGE(TAG, "display unavailable: %s", esp_err_to_name(err));
+    }
+
+    const input_config_t enc_cfg = {
+        .encoder_a_gpio    = ENC_A_GPIO,
+        .encoder_b_gpio    = ENC_B_GPIO,
+        .switch_gpio       = ENC_SW_GPIO,
+        .switch_active_low = true,      /* switch to GND, internal pull-up */
+        .long_press_ms     = 800,
+        .invert_direction  = false,
+        .trace             = true,
+    };
+    err = input_init(&enc_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "encoder unavailable: %s", esp_err_to_name(err));
     }
 
     ESP_ERROR_CHECK(ble_svc_init(BLE_DEVICE_NAME));

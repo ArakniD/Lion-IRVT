@@ -2,10 +2,32 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "TMS320F28379D.ccxml.ccxml",
+            "name": "bts_F2837xD_8ch",
             "type": "ccs-debug",
             "request": "launch",
-            "targetConfig": "/c:/Users/lucas/ti/CCSTargetConfigurations/TMS320F28379D.ccxml.ccxml"
+            "projectInfo": {
+                "name": "bts_F2837xD_8ch",
+                "resourceId": "/bts_F2837xD_8ch"
+            },
+            "launchSettings": {
+                "coresToLoadForProjectLaunch": [
+                    "C28xx_CPU1",
+                    "C28xx_CPU2"
+                ]
+            },
+            "connections": [
+                {
+                    "name": "Texas Instruments XDS100v2 USB Debug Probe_0",
+                    "cores": [
+                        {
+                            "name": "C28xx_CPU1",
+                            "debuggerSettings": {
+                                "data": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\" ?>\n<PropertyValues/>\n"
+                            }
+                        }
+                    ]
+                }
+            ]
         }
     ]
 }
