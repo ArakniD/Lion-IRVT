@@ -98,6 +98,18 @@
 //
 #define BTS_I2C_TIMEOUT_ITERATIONS 20000UL
 
+//
+// Idle-loop passes the host bus may sit busy, with no address match,
+// before the target is assumed stuck and reset. The loop runs flat out,
+// so this is a large number for a short wall-clock time.
+//
+#define BTS_I2C_TARGET_STUCK_PASSES 200000UL
+
+//
+// Address this unit answers to on the host bus.
+//
+#define BTS_I2C_TARGET_ADDRESS 0x50U
+
 // Validation limits
 #define MIN_VOLTAGE 8.0f
 #define MAX_VOLTAGE 16.8f
@@ -216,6 +228,7 @@ static volatile uint16_t adsFailCount[2] = {0, 0};
 // Forward declarations - every ISR below is registered before it is defined.
 //
 __interrupt void i2cSlaveISR(void);
+__interrupt void i2cSlaveFifoISR(void);
 __interrupt void i2cTargetISR(void);
 __interrupt void i2cMasterISR(void);
 __interrupt void canISR(void);
@@ -247,17 +260,63 @@ void initI2C_Slave(void)
     // target at 0x50. The pins were muxed by CPU1 in BTS_HAL_setupCpu2Pins() -
     // the mux registers are not writable from CPU2.
     //
+    // Configured to run from the FIFOs, following TI's own master/slave
+    // example. Three details here are easy to get wrong and each one on its
+    // own stops the target answering:
+    //
+    //   The prescaler must be set even though a target never drives SCL. It
+    //   divides SYSCLK to the module clock, which the TRM requires to sit
+    //   between 7 and 12 MHz because it times the data setup and hold windows
+    //   and clocks the input filter.
+    //
+    //   I2CCNT is decremented by the target as well as the controller. Left
+    //   at zero the module acknowledges its address and then holds SCL low
+    //   indefinitely while its own status register still reports the bus free.
+    //
+    //   With the FIFO enabled the basic RRDY and XRDY interrupts must not be
+    //   used - the TRM is explicit about this - and the FIFO interrupts arrive
+    //   on a different PIE vector, INT_I2CA_FIFO, not INT_I2CA.
+    //
     I2C_disableModule(I2CA_BASE);
-    I2C_setOwnAddress(I2CA_BASE, 0x50);
-    I2C_setBitCount(I2CA_BASE, I2C_BITCOUNT_8);
+
+    I2C_initController(I2CA_BASE, DEVICE_SYSCLK_FREQ, 100000, I2C_DUTYCYCLE_50);
     I2C_setConfig(I2CA_BASE, I2C_TARGET_RECEIVE_MODE);
-    I2C_setEmulationMode(I2CA_BASE, I2C_EMULATION_FREE_RUN);
-    I2C_enableModule(I2CA_BASE);
+    I2C_setOwnAddress(I2CA_BASE, BTS_I2C_TARGET_ADDRESS);
+    I2C_disableLoopback(I2CA_BASE);
+    I2C_setBitCount(I2CA_BASE, I2C_BITCOUNT_8);
+    I2C_setDataCount(I2CA_BASE, 2);
+    I2C_setAddressMode(I2CA_BASE, I2C_ADDR_MODE_7BITS);
+
+    I2C_enableFIFO(I2CA_BASE);
+
+    //
+    // Interrupt on every received byte. The command framing is only two or
+    // six bytes long, so there is nothing to gain from batching and a great
+    // deal to lose: a partially filled FIFO would stall mid-command.
+    //
+    I2C_setFIFOInterruptLevel(I2CA_BASE, I2C_FIFO_TXEMPTY, I2C_FIFO_RX1);
+
+    I2C_clearInterruptStatus(I2CA_BASE,
+                             I2C_INT_ADDR_TARGET | I2C_INT_ARB_LOST |
+                             I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION |
+                             I2C_INT_RXFF | I2C_INT_TXFF);
+
+    //
+    // Basic sources on 8.1, FIFO sources on 8.2.
+    //
     I2C_enableInterrupt(I2CA_BASE,
-                        I2C_INT_RX_DATA_RDY | I2C_INT_TX_DATA_RDY |
-                        I2C_INT_ADDR_TARGET | I2C_INT_STOP_CONDITION);
+                        I2C_INT_ADDR_TARGET | I2C_INT_ARB_LOST |
+                        I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION |
+                        I2C_INT_RXFF | I2C_INT_TXFF);
+
+    I2C_setEmulationMode(I2CA_BASE, I2C_EMULATION_FREE_RUN);
+
     Interrupt_register(INT_I2CA, &i2cSlaveISR);
+    Interrupt_register(INT_I2CA_FIFO, &i2cSlaveFifoISR);
     Interrupt_enable(INT_I2CA);
+    Interrupt_enable(INT_I2CA_FIFO);
+
+    I2C_enableModule(I2CA_BASE);
 }
 
 void initI2C_Master(void)
@@ -1853,8 +1912,42 @@ __interrupt void timerISR(void)
     //
 }
 
+//
+// Target-side command parser state.
+//
+// A host command is two address bytes followed by either data (a write) or a
+// repeated start and a read. Tracking that as an explicit phase rather than a
+// byte counter keeps the receive and transmit sides from sharing a counter -
+// they previously did, and the read path then skipped its own first step and
+// served whatever the buffer still held.
+//
+typedef enum {
+    eI2cAddrHi = 0,     // waiting for the high address byte
+    eI2cAddrLo,         // waiting for the low address byte
+    eI2cData,           // address complete; any further bytes are payload
+} BTS_i2cRxPhase;
+
+static volatile BTS_i2cRxPhase rxPhase   = eI2cAddrHi;
+static volatile uint16_t       rxDataIdx = 0;
+
 volatile uint16_t currentRegAddr = 0;
-volatile uint16_t byteCount = 0;
+volatile uint32_t dbgSlaveIsr = 0;
+volatile uint32_t dbgSlaveAddr = 0;
+volatile uint32_t dbgSlaveRx = 0;
+volatile uint32_t dbgSlaveTx = 0;
+volatile uint32_t dbgSlaveErr = 0;
+volatile uint32_t dbgSlaveStuck = 0;
+volatile uint16_t dbgRxSeq[8] = {0,0,0,0,0,0,0,0};
+volatile uint16_t dbgRxIdx = 0;
+volatile uint16_t dbgBcAtRx[8] = {0,0,0,0,0,0,0,0};
+volatile uint16_t dbgLastReg = 0;
+static volatile uint16_t aasPrev = 0;
+static volatile uint16_t dirPrev = 0;
+//
+// Transmit-side byte counter, separate from byteCount which tracks the
+// receive phase. A register read uses both: two bytes in, four out.
+//
+static volatile uint16_t txCount = 0;
 volatile float tempData = 0.0f;
 volatile uint16_t isWrite = 0;
 static uint16_t readBuffer[4] = {0};
@@ -1887,8 +1980,103 @@ static void applyHostRegisterWrite(uint16_t regIdx, float32_t value)
 // Runs work that interrupt handlers deferred. Called from the idle
 // loop, where a long F-RAM transfer costs nothing.
 //
+//
+// Recovers the host-facing I2C target if it locks up.
+//
+// A target that is interrupted mid-byte - the host resetting, a cable pulled,
+// a transfer abandoned on timeout - can be left holding SCL low with BUS_BUSY
+// set and no interrupt pending to service. Nothing on this side clears that:
+// the ISR only runs when the module asks it to, and a wedged module never
+// asks. The bus then stays jammed for every device on it, and the host reports
+// the unit as absent.
+//
+// Watch for BUS_BUSY that persists with no address match, and reinitialise
+// the module through its reset bit when it does.
+//
+static void serviceI2CTargetWatchdog(void)
+{
+    static uint32_t busyPasses;
+    static uint32_t lastAddrCount;
+
+    //
+    // Any address activity means the target is alive and talking; the bus
+    // being busy is then just a transfer in progress.
+    //
+    if (dbgSlaveAddr != lastAddrCount) {
+        lastAddrCount = dbgSlaveAddr;
+        busyPasses = 0U;
+        return;
+    }
+
+    if ((I2C_getStatus(I2CA_BASE) & I2C_STS_BUS_BUSY) == 0U) {
+        busyPasses = 0U;
+        return;
+    }
+
+    if (++busyPasses < BTS_I2C_TARGET_STUCK_PASSES) {
+        return;
+    }
+
+    //
+    // Busy for a long time with nothing happening: the module is stuck, not
+    // working. Reset it and re-arm as a target.
+    //
+    busyPasses = 0U;
+    dbgSlaveStuck++;
+
+    //
+    // A full peripheral reset, not just the module reset bit.
+    //
+    // Clearing IRS releases SCL, but the module comes straight back up
+    // still believing it is an addressed target transmitter - TARGET_DIR
+    // stays set - and clamps the clock again waiting to send a byte for
+    // a transaction that no longer exists. Writing I2CDXR does not clear
+    // it either. Only a reset through the system controller drops that
+    // latched state.
+    //
+    I2C_disableModule(I2CA_BASE);
+    SysCtl_resetPeripheral(SYSCTL_PERIPH_RES_I2CA);
+    SysCtl_delay(100U);
+
+    I2C_initController(I2CA_BASE, DEVICE_SYSCLK_FREQ, 100000, I2C_DUTYCYCLE_50);
+    I2C_setConfig(I2CA_BASE, I2C_TARGET_RECEIVE_MODE);
+    I2C_setOwnAddress(I2CA_BASE, BTS_I2C_TARGET_ADDRESS);
+    I2C_disableLoopback(I2CA_BASE);
+    I2C_setBitCount(I2CA_BASE, I2C_BITCOUNT_8);
+    I2C_setDataCount(I2CA_BASE, 2);
+    I2C_setAddressMode(I2CA_BASE, I2C_ADDR_MODE_7BITS);
+    I2C_enableFIFO(I2CA_BASE);
+
+    I2C_clearInterruptStatus(I2CA_BASE,
+                             I2C_INT_ADDR_TARGET | I2C_INT_ARB_LOST |
+                             I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION |
+                             I2C_INT_RXFF | I2C_INT_TXFF);
+
+    I2C_setFIFOInterruptLevel(I2CA_BASE, I2C_FIFO_TXEMPTY, I2C_FIFO_RX1);
+
+    I2C_setFIFOInterruptLevel(I2CA_BASE, I2C_FIFO_TXEMPTY, I2C_FIFO_RX1);
+
+    I2C_enableInterrupt(I2CA_BASE,
+                        I2C_INT_ADDR_TARGET | I2C_INT_ARB_LOST |
+                        I2C_INT_NO_ACK | I2C_INT_STOP_CONDITION |
+                        I2C_INT_RXFF | I2C_INT_TXFF);
+
+    I2C_setEmulationMode(I2CA_BASE, I2C_EMULATION_FREE_RUN);
+    I2C_enableModule(I2CA_BASE);
+
+    rxPhase        = eI2cAddrHi;
+    rxDataIdx      = 0;
+    txCount        = 0;
+    aasPrev        = 0;
+    bufferValid    = 0;
+    currentRegAddr = 0;
+    tempData       = 0.0f;
+}
+
 void BTS_serviceDeferredWork(void)
 {
+    serviceI2CTargetWatchdog();
+
     if (calibrationSavePending == 0U) {
         return;
     }
@@ -1932,74 +2120,272 @@ static inline uint16_t floatGetWireByte(float32_t f, uint16_t index)
 
 #pragma CODE_SECTION(i2cSlaveISR, "isrcodefuncs")
 #pragma INTERRUPT(i2cSlaveISR, HPI)
+//
+// Host register bus, target side.
+//
+// The transaction shapes the ESP32 uses are:
+//
+//   write:  S 0x50 W  addrHi addrLo  d0 d1 d2 d3 ...  P
+//   read:   S 0x50 W  addrHi addrLo  Sr 0x50 R  d0 d1 d2 d3 ...  P
+//
+// So a read is addressed twice and the register address has to survive the
+// repeated start in between. That single requirement is what most of the
+// state handling below is protecting.
+//
+// Framing lives on PIE 8.1 (address match, stop, errors) and the data bytes
+// on 8.2 (the FIFOs). Keeping them apart is not cosmetic: with the FIFO
+// enabled the TRM forbids the basic RRDY/XRDY interrupts, and mixing the two
+// is what previously let a data byte be parsed as an address byte.
+//
+static void i2cTargetResetCommand(void)
+{
+    rxPhase     = eI2cAddrHi;
+    txCount     = 0U;
+    bufferValid = 0;
+    tempData    = 0.0f;
+}
+
+#pragma CODE_SECTION(i2cSlaveISR, "isrcodefuncs")
+#pragma INTERRUPT(i2cSlaveISR, HPI)
 __interrupt void i2cSlaveISR(void)
 {
     uint32_t intSource = I2C_getInterruptStatus(I2CA_BASE);
 
-    if (intSource & I2C_INT_ADDR_TARGET) {
-        isWrite = (I2C_getStatus(I2CA_BASE) & I2C_STS_TARGET_DIR) ? 0 : 1;
-        byteCount = 0;
-        tempData = 0.0f;
+    dbgSlaveIsr++;
+
+    //
+    // Reading I2CISRC advances the module's interrupt queue. Without it the
+    // current source stays pending, this handler is never re-entered, and the
+    // module ends up holding SCL low waiting for software that never comes.
+    //
+    (void)HWREGH(I2CA_BASE + I2C_O_ISRC);
+
+    //
+    // Errors first. A host that abandons a transfer - which it does on every
+    // timeout - latches one of these, and left unhandled the target stops
+    // servicing the bus entirely.
+    //
+    if (intSource & (I2C_INT_ARB_LOST | I2C_INT_NO_ACK)) {
+        dbgSlaveErr++;
+        I2C_clearStatus(I2CA_BASE, I2C_STS_ARB_LOST | I2C_STS_NO_ACK);
+        i2cTargetResetCommand();
         currentRegAddr = 0;
-        bufferValid = 0;
     }
 
+    //
+    // Address match.
+    //
+    // AAS is a level, not a latched flag: it stays asserted for as long as
+    // this unit is the addressed target, so it has to be edge-detected or
+    // every later interrupt in the same transaction looks like a fresh
+    // command and resets the parser mid-address.
+    //
+    {
+        uint16_t aasNow = ((intSource & I2C_INT_ADDR_TARGET) != 0U) ? 1U : 0U;
+        uint16_t dirNow = ((I2C_getStatus(I2CA_BASE) & I2C_STS_TARGET_DIR) != 0U)
+                        ? 1U : 0U;
+
+        //
+        // A new phase is either AAS going high, or the direction
+        // flipping while it stays high.
+        //
+        // A register read is addressed twice - write the address, then a
+        // repeated start to read - and AAS does not necessarily drop in
+        // between. Keying purely off its edge meant the read half was
+        // never recognised, so the transmit side was never primed and the
+        // host received everything one byte late.
+        //
+        if (((aasNow != 0U) && (aasPrev == 0U)) ||
+            ((aasNow != 0U) && (dirNow != dirPrev))) {
+            dbgSlaveAddr++;
+
+            //
+            // Only a write starts a new command. The second address match of
+            // a register read must leave currentRegAddr alone - that address
+            // is the whole point of the write phase that preceded it.
+            //
+            if ((I2C_getStatus(I2CA_BASE) & I2C_STS_TARGET_DIR) == 0U) {
+                isWrite = 1U;
+                i2cTargetResetCommand();
+            } else {
+                //
+                // Read phase. The data was staged when the address was
+                // received, so there is nothing to do here but note the
+                // direction - touching the FIFO now would discard the
+                // byte already waiting to go out.
+                //
+                isWrite = 0U;
+            }
+            }
+        aasPrev = aasNow;
+        dirPrev = dirNow;
+    }
+
+    //
+    // Stop ends the transaction. Handled after the address match so a stop
+    // left over from the previous command cannot wipe the address this one
+    // has just supplied.
+    //
     if (intSource & I2C_INT_STOP_CONDITION) {
-        byteCount = 0;
-        bufferValid = 0;
-    }
-
-    if (intSource & I2C_INT_RX_DATA_RDY) {
-        uint16_t rxData = I2C_getData(I2CA_BASE) & 0xFFU;
-        if (byteCount == 0) {
-            currentRegAddr = rxData << 8;
-            byteCount++;
-        } else if (byteCount == 1) {
-            currentRegAddr |= rxData;
-            bufferValid = 0;
-            byteCount++;
-        } else {
-            floatPutWireByte(&tempData, byteCount - 2, rxData);
-            byteCount++;
-            if (byteCount == 6) {
-                uint16_t regIdx = currentRegAddr / 4;
-                if (regIdx < TOTAL_REGISTERS && regConfig[regIdx].access == REG_ACCESS_RW) {
-                    applyHostRegisterWrite(regIdx, tempData);
-                }
-                tempData = 0.0f;
-                // Auto-increment for multi-register writes.
-                currentRegAddr += 4;
-                byteCount = ((currentRegAddr / 4) < TOTAL_REGISTERS) ? 2 : 0;
-            }
-        }
-    }
-
-    if (intSource & I2C_INT_TX_DATA_RDY) {
-        uint16_t regIdx = currentRegAddr / 4;
-        if (byteCount == 0) {
-            float32_t regValue = (regIdx < TOTAL_REGISTERS) ? registers[regIdx] : -1.0f;
-            uint16_t i;
-            for (i = 0; i < 4U; i++) {
-                readBuffer[i] = floatGetWireByte(regValue, i);
-            }
-            bufferValid = 1;
-            I2C_putData(I2CA_BASE, readBuffer[0]);
-            byteCount++;
-        } else if (bufferValid && byteCount < 4) {
-            I2C_putData(I2CA_BASE, readBuffer[byteCount]);
-            byteCount++;
-            if (byteCount == 4) {
-                byteCount = 0;
-                currentRegAddr += 4;
-            }
-        } else {
-            I2C_putData(I2CA_BASE, 0xFF);
-            byteCount = 0;
-            bufferValid = 0;
-        }
+        i2cTargetResetCommand();
+        aasPrev = 0U;
     }
 
     I2C_clearInterruptStatus(I2CA_BASE, intSource);
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
+}
+
+//
+// FIFO half of the target: the actual data bytes.
+//
+#pragma CODE_SECTION(i2cSlaveFifoISR, "isrcodefuncs")
+#pragma INTERRUPT(i2cSlaveFifoISR, HPI)
+__interrupt void i2cSlaveFifoISR(void)
+{
+    uint32_t intSource = I2C_getInterruptStatus(I2CA_BASE);
+
+    dbgSlaveIsr++;
+
+    //
+    // Receive: drain the whole FIFO. More than one byte can arrive between
+    // interrupts, and anything left behind stalls the bus.
+    //
+    if (intSource & I2C_INT_RXFF) {
+        while (I2C_getRxFIFOStatus(I2CA_BASE) != I2C_FIFO_RX0) {
+            uint16_t rxData = I2C_getData(I2CA_BASE) & 0xFFU;
+
+            dbgSlaveRx++;
+            if (dbgRxIdx < 8U) {
+                dbgRxSeq[dbgRxIdx++] = rxData;
+            }
+
+            switch (rxPhase) {
+            case eI2cAddrHi:
+                currentRegAddr = (uint16_t)(rxData << 8);
+                rxPhase        = eI2cAddrLo;
+                break;
+
+            case eI2cAddrLo:
+                currentRegAddr |= rxData;
+                dbgLastReg      = currentRegAddr;
+                rxDataIdx       = 0U;
+                rxPhase         = eI2cData;
+
+                //
+                // Stage the register now, while the address phase is
+                // still in progress.
+                //
+                // If this turns out to be a read, the module starts
+                // clocking data out the moment it acknowledges the
+                // repeated start - before any interrupt can be serviced.
+                // Whatever I2CDXR holds at that instant is what the host
+                // receives first, so it has to be the real first byte
+                // already. Waiting until the read phase to load it is
+                // what put a stale byte in front of every reply and left
+                // the four real bytes one place late.
+                //
+                {
+                    uint16_t  regIdx = currentRegAddr / 4U;
+                    float32_t v      = (regIdx < TOTAL_REGISTERS)
+                                     ? registers[regIdx] : -1.0f;
+                    uint16_t  i;
+
+                    for (i = 0; i < 4U; i++) {
+                        readBuffer[i] = floatGetWireByte(v, i);
+                    }
+                    bufferValid = 1;
+                    txCount     = 1U;
+                    I2C_putData(I2CA_BASE, readBuffer[0]);
+                }
+                break;
+
+            case eI2cData:
+            default:
+                floatPutWireByte(&tempData, rxDataIdx, rxData);
+                rxDataIdx++;
+
+                if (rxDataIdx >= 4U) {
+                    uint16_t regIdx = currentRegAddr / 4U;
+
+                    if ((regIdx < TOTAL_REGISTERS) &&
+                        (regConfig[regIdx].access == REG_ACCESS_RW)) {
+                        applyHostRegisterWrite(regIdx, tempData);
+                    }
+
+                    tempData  = 0.0f;
+                    rxDataIdx = 0U;
+
+                    //
+                    // Auto-increment for a multi-register write, bounded at
+                    // the end of the map. Unbounded it walks off the end and
+                    // stays there, and since the address persists across
+                    // transactions every later read returns out of range.
+                    //
+                    if (((currentRegAddr + 4U) / 4U) < TOTAL_REGISTERS) {
+                        currentRegAddr += 4U;
+                    }
+                }
+                break;
+            }
+        }
+
+        I2C_clearInterruptStatus(I2CA_BASE, I2C_INT_RXFF);
+    }
+
+    //
+    // Transmit: the host is reading, so serve the register currentRegAddr
+    // points at, one wire byte at a time.
+    //
+    if (intSource & I2C_INT_TXFF) {
+        if ((I2C_getStatus(I2CA_BASE) & I2C_STS_TARGET_DIR) != 0U) {
+            dbgSlaveTx++;
+
+            //
+            // Load the register only at the start of a four-byte group.
+            //
+            // bufferValid is cleared as each register finishes so the
+            // next one is fetched, but testing it here as well meant a
+            // reload could happen part way through a group - after the
+            // address had already auto-incremented - so the four bytes
+            // the host received were spliced from two different
+            // registers. txCount alone marks the group boundary.
+            //
+            if (txCount == 0U) {
+                uint16_t  regIdx   = currentRegAddr / 4U;
+                float32_t regValue = (regIdx < TOTAL_REGISTERS)
+                                   ? registers[regIdx] : -1.0f;
+                uint16_t  i;
+
+                dbgLastReg = currentRegAddr;
+
+                for (i = 0; i < 4U; i++) {
+                    readBuffer[i] = floatGetWireByte(regValue, i);
+                }
+                bufferValid = 1;
+                txCount     = 0U;
+            }
+
+            I2C_putData(I2CA_BASE, readBuffer[txCount]);
+            txCount++;
+
+            if (txCount >= 4U) {
+                //
+                // Register delivered. Auto-increment so a host can burst
+                // consecutive registers without re-sending an address, and
+                // force a reload on the next byte.
+                //
+                txCount     = 0U;
+                bufferValid = 0;
+
+                if (((currentRegAddr + 4U) / 4U) < TOTAL_REGISTERS) {
+                    currentRegAddr += 4U;
+                }
+            }
+        }
+
+        I2C_clearInterruptStatus(I2CA_BASE, I2C_INT_TXFF);
+    }
+
     Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP8);
 }
 

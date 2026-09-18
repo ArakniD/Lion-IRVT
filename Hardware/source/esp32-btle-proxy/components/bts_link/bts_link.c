@@ -56,8 +56,19 @@ static esp_err_t bus_read_block(uint16_t reg_addr, float *out, size_t count)
      * One transaction for the whole block: the target auto-increments its
      * address after each complete 4-byte register on read.
      */
-    uint8_t rx[BTS_TOTAL_REGISTERS * BTS_REGISTER_SIZE];
-    size_t rx_len = count * BTS_REGISTER_SIZE;
+    /*
+     * One lead-in byte.
+     *
+     * The C2000 target starts clocking data out the instant it
+     * acknowledges the repeated start, which is before its interrupt can
+     * possibly be serviced. Whatever its transmit register happens to
+     * hold at that moment goes onto the wire first, so every reply is
+     * preceded by one byte of padding. That is a property of the
+     * peripheral, not a bug that can be fixed on the target - so read one
+     * extra byte and step over it.
+     */
+    uint8_t rx[1 + BTS_TOTAL_REGISTERS * BTS_REGISTER_SIZE];
+    size_t rx_len = 1u + (count * BTS_REGISTER_SIZE);
 
     esp_err_t err = i2c_master_transmit_receive(s_dev, addr_buf, sizeof(addr_buf),
                                                 rx, rx_len, BTS_XFER_TIMEOUT_MS);
@@ -66,7 +77,7 @@ static esp_err_t bus_read_block(uint16_t reg_addr, float *out, size_t count)
     }
 
     for (size_t i = 0; i < count; i++) {
-        out[i] = bts_wire_to_f32(&rx[i * BTS_REGISTER_SIZE]);
+        out[i] = bts_wire_to_f32(&rx[1u + (i * BTS_REGISTER_SIZE)]);
     }
     return ESP_OK;
 }
@@ -263,12 +274,44 @@ static void bts_poll_task(void *arg)
              * trip bitfield is then available for the per-channel decode.
              */
             float unit[4];
-            if (bus_read_block(BTS_REG_CALIBRATION_MODE, unit, 4) == ESP_OK) {
+            esp_err_t unit_err = bus_read_block(BTS_REG_CALIBRATION_MODE, unit, 4);
+            if (unit_err != ESP_OK) {
+                static uint32_t err_log;
+                if ((err_log++ % 40u) == 0u) {
+                    ESP_LOGW(TAG, "unit read err=%d (%s)",
+                             unit_err, esp_err_to_name(unit_err));
+                }
+            }
+            if (unit_err == ESP_OK) {
                 local.unit.unit_state      = (bts_unit_state_t)(uint32_t)unit[1];
                 local.unit.input_voltage_v = unit[2];
                 local.unit.trip_status     = (uint32_t)unit[3];
             } else {
                 cycle_ok = false;
+                /* Periodic bus scan while the link is down: tells a wiring
+                 * or address fault apart from a target that answers but
+                 * will not talk. */
+                static uint32_t scan_div;
+                if ((scan_div++ % 40u) == 0u) {
+                    int found = 0;
+                    for (uint8_t a = 0x08; a < 0x78; a++) {
+                        if (i2c_master_probe(s_bus, a, 20) == ESP_OK) {
+                            ESP_LOGW(TAG, "scan: found 0x%02X", a);
+                            found++;
+                        }
+                    }
+                    ESP_LOGW(TAG, "scan: %d device(s)", found);
+                    /* Read the pads back as plain inputs. An idle I2C bus
+                     * must read 1/1: anything else is a short, a missing
+                     * pull-up, or a peer holding the line. */
+                    {
+                        gpio_num_t sda = (gpio_num_t)s_sda_gpio;
+                        gpio_num_t scl = (gpio_num_t)s_scl_gpio;
+                        ESP_LOGW(TAG, "bus level: SDA(%d)=%d SCL(%d)=%d",
+                                 s_sda_gpio, gpio_get_level(sda),
+                                 s_scl_gpio, gpio_get_level(scl));
+                    }
+                }
             }
 
             for (uint8_t ch = 0; ch < BTS_NUM_CHANNELS; ch++) {
@@ -286,6 +329,21 @@ static void bts_poll_task(void *arg)
         local.unit.online = cycle_ok;
         local.unit.last_poll_us = esp_timer_get_time();
         if (cycle_ok) {
+            if (local.unit.consecutive_errors != 0) {
+                ESP_LOGI(TAG, "BTS link up");
+            }
+            /* Periodic proof of life with real register content, so a
+             * working link is visible rather than merely inferred from
+             * the absence of errors. */
+            static uint32_t ok_div;
+            if ((ok_div++ % 20u) == 0u) {
+                ESP_LOGI(TAG,
+                    "BTS ok: state=%d Vin=%.2f ch0 V=%.3f I=%.3f T=%.1f",
+                    (int)local.unit.unit_state, local.unit.input_voltage_v,
+                    local.channel[0].cell_voltage_v,
+                    local.channel[0].cell_current_a,
+                    local.channel[0].cell_temp_c);
+            }
             local.unit.consecutive_errors = 0;
         } else {
             local.unit.consecutive_errors++;
@@ -372,15 +430,73 @@ esp_err_t bts_link_init(const bts_link_config_t *config)
     s_sda_gpio = config->sda_gpio;
     s_scl_gpio = config->scl_gpio;
 
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = -1,
-        .sda_io_num = config->sda_gpio,
-        .scl_io_num = config->scl_gpio,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+    /*
+     * Bring the bus up by trying the plausible combinations rather than
+     * assuming one.
+     *
+     * Two things are uncertain on a new harness: which way round SDA and SCL
+     * are wired, and whether the pull-ups are stiff enough for the bit rate.
+     * The board pulls up with 10k, which is weak for 100 kHz over a ribbon -
+     * the rise time may not make it inside a bit period even though the idle
+     * level reads high. Rather than guess, probe at a low rate first and in
+     * both pin orders, and keep whichever combination actually answers.
+     */
+    struct {
+        int sda;
+        int scl;
+        uint32_t hz;
+    } attempts[] = {
+        { config->sda_gpio, config->scl_gpio, 50000 },
+        { config->sda_gpio, config->scl_gpio, 10000 },
+        { config->scl_gpio, config->sda_gpio, 50000 },
+        { config->scl_gpio, config->sda_gpio, 10000 },
+        { config->sda_gpio, config->scl_gpio,
+          config->scl_speed_hz ? config->scl_speed_hz : 100000 },
     };
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &s_bus), TAG, "i2c bus");
+
+    bool linked = false;
+    for (size_t i = 0; i < sizeof(attempts) / sizeof(attempts[0]); i++) {
+        i2c_master_bus_config_t try_cfg = {
+            .i2c_port = -1,
+            .sda_io_num = attempts[i].sda,
+            .scl_io_num = attempts[i].scl,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        if (i2c_new_master_bus(&try_cfg, &s_bus) != ESP_OK) {
+            continue;
+        }
+
+        if (i2c_master_probe(s_bus, BTS_I2C_ADDRESS, 200) == ESP_OK) {
+            ESP_LOGW(TAG, "link up: SDA=%d SCL=%d @ %u Hz",
+                     attempts[i].sda, attempts[i].scl,
+                     (unsigned)attempts[i].hz);
+            s_sda_gpio = attempts[i].sda;
+            s_scl_gpio = attempts[i].scl;
+            linked = true;
+            break;
+        }
+
+        ESP_LOGW(TAG, "no answer: SDA=%d SCL=%d @ %u Hz",
+                 attempts[i].sda, attempts[i].scl, (unsigned)attempts[i].hz);
+        i2c_del_master_bus(s_bus);
+        s_bus = NULL;
+    }
+
+    if (!linked) {
+        /* Fall back to the configured pins so the poll task can keep
+         * retrying - the unit may simply be powered down. */
+        i2c_master_bus_config_t bus_cfg = {
+            .i2c_port = -1,
+            .sda_io_num = config->sda_gpio,
+            .scl_io_num = config->scl_gpio,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &s_bus), TAG, "i2c bus");
+    }
 
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -390,9 +506,25 @@ esp_err_t bts_link_init(const bts_link_config_t *config)
          * and the bus runs over a ribbon to the BTS board; 400 kHz is not
          * worth the marginal risk here.
          */
-        .scl_speed_hz = config->scl_speed_hz ? config->scl_speed_hz : 100000,
+        /* Conservative: a weak pull-up costs rise time, and nothing here
+         * needs the bandwidth. */
+        .scl_speed_hz = 50000,
     };
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev), TAG, "i2c dev");
+
+    /* Scan the whole bus once at start-up so a wiring or address fault is
+     * distinguishable from a target that is present but not answering. */
+    {
+        int found = 0;
+        for (uint8_t a = 0x08; a < 0x78; a++) {
+            if (i2c_master_probe(s_bus, a, 50) == ESP_OK) {
+                ESP_LOGW(TAG, "i2c scan: device at 0x%02X", a);
+                found++;
+            }
+        }
+        ESP_LOGW(TAG, "i2c scan complete: %d device(s) on SDA=%d SCL=%d",
+                 found, config->sda_gpio, config->scl_gpio);
+    }
 
     esp_err_t probe = i2c_master_probe(s_bus, BTS_I2C_ADDRESS, 200);
     if (probe == ESP_OK) {
