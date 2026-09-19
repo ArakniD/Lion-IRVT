@@ -47,6 +47,7 @@ STATUS_BITS = [
     "running", "stopped", "finished", "overCurrentTrip",
     "charging", "discharging", "constVoltage", "constCurrent",
     "slaveMode", "groupDisconnect", "reversePolarity", "slotDisabled",
+    "calibrating", "calVoltageValid", "calCurrentValid",
 ]
 
 
@@ -141,7 +142,7 @@ async def main():
             await client.write_gatt_char(SLOT_SELECT, bytes([slot]), response=True)
             sel = await client.read_gatt_char(SLOT_SELECT)
             cfg = await client.read_gatt_char(SLOT_CONFIG)
-            model = cfg[28:52].split(b"\x00")[0].decode("utf-8", "replace") if len(cfg) >= 52 else ""
+            model = cfg[24:48].split(b"\x00")[0].decode("utf-8", "replace") if len(cfg) >= 48 else ""
             print(f"slot {slot}: select_readback={sel[0]} config={len(cfg)}B model={model!r}")
 
         print("\n=== notifications ===")

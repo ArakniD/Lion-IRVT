@@ -16,6 +16,7 @@
 #ifdef CPU1
 #include <bts.h>
 #include "registers.h"
+#include <math.h>
 
 //
 //--- State Machine Related ---
@@ -44,6 +45,15 @@ static void publishStatusToCpu2(void);
 void updateStatusRegisters(void);
 void modeCallback(float value, uint16_t channel);
 void BTS_HandleRegisterWrite(void);
+
+//
+// Runtime slot calibration (design doc sections 5-7). CPU1 owns the state
+// machine and the captures; CPU2 owns registers[] and the F-RAM write.
+//
+static void calHandleCommand(uint16_t opcode, float32_t argument);
+static void calServiceDeadMan(void);
+static void calPublishTelemetry(void);
+static uint16_t calSlotIsCalibrating(uint16_t ch);
 
 //
 // State Machine function prototypes
@@ -90,6 +100,558 @@ volatile UnitState unitState = eInputOK;
 // the guard is running on a substituted 0 V rather than a live measurement.
 //
 volatile uint32_t adcbEocTimeouts = 0;
+
+//
+//=============================================================================
+// Charge / energy accumulators
+//=============================================================================
+//
+// Integrated from the ADS131M08 pair - the same sensor the CC loop regulates
+// against - rather than the 12-bit internal ADC in the stats block.
+//
+// Charge and discharge accumulate their own positive magnitudes, so a charge
+// followed by a discharge on one slot leaves two separate totals instead of
+// cancelling. Each pair is zeroed only when its own direction starts.
+//
+static float32_t accChargeMah[NUM_CHANNELS];
+static float32_t accChargeMwh[NUM_CHANNELS];
+static float32_t accDischargeMah[NUM_CHANNELS];
+static float32_t accDischargeMwh[NUM_CHANNELS];
+
+//
+// The C tasks rotate C1 -> C2 -> C3 off one TASKC_FREQ_HZ timer, so C1 sees
+// every third tick. Derived rather than written out so a change to the task
+// rate carries into the integration.
+//
+#define BTS_ACC_DT_HOURS  ((float32_t)3.0 / ((float32_t)TASKC_FREQ_HZ * (float32_t)3600.0))
+
+//
+// Zeroes one direction's pair at the moment that direction starts. The
+// opposite pair is left alone so the two totals from a charge/discharge
+// cycle survive independently.
+//
+static void accResetDirection(uint16_t ch, uint16_t charging)
+{
+    if (charging) {
+        accChargeMah[ch] = (float32_t)0.0;
+        accChargeMwh[ch] = (float32_t)0.0;
+    } else {
+        accDischargeMah[ch] = (float32_t)0.0;
+        accDischargeMwh[ch] = (float32_t)0.0;
+    }
+}
+
+//
+//=============================================================================
+// Runtime slot calibration state
+//=============================================================================
+//
+// Only one slot calibrates at a time, so a single capture set is enough.
+// Everything here is touched from the 100 Hz B3 task and the 10 Hz C1 task,
+// never from an ISR.
+//
+static uint16_t  calSlot      = BTS_CAL_SLOT_NONE;
+static uint32_t  calStatusBits = 0U;
+static uint32_t  calLastResult = (uint32_t)eCalErrOk;
+static uint32_t  calSaveSeq    = 0U;
+
+//
+// Captures. The ADS and internal paths are sampled at the same instant from
+// the same physical stimulus, so both are recorded per point.
+//
+static float32_t calV_lo_adsPu, calV_lo_f28, calV_lo_V;
+static float32_t calV_hi_adsPu, calV_hi_f28, calV_hi_V;
+static float32_t calI_zero_adsPu, calI_zero_f28;
+static float32_t calI_hi_adsPu, calI_hi_f28, calI_hi_A;
+
+//
+// Dead-man timeout. A bench supply left driving an unattended slot is the
+// main physical risk in this procedure, so fixed-current mode expires if no
+// command arrives. C1 runs at 10 Hz / 3 alpha states, i.e. ~6.67 Hz, so 800
+// passes is comfortably over the specified 120 s.
+//
+#define BTS_CAL_DEADMAN_PASSES ((uint16_t)800U)
+static uint16_t calIdlePasses = 0U;
+
+//
+// Classification window for a voltage capture, in raw ADS per-unit. A point
+// between the two is too close to the other to give a useful two-point fit.
+//
+#define BTS_CAL_V_LO_MAX_PU ((float32_t)0.2)
+#define BTS_CAL_V_HI_MIN_PU ((float32_t)0.8)
+
+// Minimum separation between the two points, section 6.6.
+#define BTS_CAL_MIN_V_SPAN  ((float32_t)1.0)
+#define BTS_CAL_MIN_I_SPAN  ((float32_t)0.5)
+
+//
+// Validation windows, section 8.2. Applied on CPU1 before the result is
+// handed to CPU2, so a bad fit never reaches the F-RAM.
+//
+#define BTS_CAL_IOUT_GAIN_PU_MIN ((float32_t)0.05)
+#define BTS_CAL_IOUT_GAIN_PU_MAX ((float32_t)0.20)
+#define BTS_CAL_VOUT_GAIN_PU_MIN ((float32_t)0.10)
+#define BTS_CAL_VOUT_GAIN_PU_MAX ((float32_t)0.40)
+#define BTS_CAL_F28_GAIN_MIN     ((float32_t)0.5)
+#define BTS_CAL_F28_GAIN_MAX     ((float32_t)2.0)
+#define BTS_CAL_F28V_OFFSET_ABS  ((float32_t)1.0)
+#define BTS_CAL_F28I_OFFSET_ABS  ((float32_t)2.0)
+
+//
+// Raw per-unit converter readings, before any calibration gain/offset.
+//
+// The two paths do NOT share a per-unit definition and must not be
+// conflated: the ADS131M08 is 16-bit signed full scale, while the internal
+// path is expressed as volts-at-the-pin so it matches how
+// BTS_monitor_Iout_Vout() scales the same reading.
+//
+static float32_t calAdsVoltagePu(const BTS_measValue *m)
+{
+    return (float32_t)m->Sum_V / ((float32_t)BTS_senseAverageFactor * 32768.0f);
+}
+
+static float32_t calAdsCurrentPu(const BTS_measValue *m)
+{
+    return (float32_t)m->Sum_I / ((float32_t)BTS_senseAverageFactor * 32768.0f);
+}
+
+static float32_t calF28VoltagePu(const BTS_measValue *m)
+{
+    return ((float32_t)m->Sum_CellV /
+            ((float32_t)BTS_f28AverageFactor * 4096.0f)) * 2.5f;
+}
+
+static float32_t calF28CurrentPu(const BTS_measValue *m)
+{
+    return ((float32_t)m->Sum_CellI /
+            ((float32_t)BTS_f28AverageFactor * 4096.0f)) * 2.5f;
+}
+
+//
+// Rejects a gain that is zero, denormal, NaN or Inf. A NaN fails every
+// ordered comparison, so the self-compare catches it; the magnitude test
+// catches the rest.
+//
+static uint16_t calGainUsable(float32_t g)
+{
+    float32_t mag = (g < 0.0f) ? -g : g;
+
+    if (g != g) {
+        return 0U;
+    }
+    return ((mag > 1.0e-20f) && (mag < 1.0e20f)) ? 1U : 0U;
+}
+
+static uint16_t calSlotIsCalibrating(uint16_t ch)
+{
+    return (BTS_userInputs[ch].calState != BTS_CAL_STATE_NORMAL) ? 1U : 0U;
+}
+
+//
+// Leaves calibration on one slot, reference first. Safe to call on a slot
+// that is not calibrating.
+//
+static void calExitSlot(uint16_t ch)
+{
+    BTS_userInputs[ch].ioutCal_pu   = (float32_t)0.0;
+    BTS_userInputs[ch].voutCal_pu   = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
+    BTS_userInputs[ch].enable_logic = 0;
+    BTS_userInputs[ch].calState     = BTS_CAL_STATE_NORMAL;
+    status[ch].calibrating          = 0;
+}
+
+static void calClearCaptures(void)
+{
+    calStatusBits &= ~((1UL << BTS_CAL_ST_V_LO)       |
+                       (1UL << BTS_CAL_ST_V_HI)       |
+                       (1UL << BTS_CAL_ST_I_ZERO)     |
+                       (1UL << BTS_CAL_ST_I_LOADED)   |
+                       (1UL << BTS_CAL_ST_V_COMPUTED) |
+                       (1UL << BTS_CAL_ST_I_COMPUTED) |
+                       (1UL << BTS_CAL_ST_SAVED));
+}
+
+//
+// Ends the whole session: every slot leaves calibration, the window closes.
+//
+static void calExitAll(void)
+{
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        calExitSlot(ch);
+    }
+
+    calSlot       = BTS_CAL_SLOT_NONE;
+    calStatusBits = 0U;
+    calIdlePasses = 0U;
+}
+
+//
+// Computes and validates the two-point results, then hands them to CPU2 for
+// the F-RAM write. Voltage and current are independent: whichever is complete
+// is computed, and partial completion is reported rather than failing.
+//
+static uint32_t calComputeAndSave(void)
+{
+    float32_t out[BTS_CAL_REGS_PER_CH];
+    uint32_t  flags = BTS_CAL_FLAG_EXTERNAL;
+    uint16_t  base;
+    uint16_t  i;
+    uint16_t  haveV;
+    uint16_t  haveI;
+
+    if (calSlot >= NUM_CHANNELS) {
+        return (uint32_t)eCalErrNotCalibrating;
+    }
+
+    haveV = ((calStatusBits & (1UL << BTS_CAL_ST_V_LO)) != 0UL) &&
+            ((calStatusBits & (1UL << BTS_CAL_ST_V_HI)) != 0UL);
+    haveI = ((calStatusBits & (1UL << BTS_CAL_ST_I_ZERO))   != 0UL) &&
+            ((calStatusBits & (1UL << BTS_CAL_ST_I_LOADED)) != 0UL);
+
+    if (!haveV && !haveI) {
+        return (uint32_t)eCalErrNoCaptures;
+    }
+
+    //
+    // Start from what the slot is running now, so an incomplete session
+    // leaves the other path's stored values alone rather than zeroing them.
+    //
+    base = BTS_CAL_BASE(calSlot);
+    for (i = 0; i < BTS_CAL_REGS_PER_CH; i++) {
+        out[i] = registers[base + i];
+    }
+
+    if (haveV) {
+        float32_t dV   = calV_hi_V - calV_lo_V;
+        float32_t dF28 = calV_hi_f28 - calV_lo_f28;
+        float32_t gPu;
+        float32_t gF28;
+        float32_t span = (dV < 0.0f) ? -dV : dV;
+
+        if (span < BTS_CAL_MIN_V_SPAN) {
+            return (uint32_t)eCalErrPuRange;
+        }
+
+        gPu  = (calV_hi_adsPu - calV_lo_adsPu) / dV;
+        gF28 = dF28 != 0.0f ? (dV / dF28) : 0.0f;
+
+        if (!calGainUsable(gPu) || !calGainUsable(gF28)) {
+            return (uint32_t)eCalErrValidate;
+        }
+        if ((gPu < BTS_CAL_VOUT_GAIN_PU_MIN) || (gPu > BTS_CAL_VOUT_GAIN_PU_MAX)) {
+            return (uint32_t)eCalErrValidate;
+        }
+        if ((gF28 < BTS_CAL_F28_GAIN_MIN) || (gF28 > BTS_CAL_F28_GAIN_MAX)) {
+            return (uint32_t)eCalErrValidate;
+        }
+
+        out[BTS_CAL_VOUT_GAIN_PU]   = gPu;
+        out[BTS_CAL_VOUT_OFFSET_PU] = calV_lo_adsPu - calV_lo_V * gPu;
+        out[BTS_CAL_VOUT_GAIN_V]    = 1.0f / gPu;
+        out[BTS_CAL_VOUT_OFFSET_V]  = -out[BTS_CAL_VOUT_OFFSET_PU] / gPu;
+
+        out[BTS_CAL_F28V_GAIN]      = gF28;
+        out[BTS_CAL_F28V_OFFSET]    = calV_lo_V - calV_lo_f28 * gF28;
+
+        if ((out[BTS_CAL_F28V_OFFSET] < -BTS_CAL_F28V_OFFSET_ABS) ||
+            (out[BTS_CAL_F28V_OFFSET] >  BTS_CAL_F28V_OFFSET_ABS)) {
+            return (uint32_t)eCalErrValidate;
+        }
+
+        flags |= BTS_CAL_FLAG_V_VALID;
+        calStatusBits |= (1UL << BTS_CAL_ST_V_COMPUTED);
+    }
+
+    if (haveI) {
+        //
+        // The operator supplies a magnitude; calibration current always flows
+        // in discharge, so the sign is applied here. Entering a signed value
+        // would otherwise invert the slot's whole current reading.
+        //
+        float32_t iHi  = -calI_hi_A;
+        float32_t dF28 = calI_hi_f28 - calI_zero_f28;
+        float32_t gPu;
+        float32_t gF28;
+        float32_t span = (calI_hi_A < 0.0f) ? -calI_hi_A : calI_hi_A;
+
+        if (span < BTS_CAL_MIN_I_SPAN) {
+            return (uint32_t)eCalErrPuRange;
+        }
+
+        gPu  = (calI_hi_adsPu - calI_zero_adsPu) / iHi;
+        gF28 = dF28 != 0.0f ? (iHi / dF28) : 0.0f;
+
+        if (!calGainUsable(gPu) || !calGainUsable(gF28)) {
+            return (uint32_t)eCalErrValidate;
+        }
+        if ((gPu < BTS_CAL_IOUT_GAIN_PU_MIN) || (gPu > BTS_CAL_IOUT_GAIN_PU_MAX)) {
+            return (uint32_t)eCalErrValidate;
+        }
+        if ((gF28 < BTS_CAL_F28_GAIN_MIN) || (gF28 > BTS_CAL_F28_GAIN_MAX)) {
+            return (uint32_t)eCalErrValidate;
+        }
+
+        out[BTS_CAL_IOUT_GAIN_PU]   = gPu;
+        out[BTS_CAL_IOUT_OFFSET_PU] = calI_zero_adsPu;
+        out[BTS_CAL_IOUT_GAIN_A]    = 1.0f / gPu;
+        out[BTS_CAL_IOUT_OFFSET_A]  = -calI_zero_adsPu / gPu;
+
+        out[BTS_CAL_F28I_GAIN]      = gF28;
+        out[BTS_CAL_F28I_OFFSET]    = -calI_zero_f28 * gF28;
+
+        if ((out[BTS_CAL_F28I_OFFSET] < -BTS_CAL_F28I_OFFSET_ABS) ||
+            (out[BTS_CAL_F28I_OFFSET] >  BTS_CAL_F28I_OFFSET_ABS)) {
+            return (uint32_t)eCalErrValidate;
+        }
+
+        flags |= BTS_CAL_FLAG_I_VALID;
+        calStatusBits |= (1UL << BTS_CAL_ST_I_COMPUTED);
+    }
+
+    //
+    // Hand over for persistence. CPU2 writes F-RAM from its idle loop and
+    // sets status bit 7 when it lands - CPU1 must not claim SAVED itself.
+    //
+    for (i = 0; i < BTS_CAL_REGS_PER_CH; i++) {
+        cpu1Status.calComputed[i] = out[i];
+    }
+    cpu1Status.calSaveSlot  = calSlot;
+    cpu1Status.calSaveFlags = flags;
+    calSaveSeq++;
+    cpu1Status.calSaveSeq   = calSaveSeq;
+
+    return (uint32_t)eCalErrOk;
+}
+
+//
+// The command handler. Reached from BTS_HandleRegisterWrite() when CPU2
+// signals a write to eCalCommand, and from modeCallback() for the eChX_Mode
+// bit-2 entry point, so the one-slot-at-a-time rule lives in one place.
+//
+static void calHandleCommand(uint16_t opcode, float32_t argument)
+{
+    uint32_t result = (uint32_t)eCalErrOk;
+    uint16_t ch;
+
+    //
+    // Any command is proof of life for the dead-man timer.
+    //
+    calIdlePasses = 0U;
+
+    switch (opcode) {
+    case eCalCmdEnter: {
+        uint16_t slot = (uint16_t)registers[BTS_REG_IDX(eCalSlot)];
+
+        if (slot >= NUM_CHANNELS) {
+            result = (uint32_t)eCalErrArg;
+            break;
+        }
+        //
+        // A follower has no control loop of its own and a strap-disabled slot
+        // never runs, so neither can be driven to a reference.
+        //
+        if ((btsSlotEnabled[slot] == 0U) || (btsSlotIsLeader[slot] == 0U)) {
+            result = (uint32_t)eCalErrSlotUnavailable;
+            break;
+        }
+        //
+        // Rejected while any slot is running a charge/discharge test. A slot
+        // already in calibration is not a test - it is force-exited below.
+        //
+        for (ch = 0; ch < NUM_CHANNELS; ch++) {
+            if (status[ch].running && (calSlotIsCalibrating(ch) == 0U)) {
+                result = (uint32_t)eCalErrSlotTesting;
+                break;
+            }
+        }
+        if (result != (uint32_t)eCalErrOk) {
+            break;
+        }
+
+        //
+        // One slot only: every other slot leaves calibration first.
+        //
+        for (ch = 0; ch < NUM_CHANNELS; ch++) {
+            if (ch != slot) {
+                calExitSlot(ch);
+            }
+        }
+
+        calSlot       = slot;
+        calStatusBits = (1UL << BTS_CAL_ST_ACTIVE);
+        //
+        // Deliberately not propagated to followers the way modeCallback()
+        // propagates a normal start - a group mirrors a leader's duty, and
+        // dragging seven cells along would be a bench hazard, not a feature.
+        //
+        BTS_userInputs[slot].ioutCal_pu = (float32_t)0.0;
+        BTS_userInputs[slot].calState   = BTS_CAL_STATE_IDLE;
+        BTS_userInputs[slot].enable_logic = 0;
+        status[slot].calibrating = 1;
+        break;
+    }
+
+    case eCalCmdExit:
+        calExitAll();
+        break;
+
+    case eCalCmdClear:
+        if (calSlot >= NUM_CHANNELS) {
+            result = (uint32_t)eCalErrNotCalibrating;
+            break;
+        }
+        calClearCaptures();
+        break;
+
+    case eCalCmdCaptureVoltage: {
+        float32_t adsPu;
+
+        if (calSlot >= NUM_CHANNELS) {
+            result = (uint32_t)eCalErrNotCalibrating;
+            break;
+        }
+        adsPu = calAdsVoltagePu(&BTS_measValues[calSlot]);
+
+        if (adsPu < BTS_CAL_V_LO_MAX_PU) {
+            calV_lo_adsPu = adsPu;
+            calV_lo_f28   = calF28VoltagePu(&BTS_measValues[calSlot]);
+            calV_lo_V     = argument;
+            calStatusBits |= (1UL << BTS_CAL_ST_V_LO);
+        } else if (adsPu > BTS_CAL_V_HI_MIN_PU) {
+            calV_hi_adsPu = adsPu;
+            calV_hi_f28   = calF28VoltagePu(&BTS_measValues[calSlot]);
+            calV_hi_V     = argument;
+            calStatusBits |= (1UL << BTS_CAL_ST_V_HI);
+        } else {
+            result = (uint32_t)eCalErrPuRange;
+        }
+        break;
+    }
+
+    case eCalCmdZeroCurrent:
+        if (calSlot >= NUM_CHANNELS) {
+            result = (uint32_t)eCalErrNotCalibrating;
+            break;
+        }
+        //
+        // The zero point is only meaningful with the converter off, so drop
+        // out of fixed-current first rather than sampling a driven slot.
+        //
+        BTS_userInputs[calSlot].ioutCal_pu = (float32_t)0.0;
+        BTS_userInputs[calSlot].calState   = BTS_CAL_STATE_IDLE;
+        BTS_userInputs[calSlot].enable_logic = 0;
+        calStatusBits &= ~(1UL << BTS_CAL_ST_DRIVING);
+
+        calI_zero_adsPu = calAdsCurrentPu(&BTS_measValues[calSlot]);
+        calI_zero_f28   = calF28CurrentPu(&BTS_measValues[calSlot]);
+        calStatusBits |= (1UL << BTS_CAL_ST_I_ZERO);
+        break;
+
+    case eCalCmdSetFixedCurrent:
+        if (calSlot >= NUM_CHANNELS) {
+            result = (uint32_t)eCalErrNotCalibrating;
+            break;
+        }
+        if ((argument < (float32_t)0.0) || (argument > BTS_CAL_FIXED_I_MAX_PU)) {
+            result = (uint32_t)eCalErrArg;
+            break;
+        }
+        BTS_userInputs[calSlot].ioutCal_pu   = argument;
+        BTS_userInputs[calSlot].calState     = BTS_CAL_STATE_FIXED_I;
+        BTS_userInputs[calSlot].enable_logic = 1;
+        BTS_ctrlLoopVariables[calSlot].tripFlag = 0;
+        calStatusBits |= (1UL << BTS_CAL_ST_DRIVING);
+        break;
+
+    case eCalCmdCaptureCurrent:
+        if (calSlot >= NUM_CHANNELS) {
+            result = (uint32_t)eCalErrNotCalibrating;
+            break;
+        }
+        calI_hi_adsPu = calAdsCurrentPu(&BTS_measValues[calSlot]);
+        calI_hi_f28   = calF28CurrentPu(&BTS_measValues[calSlot]);
+        calI_hi_A     = (argument < 0.0f) ? -argument : argument;
+        calStatusBits |= (1UL << BTS_CAL_ST_I_LOADED);
+        break;
+
+    case eCalCmdComputeSave:
+        result = calComputeAndSave();
+        break;
+
+    case eCalCmdNone:
+    default:
+        return;
+    }
+
+    if (result == (uint32_t)eCalErrOk) {
+        calStatusBits &= ~(1UL << BTS_CAL_ST_FAILED);
+    } else {
+        calStatusBits |= (1UL << BTS_CAL_ST_FAILED);
+    }
+    calLastResult = result;
+
+    publishStatusToCpu2();
+}
+
+//
+// Drops a slot left driving with no host attention back to calibration idle.
+// Called from C1 at 10 Hz.
+//
+static void calServiceDeadMan(void)
+{
+    if ((calSlot >= NUM_CHANNELS) ||
+        (BTS_userInputs[calSlot].calState != BTS_CAL_STATE_FIXED_I)) {
+        calIdlePasses = 0U;
+        return;
+    }
+
+    if (++calIdlePasses < BTS_CAL_DEADMAN_PASSES) {
+        return;
+    }
+
+    calIdlePasses = 0U;
+    BTS_userInputs[calSlot].ioutCal_pu   = (float32_t)0.0;
+    BTS_userInputs[calSlot].calState     = BTS_CAL_STATE_IDLE;
+    BTS_userInputs[calSlot].enable_logic = 0;
+    calStatusBits &= ~(1UL << BTS_CAL_ST_DRIVING);
+}
+
+//
+// Publishes the live window on the slot under calibration. Zeroed when no
+// slot is selected, so a stale reading cannot be mistaken for a live one.
+//
+static void calPublishTelemetry(void)
+{
+    uint16_t i;
+
+    cpu1Status.calActiveSlot = calSlot;
+    cpu1Status.calStatus     = calStatusBits;
+    cpu1Status.calResult     = calLastResult;
+
+    if (calSlot >= NUM_CHANNELS) {
+        for (i = 0; i < 8U; i++) {
+            cpu1Status.calTelemetry[i] = (float32_t)0.0;
+        }
+        return;
+    }
+
+    {
+        const BTS_measValue *m = &BTS_measValues[calSlot];
+
+        cpu1Status.calTelemetry[0] = calAdsVoltagePu(m);
+        cpu1Status.calTelemetry[1] = calAdsCurrentPu(m);
+        cpu1Status.calTelemetry[2] = m->Vsense_V;
+        cpu1Status.calTelemetry[3] = m->Isense_A;
+        cpu1Status.calTelemetry[4] = calF28VoltagePu(m);
+        cpu1Status.calTelemetry[5] = calF28CurrentPu(m);
+        cpu1Status.calTelemetry[6] = m->CellVoltage_V;
+        cpu1Status.calTelemetry[7] = m->CellCurrent_I;
+    }
+}
 
 //
 // main() function
@@ -408,6 +970,24 @@ static void publishStatusToCpu2(void)
 
     for (ch = 0; ch < NUM_CHANNELS; ch++) {
         uint32_t bitset = 0;
+        uint32_t calFlags = calValidFlags[ch];
+
+        //
+        // Regulation mode. The ISR has tracked ctrlMode_logic all along; it
+        // simply was never copied here, so bits 6 and 7 always read 0.
+        //
+        status[ch].constVoltage = (BTS_ctrlLoopVariables[ch].ctrlMode_logic != 0U) ? 1U : 0U;
+        status[ch].constCurrent = (BTS_ctrlLoopVariables[ch].ctrlMode_logic == 0U) ? 1U : 0U;
+
+        //
+        // Calibration validity comes from the PERSISTED flags CPU2 mirrors
+        // into calValidFlags[] (CPU2TOCPU1RAM) at boot and on each save, not
+        // from the in-session capture - a slot calibrated in an earlier
+        // session must still show its ticks after a power cycle.
+        //
+        status[ch].calVoltageValid = ((calFlags & BTS_CAL_FLAG_V_VALID) != 0UL) ? 1U : 0U;
+        status[ch].calCurrentValid = ((calFlags & BTS_CAL_FLAG_I_VALID) != 0UL) ? 1U : 0U;
+
         bitset |= (status[ch].running & 0x1) << 0;
         bitset |= (status[ch].stopped & 0x1) << 1;
         bitset |= (status[ch].finished & 0x1) << 2;
@@ -420,17 +1000,40 @@ static void publishStatusToCpu2(void)
         bitset |= (status[ch].groupDisconnect & 0x1) << BTS_STATUS_GROUP_DISCONNECT;
         bitset |= (status[ch].reversePolarity & 0x1) << BTS_STATUS_REVERSE_POLARITY;
         bitset |= (status[ch].slotDisabled & 0x1) << BTS_STATUS_SLOT_DISABLED;
+        bitset |= (status[ch].calibrating & 0x1) << BTS_STATUS_CALIBRATING;
+        bitset |= (status[ch].calVoltageValid & 0x1) << BTS_STATUS_CAL_V_VALID;
+        bitset |= (status[ch].calCurrentValid & 0x1) << BTS_STATUS_CAL_I_VALID;
         cpu1Status.statusBits[ch] = bitset;
 
         cpu1Status.cellVoltage[ch] = BTS_measValues[ch].CellVoltage_V;
         cpu1Status.cellCurrent[ch] = BTS_measValues[ch].CellCurrent_I;
 
+        //
+        // The ADS131M08 engineering values. Computed at 10 Hz since the
+        // converter was fitted and, until now, read by nothing.
+        //
+        cpu1Status.senseVoltage[ch] = BTS_measValues[ch].Vsense_V;
+        cpu1Status.senseCurrent[ch] = BTS_measValues[ch].Isense_A;
+
+        cpu1Status.chargeMah[ch]    = accChargeMah[ch];
+        cpu1Status.chargeMwh[ch]    = accChargeMwh[ch];
+        cpu1Status.dischargeMah[ch] = accDischargeMah[ch];
+        cpu1Status.dischargeMwh[ch] = accDischargeMwh[ch];
+
         canData[ch].channel = ch;
         canData[ch].voltage = BTS_measValues[ch].CellVoltage_V;
         canData[ch].current = BTS_measValues[ch].CellCurrent_I;
+        //
+        // CAN carries the total for the direction the slot is set to, so a
+        // listener sees the figure for the test in progress.
+        //
+        canData[ch].mAh = status[ch].charging ? accChargeMah[ch] : accDischargeMah[ch];
+        canData[ch].mWh = status[ch].charging ? accChargeMwh[ch] : accDischargeMwh[ch];
     }
 
     cpu1Status.unitState = (uint32_t)unitState;
+
+    calPublishTelemetry();
 
     //
     // Dip-switch straps. Carried inside the seq guard so CPU2 never mirrors
@@ -463,6 +1066,31 @@ void modeCallback(float value, uint16_t channel)
         //
         if ((btsSlotEnabled[channel] == 0U) || (btsSlotIsLeader[channel] == 0U)) {
             return;
+        }
+
+        //
+        // Bit 2 is the calibration entry point. Routed through the same
+        // handler as CAL_CMD_ENTER so the one-slot-at-a-time rule, the
+        // not-while-testing rule and the follower rejection are enforced
+        // in exactly one place.
+        //
+        // Returning here is also the mode-write half of the input-voltage
+        // exemption: a slot entering calibration must not be measured
+        // against eChargeRestrictV / eDischargeRestrictV below. The 10 Hz
+        // half lives in C1().
+        //
+        if (mode & 0x04) {
+            registers[BTS_REG_IDX(eCalSlot)] = (float32_t)channel;
+            calHandleCommand((uint16_t)eCalCmdEnter, (float32_t)0.0);
+            return;
+        }
+
+        //
+        // A start on a slot that was calibrating ends its calibration first,
+        // reference down before anything else changes.
+        //
+        if (calSlotIsCalibrating(channel)) {
+            calExitAll();
         }
 
         float chargeRestrictV = registers[BTS_REG_IDX(eChargeRestrictV)];
@@ -501,6 +1129,8 @@ void modeCallback(float value, uint16_t channel)
             BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + iMinIdx];
             BTS_userInputs[channel].direction_logic  = status[channel].charging;
             BTS_userInputs[channel].enable_logic     = 1;
+
+            accResetDirection(channel, status[channel].charging);
         } else {
             BTS_userInputs[channel].enable_logic = 0;
         }
@@ -535,9 +1165,12 @@ void modeCallback(float value, uint16_t channel)
                 //
                 // A fresh start clears a stale group fault; otherwise one
                 // disconnection would keep the group latched off forever.
+                // The accumulator reset rides along so every member of the
+                // group starts its run from zero, as the leader does.
                 //
                 if (status[channel].running) {
                     status[m].groupDisconnect = 0;
+                    accResetDirection(m, status[m].charging);
                 }
             }
             if (status[channel].running) {
@@ -565,7 +1198,7 @@ void BTS_HandleRegisterWrite(void)
     if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_REG_WRITE)) {
         uint16_t regIdx = ipcMsg.regAddr;
 
-        if (regIdx < BTS_REG_IDX(eCh0_CurrentAcc)) {
+        if (regIdx < BTS_REG_IDX(eCh0_ChargeAcc_mAh)) {
             //
             // Control block: 10 registers per channel, mode is the first.
             //
@@ -581,6 +1214,15 @@ void BTS_HandleRegisterWrite(void)
             //
             uint16_t channel = (regIdx - BTS_CAL_BASE(0)) / BTS_CAL_REGS_PER_CH;
             BTS_loadCalibrationFromRegisters(channel);
+        } else if (regIdx == BTS_REG_IDX(eCalCommand)) {
+            //
+            // The runtime calibration command. This decode is not optional:
+            // without it the index falls outside both branches above, the
+            // flag is acked, and every command is accepted by CPU2 and
+            // silently discarded here.
+            //
+            calHandleCommand((uint16_t)ipcMsg.value,
+                             registers[BTS_REG_IDX(eCalArgument)]);
         }
 
         IPC_ackFlagRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_REG_WRITE);
@@ -806,6 +1448,27 @@ void C1(void)
     BTS_monitor_Iout_Vout(&BTS_measValues_ch7);
     BTS_monitor_Iout_Vout(&BTS_measValues_ch8);
 
+    //
+    // Integrate charge and energy from the measurements just refreshed. A
+    // stopped, tripped or calibrating slot contributes nothing.
+    //
+    for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
+        if ((status[ch].running == 0U) || calSlotIsCalibrating(ch)) {
+            continue;
+        }
+
+        float32_t i_A = fabsf(BTS_measValues[ch].Isense_A);
+        float32_t p_W = fabsf(BTS_measValues[ch].Isense_A * BTS_measValues[ch].Vsense_V);
+
+        if (status[ch].charging) {
+            accChargeMah[ch] += i_A * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
+            accChargeMwh[ch] += p_W * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
+        } else {
+            accDischargeMah[ch] += i_A * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
+            accDischargeMwh[ch] += p_W * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
+        }
+    }
+
     updateInputVoltage();
 
     float chargeRestrictV = registers[BTS_REG_IDX(eChargeRestrictV)];
@@ -813,6 +1476,15 @@ void C1(void)
     float inputV = registers[BTS_REG_IDX(eInputVoltage)];
 
     for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
+        //
+        // The calibration exemption, second of two places. The guard is on
+        // the INPUT BUS voltage, and a bench supply driving one slot through
+        // a DMM will normally sit outside the window - without this the slot
+        // would be stopped a fraction of a second after it started.
+        //
+        if (calSlotIsCalibrating(ch)) {
+            continue;
+        }
         if (status[ch].running) {
             if (status[ch].charging && inputV <= chargeRestrictV) {
                 status[ch].running = 0;
@@ -847,6 +1519,8 @@ void C1(void)
     }
 
     checkGroupIntegrity();
+
+    calServiceDeadMan();
 
     //
     // Publish this pass's measurements and status to CPU2.
@@ -1127,6 +1801,17 @@ __interrupt void epwmTripISR(void) {
         status[channel].stopped = 1;
         BTS_userInputs[channel].enable_logic = 0;
         BTS_ctrlLoopVariables[channel].tripFlag = 1;
+
+        //
+        // Trips stay armed through calibration and out-rank it: a trip on
+        // the slot under calibration drops it out of fixed-current here, so
+        // the reference is zero before the control loop next runs.
+        //
+        if (BTS_userInputs[channel].calState == BTS_CAL_STATE_FIXED_I) {
+            BTS_userInputs[channel].ioutCal_pu = (float32_t)0.0;
+            BTS_userInputs[channel].calState   = BTS_CAL_STATE_IDLE;
+            calStatusBits &= ~(1UL << BTS_CAL_ST_DRIVING);
+        }
 
         //
         // Slots sharing a group share a load, so one tripping makes the

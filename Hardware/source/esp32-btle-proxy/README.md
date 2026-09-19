@@ -56,30 +56,37 @@ Both were found by reading the C2000 sources, and both change what this
 firmware had to do. **Neither is a fault in this project — they are
 limitations of the BTS build in `tida-010086/bts_F2837xD_8ch/`.**
 
-### 1. The mAh/mWh accumulators cannot be reset, and are never populated
+### 1. The mAh/mWh accumulators cannot be reset on demand (partly resolved)
 
 The specified sequence was "reset the watt and current counters in the BTS
-via registers, then initiate the discharge". That is not possible against the
-current BTS firmware:
+via registers, then initiate the discharge". The **populated** half of that is
+now solved on the BTS side; the **host-commanded reset** half is not:
 
-- `eChX_CurrentAcc`, `eChX_PowerAcc`, `eChX_MinVoltage` and `eChX_MaxVoltage`
-  are all declared `REG_ACCESS_RO` in `registers.c`.
-- `i2cSlaveISR()` in `com_cpu2.c` gates every host write on
-  `regConfig[regIdx].access == REG_ACCESS_RW`, so writes to those registers
-  are silently dropped.
-- Nothing on either C2000 core ever assigns them. The only writes into the
-  stats block anywhere in the tree are `CellVoltage` and `CellCurrent`
-  (`com_cpu2.c:1140-1141`). The accumulator slots are allocated and published
-  but never integrated, so they read back as a constant 0.
+- CPU1 integrates `Isense_A`/`Vsense_V` — the 16-bit ADS131M08 pair — in its
+  6.67 Hz `C1()` task and publishes per-direction totals: charge at
+  `eChX_ChargeAcc_mAh`/`_mWh` (320/332, the old `CurrentAcc`/`PowerAcc`
+  addresses, renamed) and discharge at `eChX_DischargeAcc_mAh`/`_mWh`
+  (1156 + ch×8). Both accumulate positive magnitude into their own direction,
+  so a charge and a discharge on one slot give two separate totals.
+- They are **still `REG_ACCESS_RO`**, and `i2cSlaveISR()` still drops host
+  writes to RO registers, so a host cannot zero them whenever it likes.
+- What replaces that: the BTS resets a direction's pair itself in
+  `modeCallback()` at the moment that direction starts, and only that pair.
+  So by the time a mode write has been accepted the counters for the run
+  about to begin are already at zero — which is the behaviour the
+  reset-then-discharge sequence actually needed.
 
-**What this firmware does instead:** integrates charge and energy on the
-ESP32 (`coulomb_counter.c`), trapezoidally, against the real elapsed time
-between polls. `try_reset_bts_accumulators()` still issues the register write
-and checks the read-back, so if a future BTS build makes those registers
-writable the hardware counters will start each test zeroed with no change
-here. `bts_link_stats_are_live()` probes at boot; when it returns true, the
-raw BTS values are reported alongside the locally integrated ones
-(`bts_raw` in the result JSON) for comparison.
+**What this firmware does:** keeps its own trapezoidal integration
+(`coulomb_counter.c`) as the reported figure, because it samples on real
+elapsed time at the 250 ms poll rather than a fixed 150 ms step and does not
+lose a partial interval at the ends of a run. The BTS's own counters are read
+each poll and reported beside it (`bts_raw` in the result JSON) so the two can
+be compared. `try_reset_bts_accumulators()` still issues the write for a
+future build that makes the registers writable.
+
+Note that `bts_link_stats_are_live()` is now a **positive test only**: a unit
+that has been idle since power-up reads all-zero and is indistinguishable
+from the older firmware that never wrote these registers.
 
 ### 2. The BTS never signals end-of-test
 
@@ -120,6 +127,8 @@ A `memcpy` into a `float` on the ESP32 produces garbage. Use
 | calibration | 592 | 48 B (12 regs) |
 | unit | 976 | — (4 regs total) |
 | measured cell temp | 992 | 4 B (1 reg) |
+| sense (ADS131M08) | 1092 | 8 B (2 regs) |
+| discharge accumulators | 1156 | 8 B (2 regs) |
 
 Always derive addresses with `BTS_CTRL_ADDR()`, `BTS_STATS_ADDR()` and
 friends rather than open-coding the arithmetic.
@@ -258,13 +267,15 @@ survive an operator walking away with the tablet.
 | POST | `/api/wifi` | `{"ssid":"...","password":"..."}` |
 | GET | `/api/registers?addr=&count=` | raw BTS registers, for bring-up |
 
-Example:
+Example. There is no mDNS responder in this firmware, so use the address the
+device logs on connect (`idf.py monitor`) rather than a `.local` name:
 
 ```bash
-curl -X POST http://bts.local/api/slot/0/config \
+BTS=192.168.1.50   # from the boot log
+curl -X POST http://$BTS/api/slot/0/config \
   -d '{"model":"VTC6","serial":"ABC123","auto_recharge_to_shipping":true}'
-curl -X POST http://bts.local/api/slot/0/start
-curl http://bts.local/api/status
+curl -X POST http://$BTS/api/slot/0/start
+curl http://$BTS/api/status
 ```
 
 JSON is emitted and parsed by `json_min.c` rather than cJSON: IDF 6.1 no

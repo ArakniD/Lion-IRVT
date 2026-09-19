@@ -60,20 +60,20 @@ The following capabilities have been specified and partially or fully implemente
 - External SPI ADCs for high-bandwidth I/V (Core 1 ISR path)
 - On-chip ADC for cell voltage/current (averaged)
 - ADS1119 for cell temperature (mV → °C table)
-- **Current / Power Accumulators** (`CurrentAcc` / `PowerAcc`): intended for mAh / mWh coulomb counting while a channel is running. Integration logic is declared in the register map and is a planned Core-1 background feature (see skill for suggested implementation).
+- **Charge / discharge accumulators**: mAh and mWh per slot per direction, integrated on Core 1 in the 6.67 Hz `C1()` task from the 16-bit ADS131M08 pair. Charge at `eChX_ChargeAcc_mAh`/`_mWh` (320/332), discharge at `eChX_DischargeAcc_mAh`/`_mWh` (1156+). Each pair is zeroed only when its own direction starts.
 
 ### Status & Telemetry
 - Per-channel status bitfield exposed via registers, UART, and (indirectly) LEDs
-- CAN frames carry live V/I; mAh/mWh fields exist in the shared `CAN_data` structure
+- CAN frames carry live V/I; the `CAN_data` mAh/mWh fields are populated from the accumulator matching each slot's direction, but are not yet transmitted
 - Unit state and trip sources visible to the host
 
 ## Outstanding / Planned Items Visible in Source
 
 - Resolve the `#error "calculate a gain and offset for defaults here"` in `loadCalibration`
-- Implement continuous integration of `CurrentAcc` / `PowerAcc` (and mirror into `canData[].mAh/mWh`)
 - Replace placeholder `mvToTempTable` with real thermistor / sensor characterisation
 - Complete any missing HAL files (`bts_hal.*`) referenced by the control code
-- Optional: CRC on EEPROM blocks, RTC timestamp, explicit accumulator reset command
+- Transmit the populated `canData[].mAh`/`.mWh` in `sendCANData()`
+- Optional: RTC timestamp, host-commanded accumulator reset (the counters are RO and self-reset per direction)
 
 ## How to Use with a Build Agent / TI CCS AI Tools
 

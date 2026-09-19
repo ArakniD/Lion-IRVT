@@ -40,6 +40,9 @@
 #define LED_DISCONNECT_PERIOD   40U   // 500 ms
 #define LED_DISCONNECT_ON       20U
 
+#define LED_CAL_PERIOD          24U   // 300 ms
+#define LED_CAL_ON              12U
+
 // Function prototypes
 void LEDDriver_init(void);
 void LEDDriver_update(void);

@@ -5,6 +5,7 @@
  */
 
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -22,10 +23,12 @@ static const char *TAG = "bts_link";
 #define BTS_POLL_TASK_PRIO      6
 /*
  * Reads per channel per poll: the whole 6-register stats block in one burst,
- * plus status and cell temperature. Status and temperature live in different
- * blocks so they cannot join the stats burst.
+ * the 2-register discharge accumulator block in a second, plus status and
+ * cell temperature. Each lives in a different block, so none of them can be
+ * folded into one transaction.
  */
 #define BTS_STATS_REG_COUNT     6
+#define BTS_DISCHACC_REG_COUNT  2
 
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
@@ -36,6 +39,13 @@ static bool                    s_stats_live;
 static uint32_t                s_poll_interval_ms = 250;
 static int                     s_sda_gpio = -1;
 static int                     s_scl_gpio = -1;
+/*
+ * Set by every calibration command so the next poll reads the window even
+ * though no channel has reported BTS_STATUS_CALIBRATING yet. Without it a
+ * host that enters calibration and immediately asks for the state sees the
+ * pre-command snapshot.
+ */
+static volatile bool           s_cal_poll_due;
 
 /* ------------------------------------------------------------------ */
 /* Low-level bus access. Callers must NOT hold s_bus_mutex.            */
@@ -220,18 +230,150 @@ esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim)
 }
 
 /* ------------------------------------------------------------------ */
+/* Calibration commands                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One calibration command, as the three-step sequence the design requires:
+ * argument, opcode, result.
+ *
+ * All three run under one take of the bus mutex. The opcode is consumed on
+ * write and self-clears, so an argument that lands after it - which is what
+ * an interleaved caller would produce - would be applied to nothing.
+ */
+static esp_err_t cal_command(uint8_t opcode, float argument, uint32_t *out_result)
+{
+    if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = bus_write_reg(BTS_REG_CAL_ARGUMENT, argument);
+    if (err == ESP_OK) {
+        err = bus_write_reg(BTS_REG_CAL_COMMAND, (float)opcode);
+    }
+
+    float result = 0.0f;
+    if (err == ESP_OK) {
+        err = bus_read_block(BTS_REG_CAL_RESULT, &result, 1);
+    }
+
+    xSemaphoreGive(s_bus_mutex);
+
+    if (out_result != NULL) {
+        *out_result = (err == ESP_OK) ? (uint32_t)result : 0u;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cal opcode %u failed: %s", opcode, esp_err_to_name(err));
+        return err;
+    }
+
+    /* Refresh the window on the next poll rather than waiting for the unit
+     * to start reporting BTS_STATUS_CALIBRATING on some channel. */
+    s_cal_poll_due = true;
+
+    if ((uint32_t)result != BTS_CAL_ERR_OK) {
+        ESP_LOGW(TAG, "cal opcode %u refused: %s", opcode,
+                 bts_link_cal_result_name((uint32_t)result));
+    }
+    return ESP_OK;
+}
+
+esp_err_t bts_link_cal_enter(uint8_t slot, uint32_t *out_result)
+{
+    if (slot >= BTS_NUM_CHANNELS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* eCalSlot is a separate register from the argument, so it is set before
+     * the opcode rather than carried in it. */
+    esp_err_t err = bts_link_write_reg(BTS_REG_CAL_SLOT, (float)slot);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return cal_command(BTS_CAL_CMD_ENTER, 0.0f, out_result);
+}
+
+esp_err_t bts_link_cal_exit(uint32_t *out_result)
+{
+    return cal_command(BTS_CAL_CMD_EXIT, 0.0f, out_result);
+}
+
+esp_err_t bts_link_cal_clear(uint32_t *out_result)
+{
+    return cal_command(BTS_CAL_CMD_CLEAR, 0.0f, out_result);
+}
+
+esp_err_t bts_link_cal_capture_voltage(float measured_v, uint32_t *out_result)
+{
+    return cal_command(BTS_CAL_CMD_CAPTURE_VOLTAGE, measured_v, out_result);
+}
+
+esp_err_t bts_link_cal_zero_current(uint32_t *out_result)
+{
+    return cal_command(BTS_CAL_CMD_ZERO_CURRENT, 0.0f, out_result);
+}
+
+esp_err_t bts_link_cal_set_fixed_current(float pu, uint32_t *out_result)
+{
+    /*
+     * The unit clamps this too, but rejecting here keeps an out-of-range
+     * request off the wire entirely - this one puts real current through a
+     * cell holder.
+     */
+    if (!(pu >= 0.0f) || pu > 0.8f) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return cal_command(BTS_CAL_CMD_SET_FIXED_CURRENT, pu, out_result);
+}
+
+esp_err_t bts_link_cal_capture_current(float measured_a, uint32_t *out_result)
+{
+    /* The firmware applies the discharge sign itself; a signed value here
+     * would invert the slot's stored gain. */
+    return cal_command(BTS_CAL_CMD_CAPTURE_CURRENT, fabsf(measured_a), out_result);
+}
+
+esp_err_t bts_link_cal_compute_save(uint32_t *out_result)
+{
+    return cal_command(BTS_CAL_CMD_COMPUTE_SAVE, 0.0f, out_result);
+}
+
+const char *bts_link_cal_result_name(uint32_t result)
+{
+    switch (result) {
+    case BTS_CAL_ERR_OK:               return "ok";
+    case BTS_CAL_ERR_BUSY:             return "another slot is calibrating";
+    case BTS_CAL_ERR_TESTING:          return "slot is running a test";
+    case BTS_CAL_ERR_SLOT_UNAVAILABLE: return "slot disabled or not a group leader";
+    case BTS_CAL_ERR_PU_RANGE:         return "pu outside the required window";
+    case BTS_CAL_ERR_INSUFFICIENT:     return "insufficient captures";
+    case BTS_CAL_ERR_VALIDATE:         return "computed gain failed validation";
+    case BTS_CAL_ERR_FRAM:             return "F-RAM write failed";
+    case BTS_CAL_ERR_ARG:              return "argument out of range";
+    case BTS_CAL_ERR_NOT_ACTIVE:       return "not in the calibration state";
+    default:                           return "unknown";
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Poll task                                                          */
 /* ------------------------------------------------------------------ */
 
 static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_bits)
 {
     float stats[BTS_STATS_REG_COUNT];
+    float dischacc[BTS_DISCHACC_REG_COUNT];
     float status_raw = 0.0f;
     float temp_raw = 0.0f;
 
-    esp_err_t err = bus_read_block(BTS_STATS_ADDR(ch, BTS_STATS_CURRENT_ACC),
+    esp_err_t err = bus_read_block(BTS_STATS_ADDR(ch, BTS_STATS_CHARGE_ACC_MAH),
                                    stats, BTS_STATS_REG_COUNT);
     if (err != ESP_OK) {
+        st->valid = false;
+        return;
+    }
+
+    if (bus_read_block(BTS_DISCHACC_ADDR(ch, BTS_DISCHACC_MAH),
+                       dischacc, BTS_DISCHACC_REG_COUNT) != ESP_OK) {
         st->valid = false;
         return;
     }
@@ -245,12 +387,14 @@ static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_
         return;
     }
 
-    st->current_acc    = stats[BTS_STATS_CURRENT_ACC  / BTS_REGISTER_SIZE];
-    st->min_voltage_v  = stats[BTS_STATS_MIN_VOLTAGE  / BTS_REGISTER_SIZE];
-    st->max_voltage_v  = stats[BTS_STATS_MAX_VOLTAGE  / BTS_REGISTER_SIZE];
-    st->power_acc      = stats[BTS_STATS_POWER_ACC    / BTS_REGISTER_SIZE];
-    st->cell_voltage_v = stats[BTS_STATS_CELL_VOLTAGE / BTS_REGISTER_SIZE];
-    st->cell_current_a = stats[BTS_STATS_CELL_CURRENT / BTS_REGISTER_SIZE];
+    st->charge_mah     = stats[BTS_STATS_CHARGE_ACC_MAH / BTS_REGISTER_SIZE];
+    st->min_voltage_v  = stats[BTS_STATS_MIN_VOLTAGE    / BTS_REGISTER_SIZE];
+    st->max_voltage_v  = stats[BTS_STATS_MAX_VOLTAGE    / BTS_REGISTER_SIZE];
+    st->charge_mwh     = stats[BTS_STATS_CHARGE_ACC_MWH / BTS_REGISTER_SIZE];
+    st->cell_voltage_v = stats[BTS_STATS_CELL_VOLTAGE   / BTS_REGISTER_SIZE];
+    st->cell_current_a = stats[BTS_STATS_CELL_CURRENT   / BTS_REGISTER_SIZE];
+    st->discharge_mah  = dischacc[BTS_DISCHACC_MAH / BTS_REGISTER_SIZE];
+    st->discharge_mwh  = dischacc[BTS_DISCHACC_MWH / BTS_REGISTER_SIZE];
     st->cell_temp_c    = temp_raw;
     st->status_bits    = (uint32_t)status_raw;
     st->cmpss_trip     = (trip_bits & BTS_TRIP_CMPSS(ch)) != 0;
@@ -258,11 +402,58 @@ static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_
     st->valid          = true;
 }
 
+/*
+ * Refreshes the calibration window, registers 1036-1088, as one burst.
+ *
+ * Called only when calibration is live or a command has just been issued:
+ * the normal cycle is already 33 transactions in 250 ms, and this feature
+ * is idle almost all of the time.
+ */
+static void poll_cal_window(bts_cal_state_t *cal, const bts_channel_state_t *chans)
+{
+    float w[BTS_CAL_WINDOW_COUNT];
+
+    if (bus_read_block(BTS_REG_CAL_SLOT, w, BTS_CAL_WINDOW_COUNT) != ESP_OK) {
+        cal->active = false;
+        return;
+    }
+
+    const uint32_t slot = (uint32_t)w[0];
+
+    cal->slot        = (slot < BTS_NUM_CHANNELS) ? (uint8_t)slot : BTS_CAL_SLOT_NONE;
+    /* w[1] is eCalCommand, which self-clears and carries nothing for a host. */
+    cal->status_bits = (uint32_t)w[3];
+    cal->result      = (uint32_t)w[4];
+    cal->ads_v_pu    = w[5];
+    cal->ads_i_pu    = w[6];
+    cal->ads_v_v     = w[7];
+    cal->ads_i_a     = w[8];
+    cal->f28_v_pu    = w[9];
+    cal->f28_i_pu    = w[10];
+    cal->f28_v_v     = w[11];
+    cal->f28_i_a     = w[12];
+    cal->temp_c      = w[13];
+    cal->active      = (cal->status_bits & BTS_CAL_ST_ACTIVE) != 0;
+
+    /* Ticks come from the slot's own status word, which reflects what is
+     * persisted rather than what this session captured. */
+    if (cal->slot < BTS_NUM_CHANNELS) {
+        const uint32_t st = chans[cal->slot].status_bits;
+        cal->v_tick = (st & BTS_STATUS_CAL_V_VALID) != 0;
+        cal->i_tick = (st & BTS_STATUS_CAL_I_VALID) != 0;
+    } else {
+        cal->v_tick = false;
+        cal->i_tick = false;
+    }
+}
+
 static void bts_poll_task(void *arg)
 {
     (void)arg;
     bts_snapshot_t local;
     memset(&local, 0, sizeof(local));
+    /* Zero is slot 0, so the "none" sentinel has to be set explicitly. */
+    local.cal.slot = BTS_CAL_SLOT_NONE;
 
     for (;;) {
         bool cycle_ok = true;
@@ -319,6 +510,23 @@ static void bts_poll_task(void *arg)
                 if (!local.channel[ch].valid) {
                     cycle_ok = false;
                 }
+            }
+
+            /*
+             * The calibration burst is conditional: a slot reporting
+             * BTS_STATUS_CALIBRATING, the window already active, or a
+             * command just issued. Reading it unconditionally would add a
+             * transaction to every 250 ms cycle for a feature used at the
+             * bench a few times in a unit's life.
+             */
+            bool cal_wanted = local.cal.active || s_cal_poll_due;
+            for (uint8_t ch = 0; ch < BTS_NUM_CHANNELS && !cal_wanted; ch++) {
+                cal_wanted = (local.channel[ch].status_bits &
+                              BTS_STATUS_CALIBRATING) != 0;
+            }
+            if (cal_wanted) {
+                s_cal_poll_due = false;
+                poll_cal_window(&local.cal, local.channel);
             }
 
             xSemaphoreGive(s_bus_mutex);
@@ -388,30 +596,39 @@ bool bts_link_stats_are_live(void)
 /*
  * Probes whether the BTS is populating its own accumulators.
  *
- * Runs a short discharge-free observation: read CurrentAcc/PowerAcc for
- * every channel twice, a poll apart. The current firmware never assigns
- * these registers, so they are identically zero and this returns false. If a
- * later BTS build starts integrating, any non-zero value flips it to true
- * and the raw accumulators get surfaced in the API for comparison against
- * the ESP32's own integration.
+ * Reads the charge pair and the discharge pair on every channel. A firmware
+ * that integrates leaves a non-zero total behind on any slot that has run
+ * since power-up, so this is a positive test only: a unit that is genuinely
+ * idle from cold reads all-zero and is indistinguishable from the older
+ * firmware that never wrote these registers at all. The result only gates
+ * whether the BTS figures are reported beside the local ones, so failing
+ * closed costs nothing.
  */
 static void probe_stats_liveness(void)
 {
     s_stats_live = false;
     for (uint8_t ch = 0; ch < BTS_NUM_CHANNELS; ch++) {
-        float v[4];
-        if (bts_link_read_block(BTS_STATS_ADDR(ch, BTS_STATS_CURRENT_ACC), v, 4) != ESP_OK) {
-            continue;
+        float chg[4];
+        float dch[2];
+
+        if (bts_link_read_block(BTS_STATS_ADDR(ch, BTS_STATS_CHARGE_ACC_MAH), chg, 4) == ESP_OK) {
+            /* ChargeAcc_mAh, MinVoltage, MaxVoltage, ChargeAcc_mWh. */
+            if (chg[0] != 0.0f || chg[3] != 0.0f) {
+                s_stats_live = true;
+                return;
+            }
         }
-        /* CurrentAcc, MinVoltage, MaxVoltage, PowerAcc all pinned at 0. */
-        if (v[0] != 0.0f || v[3] != 0.0f) {
-            s_stats_live = true;
-            return;
+        if (bts_link_read_block(BTS_DISCHACC_ADDR(ch, BTS_DISCHACC_MAH), dch, 2) == ESP_OK) {
+            if (dch[0] != 0.0f || dch[1] != 0.0f) {
+                s_stats_live = true;
+                return;
+            }
         }
     }
-    ESP_LOGW(TAG,
-             "BTS mAh/mWh accumulators read back as zero and are REG_ACCESS_RO; "
-             "using on-ESP32 coulomb counting instead");
+    ESP_LOGI(TAG,
+             "BTS accumulators all zero - either no slot has run since power-up "
+             "or this is a build that never populated them; using on-ESP32 "
+             "coulomb counting either way");
 }
 
 esp_err_t bts_link_init(const bts_link_config_t *config)
@@ -502,12 +719,13 @@ esp_err_t bts_link_init(const bts_link_config_t *config)
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = BTS_I2C_ADDRESS,
         /*
-         * 100 kHz. The C2000 target ISR does a fair amount of work per byte
-         * and the bus runs over a ribbon to the BTS board; 400 kHz is not
-         * worth the marginal risk here.
+         * 50 kHz, deliberately overriding config->scl_speed_hz (main.c asks
+         * for 100 kHz, which reaches only the bring-up probe list). The C2000
+         * target ISR does a fair amount of work per byte, the bus runs over a
+         * ribbon to the BTS board, and the board's 10k pull-ups are weak, so
+         * rise time - not bandwidth - is the binding constraint. Nothing here
+         * needs the throughput.
          */
-        /* Conservative: a weak pull-up costs rise time, and nothing here
-         * needs the bandwidth. */
         .scl_speed_hz = 50000,
     };
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev), TAG, "i2c dev");

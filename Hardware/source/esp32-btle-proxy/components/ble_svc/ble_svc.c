@@ -42,9 +42,12 @@ static const ble_uuid128_t s_uuid_slot_serial  = TESTER_UUID128(0x00, 0x07);
 static const ble_uuid128_t s_uuid_cat_index    = TESTER_UUID128(0x00, 0x08);
 static const ble_uuid128_t s_uuid_cat_entry    = TESTER_UUID128(0x00, 0x09);
 static const ble_uuid128_t s_uuid_slot_status  = TESTER_UUID128(0x00, 0x0a);
+static const ble_uuid128_t s_uuid_cal_cmd      = TESTER_UUID128(0x00, 0x0b);
+static const ble_uuid128_t s_uuid_cal_status   = TESTER_UUID128(0x00, 0x0c);
 
 static uint16_t s_unit_status_handle;
 static uint16_t s_slot_status_handle;
+static uint16_t s_cal_status_handle;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t  s_own_addr_type;
 static uint8_t  s_selected_slot;
@@ -205,10 +208,32 @@ static void build_catalog_entry(uint8_t index, ble_catalog_entry_t *out)
     snprintf(out->manufacturer, sizeof(out->manufacturer), "%s", m->manufacturer);
 }
 
+static void build_cal_status(ble_cal_status_t *out)
+{
+    bts_snapshot_t snap;
+    bts_link_get_snapshot(&snap);
+
+    memset(out, 0, sizeof(*out));
+    out->slot        = snap.cal.slot;
+    out->active      = snap.cal.active ? 1 : 0;
+    out->v_tick      = snap.cal.v_tick ? 1 : 0;
+    out->i_tick      = snap.cal.i_tick ? 1 : 0;
+    out->status_bits = snap.cal.status_bits;
+    out->result      = snap.cal.result;
+    out->ads_v_pu    = snap.cal.ads_v_pu;
+    out->ads_i_pu    = snap.cal.ads_i_pu;
+    out->ads_v_v     = snap.cal.ads_v_v;
+    out->ads_i_a     = snap.cal.ads_i_a;
+    out->f28_v_pu    = snap.cal.f28_v_pu;
+    out->f28_i_pu    = snap.cal.f28_i_pu;
+    out->f28_v_v     = snap.cal.f28_v_v;
+    out->f28_i_a     = snap.cal.f28_i_a;
+    out->temp_c      = snap.cal.temp_c;
+}
+
 /* ------------------------------------------------------------------ */
 /* Write handlers                                                     */
 /* ------------------------------------------------------------------ */
-
 static int read_flat(struct os_mbuf *om, void *dst, uint16_t exact_len)
 {
     uint16_t om_len = OS_MBUF_PKTLEN(om);
@@ -250,6 +275,64 @@ static int handle_command(struct os_mbuf *om)
          * "unlikely" so the client sees the failure; the reason is visible
          * in the slot's state and fault fields.
          */
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    return 0;
+}
+
+/*
+ * Calibration commands go straight to the unit; the ESP32 holds no
+ * calibration state of its own. A refusal by the BTS is reported as a
+ * generic ATT error - the specific code is in the status characteristic,
+ * which a client reads anyway to watch the capture progress.
+ */
+static int handle_cal_cmd(struct os_mbuf *om)
+{
+    ble_cal_cmd_t cmd;
+    int rc = read_flat(om, &cmd, sizeof(cmd));
+    if (rc != 0) {
+        return rc;
+    }
+
+    esp_err_t err;
+    uint32_t  result = 0;
+    switch (cmd.opcode) {
+    case BTS_CAL_CMD_ENTER:
+        if (cmd.slot >= SLOT_COUNT) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        err = bts_link_cal_enter(cmd.slot, &result);
+        break;
+    case BTS_CAL_CMD_EXIT:
+        err = bts_link_cal_exit(&result);
+        break;
+    case BTS_CAL_CMD_CAPTURE_VOLTAGE:
+        err = bts_link_cal_capture_voltage(cmd.arg, &result);
+        break;
+    case BTS_CAL_CMD_ZERO_CURRENT:
+        err = bts_link_cal_zero_current(&result);
+        break;
+    case BTS_CAL_CMD_SET_FIXED_CURRENT:
+        err = bts_link_cal_set_fixed_current(cmd.arg, &result);
+        break;
+    case BTS_CAL_CMD_CAPTURE_CURRENT:
+        err = bts_link_cal_capture_current(cmd.arg, &result);
+        break;
+    case BTS_CAL_CMD_COMPUTE_SAVE:
+        err = bts_link_cal_compute_save(&result);
+        break;
+    case BTS_CAL_CMD_CLEAR:
+        err = bts_link_cal_clear(&result);
+        break;
+    default:
+        ESP_LOGW(TAG, "unknown calibration opcode %u", cmd.opcode);
+        return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    }
+
+    if (err != ESP_OK || result != BTS_CAL_ERR_OK) {
+        ESP_LOGW(TAG, "cal opcode %u refused: %s", cmd.opcode,
+                 (err != ESP_OK) ? esp_err_to_name(err)
+                                 : bts_link_cal_result_name(result));
         return BLE_ATT_ERR_UNLIKELY;
     }
     return 0;
@@ -364,11 +447,20 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
             return os_mbuf_append(ctxt->om, &rec, sizeof(rec)) == 0
                        ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         }
+        if (ble_uuid_cmp(uuid, &s_uuid_cal_status.u) == 0) {
+            ble_cal_status_t rec;
+            build_cal_status(&rec);
+            return os_mbuf_append(ctxt->om, &rec, sizeof(rec)) == 0
+                       ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
         return BLE_ATT_ERR_UNLIKELY;
 
     case BLE_GATT_ACCESS_OP_WRITE_CHR:
         if (ble_uuid_cmp(uuid, &s_uuid_command.u) == 0) {
             return handle_command(ctxt->om);
+        }
+        if (ble_uuid_cmp(uuid, &s_uuid_cal_cmd.u) == 0) {
+            return handle_cal_cmd(ctxt->om);
         }
         if (ble_uuid_cmp(uuid, &s_uuid_slot_config.u) == 0) {
             return handle_slot_config_write(ctxt->om);
@@ -448,6 +540,18 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &s_slot_status_handle,
             }, {
+                /* Appended, never inserted: the discriminators are the
+                 * client's contract and renumbering them breaks every
+                 * existing decoder. */
+                .uuid = &s_uuid_cal_cmd.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_WRITE,
+            }, {
+                .uuid = &s_uuid_cal_status.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &s_cal_status_handle,
+            }, {
                 0,
             },
         },
@@ -493,14 +597,38 @@ static void on_slot_change(uint8_t slot, const slot_status_t *status)
 /*
  * While anything is running, push every slot once a second so a UI gets the
  * live mAh/mWh totals without polling over GATT. Idle slots produce nothing.
+ *
+ * Calibration is the exception: it notifies at 2 Hz while active, because an
+ * operator adjusting a bench supply to land inside a pu window is watching
+ * the number move and a 1 Hz update feels unresponsive. The tick is
+ * therefore 500 ms and the slot/unit work runs on every second pass.
  */
 static void notify_task(void *arg)
 {
     (void)arg;
+    bool slot_pass = false;
+
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        slot_pass = !slot_pass;
 
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            continue;
+        }
+
+        if (s_cal_status_handle != 0) {
+            ble_cal_status_t cal;
+            build_cal_status(&cal);
+            if (cal.active) {
+                struct os_mbuf *om = ble_hs_mbuf_from_flat(&cal, sizeof(cal));
+                if (om != NULL) {
+                    (void)ble_gatts_notify_custom(s_conn_handle,
+                                                  s_cal_status_handle, om);
+                }
+            }
+        }
+
+        if (!slot_pass) {
             continue;
         }
 

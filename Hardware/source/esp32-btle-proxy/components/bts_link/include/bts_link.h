@@ -30,8 +30,15 @@ typedef struct {
     float    cell_voltage_v;
     float    cell_current_a;
     float    cell_temp_c;
-    float    current_acc;      /* see bts_link_stats_are_live() */
-    float    power_acc;        /* see bts_link_stats_are_live() */
+    /*
+     * Per-direction totals from the BTS itself. Each accumulates positive
+     * magnitude and is zeroed only when its own direction starts, so a
+     * charge and a discharge on one slot leave two independent figures.
+     */
+    float    charge_mah;
+    float    charge_mwh;
+    float    discharge_mah;
+    float    discharge_mwh;
     float    min_voltage_v;
     float    max_voltage_v;
     uint32_t status_bits;      /* BTS_STATUS_* */
@@ -50,10 +57,40 @@ typedef struct {
     int64_t          last_poll_us;
 } bts_unit_status_t;
 
+/*
+ * Calibration window, registers 1036-1088.
+ *
+ * Only refreshed while the unit reports calibration active; the fields hold
+ * their last values otherwise, and `active` is what tells them apart. The
+ * poll task skips the burst when idle so the normal 33-transaction cycle
+ * does not get longer for a feature that is almost never in use.
+ */
+typedef struct {
+    bool     active;           /* BTS_CAL_ST_ACTIVE in status_bits       */
+    uint8_t  slot;             /* BTS_CAL_SLOT_NONE when none selected   */
+    uint32_t status_bits;      /* BTS_CAL_ST_*                           */
+    uint32_t result;           /* bts_cal_result_t of the last command   */
+
+    float    ads_v_pu;         /* raw, pre-gain                          */
+    float    ads_i_pu;
+    float    ads_v_v;
+    float    ads_i_a;
+    float    f28_v_pu;
+    float    f28_i_pu;
+    float    f28_v_v;
+    float    f28_i_a;
+    float    temp_c;
+
+    /* Persisted validity of the selected slot, from its status word. */
+    bool     v_tick;
+    bool     i_tick;
+} bts_cal_state_t;
+
 /* Full snapshot handed out by bts_link_get_snapshot(). */
 typedef struct {
     bts_channel_state_t channel[BTS_NUM_CHANNELS];
     bts_unit_status_t   unit;
+    bts_cal_state_t     cal;
 } bts_snapshot_t;
 
 typedef struct {
@@ -116,20 +153,44 @@ typedef struct {
 esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *limits);
 
 /*
+ * Calibration commands.
+ *
+ * Each writes eCalArgument, then eCalCommand, then reads eCalResult back,
+ * all under the bus mutex so the three-step sequence cannot interleave with
+ * the poll task or another caller. `out_result` receives the BTS_CAL_ERR_*
+ * code; the esp_err_t return covers only the transport.
+ *
+ * A non-zero result is a refusal by the unit, not a bus failure - report it
+ * rather than retrying.
+ */
+esp_err_t bts_link_cal_enter(uint8_t slot, uint32_t *out_result);
+esp_err_t bts_link_cal_exit(uint32_t *out_result);
+esp_err_t bts_link_cal_clear(uint32_t *out_result);
+esp_err_t bts_link_cal_capture_voltage(float measured_v, uint32_t *out_result);
+esp_err_t bts_link_cal_zero_current(uint32_t *out_result);
+esp_err_t bts_link_cal_set_fixed_current(float pu, uint32_t *out_result);
+esp_err_t bts_link_cal_capture_current(float measured_a, uint32_t *out_result);
+esp_err_t bts_link_cal_compute_save(uint32_t *out_result);
+
+/* Human-readable form of a BTS_CAL_ERR_* code, for API and log messages. */
+const char *bts_link_cal_result_name(uint32_t result);
+
+/*
  * Whether the BTS is populating its own mAh/mWh accumulators.
  *
- * As of the current F2837xD firmware it is NOT: eChX_CurrentAcc,
- * eChX_PowerAcc, eChX_MinVoltage and eChX_MaxVoltage are declared
- * REG_ACCESS_RO in registers.c and no code path on either core ever assigns
- * them, so they read back as a constant 0. They are also RO, which means the
- * host cannot zero them either - the "reset the watt and current counters in
- * the BTS via registers" step is not possible against this firmware build.
+ * The current F2837xD firmware does: CPU1 integrates the ADS131M08 pair in
+ * its 6.67 Hz C1 task and publishes charge totals at 320/332 and discharge
+ * totals at 1156+. They remain REG_ACCESS_RO, so a host still cannot zero
+ * them on demand - the BTS resets a direction's pair itself when that
+ * direction starts, which is what the "reset then discharge" sequence
+ * actually needed.
  *
- * The test engine therefore integrates charge and energy on the ESP32 from
- * the polled voltage/current pair (see coulomb_counter.c) and treats the BTS
- * accumulators as advisory. This function probes them at startup: if a
- * future BTS build starts populating them, it returns true and the raw
- * values are surfaced alongside the locally integrated ones for comparison.
+ * They are still advisory here. The test engine keeps its own trapezoidal
+ * integration (coulomb_counter.c), which samples on real elapsed time at the
+ * 250 ms poll rather than a fixed 150 ms step, and reports the BTS figures
+ * beside it for comparison. This probe is what gates that reporting: it can
+ * legitimately read false on a unit that has been idle since power-up and
+ * has never run a slot.
  */
 bool bts_link_stats_are_live(void);
 

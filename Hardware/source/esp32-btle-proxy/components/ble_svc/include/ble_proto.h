@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define BLE_PROTO_VERSION       1
+#define BLE_PROTO_VERSION       2
 
 /* Attribute value sizes are bounded by the negotiated MTU (247 - 3). */
 #define BLE_PROTO_MAX_PAYLOAD   244
@@ -148,6 +148,47 @@ typedef struct __attribute__((packed)) {
 
 #define BLE_CATALOG_KIND_CHEMISTRY  0
 #define BLE_CATALOG_KIND_MODEL      1
+
+/*
+ * Calibration control, characteristic 000b.
+ *
+ * `opcode` is a bts_cal_cmd_t; `arg` carries the measured volts, measured
+ * amps or pu setpoint, and is ignored by the opcodes that take none. `slot`
+ * is only read by ENTER.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t  opcode;
+    uint8_t  slot;
+    uint16_t reserved;
+    float    arg;
+} ble_cal_cmd_t;
+
+/*
+ * Calibration status, characteristic 000c.
+ *
+ * The 9 telemetry floats are the raw pre-gain per-unit readings and the
+ * post-gain engineering values of both measurement paths, as the unit
+ * publishes them at 1056-1088.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t  slot;          /* 255 = none                            */
+    uint8_t  active;
+    uint8_t  v_tick;        /* persisted voltage cal valid           */
+    uint8_t  i_tick;        /* persisted current cal valid           */
+
+    uint32_t status_bits;   /* BTS_CAL_ST_*                          */
+    uint32_t result;        /* bts_cal_result_t of the last command  */
+
+    float    ads_v_pu;
+    float    ads_i_pu;
+    float    ads_v_v;
+    float    ads_i_a;
+    float    f28_v_pu;
+    float    f28_i_pu;
+    float    f28_v_v;
+    float    f28_i_a;
+    float    temp_c;
+} ble_cal_status_t;
 
 #ifdef __cplusplus
 }

@@ -87,8 +87,23 @@
 #define ADS1119_DRDY_GPIO_2 43     // DRDY for ADS1119 #2 (net DRDY4)
 
 // EEPROM layout
+//
+// The stride is fixed rather than derived from sizeof(BTS_channelCalibration).
+// It used to be 2*sizeof(), which put channel 4's block at 0x0100 - exactly
+// where the global voltage thresholds live. saveAllCalibration() iterates
+// 0->7, so channel 0 wrote the globals and channel 4 then overwrote them;
+// at the next boot they failed validation and the 9/10/15/16 V defaults were
+// silently installed. Channel 4's own block still validated, so nothing
+// looked wrong - the thresholds simply never persisted.
+//
+// A fixed stride also decouples the wire layout from sizeof, so adding struct
+// fields no longer moves every channel's block. The FM24V10 is 128 KiB, so
+// the generosity costs nothing.
+//
 #define EEPROM_I2C_ADDR       0x50
-#define EEPROM_GLOBAL_V_ADDR  0x0100   // 16 bytes = 4 floats
+#define CAL_FRAM_STRIDE_BYTES 128U     // per channel, fixed
+#define CAL_FRAM_BASE         0x0000U  // ch N at BASE + N*STRIDE, ends 0x03FF
+#define EEPROM_GLOBAL_V_ADDR  0x0400   // 16 bytes = 4 floats (was 0x0100)
 
 //
 // Polling bound for the blocking I2C helpers. At 160 MHz this is a few
@@ -747,7 +762,7 @@ static void bytesToCalibration(const uint16_t *bytes, BTS_channelCalibration *ca
 bool writeEEPROM(uint16_t channel, const BTS_channelCalibration* data)
 {
     uint16_t bytes[CAL_EEPROM_BYTES];
-    uint16_t eepromAddr = channel * CAL_EEPROM_BYTES;
+    uint16_t eepromAddr = CAL_FRAM_BASE + channel * CAL_FRAM_STRIDE_BYTES;
 
     calibrationToBytes(data, bytes);
     return i2cWriteBlock(EEPROM_I2C_ADDR, eepromAddr, bytes, CAL_EEPROM_BYTES);
@@ -756,13 +771,53 @@ bool writeEEPROM(uint16_t channel, const BTS_channelCalibration* data)
 bool readEEPROM(uint16_t channel, BTS_channelCalibration* data)
 {
     uint16_t bytes[CAL_EEPROM_BYTES];
-    uint16_t eepromAddr = channel * CAL_EEPROM_BYTES;
+    uint16_t eepromAddr = CAL_FRAM_BASE + channel * CAL_FRAM_STRIDE_BYTES;
 
     if (!i2cReadBlock(EEPROM_I2C_ADDR, eepromAddr, bytes, CAL_EEPROM_BYTES)) {
         return false;
     }
     bytesToCalibration(bytes, data);
     return true;
+}
+
+//
+// CRC-32 over the struct's words, excluding the trailing crc32 field itself.
+// Each 16-bit C28x word contributes its two wire bytes low half first, which
+// is the little-endian word order the image is written in.
+//
+static uint32_t calibrationCrc32(const BTS_channelCalibration *cal)
+{
+    const uint16_t *words = (const uint16_t *)cal;
+    uint16_t nWords = (uint16_t)sizeof(BTS_channelCalibration) - 2U;
+    uint32_t crc = 0xFFFFFFFFUL;
+    uint16_t i;
+    uint16_t b;
+    uint16_t bit;
+
+    for (i = 0; i < nWords; i++) {
+        for (b = 0; b < 2U; b++) {
+            crc ^= (uint32_t)((words[i] >> (b * 8U)) & 0xFFU);
+            for (bit = 0; bit < 8U; bit++) {
+                crc = (crc & 1UL) ? ((crc >> 1) ^ 0xEDB88320UL) : (crc >> 1);
+            }
+        }
+    }
+    return crc ^ 0xFFFFFFFFUL;
+}
+
+//
+// True when a and b agree to within 0.1 %, used to catch a partially-written
+// block through the reciprocal gain pair.
+//
+static bool calWithinTenth(float32_t a, float32_t b)
+{
+    float32_t diff = a - b;
+    float32_t mag  = (b < 0.0f) ? -b : b;
+
+    if (diff < 0.0f) {
+        diff = -diff;
+    }
+    return (diff <= (mag * 0.001f));
 }
 
 //
@@ -786,6 +841,33 @@ static bool validateCalibration(const BTS_channelCalibration* cal, uint16_t chan
         return false;
     }
     if (cal->F28I_Gain < 0.5f || cal->F28I_Gain > 2.0f || cal->F28I_Offset < -2.0f || cal->F28I_Offset > 2.0f) {
+        return false;
+    }
+    //
+    // The Iout/Vout gains were not range-checked at all, so a corrupt or
+    // half-written block passed straight into the control loop's setpoint
+    // arithmetic. Windows derived from the known-good compiled values.
+    //
+    if (cal->IoutGain_pu < 0.05f || cal->IoutGain_pu > 0.20f) {
+        return false;
+    }
+    if (cal->VoutGain_pu < 0.10f || cal->VoutGain_pu > 0.40f) {
+        return false;
+    }
+    //
+    // The pu and engineering gains are a reciprocal pair. Disagreement means
+    // a partially-written block, whatever the individual values look like.
+    //
+    if (cal->IoutGain_A == 0.0f || cal->VoutGain_V == 0.0f) {
+        return false;
+    }
+    if (!calWithinTenth(1.0f / cal->IoutGain_pu, cal->IoutGain_A)) {
+        return false;
+    }
+    if (!calWithinTenth(1.0f / cal->VoutGain_pu, cal->VoutGain_V)) {
+        return false;
+    }
+    if (cal->crc32 != calibrationCrc32(cal)) {
         return false;
     }
     return true;
@@ -902,8 +984,17 @@ void loadCalibration(void)
     for (ch = 0; ch < NUM_CHANNELS; ch++) {
         BTS_channelCalibration cal;
 
+        //
+        // calValidFlags[] is NOLOAD from CPU1's side, and CPU1 reads it every
+        // status pass for the display ticks. Clear it before anything can
+        // observe the RAM's power-up contents as validity.
+        //
+        calibrationData[ch].calFlags = 0UL;
+        calValidFlags[ch] = 0UL;
+
         if (readEEPROM(ch, &cal) && validateCalibration(&cal, ch)) {
             calibrationData[ch] = cal;
+            calValidFlags[ch] = cal.calFlags;
             applyStoredCalibration(ch, &cal);
         } else {
             applyDefaultCalibration(ch);
@@ -939,14 +1030,28 @@ void loadCalibration(void)
     // The register file is now complete and consistent - tell CPU1 to
     // recalculate its program variables from it and go.
     //
+    registers[BTS_REG_IDX(eCalSlot)]     = (float32_t)BTS_CAL_SLOT_NONE;
+    registers[BTS_REG_IDX(eCalCommand)]  = 0.0f;
+    registers[BTS_REG_IDX(eCalArgument)] = 0.0f;
+    registers[BTS_REG_IDX(eCalStatus)]   = 0.0f;
+    registers[BTS_REG_IDX(eCalResult)]   = 0.0f;
+
     notifyCpu1CalibrationReload();
 }
 
-void saveCalibration(uint16_t channel)
+//
+// Commits one channel's register-file calibration to F-RAM.
+//
+// extraFlags is OR-ed into the stored calFlags, so a runtime calibration can
+// mark which of the two paths it established while a plain re-save preserves
+// whatever was already recorded.
+//
+static bool saveCalibrationFlags(uint16_t channel, uint32_t extraFlags)
 {
     BTS_channelCalibration cal;
     uint16_t tempBase = BTS_TEMP_BASE(channel);
     uint16_t calBase  = BTS_CAL_BASE(channel);
+    bool     written  = false;
 
     cal.header   = BTS_CAL_MAKE_HEADER(channel);
     cal.dateTime = CPUTimer_getTimerCount(CPUTIMER1_BASE);
@@ -966,9 +1071,14 @@ void saveCalibration(uint16_t channel)
     cal.VoutGain_V    = registers[calBase + BTS_CAL_VOUT_GAIN_V];
     cal.VoutOffset_V  = registers[calBase + BTS_CAL_VOUT_OFFSET_V];
 
+    cal.calFlags = calibrationData[channel].calFlags | extraFlags;
+    cal.crc32    = calibrationCrc32(&cal);
+
     if (validateCalibration(&cal, channel)) {
         if (writeEEPROM(channel, &cal)) {
             calibrationData[channel] = cal;
+            calValidFlags[channel] = cal.calFlags;
+            written = true;
         }
     }
 
@@ -992,6 +1102,13 @@ void saveCalibration(uint16_t channel)
         }
         i2cWriteBlock(EEPROM_I2C_ADDR, EEPROM_GLOBAL_V_ADDR, voltageBytes, 16U);
     }
+
+    return written;
+}
+
+void saveCalibration(uint16_t channel)
+{
+    (void)saveCalibrationFlags(channel, 0UL);
 }
 
 //
@@ -1830,6 +1947,18 @@ void BTS_serviceADS1119(void)
 }
 
 //
+// Runtime calibration save handshake. CPU1 computes and validates the
+// two-point result, then bumps calSaveSeq; this side notices the change and
+// defers the F-RAM write to the idle loop, exactly as the eCalibrationMode
+// commit does. Nothing here may touch the F-RAM - mirrorCpu1Status() runs
+// inside timerISR.
+//
+static volatile uint16_t calRuntimeSavePending = 0U;
+static volatile uint16_t calRuntimeSaveSlot    = 0U;
+static volatile uint32_t calRuntimeSaveFlags   = 0U;
+static uint32_t calRuntimeSaveSeqSeen = 0U;
+
+//
 // Mirrors the measurements and status CPU1 published in CPU1TOCPU2RAM into
 // the register file, so the external interfaces see current data. The seq
 // counter is even and unchanged across a consistent snapshot.
@@ -1840,6 +1969,20 @@ static void mirrorCpu1Status(void)
     uint32_t statusBits[NUM_CHANNELS];
     float32_t cellV[NUM_CHANNELS];
     float32_t cellI[NUM_CHANNELS];
+    float32_t senseV[NUM_CHANNELS];
+    float32_t senseI[NUM_CHANNELS];
+    float32_t chgMah[NUM_CHANNELS];
+    float32_t chgMwh[NUM_CHANNELS];
+    float32_t dchMah[NUM_CHANNELS];
+    float32_t dchMwh[NUM_CHANNELS];
+    float32_t calTelemetry[8];
+    float32_t calComputed[BTS_CAL_REGS_PER_CH];
+    uint32_t calActiveSlot;
+    uint32_t calStatus;
+    uint32_t calResult;
+    uint32_t calSaveSeq;
+    uint32_t calSaveSlot;
+    uint32_t calSaveFlags;
     float32_t inputV;
     uint32_t unitState;
     uint32_t tripStatus;
@@ -1848,6 +1991,7 @@ static void mirrorCpu1Status(void)
     uint32_t slotEnable;
     uint32_t groupSize;
     uint16_t ch;
+    uint16_t i;
     uint16_t attempts = 0;
 
     do {
@@ -1859,7 +2003,25 @@ static void mirrorCpu1Status(void)
             statusBits[ch] = cpu1Status.statusBits[ch];
             cellV[ch] = cpu1Status.cellVoltage[ch];
             cellI[ch] = cpu1Status.cellCurrent[ch];
+            senseV[ch] = cpu1Status.senseVoltage[ch];
+            senseI[ch] = cpu1Status.senseCurrent[ch];
+            chgMah[ch] = cpu1Status.chargeMah[ch];
+            chgMwh[ch] = cpu1Status.chargeMwh[ch];
+            dchMah[ch] = cpu1Status.dischargeMah[ch];
+            dchMwh[ch] = cpu1Status.dischargeMwh[ch];
         }
+        for (i = 0; i < 8U; i++) {
+            calTelemetry[i] = cpu1Status.calTelemetry[i];
+        }
+        for (i = 0; i < BTS_CAL_REGS_PER_CH; i++) {
+            calComputed[i] = cpu1Status.calComputed[i];
+        }
+        calActiveSlot = cpu1Status.calActiveSlot;
+        calStatus     = cpu1Status.calStatus;
+        calResult     = cpu1Status.calResult;
+        calSaveSeq    = cpu1Status.calSaveSeq;
+        calSaveSlot   = cpu1Status.calSaveSlot;
+        calSaveFlags  = cpu1Status.calSaveFlags;
         inputV     = cpu1Status.inputVoltage;
         unitState  = cpu1Status.unitState;
         tripStatus = cpu1Status.tripStatus;
@@ -1875,13 +2037,56 @@ static void mirrorCpu1Status(void)
 
     for (ch = 0; ch < NUM_CHANNELS; ch++) {
         registers[BTS_CTRL_BASE(ch) + BTS_REG_IDX(eCh0_Status)] = (float32_t)statusBits[ch];
-        registers[BTS_STATS_BASE(ch) + (BTS_REG_IDX(eCh0_CellVoltage) - BTS_REG_IDX(eCh0_CurrentAcc))] = cellV[ch];
-        registers[BTS_STATS_BASE(ch) + (BTS_REG_IDX(eCh0_CellCurrent) - BTS_REG_IDX(eCh0_CurrentAcc))] = cellI[ch];
+        registers[BTS_STATS_BASE(ch) + (BTS_REG_IDX(eCh0_CellVoltage) - BTS_REG_IDX(eCh0_ChargeAcc_mAh))] = cellV[ch];
+        registers[BTS_STATS_BASE(ch) + (BTS_REG_IDX(eCh0_CellCurrent) - BTS_REG_IDX(eCh0_ChargeAcc_mAh))] = cellI[ch];
+        registers[BTS_SENSE_BASE(ch) + BTS_SENSE_VOLTAGE] = senseV[ch];
+        registers[BTS_SENSE_BASE(ch) + BTS_SENSE_CURRENT] = senseI[ch];
+        registers[BTS_STATS_BASE(ch)] = chgMah[ch];
+        registers[BTS_STATS_BASE(ch) + (BTS_REG_IDX(eCh0_ChargeAcc_mWh) - BTS_REG_IDX(eCh0_ChargeAcc_mAh))] = chgMwh[ch];
+        registers[BTS_DISCHACC_BASE(ch) + BTS_DISCHACC_MAH] = dchMah[ch];
+        registers[BTS_DISCHACC_BASE(ch) + BTS_DISCHACC_MWH] = dchMwh[ch];
     }
 
     registers[BTS_REG_IDX(eInputVoltage)] = inputV;
     registers[BTS_REG_IDX(eUnitState)]    = (float32_t)unitState;
     registers[BTS_REG_IDX(eTripStatus)]   = (float32_t)tripStatus;
+
+    //
+    // Calibration window. Bit 7 (written to F-RAM) is owned by this side, so
+    // it is OR-ed back over whatever CPU1 published rather than overwritten.
+    //
+    registers[BTS_REG_IDX(eCalSlot)]   = (float32_t)calActiveSlot;
+    registers[BTS_REG_IDX(eCalStatus)] = (float32_t)(calStatus |
+        ((uint32_t)registers[BTS_REG_IDX(eCalStatus)] & (1UL << BTS_CAL_ST_SAVED)));
+    registers[BTS_REG_IDX(eCalResult)] = (float32_t)calResult;
+
+    for (i = 0; i < 8U; i++) {
+        registers[BTS_REG_IDX(eCalAdsV_pu) + i] = calTelemetry[i];
+    }
+    //
+    // The cell temperature is this side's: the ADS1119 converters are on
+    // CPU2's I2CB, so CPU1 has no reading to publish.
+    //
+    registers[BTS_REG_IDX(eCalTemp_C)] = (calActiveSlot < NUM_CHANNELS)
+                                       ? registers[BTS_CELLTEMP_IDX((uint16_t)calActiveSlot)]
+                                       : 0.0f;
+
+    //
+    // A new computed result. Stage it into the register file here - that is
+    // CPU2-owned memory and cheap - but leave the F-RAM write to the idle
+    // loop.
+    //
+    if ((calSaveSeq != calRuntimeSaveSeqSeen) && (calSaveSlot < NUM_CHANNELS)) {
+        uint16_t calBase = BTS_CAL_BASE((uint16_t)calSaveSlot);
+
+        calRuntimeSaveSeqSeen = calSaveSeq;
+        for (i = 0; i < BTS_CAL_REGS_PER_CH; i++) {
+            registers[calBase + i] = calComputed[i];
+        }
+        calRuntimeSaveSlot    = (uint16_t)calSaveSlot;
+        calRuntimeSaveFlags   = calSaveFlags;
+        calRuntimeSavePending = 1U;
+    }
 
     //
     // Dip-switch straps. Only published once CPU1 says it has latched
@@ -1973,6 +2178,22 @@ static void applyHostRegisterWrite(uint16_t regIdx, float32_t value)
 
     if (regIdx == BTS_REG_IDX(eCalibrationMode) && value == 2.0f) {
         calibrationSavePending = 1U;
+    }
+
+    //
+    // A calibration command is consumed on write. Self-clearing here rather
+    // than waiting for CPU1 means a host polling eCalCommand sees 0 as soon
+    // as the write is accepted; the opcode itself already travelled to CPU1
+    // in the IPC payload, so clearing the register cannot lose it.
+    //
+    if ((regIdx == BTS_REG_IDX(eCalCommand)) && (value != 0.0f)) {
+        registers[regIdx] = 0.0f;
+        //
+        // A fresh command supersedes any previous save indication.
+        //
+        registers[BTS_REG_IDX(eCalStatus)] =
+            (float32_t)((uint32_t)registers[BTS_REG_IDX(eCalStatus)] &
+                        ~(1UL << BTS_CAL_ST_SAVED));
     }
 }
 
@@ -2076,6 +2297,33 @@ static void serviceI2CTargetWatchdog(void)
 void BTS_serviceDeferredWork(void)
 {
     serviceI2CTargetWatchdog();
+
+    //
+    // Runtime calibration commit. F-RAM is never written from an ISR - the
+    // request arrives in timerISR and the transfer happens here.
+    //
+    if (calRuntimeSavePending != 0U) {
+        uint16_t slot  = calRuntimeSaveSlot;
+        uint32_t flags = calRuntimeSaveFlags;
+        uint32_t st;
+
+        calRuntimeSavePending = 0U;
+
+        if (saveCalibrationFlags(slot, flags)) {
+            st = (uint32_t)registers[BTS_REG_IDX(eCalStatus)] | (1UL << BTS_CAL_ST_SAVED);
+            registers[BTS_REG_IDX(eCalStatus)] = (float32_t)st;
+            registers[BTS_REG_IDX(eCalResult)] = (float32_t)eCalErrOk;
+            //
+            // The register file now holds the new gains; CPU1 reloads its
+            // program variables from there.
+            //
+            notifyCpu1CalibrationReload();
+        } else {
+            registers[BTS_REG_IDX(eCalResult)] = (float32_t)eCalErrWriteFailed;
+            st = (uint32_t)registers[BTS_REG_IDX(eCalStatus)] | (1UL << BTS_CAL_ST_FAILED);
+            registers[BTS_REG_IDX(eCalStatus)] = (float32_t)st;
+        }
+    }
 
     if (calibrationSavePending == 0U) {
         return;

@@ -39,7 +39,27 @@
 // the same reason as the block above - never inserted mid-map.
 //
 #define NUM_GROUP_REGISTERS (3)
-#define TOTAL_REGISTERS (NUM_CONTROL_REGISTERS + NUM_STATS_REGISTERS + NUM_CALIBRATION_REGISTERS + NUM_UNIT_REGISTERS + NUM_TEMP_MEAS_REGISTERS + NUM_GROUP_REGISTERS) // 259
+//
+// Runtime slot calibration. Unit-scoped rather than per-slot: only one slot
+// calibrates at a time, and eight copies of the telemetry window would need
+// 144 words of CPU2TOCPU1RAM, which is not available.
+//
+#define NUM_CAL_CONTROL_REGISTERS (5)
+#define NUM_CAL_TELEMETRY_REGISTERS (9)
+//
+// ADS131M08 engineering values, one pair per slot. The stats block at 336
+// carries the 12-bit internal ADC; this is the 16-bit converter, which until
+// now was computed every 100 ms and read by nothing.
+//
+#define NUM_SENSE_REGISTERS (NUM_CHANNELS * 2) // 16
+//
+// Discharge mAh/mWh accumulators. The pair at 320/332 in the stats block is
+// the CHARGE direction; this block is the discharge one. Two blocks rather
+// than one signed pair so a charge followed by a discharge on the same slot
+// yields two separate positive totals instead of cancelling.
+//
+#define NUM_DISCHACC_REGISTERS (NUM_CHANNELS * 2) // 16
+#define TOTAL_REGISTERS (NUM_CONTROL_REGISTERS + NUM_STATS_REGISTERS + NUM_CALIBRATION_REGISTERS + NUM_UNIT_REGISTERS + NUM_TEMP_MEAS_REGISTERS + NUM_GROUP_REGISTERS + NUM_CAL_CONTROL_REGISTERS + NUM_CAL_TELEMETRY_REGISTERS + NUM_SENSE_REGISTERS + NUM_DISCHACC_REGISTERS) // 305
 
 // CAN bus configuration
 #define CAN_BITRATE 500000 // 500 kbps
@@ -134,52 +154,52 @@ typedef enum {
     eCh7_DischargeCurrentMax = 312,
     eCh7_Status = 316,
     // Stats Block (48 registers)
-    eCh0_CurrentAcc = 320,
+    eCh0_ChargeAcc_mAh = 320,
     eCh0_MinVoltage = 324,
     eCh0_MaxVoltage = 328,
-    eCh0_PowerAcc = 332,
+    eCh0_ChargeAcc_mWh = 332,
     eCh0_CellVoltage = 336,
     eCh0_CellCurrent = 340,
-    eCh1_CurrentAcc = 344,
+    eCh1_ChargeAcc_mAh = 344,
     eCh1_MinVoltage = 348,
     eCh1_MaxVoltage = 352,
-    eCh1_PowerAcc = 356,
+    eCh1_ChargeAcc_mWh = 356,
     eCh1_CellVoltage = 360,
     eCh1_CellCurrent = 364,
-    eCh2_CurrentAcc = 368,
+    eCh2_ChargeAcc_mAh = 368,
     eCh2_MinVoltage = 372,
     eCh2_MaxVoltage = 376,
-    eCh2_PowerAcc = 380,
+    eCh2_ChargeAcc_mWh = 380,
     eCh2_CellVoltage = 384,
     eCh2_CellCurrent = 388,
-    eCh3_CurrentAcc = 392,
+    eCh3_ChargeAcc_mAh = 392,
     eCh3_MinVoltage = 396,
     eCh3_MaxVoltage = 400,
-    eCh3_PowerAcc = 404,
+    eCh3_ChargeAcc_mWh = 404,
     eCh3_CellVoltage = 408,
     eCh3_CellCurrent = 412,
-    eCh4_CurrentAcc = 416,
+    eCh4_ChargeAcc_mAh = 416,
     eCh4_MinVoltage = 420,
     eCh4_MaxVoltage = 424,
-    eCh4_PowerAcc = 428,
+    eCh4_ChargeAcc_mWh = 428,
     eCh4_CellVoltage = 432,
     eCh4_CellCurrent = 436,
-    eCh5_CurrentAcc = 440,
+    eCh5_ChargeAcc_mAh = 440,
     eCh5_MinVoltage = 444,
     eCh5_MaxVoltage = 448,
-    eCh5_PowerAcc = 452,
+    eCh5_ChargeAcc_mWh = 452,
     eCh5_CellVoltage = 456,
     eCh5_CellCurrent = 460,
-    eCh6_CurrentAcc = 464,
+    eCh6_ChargeAcc_mAh = 464,
     eCh6_MinVoltage = 468,
     eCh6_MaxVoltage = 472,
-    eCh6_PowerAcc = 476,
+    eCh6_ChargeAcc_mWh = 476,
     eCh6_CellVoltage = 480,
     eCh6_CellCurrent = 484,
-    eCh7_CurrentAcc = 488,
+    eCh7_ChargeAcc_mAh = 488,
     eCh7_MinVoltage = 492,
     eCh7_MaxVoltage = 496,
-    eCh7_PowerAcc = 500,
+    eCh7_ChargeAcc_mWh = 500,
     eCh7_CellVoltage = 504,
     eCh7_CellCurrent = 508,
     // Calibration Block (116 registers)
@@ -326,7 +346,82 @@ typedef enum {
     eSlotMode = 1024,
     eSlotEnable = 1028,
     eGroupSize = 1032,
+    //
+    // Calibration control (5 registers, unit-scoped). The host writes
+    // eCalArgument first, then eCalCommand; the command is consumed on
+    // write and eCalCommand self-clears.
+    //
+    eCalSlot = 1036,
+    eCalCommand = 1040,
+    eCalArgument = 1044,
+    eCalStatus = 1048,
+    eCalResult = 1052,
+    //
+    // Calibration live telemetry (9 registers, RO). A window on the slot
+    // named by eCalSlot, zeroed when no slot is selected. The _pu values are
+    // the raw normalised converter readings BEFORE any gain/offset - that is
+    // the quantity the two-point maths consumes.
+    //
+    eCalAdsV_pu = 1056,
+    eCalAdsI_pu = 1060,
+    eCalAdsV_V = 1064,
+    eCalAdsI_A = 1068,
+    eCalF28V_pu = 1072,
+    eCalF28I_pu = 1076,
+    eCalF28V_V = 1080,
+    eCalF28I_A = 1084,
+    eCalTemp_C = 1088,
+    //
+    // ADS131M08 engineering values (16 registers, RO, stride 8).
+    //
+    eCh0_SenseVoltage = 1092,
+    eCh0_SenseCurrent = 1096,
+    eCh1_SenseVoltage = 1100,
+    eCh1_SenseCurrent = 1104,
+    eCh2_SenseVoltage = 1108,
+    eCh2_SenseCurrent = 1112,
+    eCh3_SenseVoltage = 1116,
+    eCh3_SenseCurrent = 1120,
+    eCh4_SenseVoltage = 1124,
+    eCh4_SenseCurrent = 1128,
+    eCh5_SenseVoltage = 1132,
+    eCh5_SenseCurrent = 1136,
+    eCh6_SenseVoltage = 1140,
+    eCh6_SenseCurrent = 1144,
+    eCh7_SenseVoltage = 1148,
+    eCh7_SenseCurrent = 1152,
+    //
+    // Discharge accumulators (16 registers, RO, stride 8). The charge
+    // direction lives at 320/332 in the stats block.
+    //
+    eCh0_DischargeAcc_mAh = 1156,
+    eCh0_DischargeAcc_mWh = 1160,
+    eCh1_DischargeAcc_mAh = 1164,
+    eCh1_DischargeAcc_mWh = 1168,
+    eCh2_DischargeAcc_mAh = 1172,
+    eCh2_DischargeAcc_mWh = 1176,
+    eCh3_DischargeAcc_mAh = 1180,
+    eCh3_DischargeAcc_mWh = 1184,
+    eCh4_DischargeAcc_mAh = 1188,
+    eCh4_DischargeAcc_mWh = 1192,
+    eCh5_DischargeAcc_mAh = 1196,
+    eCh5_DischargeAcc_mWh = 1200,
+    eCh6_DischargeAcc_mAh = 1204,
+    eCh6_DischargeAcc_mWh = 1208,
+    eCh7_DischargeAcc_mAh = 1212,
+    eCh7_DischargeAcc_mWh = 1216,
 } RegisterAddress;
+
+//
+// Registers per channel in each block. Defined here rather than with the
+// BTS_*_BASE() macros below because BTS_cpu1Status sizes an array with one.
+//
+#define BTS_CTRL_REGS_PER_CH        (10U)
+#define BTS_STATS_REGS_PER_CH       (6U)
+#define BTS_TEMP_REGS_PER_CH        (2U)
+#define BTS_CAL_REGS_PER_CH         (12U)
+#define BTS_SENSE_REGS_PER_CH       (2U)
+#define BTS_DISCHACC_REGS_PER_CH    (2U)
 
 typedef struct {
     uint16_t virtualAddr;   // Register address (from RegisterAddress enum)
@@ -359,6 +454,14 @@ typedef struct {
     uint32_t groupDisconnect;  // a member of this slot's group fell out of sync
     uint32_t reversePolarity;  // measured cell voltage is negative
     uint32_t slotDisabled;     // masked off by the ENABLE dip switch
+    uint32_t calibrating;      // slot is in the runtime calibration state
+    //
+    // Set from the PERSISTED calFlags, not from the in-session capture, so a
+    // slot calibrated in an earlier session still shows its ticks after a
+    // power cycle.
+    //
+    uint32_t calVoltageValid;
+    uint32_t calCurrentValid;
 } ChannelStatus;
 
 //
@@ -381,6 +484,9 @@ typedef struct {
 #define BTS_STATUS_GROUP_DISCONNECT   9U
 #define BTS_STATUS_REVERSE_POLARITY  10U
 #define BTS_STATUS_SLOT_DISABLED     11U
+#define BTS_STATUS_CALIBRATING       12U
+#define BTS_STATUS_CAL_V_VALID       13U
+#define BTS_STATUS_CAL_I_VALID       14U
 
 // Bitfield for eTripStatus register
 typedef struct {
@@ -408,7 +514,7 @@ typedef struct _BTS_channelCalibration
     uint32_t  header;  // 0xA5CC for validation
     uint32_t  dateTime;
 
-    float32_t MinCellTemp;      // Minimum cell temperature 
+    float32_t MinCellTemp;      // Minimum cell temperature
     float32_t MaxCellTemp;      // Maximum cell temperature
     float32_t F28V_Gain;        // ADC gain for cell voltage
     float32_t F28V_Offset;      // ADC offset for cell voltage
@@ -422,7 +528,71 @@ typedef struct _BTS_channelCalibration
     float32_t VoutOffset_pu;
     float32_t VoutGain_V;
     float32_t VoutOffset_V;
+    //
+    // Appended at the END so every field above keeps its existing offset in
+    // the F-RAM image.
+    //
+    uint32_t  calFlags;         // BTS_CAL_FLAG_*
+    uint32_t  crc32;            // over all preceding fields
 } BTS_channelCalibration;
+
+#define BTS_CAL_FLAG_V_VALID   0x00000001UL
+#define BTS_CAL_FLAG_I_VALID   0x00000002UL
+#define BTS_CAL_FLAG_EXTERNAL  0x00000004UL  // externally referenced, not a compiled default
+
+//
+//=============================================================================
+// Runtime slot calibration protocol
+//=============================================================================
+//
+typedef enum {
+    eCalCmdNone = 0,
+    eCalCmdEnter = 1,
+    eCalCmdExit = 2,
+    eCalCmdCaptureVoltage = 3,   // argument: measured volts
+    eCalCmdZeroCurrent = 4,
+    eCalCmdSetFixedCurrent = 5,  // argument: uncalibrated pu setpoint
+    eCalCmdCaptureCurrent = 6,   // argument: measured amps, MAGNITUDE
+    eCalCmdComputeSave = 7,
+    eCalCmdClear = 8,
+} BTS_calCommand;
+
+#define BTS_CAL_ST_ACTIVE        0U
+#define BTS_CAL_ST_V_LO          1U
+#define BTS_CAL_ST_V_HI          2U
+#define BTS_CAL_ST_I_ZERO        3U
+#define BTS_CAL_ST_I_LOADED      4U
+#define BTS_CAL_ST_V_COMPUTED    5U
+#define BTS_CAL_ST_I_COMPUTED    6U
+#define BTS_CAL_ST_SAVED         7U
+#define BTS_CAL_ST_DRIVING       8U
+#define BTS_CAL_ST_FAILED        9U
+
+typedef enum {
+    eCalErrOk = 0,
+    eCalErrBusy = 1,               // another slot is already calibrating
+    eCalErrSlotTesting = 2,        // a slot is running a charge/discharge test
+    eCalErrSlotUnavailable = 3,    // strap-disabled, or a group follower
+    eCalErrPuRange = 4,            // reading outside the required pu window
+    eCalErrNoCaptures = 5,
+    eCalErrValidate = 6,           // computed gain failed validation
+    eCalErrWriteFailed = 7,
+    eCalErrArg = 8,
+    eCalErrNotCalibrating = 9,
+} BTS_calResult;
+
+//
+// Per-channel runtime calibration state, held in BTS_userInput.calState.
+//
+#define BTS_CAL_STATE_NORMAL   0U
+#define BTS_CAL_STATE_IDLE     1U   // enable_logic held low, measurement still runs
+#define BTS_CAL_STATE_FIXED_I  2U   // driving ioutCal_pu in discharge
+
+// Highest fixed-current setpoint the handler will accept, ~8 A.
+#define BTS_CAL_FIXED_I_MAX_PU ((float32_t)0.8)
+
+// eCalSlot value meaning "no slot selected".
+#define BTS_CAL_SLOT_NONE      ((uint16_t)255U)
 
 typedef struct
 {
@@ -507,6 +677,41 @@ typedef struct {
     uint32_t  slotMode;                  // mirrors eSlotMode,   0-7
     uint32_t  slotEnable;                // mirrors eSlotEnable, 0-7
     uint32_t  groupSize;                 // mirrors eGroupSize,  1/2/4/8
+    //
+    // ADS131M08 engineering values, mirrors eChX_SenseVoltage/SenseCurrent.
+    //
+    float32_t senseVoltage[NUM_CHANNELS];
+    float32_t senseCurrent[NUM_CHANNELS];
+    //
+    // Per-direction charge/energy totals, integrated in C1() from the
+    // ADS131M08 pair above. Mirrors eChX_ChargeAcc_* and eChX_DischargeAcc_*.
+    //
+    float32_t chargeMah[NUM_CHANNELS];
+    float32_t chargeMwh[NUM_CHANNELS];
+    float32_t dischargeMah[NUM_CHANNELS];
+    float32_t dischargeMwh[NUM_CHANNELS];
+    //
+    // Runtime calibration. CPU1 owns the state machine and the captures;
+    // CPU2 mirrors these into the 1036+ block and performs the F-RAM write,
+    // which must never happen from an ISR.
+    //
+    uint32_t  calActiveSlot;             // 0-7, or BTS_CAL_SLOT_NONE
+    uint32_t  calStatus;                 // mirrors eCalStatus, except bit 7
+    uint32_t  calResult;                 // mirrors eCalResult
+    //
+    // Live telemetry for calActiveSlot, in eCalAdsV_pu..eCalF28I_A order.
+    // eCalTemp_C is filled by CPU2, which owns the ADS1119 readings.
+    //
+    float32_t calTelemetry[8];
+    //
+    // Compute-and-save handshake. CPU1 fills calComputed in
+    // BTS_CAL_F28V_GAIN..BTS_CAL_VOUT_OFFSET_V order and then bumps
+    // calSaveSeq; CPU2 acts on the change exactly once.
+    //
+    uint32_t  calSaveSeq;
+    uint32_t  calSaveSlot;
+    uint32_t  calSaveFlags;              // BTS_CAL_FLAG_*
+    float32_t calComputed[BTS_CAL_REGS_PER_CH];
 } BTS_cpu1Status;
 
 typedef enum {
@@ -531,6 +736,12 @@ typedef struct
     volatile float32_t dutyRef_pu;
     volatile float32_t ioutCal_pu;
     volatile float32_t voutCal_pu;
+    //
+    // Runtime calibration state, BTS_CAL_STATE_*. Replaces the compile-time
+    // BTS_CALIBRATION_ENABLED path, which selected calibration behaviour for
+    // every channel at once.
+    //
+    volatile uint16_t  calState;
 
     /* Calibration Data Entry */
     float32_t IoutGain_pu;
@@ -595,24 +806,32 @@ typedef struct
 // assuming 10 registers per channel:
 //
 //   control      10 regs/channel  eCh0_Mode        .. eCh7_Status
-//   stats         6 regs/channel  eCh0_CurrentAcc  .. eCh7_CellCurrent
+//   stats         6 regs/channel  eCh0_ChargeAcc_mAh  .. eCh7_CellCurrent
 //   temperature   2 regs/channel  eCh0_MinCellTemp .. eCh7_MaxCellTemp
 //   global V      4 regs total    eChargeDisableV  .. eDischargeDisableV
 //   calibration  12 regs/channel  eCh0_F28V_Gain   .. eCh7_VoutOffset_V
 //   unit          4 regs total    eCalibrationMode .. eTripStatus
 //   cell temp     1 reg/channel   eCh0_CellTemp    .. eCh7_CellTemp
+//   discharge acc 2 regs/channel  eCh0_DischargeAcc_mAh .. eCh7_DischargeAcc_mWh
 //
 #define BTS_REG_IDX(addr)           ((uint16_t)((addr) / 4U))
 
-#define BTS_CTRL_REGS_PER_CH        (10U)
-#define BTS_STATS_REGS_PER_CH       (6U)
-#define BTS_TEMP_REGS_PER_CH        (2U)
-#define BTS_CAL_REGS_PER_CH         (12U)
-
 #define BTS_CTRL_BASE(ch)   (BTS_REG_IDX(eCh0_Mode)         + (ch) * BTS_CTRL_REGS_PER_CH)
-#define BTS_STATS_BASE(ch)  (BTS_REG_IDX(eCh0_CurrentAcc)   + (ch) * BTS_STATS_REGS_PER_CH)
+#define BTS_STATS_BASE(ch)  (BTS_REG_IDX(eCh0_ChargeAcc_mAh)   + (ch) * BTS_STATS_REGS_PER_CH)
 #define BTS_TEMP_BASE(ch)   (BTS_REG_IDX(eCh0_MinCellTemp)  + (ch) * BTS_TEMP_REGS_PER_CH)
 #define BTS_CAL_BASE(ch)    (BTS_REG_IDX(eCh0_F28V_Gain)    + (ch) * BTS_CAL_REGS_PER_CH)
+#define BTS_SENSE_BASE(ch)  (BTS_REG_IDX(eCh0_SenseVoltage) + (ch) * BTS_SENSE_REGS_PER_CH)
+#define BTS_DISCHACC_BASE(ch) (BTS_REG_IDX(eCh0_DischargeAcc_mAh) + (ch) * BTS_DISCHACC_REGS_PER_CH)
+
+// Offsets within the 2-register accumulator blocks. The charge pair is not
+// contiguous - it is interleaved with min/max voltage in the stats block - so
+// only the discharge block gets a base-plus-offset pair.
+#define BTS_DISCHACC_MAH       0U
+#define BTS_DISCHACC_MWH       1U
+
+// Offsets within the 2-register sense block at BTS_SENSE_BASE(ch).
+#define BTS_SENSE_VOLTAGE      0U
+#define BTS_SENSE_CURRENT      1U
 
 // Measured cell temperature is one register per channel, so the index is the
 // block base plus the channel. Distinct from BTS_TEMP_BASE(), which is the
@@ -682,7 +901,11 @@ typedef enum {
 
 // EEPROM validation header. The channel is carried in its own field rather
 // than OR-ed into the header, which would collide for channels >= 4.
-#define BTS_CAL_HEADER         0xA5CC0000UL
+//
+// Bumped to 0xA5CD for the calFlags/crc32 revision and the fixed 128-byte
+// F-RAM stride. Pre-change images are rejected rather than reinterpreted, so
+// every slot falls back to compiled defaults once and must be recalibrated.
+#define BTS_CAL_HEADER         0xA5CD0000UL
 #define BTS_CAL_HEADER_MASK    0xFFFF0000UL
 #define BTS_CAL_CHANNEL_MASK   0x0000FFFFUL
 #define BTS_CAL_MAKE_HEADER(ch)    (BTS_CAL_HEADER | ((uint32_t)(ch) & BTS_CAL_CHANNEL_MASK))
@@ -695,7 +918,10 @@ typedef enum {
 // Written by CPU2, read by CPU1 (CPU2TOCPU1RAM):
 extern volatile float32_t              registers[TOTAL_REGISTERS];
 extern volatile BTS_ipcMessage         ipcMsg;
-extern volatile BTS_channelCalibration calibrationData[NUM_CHANNELS];
+extern volatile uint32_t               calValidFlags[NUM_CHANNELS];
+
+// CPU2-private: the full image never crosses to CPU1, only calValidFlags does.
+extern BTS_channelCalibration          calibrationData[NUM_CHANNELS];
 
 // Written by CPU1, read by CPU2 (CPU1TOCPU2RAM):
 extern volatile CAN_data               canData[NUM_CHANNELS];

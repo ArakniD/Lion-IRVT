@@ -417,19 +417,17 @@ void BTS_HAL_setupExAdcGpio_Adc1(void)
     GPIO_setDirectionMode(BTS_SPI_DRDY_GPIO_ADC1, GPIO_DIR_MODE_IN);
     GPIO_setQualificationMode(BTS_SPI_DRDY_GPIO_ADC1, GPIO_QUAL_SYNC);
     //
-    // Select GPIO40 as XINT1
+    // Route this ADC's DRDY pin to its external interrupt. The XINT number
+    // comes from bts_user_settings.h - see the note there about why CPU1 owns
+    // XINT3/XINT5 rather than XINT1/XINT2.
     //
     GPIO_setInterruptPin(BTS_SPI_DRDY_GPIO_ADC1, BTS_PSI_DRDY_XINT_GPIO1);
 
     //
-    // Configure XINT1 to be a triggered by a falling edge and XINT2 to be
-    // triggered by a rising edge.
+    // DRDY asserts low when a conversion is ready.
     //
     GPIO_setInterruptType(BTS_PSI_DRDY_XINT_GPIO1, GPIO_INT_TYPE_FALLING_EDGE);
 
-    //
-    // Enable XINT1
-    //
     GPIO_enableInterrupt(BTS_PSI_DRDY_XINT_GPIO1);
 
 
@@ -452,19 +450,15 @@ void BTS_HAL_setupExAdcGpio_Adc2(void)
     GPIO_setDirectionMode(BTS_SPI_DRDY_GPIO_ADC2, GPIO_DIR_MODE_IN);
     GPIO_setQualificationMode(BTS_SPI_DRDY_GPIO_ADC2, GPIO_QUAL_SYNC);
     //
-    // Select GPIO49 as XINT2
+    // As for ADC1 above - the XINT number is set in bts_user_settings.h.
     //
     GPIO_setInterruptPin(BTS_SPI_DRDY_GPIO_ADC2, BTS_PSI_DRDY_XINT_GPIO2);
 
     //
-    // Configure XINT2 to be a triggered by a falling edge and XINT2 to be
-    // triggered by a rising edge.
+    // DRDY asserts low when a conversion is ready.
     //
     GPIO_setInterruptType(BTS_PSI_DRDY_XINT_GPIO2, GPIO_INT_TYPE_FALLING_EDGE);
 
-    //
-    // Enable XINT2
-    //
     GPIO_enableInterrupt(BTS_PSI_DRDY_XINT_GPIO2);
 
 
@@ -1213,6 +1207,20 @@ void BTS_HAL_setupTripSystem(void) {
     // false. Before re-enabling a hardware trip, wire TZ1/TZ2 (INPUT1/INPUT2)
     // or set up the Digital Compare path - and note INPUT1/INPUT2 default to
     // GPIO0, which is EPWM1A on this board.
+    //
+    // Input X-BAR allocation, since it is one device-global resource shared
+    // by both cores and nothing else records who owns what:
+    //
+    //   INPUT4  XINT1  CPU2, ADS1119 DRDY1
+    //   INPUT5  XINT2  CPU2, ADS1119 DRDY2
+    //   INPUT6  XINT3  CPU1, external SPI ADC1 DRDY
+    //   INPUT14 XINT5  CPU1, external SPI ADC2 DRDY
+    //   INPUT9..14     GPIO trips ch1..ch6 (below, all currently compiled out)
+    //
+    // INPUT14 is therefore double-booked between XINT5 and the channel-6 GPIO
+    // trip. Only one can win, and today the trips are disabled so it is XINT5.
+    // Re-enabling the channel-6 hardware trip means moving one of them - the
+    // free inputs are INPUT1, 2, 3, 7 and 8.
     //
 #if (BTS_TRIP_GPIO_CH1_ENABLED == true) && (BTS_TRIP_HW_CH1_ENABLED == true)
     BTS_HAL_setupInputXBAR(9,  0, BTS_TRP_PIN_GPIO_CH1);

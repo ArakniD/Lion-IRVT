@@ -26,8 +26,20 @@ volatile float32_t registers[TOTAL_REGISTERS];
 #pragma DATA_SECTION(ipcMsg, "CPU2TOCPU1RAM")
 volatile BTS_ipcMessage ipcMsg;
 
-#pragma DATA_SECTION(calibrationData, "CPU2TOCPU1RAM")
-volatile BTS_channelCalibration calibrationData[NUM_CHANNELS];
+//
+// The full calibration image is CPU2-private: every float in it is also
+// published through registers[], which is what CPU1 actually reads. Keeping
+// the array out of the message RAM buys back 288 words of a 1024-word block
+// that the calibration registers had overflowed.
+//
+// CPU1 needs exactly one thing from it - the persisted validity flags, so a
+// slot calibrated in an earlier session still reports its status bits after a
+// power cycle. Those go across on their own.
+//
+BTS_channelCalibration calibrationData[NUM_CHANNELS];
+
+#pragma DATA_SECTION(calValidFlags, "CPU2TOCPU1RAM")
+volatile uint32_t calValidFlags[NUM_CHANNELS];
 
 //
 // CPU1 -> CPU2. CPU1 publishes measurements and status here; CPU2 mirrors
@@ -95,21 +107,21 @@ const RegisterConfig regConfig[TOTAL_REGISTERS] = {
     {eCh7_DischargeCurrentMin, REG_ACCESS_RW, 4}, {eCh7_DischargeCurrentMax, REG_ACCESS_RW, 4},
     {eCh7_Status, REG_ACCESS_RO, 4},
     // Stats Block
-    {eCh0_CurrentAcc, REG_ACCESS_RO, 4}, {eCh0_MinVoltage, REG_ACCESS_RO, 4}, {eCh0_MaxVoltage, REG_ACCESS_RO, 4}, {eCh0_PowerAcc, REG_ACCESS_RO, 4},
+    {eCh0_ChargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh0_MinVoltage, REG_ACCESS_RO, 4}, {eCh0_MaxVoltage, REG_ACCESS_RO, 4}, {eCh0_ChargeAcc_mWh, REG_ACCESS_RO, 4},
     {eCh0_CellVoltage, REG_ACCESS_RO, 4}, {eCh0_CellCurrent, REG_ACCESS_RO, 4},
-    {eCh1_CurrentAcc, REG_ACCESS_RO, 4}, {eCh1_MinVoltage, REG_ACCESS_RO, 4}, {eCh1_MaxVoltage, REG_ACCESS_RO, 4}, {eCh1_PowerAcc, REG_ACCESS_RO, 4},
+    {eCh1_ChargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh1_MinVoltage, REG_ACCESS_RO, 4}, {eCh1_MaxVoltage, REG_ACCESS_RO, 4}, {eCh1_ChargeAcc_mWh, REG_ACCESS_RO, 4},
     {eCh1_CellVoltage, REG_ACCESS_RO, 4}, {eCh1_CellCurrent, REG_ACCESS_RO, 4},
-    {eCh2_CurrentAcc, REG_ACCESS_RO, 4}, {eCh2_MinVoltage, REG_ACCESS_RO, 4}, {eCh2_MaxVoltage, REG_ACCESS_RO, 4}, {eCh2_PowerAcc, REG_ACCESS_RO, 4},
+    {eCh2_ChargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh2_MinVoltage, REG_ACCESS_RO, 4}, {eCh2_MaxVoltage, REG_ACCESS_RO, 4}, {eCh2_ChargeAcc_mWh, REG_ACCESS_RO, 4},
     {eCh2_CellVoltage, REG_ACCESS_RO, 4}, {eCh2_CellCurrent, REG_ACCESS_RO, 4},
-    {eCh3_CurrentAcc, REG_ACCESS_RO, 4}, {eCh3_MinVoltage, REG_ACCESS_RO, 4}, {eCh3_MaxVoltage, REG_ACCESS_RO, 4}, {eCh3_PowerAcc, REG_ACCESS_RO, 4},
+    {eCh3_ChargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh3_MinVoltage, REG_ACCESS_RO, 4}, {eCh3_MaxVoltage, REG_ACCESS_RO, 4}, {eCh3_ChargeAcc_mWh, REG_ACCESS_RO, 4},
     {eCh3_CellVoltage, REG_ACCESS_RO, 4}, {eCh3_CellCurrent, REG_ACCESS_RO, 4},
-    {eCh4_CurrentAcc, REG_ACCESS_RO, 4}, {eCh4_MinVoltage, REG_ACCESS_RO, 4}, {eCh4_MaxVoltage, REG_ACCESS_RO, 4}, {eCh4_PowerAcc, REG_ACCESS_RO, 4},
+    {eCh4_ChargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh4_MinVoltage, REG_ACCESS_RO, 4}, {eCh4_MaxVoltage, REG_ACCESS_RO, 4}, {eCh4_ChargeAcc_mWh, REG_ACCESS_RO, 4},
     {eCh4_CellVoltage, REG_ACCESS_RO, 4}, {eCh4_CellCurrent, REG_ACCESS_RO, 4},
-    {eCh5_CurrentAcc, REG_ACCESS_RO, 4}, {eCh5_MinVoltage, REG_ACCESS_RO, 4}, {eCh5_MaxVoltage, REG_ACCESS_RO, 4}, {eCh5_PowerAcc, REG_ACCESS_RO, 4},
+    {eCh5_ChargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh5_MinVoltage, REG_ACCESS_RO, 4}, {eCh5_MaxVoltage, REG_ACCESS_RO, 4}, {eCh5_ChargeAcc_mWh, REG_ACCESS_RO, 4},
     {eCh5_CellVoltage, REG_ACCESS_RO, 4}, {eCh5_CellCurrent, REG_ACCESS_RO, 4},
-    {eCh6_CurrentAcc, REG_ACCESS_RO, 4}, {eCh6_MinVoltage, REG_ACCESS_RO, 4}, {eCh6_MaxVoltage, REG_ACCESS_RO, 4}, {eCh6_PowerAcc, REG_ACCESS_RO, 4},
+    {eCh6_ChargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh6_MinVoltage, REG_ACCESS_RO, 4}, {eCh6_MaxVoltage, REG_ACCESS_RO, 4}, {eCh6_ChargeAcc_mWh, REG_ACCESS_RO, 4},
     {eCh6_CellVoltage, REG_ACCESS_RO, 4}, {eCh6_CellCurrent, REG_ACCESS_RO, 4},
-    {eCh7_CurrentAcc, REG_ACCESS_RO, 4}, {eCh7_MinVoltage, REG_ACCESS_RO, 4}, {eCh7_MaxVoltage, REG_ACCESS_RO, 4}, {eCh7_PowerAcc, REG_ACCESS_RO, 4},
+    {eCh7_ChargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh7_MinVoltage, REG_ACCESS_RO, 4}, {eCh7_MaxVoltage, REG_ACCESS_RO, 4}, {eCh7_ChargeAcc_mWh, REG_ACCESS_RO, 4},
     {eCh7_CellVoltage, REG_ACCESS_RO, 4}, {eCh7_CellCurrent, REG_ACCESS_RO, 4},
     // Calibration Block
     {eCh0_MinCellTemp, REG_ACCESS_RW, 4}, {eCh0_MaxCellTemp, REG_ACCESS_RW, 4},
@@ -181,7 +193,35 @@ const RegisterConfig regConfig[TOTAL_REGISTERS] = {
     {eCh6_CellTemp, REG_ACCESS_RO, 4}, {eCh7_CellTemp, REG_ACCESS_RO, 4},
     // Slot grouping (MODE / ENABLE dip switches)
     {eSlotMode, REG_ACCESS_RO, 4}, {eSlotEnable, REG_ACCESS_RO, 4},
-    {eGroupSize, REG_ACCESS_RO, 4}
+    {eGroupSize, REG_ACCESS_RO, 4},
+    // Calibration control
+    {eCalSlot, REG_ACCESS_RW, 4}, {eCalCommand, REG_ACCESS_RW, 4},
+    {eCalArgument, REG_ACCESS_RW, 4}, {eCalStatus, REG_ACCESS_RO, 4},
+    {eCalResult, REG_ACCESS_RO, 4},
+    // Calibration live telemetry
+    {eCalAdsV_pu, REG_ACCESS_RO, 4}, {eCalAdsI_pu, REG_ACCESS_RO, 4},
+    {eCalAdsV_V, REG_ACCESS_RO, 4}, {eCalAdsI_A, REG_ACCESS_RO, 4},
+    {eCalF28V_pu, REG_ACCESS_RO, 4}, {eCalF28I_pu, REG_ACCESS_RO, 4},
+    {eCalF28V_V, REG_ACCESS_RO, 4}, {eCalF28I_A, REG_ACCESS_RO, 4},
+    {eCalTemp_C, REG_ACCESS_RO, 4},
+    // ADS131M08 engineering values
+    {eCh0_SenseVoltage, REG_ACCESS_RO, 4}, {eCh0_SenseCurrent, REG_ACCESS_RO, 4},
+    {eCh1_SenseVoltage, REG_ACCESS_RO, 4}, {eCh1_SenseCurrent, REG_ACCESS_RO, 4},
+    {eCh2_SenseVoltage, REG_ACCESS_RO, 4}, {eCh2_SenseCurrent, REG_ACCESS_RO, 4},
+    {eCh3_SenseVoltage, REG_ACCESS_RO, 4}, {eCh3_SenseCurrent, REG_ACCESS_RO, 4},
+    {eCh4_SenseVoltage, REG_ACCESS_RO, 4}, {eCh4_SenseCurrent, REG_ACCESS_RO, 4},
+    {eCh5_SenseVoltage, REG_ACCESS_RO, 4}, {eCh5_SenseCurrent, REG_ACCESS_RO, 4},
+    {eCh6_SenseVoltage, REG_ACCESS_RO, 4}, {eCh6_SenseCurrent, REG_ACCESS_RO, 4},
+    {eCh7_SenseVoltage, REG_ACCESS_RO, 4}, {eCh7_SenseCurrent, REG_ACCESS_RO, 4},
+    // Discharge accumulators
+    {eCh0_DischargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh0_DischargeAcc_mWh, REG_ACCESS_RO, 4},
+    {eCh1_DischargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh1_DischargeAcc_mWh, REG_ACCESS_RO, 4},
+    {eCh2_DischargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh2_DischargeAcc_mWh, REG_ACCESS_RO, 4},
+    {eCh3_DischargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh3_DischargeAcc_mWh, REG_ACCESS_RO, 4},
+    {eCh4_DischargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh4_DischargeAcc_mWh, REG_ACCESS_RO, 4},
+    {eCh5_DischargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh5_DischargeAcc_mWh, REG_ACCESS_RO, 4},
+    {eCh6_DischargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh6_DischargeAcc_mWh, REG_ACCESS_RO, 4},
+    {eCh7_DischargeAcc_mAh, REG_ACCESS_RO, 4}, {eCh7_DischargeAcc_mWh, REG_ACCESS_RO, 4}
 };
 
 const UARTRegisterConfig uartRegConfig[TOTAL_REGISTERS] = {
@@ -274,52 +314,52 @@ const UARTRegisterConfig uartRegConfig[TOTAL_REGISTERS] = {
     {eCh7_DischargeCurrentMax, "C7DCMAX", "Ch7_DischargeCurrentMax", REG_ACCESS_RW},
     {eCh7_Status, "C7S", "Ch7_Status", REG_ACCESS_RO},
     // Stats Block
-    {eCh0_CurrentAcc, "C0CA", "Ch0_CurrentAcc", REG_ACCESS_RO},
+    {eCh0_ChargeAcc_mAh, "C0CA", "Ch0_ChargeAcc_mAh", REG_ACCESS_RO},
     {eCh0_MinVoltage, "C0MINV", "Ch0_MinVoltage", REG_ACCESS_RO},
     {eCh0_MaxVoltage, "C0MAXV", "Ch0_MaxVoltage", REG_ACCESS_RO},
-    {eCh0_PowerAcc, "C0PA", "Ch0_PowerAcc", REG_ACCESS_RO},
+    {eCh0_ChargeAcc_mWh, "C0CW", "Ch0_ChargeAcc_mWh", REG_ACCESS_RO},
     {eCh0_CellVoltage, "C0VOLT", "Ch0_CellVoltage", REG_ACCESS_RO},
     {eCh0_CellCurrent, "C0CURR", "Ch0_CellCurrent", REG_ACCESS_RO},
-    {eCh1_CurrentAcc, "C1CA", "Ch1_CurrentAcc", REG_ACCESS_RO},
+    {eCh1_ChargeAcc_mAh, "C1CA", "Ch1_ChargeAcc_mAh", REG_ACCESS_RO},
     {eCh1_MinVoltage, "C1MINV", "Ch1_MinVoltage", REG_ACCESS_RO},
     {eCh1_MaxVoltage, "C1MAXV", "Ch1_MaxVoltage", REG_ACCESS_RO},
-    {eCh1_PowerAcc, "C1PA", "Ch1_PowerAcc", REG_ACCESS_RO},
+    {eCh1_ChargeAcc_mWh, "C1CW", "Ch1_ChargeAcc_mWh", REG_ACCESS_RO},
     {eCh1_CellVoltage, "C1VOLT", "Ch1_CellVoltage", REG_ACCESS_RO},
     {eCh1_CellCurrent, "C1CURR", "Ch1_CellCurrent", REG_ACCESS_RO},
-    {eCh2_CurrentAcc, "C2CA", "Ch2_CurrentAcc", REG_ACCESS_RO},
+    {eCh2_ChargeAcc_mAh, "C2CA", "Ch2_ChargeAcc_mAh", REG_ACCESS_RO},
     {eCh2_MinVoltage, "C2MINV", "Ch2_MinVoltage", REG_ACCESS_RO},
     {eCh2_MaxVoltage, "C2MAXV", "Ch2_MaxVoltage", REG_ACCESS_RO},
-    {eCh2_PowerAcc, "C2PA", "Ch2_PowerAcc", REG_ACCESS_RO},
+    {eCh2_ChargeAcc_mWh, "C2CW", "Ch2_ChargeAcc_mWh", REG_ACCESS_RO},
     {eCh2_CellVoltage, "C2VOLT", "Ch2_CellVoltage", REG_ACCESS_RO},
     {eCh2_CellCurrent, "C2CURR", "Ch2_CellCurrent", REG_ACCESS_RO},
-    {eCh3_CurrentAcc, "C3CA", "Ch3_CurrentAcc", REG_ACCESS_RO},
+    {eCh3_ChargeAcc_mAh, "C3CA", "Ch3_ChargeAcc_mAh", REG_ACCESS_RO},
     {eCh3_MinVoltage, "C3MINV", "Ch3_MinVoltage", REG_ACCESS_RO},
     {eCh3_MaxVoltage, "C3MAXV", "Ch3_MaxVoltage", REG_ACCESS_RO},
-    {eCh3_PowerAcc, "C3PA", "Ch3_PowerAcc", REG_ACCESS_RO},
+    {eCh3_ChargeAcc_mWh, "C3CW", "Ch3_ChargeAcc_mWh", REG_ACCESS_RO},
     {eCh3_CellVoltage, "C3VOLT", "Ch3_CellVoltage", REG_ACCESS_RO},
     {eCh3_CellCurrent, "C3CURR", "Ch3_CellCurrent", REG_ACCESS_RO},
-    {eCh4_CurrentAcc, "C4CA", "Ch4_CurrentAcc", REG_ACCESS_RO},
+    {eCh4_ChargeAcc_mAh, "C4CA", "Ch4_ChargeAcc_mAh", REG_ACCESS_RO},
     {eCh4_MinVoltage, "C4MINV", "Ch4_MinVoltage", REG_ACCESS_RO},
     {eCh4_MaxVoltage, "C4MAXV", "Ch4_MaxVoltage", REG_ACCESS_RO},
-    {eCh4_PowerAcc, "C4PA", "Ch4_PowerAcc", REG_ACCESS_RO},
+    {eCh4_ChargeAcc_mWh, "C4CW", "Ch4_ChargeAcc_mWh", REG_ACCESS_RO},
     {eCh4_CellVoltage, "C4VOLT", "Ch4_CellVoltage", REG_ACCESS_RO},
     {eCh4_CellCurrent, "C4CURR", "Ch4_CellCurrent", REG_ACCESS_RO},
-    {eCh5_CurrentAcc, "C5CA", "Ch5_CurrentAcc", REG_ACCESS_RO},
+    {eCh5_ChargeAcc_mAh, "C5CA", "Ch5_ChargeAcc_mAh", REG_ACCESS_RO},
     {eCh5_MinVoltage, "C5MINV", "Ch5_MinVoltage", REG_ACCESS_RO},
     {eCh5_MaxVoltage, "C5MAXV", "Ch5_MaxVoltage", REG_ACCESS_RO},
-    {eCh5_PowerAcc, "C5PA", "Ch5_PowerAcc", REG_ACCESS_RO},
+    {eCh5_ChargeAcc_mWh, "C5CW", "Ch5_ChargeAcc_mWh", REG_ACCESS_RO},
     {eCh5_CellVoltage, "C5VOLT", "Ch5_CellVoltage", REG_ACCESS_RO},
     {eCh5_CellCurrent, "C5CURR", "Ch5_CellCurrent", REG_ACCESS_RO},
-    {eCh6_CurrentAcc, "C6CA", "Ch6_CurrentAcc", REG_ACCESS_RO},
+    {eCh6_ChargeAcc_mAh, "C6CA", "Ch6_ChargeAcc_mAh", REG_ACCESS_RO},
     {eCh6_MinVoltage, "C6MINV", "Ch6_MinVoltage", REG_ACCESS_RO},
     {eCh6_MaxVoltage, "C6MAXV", "Ch6_MaxVoltage", REG_ACCESS_RO},
-    {eCh6_PowerAcc, "C6PA", "Ch6_PowerAcc", REG_ACCESS_RO},
+    {eCh6_ChargeAcc_mWh, "C6CW", "Ch6_ChargeAcc_mWh", REG_ACCESS_RO},
     {eCh6_CellVoltage, "C6VOLT", "Ch6_CellVoltage", REG_ACCESS_RO},
     {eCh6_CellCurrent, "C6CURR", "Ch6_CellCurrent", REG_ACCESS_RO},
-    {eCh7_CurrentAcc, "C7CA", "Ch7_CurrentAcc", REG_ACCESS_RO},
+    {eCh7_ChargeAcc_mAh, "C7CA", "Ch7_ChargeAcc_mAh", REG_ACCESS_RO},
     {eCh7_MinVoltage, "C7MINV", "Ch7_MinVoltage", REG_ACCESS_RO},
     {eCh7_MaxVoltage, "C7MAXV", "Ch7_MaxVoltage", REG_ACCESS_RO},
-    {eCh7_PowerAcc, "C7PA", "Ch7_PowerAcc", REG_ACCESS_RO},
+    {eCh7_ChargeAcc_mWh, "C7CW", "Ch7_ChargeAcc_mWh", REG_ACCESS_RO},
     {eCh7_CellVoltage, "C7VOLT", "Ch7_CellVoltage", REG_ACCESS_RO},
     {eCh7_CellCurrent, "C7CURR", "Ch7_CellCurrent", REG_ACCESS_RO},
     // Calibration Block
@@ -455,5 +495,55 @@ const UARTRegisterConfig uartRegConfig[TOTAL_REGISTERS] = {
     // Slot grouping (MODE / ENABLE dip switches)
     {eSlotMode, "SMD", "SlotMode", REG_ACCESS_RO},
     {eSlotEnable, "SEN", "SlotEnable", REG_ACCESS_RO},
-    {eGroupSize, "SGS", "GroupSize", REG_ACCESS_RO}
+    {eGroupSize, "SGS", "GroupSize", REG_ACCESS_RO},
+    // Calibration control
+    {eCalSlot, "CALSLOT", "CalSlot", REG_ACCESS_RW},
+    {eCalCommand, "CALCMD", "CalCommand", REG_ACCESS_RW},
+    {eCalArgument, "CALARG", "CalArgument", REG_ACCESS_RW},
+    {eCalStatus, "CALSTAT", "CalStatus", REG_ACCESS_RO},
+    {eCalResult, "CALRES", "CalResult", REG_ACCESS_RO},
+    // Calibration live telemetry
+    {eCalAdsV_pu, "CALAVPU", "CalAdsV_pu", REG_ACCESS_RO},
+    {eCalAdsI_pu, "CALAIPU", "CalAdsI_pu", REG_ACCESS_RO},
+    {eCalAdsV_V, "CALAVV", "CalAdsV_V", REG_ACCESS_RO},
+    {eCalAdsI_A, "CALAIA", "CalAdsI_A", REG_ACCESS_RO},
+    {eCalF28V_pu, "CALFVPU", "CalF28V_pu", REG_ACCESS_RO},
+    {eCalF28I_pu, "CALFIPU", "CalF28I_pu", REG_ACCESS_RO},
+    {eCalF28V_V, "CALFVV", "CalF28V_V", REG_ACCESS_RO},
+    {eCalF28I_A, "CALFIA", "CalF28I_A", REG_ACCESS_RO},
+    {eCalTemp_C, "CALTEMP", "CalTemp_C", REG_ACCESS_RO},
+    // ADS131M08 engineering values
+    {eCh0_SenseVoltage, "C0SV", "Ch0_SenseVoltage", REG_ACCESS_RO},
+    {eCh0_SenseCurrent, "C0SI", "Ch0_SenseCurrent", REG_ACCESS_RO},
+    {eCh1_SenseVoltage, "C1SV", "Ch1_SenseVoltage", REG_ACCESS_RO},
+    {eCh1_SenseCurrent, "C1SI", "Ch1_SenseCurrent", REG_ACCESS_RO},
+    {eCh2_SenseVoltage, "C2SV", "Ch2_SenseVoltage", REG_ACCESS_RO},
+    {eCh2_SenseCurrent, "C2SI", "Ch2_SenseCurrent", REG_ACCESS_RO},
+    {eCh3_SenseVoltage, "C3SV", "Ch3_SenseVoltage", REG_ACCESS_RO},
+    {eCh3_SenseCurrent, "C3SI", "Ch3_SenseCurrent", REG_ACCESS_RO},
+    {eCh4_SenseVoltage, "C4SV", "Ch4_SenseVoltage", REG_ACCESS_RO},
+    {eCh4_SenseCurrent, "C4SI", "Ch4_SenseCurrent", REG_ACCESS_RO},
+    {eCh5_SenseVoltage, "C5SV", "Ch5_SenseVoltage", REG_ACCESS_RO},
+    {eCh5_SenseCurrent, "C5SI", "Ch5_SenseCurrent", REG_ACCESS_RO},
+    {eCh6_SenseVoltage, "C6SV", "Ch6_SenseVoltage", REG_ACCESS_RO},
+    {eCh6_SenseCurrent, "C6SI", "Ch6_SenseCurrent", REG_ACCESS_RO},
+    {eCh7_SenseVoltage, "C7SV", "Ch7_SenseVoltage", REG_ACCESS_RO},
+    {eCh7_SenseCurrent, "C7SI", "Ch7_SenseCurrent", REG_ACCESS_RO},
+    // Discharge accumulators
+    {eCh0_DischargeAcc_mAh, "C0DA", "Ch0_DischargeAcc_mAh", REG_ACCESS_RO},
+    {eCh0_DischargeAcc_mWh, "C0DW", "Ch0_DischargeAcc_mWh", REG_ACCESS_RO},
+    {eCh1_DischargeAcc_mAh, "C1DA", "Ch1_DischargeAcc_mAh", REG_ACCESS_RO},
+    {eCh1_DischargeAcc_mWh, "C1DW", "Ch1_DischargeAcc_mWh", REG_ACCESS_RO},
+    {eCh2_DischargeAcc_mAh, "C2DA", "Ch2_DischargeAcc_mAh", REG_ACCESS_RO},
+    {eCh2_DischargeAcc_mWh, "C2DW", "Ch2_DischargeAcc_mWh", REG_ACCESS_RO},
+    {eCh3_DischargeAcc_mAh, "C3DA", "Ch3_DischargeAcc_mAh", REG_ACCESS_RO},
+    {eCh3_DischargeAcc_mWh, "C3DW", "Ch3_DischargeAcc_mWh", REG_ACCESS_RO},
+    {eCh4_DischargeAcc_mAh, "C4DA", "Ch4_DischargeAcc_mAh", REG_ACCESS_RO},
+    {eCh4_DischargeAcc_mWh, "C4DW", "Ch4_DischargeAcc_mWh", REG_ACCESS_RO},
+    {eCh5_DischargeAcc_mAh, "C5DA", "Ch5_DischargeAcc_mAh", REG_ACCESS_RO},
+    {eCh5_DischargeAcc_mWh, "C5DW", "Ch5_DischargeAcc_mWh", REG_ACCESS_RO},
+    {eCh6_DischargeAcc_mAh, "C6DA", "Ch6_DischargeAcc_mAh", REG_ACCESS_RO},
+    {eCh6_DischargeAcc_mWh, "C6DW", "Ch6_DischargeAcc_mWh", REG_ACCESS_RO},
+    {eCh7_DischargeAcc_mAh, "C7DA", "Ch7_DischargeAcc_mAh", REG_ACCESS_RO},
+    {eCh7_DischargeAcc_mWh, "C7DW", "Ch7_DischargeAcc_mWh", REG_ACCESS_RO}
 };

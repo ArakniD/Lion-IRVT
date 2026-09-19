@@ -16,6 +16,10 @@
  *
  * with the state letter colour-coded: D discharge, C charge, R rest,
  * G good/complete, F fault, and a dim dash when the slot is idle.
+ *
+ * Three other screens replace the table: the waiting screen while the BTS
+ * has never answered, the boot self-test, and the calibration screen, which
+ * outranks the table whenever a slot is being calibrated.
  */
 
 #include <string.h>
@@ -478,12 +482,122 @@ static void draw_slot_row(uint8_t slot)
 }
 
 /*
+ * Calibration screen.
+ *
+ * Shows only the slot under calibration: both measurement paths side by
+ * side in engineering units and in the raw per-unit the two-point maths
+ * actually consumes, so an operator adjusting a bench supply can see the pu
+ * land inside its window rather than inferring it from the volts.
+ */
+#define CAL_COL_ADS_R   162
+#define CAL_COL_F28_R   224
+#define CAL_TICK_X      228
+
+/*
+ * The 5x7 font covers ASCII only, so the tick is drawn rather than typed:
+ * a short stroke and a tall one sharing a baseline.
+ */
+static void band_tick(int x, int y, int band_y, uint16_t colour)
+{
+    band_fill_rect(x,     y + 5, 3, 4, band_y, colour);
+    band_fill_rect(x + 3, y,     3, 9, band_y, colour);
+}
+
+static void draw_cal_screen(const bts_snapshot_t *snap)
+{
+    const bts_cal_state_t *cal = &snap->cal;
+
+    char title[24];
+    snprintf(title, sizeof(title), "SLOT %u", (unsigned)(cal->slot + 1));
+
+    char v_ads[12], v_f28[12], vpu_ads[12], vpu_f28[12];
+    char a_ads[12], a_f28[12], apu_ads[12], apu_f28[12], temp[16];
+
+    fmt_value(v_ads,   sizeof(v_ads),   cal->ads_v_v,  4);
+    fmt_value(v_f28,   sizeof(v_f28),   cal->f28_v_v,  4);
+    fmt_value(vpu_ads, sizeof(vpu_ads), cal->ads_v_pu, 4);
+    fmt_value(vpu_f28, sizeof(vpu_f28), cal->f28_v_pu, 4);
+    fmt_value(a_ads,   sizeof(a_ads),   cal->ads_i_a,  4);
+    fmt_value(a_f28,   sizeof(a_f28),   cal->f28_i_a,  4);
+    fmt_value(apu_ads, sizeof(apu_ads), cal->ads_i_pu, 4);
+    fmt_value(apu_f28, sizeof(apu_f28), cal->f28_i_pu, 4);
+    fmt_value(temp,    sizeof(temp),    cal->temp_c,   1);
+    strncat(temp, " C", sizeof(temp) - strlen(temp) - 1);
+
+    for (int band_y = 20; band_y < s_cfg.height; band_y += UI_BAND_H) {
+        band_clear(C_BLACK);
+
+        if (band_y == 20) {
+            band_fill_rect(0, 20, s_cfg.width, UI_BAND_H, band_y, C_HEADER_BG);
+            band_text(4, 27, band_y, "CALIBRATION", C_YELLOW, 1);
+            band_text_right(236, 27, band_y, title, C_WHITE, 1);
+        } else if (band_y == 44) {
+            band_text_right(CAL_COL_ADS_R, 51, band_y, "ADS131", C_GREY, 1);
+            band_text_right(CAL_COL_F28_R, 51, band_y, "F28 ADC", C_GREY, 1);
+            band_fill_rect(0, 62, s_cfg.width, 1, band_y, C_DIM);
+        } else if (band_y == 68) {
+            band_text(8, 75, band_y, "V", C_WHITE, 1);
+            band_text_right(CAL_COL_ADS_R, 75, band_y, v_ads, C_WHITE, 1);
+            band_text_right(CAL_COL_F28_R, 75, band_y, v_f28, C_WHITE, 1);
+            if (cal->v_tick) {
+                band_tick(CAL_TICK_X, 74, band_y, C_GREEN);
+            }
+        } else if (band_y == 92) {
+            band_text(8, 99, band_y, "pu", C_GREY, 1);
+            band_text_right(CAL_COL_ADS_R, 99, band_y, vpu_ads, C_GREY, 1);
+            band_text_right(CAL_COL_F28_R, 99, band_y, vpu_f28, C_GREY, 1);
+        } else if (band_y == 116) {
+            band_text(8, 123, band_y, "A", C_WHITE, 1);
+            band_text_right(CAL_COL_ADS_R, 123, band_y, a_ads, C_WHITE, 1);
+            band_text_right(CAL_COL_F28_R, 123, band_y, a_f28, C_WHITE, 1);
+            if (cal->i_tick) {
+                band_tick(CAL_TICK_X, 122, band_y, C_GREEN);
+            }
+        } else if (band_y == 140) {
+            band_text(8, 147, band_y, "pu", C_GREY, 1);
+            band_text_right(CAL_COL_ADS_R, 147, band_y, apu_ads, C_GREY, 1);
+            band_text_right(CAL_COL_F28_R, 147, band_y, apu_f28, C_GREY, 1);
+        } else if (band_y == 164) {
+            band_text(8, 171, band_y, "T", C_WHITE, 1);
+            band_text_right(CAL_COL_ADS_R, 171, band_y, temp, C_CYAN, 1);
+        } else if (band_y == 188) {
+            /* Which capture points are held, so the operator knows what
+             * COMPUTE_SAVE would have to work with. */
+            static const struct {
+                const char *label;
+                uint32_t    bit;
+                int         x;
+            } points[] = {
+                { "LO", BTS_CAL_ST_V_LOW,    8 },
+                { "HI", BTS_CAL_ST_V_HIGH,  60 },
+                { "I0", BTS_CAL_ST_I_ZERO, 112 },
+                { "IL", BTS_CAL_ST_I_LOADED, 164 },
+            };
+            band_fill_rect(0, 190, s_cfg.width, 1, band_y, C_DIM);
+            for (size_t i = 0; i < sizeof(points) / sizeof(points[0]); i++) {
+                const bool held = (cal->status_bits & points[i].bit) != 0;
+                band_text(points[i].x, 197, band_y, points[i].label,
+                          held ? C_GREEN : C_DIM, 1);
+                band_text(points[i].x + 18, 197, band_y, held ? "set" : "---",
+                          held ? C_GREEN : C_DIM, 1);
+            }
+        } else if (band_y == 212 && cal->result != BTS_CAL_ERR_OK) {
+            /* The last refusal, which is otherwise only visible over the
+             * API - and the bench operator is the one who has to act on it. */
+            band_text(8, 219, band_y, bts_link_cal_result_name(cal->result),
+                      C_RED, 1);
+        }
+
+        push_band(band_y);
+    }
+}
+
+/*
  * Boot/idle screen, shown while the BTS has never answered.
  *
  * The slot table would be eight rows of dashes at that point, which tells
  * an operator nothing. This says what is actually wrong.
- */
-static void draw_waiting_screen(const bts_snapshot_t *snap)
+ */static void draw_waiting_screen(const bts_snapshot_t *snap)
 {
     for (int band_y = 20; band_y < s_cfg.height; band_y += UI_BAND_H) {
         band_clear(C_BLACK);
@@ -631,7 +745,15 @@ static void display_task(void *arg)
 
         draw_header(&snap);
 
-        if (snap.unit.online) {
+        /*
+         * Calibration outranks the slot table: the operator is at the bench
+         * with a DMM in hand, and the seven other slots are idle by the
+         * one-slot-at-a-time rule anyway.
+         */
+        if (snap.cal.active && snap.cal.slot < SLOT_COUNT) {
+            draw_cal_screen(&snap);
+            showed_table = false;
+        } else if (snap.unit.online) {
             if (!showed_table) {
                 draw_titles();
                 showed_table = true;

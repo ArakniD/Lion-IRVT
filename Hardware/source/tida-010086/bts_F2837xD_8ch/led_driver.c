@@ -77,6 +77,12 @@ void LEDDriver_update(void) {
             color = ((tick % LED_REVERSE_PERIOD) < LED_REVERSE_ON) ? colorRed : 0;
         } else if (status & (1UL << BTS_STATUS_GROUP_DISCONNECT)) {
             color = ((tick % LED_DISCONNECT_PERIOD) < LED_DISCONNECT_ON) ? colorRed : 0;
+        } else if (status & (1UL << BTS_STATUS_CALIBRATING)) {
+            //
+            // Ranked below the fault states on purpose: a slot that trips
+            // during calibration must still read as tripped.
+            //
+            color = ((tick % LED_CAL_PERIOD) < LED_CAL_ON) ? colorWhite : 0;
         } else if (status & ((1UL << BTS_STATUS_CHARGING) |
                              (1UL << BTS_STATUS_DISCHARGING))) {
             if (status & (1UL << BTS_STATUS_RUNNING)) {

@@ -126,11 +126,15 @@ typedef struct {
     float    shipping_voltage_v;
 
     /*
-     * Raw BTS accumulator values at the end of the discharge. Meaningful
-     * only if bts_link_stats_are_live() - see coulomb_counter.h.
+     * The BTS's own accumulators at the end of the discharge, for comparison
+     * against the locally integrated figures above - see coulomb_counter.h.
+     * The discharge pair is the one to compare; the charge pair is carried
+     * so a recharge-to-shipping step can be checked the same way.
      */
-    float    bts_current_acc;
-    float    bts_power_acc;
+    float    bts_discharge_mah;
+    float    bts_discharge_mwh;
+    float    bts_charge_mah;
+    float    bts_charge_mwh;
 
     int64_t  completed_unix;
 } slot_result_t;

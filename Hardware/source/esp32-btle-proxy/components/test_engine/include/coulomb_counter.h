@@ -6,22 +6,22 @@
  * WHY THIS EXISTS
  * ---------------
  * The requirement was to reset the BTS mAh/mWh counters over I2C and then
- * read them back at the end of a discharge. That is not possible against the
- * current F2837xD firmware:
+ * read them back at the end of a discharge. Only half of that is possible
+ * against the current F2837xD firmware:
  *
- *   1. eChX_CurrentAcc and eChX_PowerAcc are declared REG_ACCESS_RO in
- *      registers.c, and i2cSlaveISR() drops any host write to a RO register
- *      (`regConfig[regIdx].access == REG_ACCESS_RW` gate). So the host
- *      cannot zero them.
- *   2. Nothing on either core ever writes them. Searching the whole C2000
- *      tree for assignments to the stats block turns up only CellVoltage and
- *      CellCurrent - the accumulator slots are allocated and published but
- *      never integrated, so they read back as a constant 0.
+ *   1. The BTS does now integrate. CPU1 accumulates the ADS131M08 pair in
+ *      its C1 task and publishes per-direction totals - charge at
+ *      eChX_ChargeAcc_mAh/_mWh (320/332), discharge at
+ *      eChX_DischargeAcc_mAh/_mWh (1156+).
+ *   2. But they are still REG_ACCESS_RO and i2cSlaveISR() drops any host
+ *      write to a RO register, so the host cannot zero them on demand. The
+ *      BTS zeroes a direction's pair itself when that direction starts,
+ *      which covers the reset-then-discharge sequence but nothing else.
  *
- * So the proxy integrates locally instead, from the same voltage/current
- * pair the BTS publishes. bts_link_stats_are_live() probes at boot and, if a
- * future BTS build starts populating those registers, the raw values are
- * reported alongside these for comparison.
+ * This integrator stays the reported figure: it samples on real elapsed time
+ * at the 250 ms poll rather than the BTS's fixed 150 ms step, and it does
+ * not lose a partial interval at either end of a run. The BTS totals are
+ * read each poll and reported beside these for comparison.
  *
  * METHOD
  * ------

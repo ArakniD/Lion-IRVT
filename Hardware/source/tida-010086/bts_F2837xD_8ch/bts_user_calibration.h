@@ -10,11 +10,13 @@
 #define BTS_USER_CALIBRATION_H_
 
 
-#define BTS_CALIBRATION_ENABLED (false)
-#define BTS_CALIBATION_MODE BTS_CALIBRATION_CC
-#define BTS_CALIBRATION_CC (1)
-#define BTS_CALIBRATION_CV (2)
-
+//
+// The per-channel constants below are BOOT DEFAULTS only. Calibration itself
+// is a runtime, externally-referenced procedure driven through the register
+// block at 1036 and persisted to F-RAM; the compile-time
+// BTS_CALIBRATION_ENABLED switch it replaced forced every channel into
+// calibration at once.
+//
 #define BTS_IOUT_CALIBRATION_POINT1 ((float32_t)0.05)
 #define BTS_IOUT_CALIBRATION_POINT2 ((float32_t)0.5)
 #define BTS_IOUT_CALIBRATION_POINT3 ((float32_t)0.25)

@@ -251,14 +251,15 @@ static void emit_result(json_out_t *j, const char *key, const slot_result_t *r)
     json_kv_f(j, "recharge_mah", r->recharge_mah, 1);
     json_kv_f(j, "shipping_voltage_v", r->shipping_voltage_v, 3);
     /*
-     * Raw BTS accumulators. Zero unless a future BTS build populates them -
-     * see bts_link_stats_are_live(). Reported so a comparison against the
-     * locally integrated figures is possible without a firmware change here.
+     * The BTS's own accumulators, for comparison against the locally
+     * integrated figures above - see bts_link_stats_are_live().
      */
     json_obj_open(j, "bts_raw");
     json_kv_bool(j, "live", bts_link_stats_are_live());
-    json_kv_f(j, "current_acc", r->bts_current_acc, 3);
-    json_kv_f(j, "power_acc", r->bts_power_acc, 3);
+    json_kv_f(j, "discharge_mah", r->bts_discharge_mah, 3);
+    json_kv_f(j, "discharge_mwh", r->bts_discharge_mwh, 3);
+    json_kv_f(j, "charge_mah", r->bts_charge_mah, 3);
+    json_kv_f(j, "charge_mwh", r->bts_charge_mwh, 3);
     json_obj_close(j);
     json_kv_i(j, "completed_uptime_s", r->completed_unix);
     json_obj_close(j);
@@ -760,6 +761,243 @@ static esp_err_t h_registers(httpd_req_t *req)
 }
 
 /*
+ * Generic register write, the mirror of the read-only GET above.
+ *
+ * Deliberately unguarded beyond the address checks: this is the escape
+ * hatch for bring-up and for anything the typed endpoints do not cover, and
+ * the unit enforces its own RW access list per register.
+ */
+static esp_err_t h_registers_post(httpd_req_t *req)
+{
+    char body[REQ_BUF];
+    const int len = read_body(req, body, sizeof(body));
+    if (len <= 0) {
+        return send_error(req, "400 Bad Request", "missing body");
+    }
+
+    double addr_num;
+    double value_num;
+    if (!json_get_num(body, (size_t)len, "addr", &addr_num)) {
+        return send_error(req, "400 Bad Request", "missing addr");
+    }
+    if (!json_get_num(body, (size_t)len, "value", &value_num)) {
+        return send_error(req, "400 Bad Request", "missing value");
+    }
+    if (addr_num < 0.0 ||
+        addr_num > (double)((BTS_TOTAL_REGISTERS - 1) * BTS_REGISTER_SIZE)) {
+        return send_error(req, "400 Bad Request", "addr out of range");
+    }
+
+    const uint32_t addr = (uint32_t)addr_num;
+    if (addr % BTS_REGISTER_SIZE != 0) {
+        return send_error(req, "400 Bad Request", "addr must be a multiple of 4");
+    }
+
+    const esp_err_t err = bts_link_write_reg((uint16_t)addr, (float)value_num);
+    if (err != ESP_OK) {
+        return send_error(req, "502 Bad Gateway", esp_err_to_name(err));
+    }
+    return send_ok(req);
+}
+
+/* ------------------------------------------------------------------ */
+/* Calibration                                                        */
+/* ------------------------------------------------------------------ */
+
+static void emit_cal(json_out_t *j, const bts_cal_state_t *cal)
+{
+    json_obj_open(j, "calibration");
+    json_kv_bool(j, "active", cal->active);
+    json_kv_u(j, "slot", cal->slot);
+    json_kv_u(j, "status", cal->status_bits);
+    json_kv_u(j, "result", cal->result);
+    json_kv_str(j, "result_text", bts_link_cal_result_name(cal->result));
+
+    /* The status bits broken out, so a client does not have to carry its own
+     * copy of the bit numbering. */
+    json_obj_open(j, "captures");
+    json_kv_bool(j, "voltage_low",  (cal->status_bits & BTS_CAL_ST_V_LOW) != 0);
+    json_kv_bool(j, "voltage_high", (cal->status_bits & BTS_CAL_ST_V_HIGH) != 0);
+    json_kv_bool(j, "current_zero", (cal->status_bits & BTS_CAL_ST_I_ZERO) != 0);
+    json_kv_bool(j, "current_loaded", (cal->status_bits & BTS_CAL_ST_I_LOADED) != 0);
+    json_kv_bool(j, "voltage_computed", (cal->status_bits & BTS_CAL_ST_V_COMPUTED) != 0);
+    json_kv_bool(j, "current_computed", (cal->status_bits & BTS_CAL_ST_I_COMPUTED) != 0);
+    json_kv_bool(j, "saved", (cal->status_bits & BTS_CAL_ST_SAVED) != 0);
+    json_kv_bool(j, "driving", (cal->status_bits & BTS_CAL_ST_DRIVING) != 0);
+    json_kv_bool(j, "failed", (cal->status_bits & BTS_CAL_ST_FAILED) != 0);
+    json_obj_close(j);
+
+    json_obj_open(j, "live");
+    json_kv_f(j, "ads_v_pu", cal->ads_v_pu, 5);
+    json_kv_f(j, "ads_i_pu", cal->ads_i_pu, 5);
+    json_kv_f(j, "ads_v_v", cal->ads_v_v, 4);
+    json_kv_f(j, "ads_i_a", cal->ads_i_a, 4);
+    json_kv_f(j, "f28_v_pu", cal->f28_v_pu, 5);
+    json_kv_f(j, "f28_i_pu", cal->f28_i_pu, 5);
+    json_kv_f(j, "f28_v_v", cal->f28_v_v, 4);
+    json_kv_f(j, "f28_i_a", cal->f28_i_a, 4);
+    json_kv_f(j, "temp_c", cal->temp_c, 1);
+    json_obj_close(j);
+
+    json_obj_open(j, "ticks");
+    json_kv_bool(j, "voltage_valid", cal->v_tick);
+    json_kv_bool(j, "current_valid", cal->i_tick);
+    json_obj_close(j);
+
+    json_obj_close(j);
+}
+
+static esp_err_t h_calibration_get(httpd_req_t *req)
+{
+    bts_snapshot_t snap;
+    bts_link_get_snapshot(&snap);
+
+    json_out_t j;
+    json_init(&j, s_resp, sizeof(s_resp));
+    json_obj_open(&j, NULL);
+    emit_cal(&j, &snap.cal);
+
+    /* The persisted gains of the selected slot, so a client can show a
+     * before/after table without a second round trip. */
+    if (snap.cal.slot < BTS_NUM_CHANNELS) {
+        float gains[12];
+        if (bts_link_read_block(BTS_CAL_ADDR(snap.cal.slot, BTS_CAL_F28V_GAIN),
+                                gains, 12) == ESP_OK) {
+            json_obj_open(&j, "gains");
+            json_kv_f(&j, "f28v_gain", gains[0], 6);
+            json_kv_f(&j, "f28v_offset", gains[1], 6);
+            json_kv_f(&j, "f28i_gain", gains[2], 6);
+            json_kv_f(&j, "f28i_offset", gains[3], 6);
+            json_kv_f(&j, "iout_gain_pu", gains[4], 6);
+            json_kv_f(&j, "iout_offset_pu", gains[5], 6);
+            json_kv_f(&j, "iout_gain_a", gains[6], 6);
+            json_kv_f(&j, "iout_offset_a", gains[7], 6);
+            json_kv_f(&j, "vout_gain_pu", gains[8], 6);
+            json_kv_f(&j, "vout_offset_pu", gains[9], 6);
+            json_kv_f(&j, "vout_gain_v", gains[10], 6);
+            json_kv_f(&j, "vout_offset_v", gains[11], 6);
+            json_obj_close(&j);
+        }
+    }
+    json_obj_close(&j);
+    return send_json(req, &j);
+}
+
+/* Reports the command's outcome, with the unit's refusal code spelled out. */
+static esp_err_t send_cal_result(httpd_req_t *req, esp_err_t err, uint32_t result)
+{
+    if (err == ESP_ERR_INVALID_ARG) {
+        return send_error(req, "400 Bad Request", "argument out of range");
+    }
+    if (err != ESP_OK) {
+        return send_error(req, "502 Bad Gateway", esp_err_to_name(err));
+    }
+    if (result != BTS_CAL_ERR_OK) {
+        return send_error(req, "409 Conflict", bts_link_cal_result_name(result));
+    }
+    return send_ok(req);
+}
+
+/*
+ * One number out of the body, for the three commands that carry an
+ * argument. Returns false and answers the request when it is absent.
+ */
+static bool cal_body_num(httpd_req_t *req, const char *key, double *out,
+                         esp_err_t *sent)
+{
+    char body[REQ_BUF];
+    const int len = read_body(req, body, sizeof(body));
+    if (len <= 0 || !json_get_num(body, (size_t)len, key, out)) {
+        *sent = send_error(req, "400 Bad Request", "missing argument");
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t h_cal_enter(httpd_req_t *req)
+{
+    double slot;
+    esp_err_t sent;
+    if (!cal_body_num(req, "slot", &slot, &sent)) {
+        return sent;
+    }
+    if (slot < 0.0 || slot >= (double)SLOT_COUNT) {
+        return send_error(req, "400 Bad Request", "bad slot");
+    }
+
+    uint32_t result = 0;
+    const esp_err_t err = bts_link_cal_enter((uint8_t)slot, &result);
+    return send_cal_result(req, err, result);
+}
+
+static esp_err_t h_cal_exit(httpd_req_t *req)
+{
+    uint32_t result = 0;
+    const esp_err_t err = bts_link_cal_exit(&result);
+    return send_cal_result(req, err, result);
+}
+
+static esp_err_t h_cal_clear(httpd_req_t *req)
+{
+    uint32_t result = 0;
+    const esp_err_t err = bts_link_cal_clear(&result);
+    return send_cal_result(req, err, result);
+}
+
+static esp_err_t h_cal_voltage(httpd_req_t *req)
+{
+    double measured;
+    esp_err_t sent;
+    if (!cal_body_num(req, "measured_v", &measured, &sent)) {
+        return sent;
+    }
+
+    uint32_t result = 0;
+    const esp_err_t err = bts_link_cal_capture_voltage((float)measured, &result);
+    return send_cal_result(req, err, result);
+}
+
+static esp_err_t h_cal_zero_current(httpd_req_t *req)
+{
+    uint32_t result = 0;
+    const esp_err_t err = bts_link_cal_zero_current(&result);
+    return send_cal_result(req, err, result);
+}
+
+static esp_err_t h_cal_fixed_current(httpd_req_t *req)
+{
+    double pu;
+    esp_err_t sent;
+    if (!cal_body_num(req, "pu", &pu, &sent)) {
+        return sent;
+    }
+
+    uint32_t result = 0;
+    const esp_err_t err = bts_link_cal_set_fixed_current((float)pu, &result);
+    return send_cal_result(req, err, result);
+}
+
+static esp_err_t h_cal_current(httpd_req_t *req)
+{
+    double measured;
+    esp_err_t sent;
+    if (!cal_body_num(req, "measured_a", &measured, &sent)) {
+        return sent;
+    }
+
+    uint32_t result = 0;
+    const esp_err_t err = bts_link_cal_capture_current((float)measured, &result);
+    return send_cal_result(req, err, result);
+}
+
+static esp_err_t h_cal_save(httpd_req_t *req)
+{
+    uint32_t result = 0;
+    const esp_err_t err = bts_link_cal_compute_save(&result);
+    return send_cal_result(req, err, result);
+}
+
+/*
  * Bus-level I2C diagnostic, for bring-up.
  *
  * Distinguishes "a line is stuck low" (wiring, pull-ups) from "the bus is
@@ -857,11 +1095,38 @@ static esp_err_t h_slot_post_dispatch(httpd_req_t *req)
     return send_error(req, "404 Not Found", "unknown slot action");
 }
 
+/*
+ * Calibration actions, dispatched the same way and for the same reason: the
+ * wildcard would otherwise collapse every /api/calibration/<action> onto one
+ * pattern and hand them all to whichever was registered first.
+ */
+static esp_err_t h_cal_post_dispatch(httpd_req_t *req)
+{
+    const char *action = strrchr(req->uri, '/');
+    if (action == NULL || action[1] == '\0') {
+        return send_error(req, "404 Not Found", "missing action");
+    }
+    action++;
+
+    if (strcmp(action, "enter") == 0)         return h_cal_enter(req);
+    if (strcmp(action, "exit") == 0)          return h_cal_exit(req);
+    if (strcmp(action, "clear") == 0)         return h_cal_clear(req);
+    if (strcmp(action, "voltage") == 0)       return h_cal_voltage(req);
+    if (strcmp(action, "zero_current") == 0)  return h_cal_zero_current(req);
+    if (strcmp(action, "fixed_current") == 0) return h_cal_fixed_current(req);
+    if (strcmp(action, "current") == 0)       return h_cal_current(req);
+    if (strcmp(action, "save") == 0)          return h_cal_save(req);
+
+    return send_error(req, "404 Not Found", "unknown calibration action");
+}
+
 static const httpd_uri_t s_routes[] = {
     { .uri = "/api/status",          .method = HTTP_GET,  .handler = h_status       },
     { .uri = "/api/catalog",         .method = HTTP_GET,  .handler = h_catalog      },
     { .uri = "/api/results",         .method = HTTP_GET,  .handler = h_results      },
     { .uri = "/api/registers",       .method = HTTP_GET,  .handler = h_registers    },
+    { .uri = "/api/registers",       .method = HTTP_POST, .handler = h_registers_post },
+    { .uri = "/api/calibration",     .method = HTTP_GET,  .handler = h_calibration_get },
     { .uri = "/api/i2c_diag",        .method = HTTP_GET,  .handler = h_i2c_diag     },
     { .uri = "/api/abort_all",       .method = HTTP_POST, .handler = h_abort_all    },
     { .uri = "/api/wifi",            .method = HTTP_POST, .handler = h_wifi_post    },
@@ -871,6 +1136,7 @@ static const httpd_uri_t s_routes[] = {
      * segment above. These must stay after the exact paths, because the
      * matcher takes the first registered pattern that matches.
      */
+    { .uri = "/api/calibration/*",   .method = HTTP_POST, .handler = h_cal_post_dispatch  },
     { .uri = "/api/slot/*",          .method = HTTP_POST, .handler = h_slot_post_dispatch },
     { .uri = "/api/slot/*",          .method = HTTP_GET,  .handler = h_slot_get_dispatch  },
     { .uri = "/*",                   .method = HTTP_OPTIONS, .handler = h_options   },

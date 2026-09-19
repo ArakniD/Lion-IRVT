@@ -205,34 +205,19 @@ static esp_err_t start_power(uint8_t slot, uint32_t mode)
 }
 
 /*
- * Best-effort attempt at the specified "reset the watt and current counters
- * in the BTS via registers" step.
+ * The specified "reset the watt and current counters in the BTS via
+ * registers" step.
  *
- * The current F2837xD build declares eChX_CurrentAcc and eChX_PowerAcc
- * REG_ACCESS_RO, and i2cSlaveISR() silently drops host writes to RO
- * registers, so this cannot succeed today - which is why the engine carries
- * its own integrator (coulomb_counter.c). The write is still issued and the
- * read-back checked, so that the moment a BTS build makes those registers
- * writable the hardware counters start each test zeroed with no change
- * needed here.
+ * The registers are REG_ACCESS_RO and i2cSlaveISR() drops host writes to
+ * them, so this cannot succeed - but it no longer needs to. The BTS zeroes
+ * a direction's pair itself the moment that direction starts, so by the time
+ * the mode write below lands the counters are already at zero. The write is
+ * kept so a later build that does make them writable needs no change here.
  */
 static void try_reset_bts_accumulators(uint8_t slot)
 {
-    const uint16_t cur = BTS_STATS_ADDR(slot, BTS_STATS_CURRENT_ACC);
-    const uint16_t pwr = BTS_STATS_ADDR(slot, BTS_STATS_POWER_ACC);
-
-    (void)bts_link_write_reg(cur, 0.0f);
-    (void)bts_link_write_reg(pwr, 0.0f);
-
-    float back_cur = 0.0f, back_pwr = 0.0f;
-    if (bts_link_read_reg(cur, &back_cur) == ESP_OK &&
-        bts_link_read_reg(pwr, &back_pwr) == ESP_OK) {
-        if (back_cur != 0.0f || back_pwr != 0.0f) {
-            ESP_LOGW(TAG, "slot %u: BTS accumulators did not clear (%.3f / %.3f)"
-                          " - read-only in this BTS build, using local "
-                          "integration", slot, back_cur, back_pwr);
-        }
-    }
+    (void)bts_link_write_reg(BTS_DISCHACC_ADDR(slot, BTS_DISCHACC_MAH), 0.0f);
+    (void)bts_link_write_reg(BTS_DISCHACC_ADDR(slot, BTS_DISCHACC_MWH), 0.0f);
 }
 
 /* ------------------------------------------------------------------ */
@@ -360,9 +345,11 @@ static void finish_test(uint8_t slot, const bts_snapshot_t *snap)
     r->serial[sizeof(r->serial) - 1] = '\0';
     r->model_name[sizeof(r->model_name) - 1] = '\0';
 
-    /* Advisory: zero unless a future BTS build populates them. */
-    r->bts_current_acc = snap->channel[slot].current_acc;
-    r->bts_power_acc   = snap->channel[slot].power_acc;
+    /* Advisory: the BTS's own totals, for comparison against the local ones. */
+    r->bts_discharge_mah = snap->channel[slot].discharge_mah;
+    r->bts_discharge_mwh = snap->channel[slot].discharge_mwh;
+    r->bts_charge_mah    = snap->channel[slot].charge_mah;
+    r->bts_charge_mwh    = snap->channel[slot].charge_mwh;
     r->completed_unix  = esp_timer_get_time() / 1000000;
 
     bts_link_stop_channel(slot);
@@ -480,9 +467,9 @@ static void tick_discharge(uint8_t slot, const bts_channel_state_t *ch)
 
     if (!c->power_started) {
         /*
-         * Order matters: zero the counters, then initiate. The BTS-side
-         * reset is best-effort (see try_reset_bts_accumulators); the local
-         * integrator is what produces the reported figures.
+         * Order matters: zero the counters, then initiate. The BTS zeroes
+         * its own pair on the mode write (see try_reset_bts_accumulators);
+         * the local integrator is what produces the reported figures.
          */
         try_reset_bts_accumulators(slot);
         coulomb_reset(&c->discharge_cc);

@@ -510,8 +510,16 @@
 #define BTS_SPI_DOUT_PIN_CONFIG_ADC1      GPIO_17_SPISOMIA
 #define BTS_SPI_DIN_PIN_CONFIG_ADC1       GPIO_16_SPISIMOA
 #define BTS_SPI_SCLK_PIN_CONFIG_ADC1      GPIO_18_SPICLKA
-#define BTS_SPI_DRDY_XINT_ADC1            INT_XINT1
-#define BTS_PSI_DRDY_XINT_GPIO1           GPIO_INT_XINT1
+//
+// XINT3, not XINT1. The Input X-BAR is a single device-global resource, not
+// per-core: GPIO_setInterruptPin() resolves XINT1 -> INPUT4 and writes
+// INPUT4SELECT in the one X-BAR at 0x7900. CPU2 points XINT1/XINT2 at the
+// ADS1119 DRDY pins after CPU1 has set them here, and CPU2 boots last, so it
+// won. ISR1/ISR3 never saw a DRDY edge. XINT3 -> INPUT6 and XINT5 -> INPUT14
+// are ours alone. (XINT4 -> INPUT13 is reserved for the channel-5 GPIO trip.)
+//
+#define BTS_SPI_DRDY_XINT_ADC1            INT_XINT3
+#define BTS_PSI_DRDY_XINT_GPIO1           GPIO_INT_XINT3
 #define BTS_SPI_DRDY_CINT_ADC1            INT_SPIA_RX
 #define BTS_DRDY_ADC1                     ISR1
 #define BTS_RXFIFO_SPI1                   ISR2
@@ -530,8 +538,9 @@
 #define BTS_SPI_DOUT_PIN_CONFIG_ADC2      GPIO_51_SPISOMIC
 #define BTS_SPI_DIN_PIN_CONFIG_ADC2       GPIO_50_SPISIMOC
 #define BTS_SPI_SCLK_PIN_CONFIG_ADC2      GPIO_52_SPICLKC
-#define BTS_SPI_DRDY_XINT_ADC2            INT_XINT2
-#define BTS_PSI_DRDY_XINT_GPIO2           GPIO_INT_XINT2
+// XINT5 -> INPUT14, not XINT2 -> INPUT5. See the note on ADC1 above.
+#define BTS_SPI_DRDY_XINT_ADC2            INT_XINT5
+#define BTS_PSI_DRDY_XINT_GPIO2           GPIO_INT_XINT5
 #define BTS_SPI_DRDY_CINT_ADC2            INT_SPIC_RX
 #define BTS_DRDY_ADC2                     ISR3
 #define BTS_RXFIFO_SPI2                   ISR4

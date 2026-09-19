@@ -331,6 +331,10 @@ void BTS_initUserVariables(void)
             BTS_userInputs[ch].F28V_Offset = BTS_F28V_OFFSET_DEFAULT;
             BTS_userInputs[ch].F28I_Gain   = BTS_F28I_GAIN_DEFAULT;
             BTS_userInputs[ch].F28I_Offset = BTS_F28I_OFFSET_DEFAULT;
+
+            BTS_userInputs[ch].calState   = BTS_CAL_STATE_NORMAL;
+            BTS_userInputs[ch].ioutCal_pu = (float32_t)0.0;
+            BTS_userInputs[ch].voutCal_pu = (float32_t)0.0;
         }
     }
 
@@ -557,6 +561,38 @@ void BTS_setupSfraGui(void)
 #pragma CODE_SECTION(BTS_updateReference,"ramfuncs");
 void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoopVariable)
 {
+    //
+    // Calibration is a per-channel runtime state, not the compile-time
+    // switch it used to be: one slot drives a reference while the other
+    // seven keep running normally.
+    //
+    if (userInput->calState != BTS_CAL_STATE_NORMAL) {
+        if (userInput->calState == BTS_CAL_STATE_FIXED_I) {
+            ctrlLoopVariable->ioutRef_pu = userInput->ioutCal_pu;
+            ctrlLoopVariable->voutRef_pu = (float32_t)1.0;
+        } else {
+            //
+            // Calibration idle. The converter is held off but the ADCs keep
+            // sampling, which is what the zero-current capture needs.
+            //
+            userInput->enable_logic      = 0;
+            ctrlLoopVariable->ioutRef_pu = (float32_t)0.0;
+            ctrlLoopVariable->voutRef_pu = (float32_t)0.0;
+        }
+
+        //
+        // Calibration current always flows in discharge, which the loop
+        // represents with a negative direction coefficient.
+        //
+        ctrlLoopVariable->direction_coeff = -1.0;
+        ctrlLoopVariable->direction_logic = 0U;
+
+#if(BTS_TRIP_CODE)
+        ctrlLoopVariable->tripFlag = userInput->enable_logic ? 0U : 1U;
+#endif
+        return;
+    }
+
 #if(BTS_TRIP_CODE)
     if(userInput->enable_logic){
         ctrlLoopVariable->tripFlag=0;
@@ -566,7 +602,6 @@ void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoo
     }
 #endif
 
-#if(BTS_CALIBRATION_ENABLED== false)
     ctrlLoopVariable->ioutRef_pu = userInput->iref_A * userInput->IoutGain_pu + userInput->IoutOffset_pu;
 
     ctrlLoopVariable->dutySetRef_pu=  userInput->dutyRef_pu;
@@ -581,27 +616,6 @@ void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoo
         ctrlLoopVariable->direction_logic=0U;
         ctrlLoopVariable->voutRef_pu = userInput->vref_discharge_V * userInput->VoutGain_pu + userInput->VoutOffset_pu;
     }
-#endif
-
-#if(BTS_CALIBRATION_ENABLED== true)
-#if(BTS_CALIBATION_MODE==BTS_CALIBRATION_CC)
-    ctrlLoopVariable->ioutRef_pu = userInput->ioutCal_pu;
-    ctrlLoopVariable->voutRef_pu = (float32_t)1.0;
-#endif
-#if(BTS_CALIBATION_MODE==BTS_CALIBRATION_CV)
-    ctrlLoopVariable->ioutRef_pu = (float32_t)1.0;
-    ctrlLoopVariable->voutRef_pu = userInput->voutCal_pu;
-#endif
-    if(userInput->direction_logic ==1) {
-        ctrlLoopVariable->direction_coeff=1.0;
-        ctrlLoopVariable->direction_logic=1U;
-    }
-    else {
-        ctrlLoopVariable->direction_coeff=-1.0;
-        ctrlLoopVariable->direction_logic=0U;}
-
-#endif
-
 }
 
 //
