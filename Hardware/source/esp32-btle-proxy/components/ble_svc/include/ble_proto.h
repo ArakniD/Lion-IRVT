@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define BLE_PROTO_VERSION       3
+#define BLE_PROTO_VERSION       4
 
 /* Attribute value sizes are bounded by the negotiated MTU (247 - 3). */
 #define BLE_PROTO_MAX_PAYLOAD   244
@@ -215,6 +215,37 @@ typedef struct __attribute__((packed)) {
     float    f28_i_a;
     float    temp_c;
 } ble_cal_status_t;
+
+/*
+ * Register access, characteristic 000d. Added in BLE_PROTO_VERSION 4.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Characteristic 0003 drives the ESP32's *test engine* - start a whole
+ * characterisation, abort it, pause it. It has no way to say "charge this
+ * slot": that is the BTS's own eChX_Mode register, which until now was
+ * reachable only over CAN, HTTP or I2C. A BLE-only host could therefore run
+ * a test but not command a bare charge or discharge. This closes that gap.
+ *
+ * A write sets `write` to 1 and carries the value; a read sets it to 0 and
+ * ignores `value`. In both cases the reply is read back from the SAME
+ * characteristic and carries the register's value after the operation.
+ *
+ * `addr` is the BYTE address, as on the I2C bus - index = addr / 4. The
+ * value is a native little-endian float here, NOT the big-endian I2C wire
+ * format: the conversion stays inside bts_regs.h, as it does for every other
+ * record in this header.
+ *
+ * A write to a read-only register is silently dropped by the BTS, exactly as
+ * it is on every other transport, so a client must read back rather than
+ * treat a successful write as proof the value took effect.
+ */
+typedef struct __attribute__((packed)) {
+    uint16_t addr;          /* byte address, index = addr / 4        */
+    uint8_t  write;         /* 1 = write, 0 = read                   */
+    uint8_t  count;         /* reserved for burst reads; must be 1   */
+    float    value;         /* value to write, or the value read back */
+} ble_register_cmd_t;
 
 #ifdef __cplusplus
 }

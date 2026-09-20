@@ -44,6 +44,7 @@ static const ble_uuid128_t s_uuid_cat_entry    = TESTER_UUID128(0x00, 0x09);
 static const ble_uuid128_t s_uuid_slot_status  = TESTER_UUID128(0x00, 0x0a);
 static const ble_uuid128_t s_uuid_cal_cmd      = TESTER_UUID128(0x00, 0x0b);
 static const ble_uuid128_t s_uuid_cal_status   = TESTER_UUID128(0x00, 0x0c);
+static const ble_uuid128_t s_uuid_register     = TESTER_UUID128(0x00, 0x0d);
 
 static uint16_t s_unit_status_handle;
 static uint16_t s_slot_status_handle;
@@ -52,6 +53,13 @@ static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t  s_own_addr_type;
 static uint8_t  s_selected_slot;
 static uint8_t  s_catalog_index;
+/*
+ * Reply to the most recent register operation, read back from the same
+ * characteristic. Like slot-select this is a single global, so overlapping
+ * register operations from one client would race - the server tracks one
+ * connection, and a client must not pipeline its own reads.
+ */
+static ble_register_cmd_t s_register_reply;
 static bool     s_wifi_connected;
 static char     s_device_name[32] = "BTS-Tester";
 
@@ -410,6 +418,68 @@ static int handle_serial_write(struct os_mbuf *om)
 /* GATT access                                                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Register read/write, characteristic 000d.
+ *
+ * Gives a BLE-only host the same reach as CAN or HTTP: eChX_Mode, the slot
+ * limit registers and the unit thresholds. Without it a client can run the
+ * test engine but cannot command a bare charge or discharge.
+ *
+ * The result is stashed in s_register_reply for the client to read back from
+ * the same characteristic. A write to a read-only register is dropped by the
+ * BTS without an error, so the read-back is how a client confirms the value
+ * actually took - do not treat a successful write as proof.
+ */
+static int handle_register_cmd(struct os_mbuf *om)
+{
+    ble_register_cmd_t cmd;
+    int rc = read_flat(om, &cmd, sizeof(cmd));
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (cmd.addr % BTS_REGISTER_SIZE != 0 ||
+        (cmd.addr / BTS_REGISTER_SIZE) >= BTS_TOTAL_REGISTERS) {
+        ESP_LOGW(TAG, "register address %u is unaligned or out of range",
+                 cmd.addr);
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    if (cmd.count != 1) {
+        /* Burst reads are reserved, not implemented. Reject rather than
+         * silently return a single value for a request that asked for more. */
+        return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    }
+
+    esp_err_t err;
+    float value = cmd.value;
+
+    if (cmd.write) {
+        err = bts_link_write_reg(cmd.addr, cmd.value);
+        if (err == ESP_OK) {
+            /* Read back so the reply carries what the register actually
+             * holds, which differs from what was written if the target
+             * considers it read-only. */
+            if (bts_link_read_reg(cmd.addr, &value) != ESP_OK) {
+                value = cmd.value;
+            }
+        }
+    } else {
+        err = bts_link_read_reg(cmd.addr, &value);
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "register %u %s failed: %s", cmd.addr,
+                 cmd.write ? "write" : "read", esp_err_to_name(err));
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    s_register_reply.addr  = cmd.addr;
+    s_register_reply.write = cmd.write;
+    s_register_reply.count = 1;
+    s_register_reply.value = value;
+    return 0;
+}
+
 static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
                        struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
@@ -467,6 +537,11 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
             return os_mbuf_append(ctxt->om, &rec, sizeof(rec)) == 0
                        ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         }
+        if (ble_uuid_cmp(uuid, &s_uuid_register.u) == 0) {
+            return os_mbuf_append(ctxt->om, &s_register_reply,
+                                  sizeof(s_register_reply)) == 0
+                       ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
         return BLE_ATT_ERR_UNLIKELY;
 
     case BLE_GATT_ACCESS_OP_WRITE_CHR:
@@ -475,6 +550,9 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
         }
         if (ble_uuid_cmp(uuid, &s_uuid_cal_cmd.u) == 0) {
             return handle_cal_cmd(ctxt->om);
+        }
+        if (ble_uuid_cmp(uuid, &s_uuid_register.u) == 0) {
+            return handle_register_cmd(ctxt->om);
         }
         if (ble_uuid_cmp(uuid, &s_uuid_slot_config.u) == 0) {
             return handle_slot_config_write(ctxt->om);
@@ -565,6 +643,12 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                 .access_cb = gatt_access,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &s_cal_status_handle,
+            }, {
+                /* Appended for BLE_PROTO_VERSION 4. Does not notify: a
+                 * register value is only meaningful in reply to a request. */
+                .uuid = &s_uuid_register.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
             }, {
                 0,
             },

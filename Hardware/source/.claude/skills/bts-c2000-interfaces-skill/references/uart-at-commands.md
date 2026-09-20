@@ -9,7 +9,7 @@ are mutually exclusive:
 
 | `BTS_DEBUG_CONSOLE` | GPIO28 | GPIO29 | Console | WS2812B LEDs | Ch1 GPIO trip |
 |---|---|---|---|---|---|
-| `true` — **current setting** | SCIRXDA | SCITXDA | **SCIA, 115200 8N1** | disabled | disabled |
+| `true` — **current setting** | SCIRXDA | SCITXDA | **SCIA, 8N1 — see the baud warning** | disabled | disabled |
 | `false` — production | ch1 trip input | SCITXDA @ 800 kbaud | **none** | enabled | enabled |
 
 In a production build there is no console at all. `initUART()` compiles to
@@ -27,7 +27,27 @@ currently masked anyway.)
 
 ## Physical
 
-- **SCIA**, GPIO28 = RX, GPIO29 = TX, **115200 8N1**
+> ### The working baud rate is ~7267, not 115200
+>
+> **Open issue, root cause not established.** `BTS_CONSOLE_BAUDRATE` is
+> `115200` and `SCI_setConfig()` computes BRR = 42 from `DEVICE_LSPCLK_FREQ`,
+> which by the arithmetic should give about **145 kbaud** — already not what
+> the constant says. In practice the console only works when the host
+> connects at **approximately 7267 baud**. At 115200 the port answers but
+> every received byte is framing garbage: sending `A`, `T`, `+` produced 254,
+> 248, 254, 245.
+>
+> The rate that works implies the real LSPCLK is far below what
+> `DEVICE_LSPCLK_FREQ` claims. That has **not** been confirmed — reading
+> `ClkCfgRegs` over JTAG returned all zeros, which is a known artefact on
+> this part when the registers are read while the core is running.
+>
+> **Halt the core before judging the PLL, and do not change the baud
+> constant** until the clock tree has been read properly. The same LSPCLK
+> feeds SPI and the LED driver's 800 kbaud WS2812B timing, so a change made
+> to fix the console may break either.
+
+- **SCIA**, GPIO28 = RX, GPIO29 = TX, 8N1 — **connect at ~7267 baud**
 - Reaches the TMDSCNCD28379D's isolated FTDI backchannel — the COM port that
   enumerates on the same USB cable as the XDS debug probe. No extra adapter.
 - Line termination accepted: `\r`, `\n` or `\r\n`. Responses end `\r\n`.
@@ -121,7 +141,10 @@ with `regConfig[]`. A representative sample:
 | `C0SV` | `Ch0_SenseVoltage` | RO — **ADS131M08, 16-bit** |
 | `C0SI` | `Ch0_SenseCurrent` | RO — **ADS131M08, 16-bit** |
 | `C0TEMP` | `Ch0_CellTemp` | RO — measured, from ADS1119 |
+| `C0CHS` | `Ch0_ChargeRuntime_s` | RO — seconds charging this run |
+| `C0DHS` | `Ch0_DischargeRuntime_s` | RO — seconds discharging this run |
 | `C0MINT` | `Ch0_MinCellTemp` | RW — configured limit, not a measurement |
+| `C0SPARE` | `Ch0_SettingsSpare` | RO — reserved, reads 0.0 |
 | `CDV` | `ChargeDisableV` | RW |
 | `CALM` | `CalibrationMode` | RW |
 | `UNITST` | `UnitState` | RO |
@@ -135,18 +158,57 @@ with `regConfig[]`. A representative sample:
 | `CALRES` | `CalResult` | RO |
 | `CALAVPU` … `CALFIA` | `CalAdsV_pu` … `CalF28I_A` | RO — live telemetry |
 | `CALTEMP` | `CalTemp_C` | RO |
+| `WD` | `HostWatchdog_s` | RW — supervision timeout, **0 disables** |
+| `WDREM` | `WatchdogRemaining_s` | RO — live countdown |
+
+Names follow the map automatically through `uartRegConfig[]`, so v2's
+additions needed no parser change.
 
 Note the naming trap: `C0VOLT` / `C0CURR` are the **internal** ADC, while
 `C0SV` / `C0SI` are the external ADS131M08 — the opposite of what the names
 suggest. See `SKILL.md`.
+
+### Pause and resume
+
+Two commands that are **not** register names:
+
+```
+AT+C0PAUSE
+OK
+AT+C0RESUME
+OK
+```
+
+They write the corresponding edge bit into `eChX_Mode` (`BTS_MODE_PAUSE`
+`0x08`, `BTS_MODE_RESUME` `0x10`). Reachable by writing the mode register
+directly, but an operator at a serial console should not have to compute a
+bitmask to stop a cell safely. `<n>` is the 0-based channel.
+
+A pause freezes the slot's six counters without losing them; a resume picks
+up where it left off and clears `WD_TRIPPED` / `RESTORED`. Both are no-ops in
+the wrong state — read `C0S` back rather than trusting the `OK`, which only
+says the command parsed.
 
 ---
 
 ## Side effects
 
 - Any RW write raises `IPC_FLAG0` to CPU1 with `ipcMsg` as the payload. CPU1
-  only decodes the control block, the per-channel calibration block and
-  `eCalCommand`; anything else is acked and discarded.
+  only decodes the settings region's mode register and calibration group, plus
+  `eCalCommand`; anything else — including `WD` — is acked and discarded. That
+  is correct for the watchdog, whose countdown CPU2 owns.
+- **Any AT command reloads the host watchdog**, because they all funnel
+  through `applyHostRegisterWrite()`. A console session alone keeps
+  supervision fed. Verified: `AT+WD?` → `+WD=30.00`.
+- `AT+WD=0` **disables supervision** and prints a warning from the idle loop.
+  On a machine that charges lithium cells unattended that is a bench setting
+  and a dangerous production one.
+
+  > **Known bug:** the same warning is printed periodically even when the
+  > watchdog is armed and `WD` reads 30.0. `hostWdDisableWarn` is set only on
+  > a write of `0.0` and reads 0 when sampled, so the trigger has not been
+  > found. Cosmetic — supervision is verifiably armed — but alarming and
+  > wrong. Check `AT+WD?` rather than believing the banner.
 - `AT+CALM=2` sets `calibrationSavePending`; the idle loop then saves all
   eight channels plus the global voltage thresholds to F-RAM. There is **no
   completion response** — `OK` acknowledges the register write, not the save.
@@ -179,9 +241,36 @@ OK
 ```
 
 `145` = `0b10010001` → bit 0 RUNNING, bit 4 CHARGING, bit 7 CONST_CURRENT.
-Bit 7 is now genuinely populated from `ctrlMode_logic`; on earlier builds the
-same state read as `17`. The build is CC-only, so bit 6 (CONST_VOLTAGE) will
-not appear.
+Bit 7 is genuinely populated from `ctrlMode_logic`; on builds before the
+calibration work the same state read as `17`. The build is CC-only, so bit 6
+(CONST_VOLTAGE) will not appear.
+
+Pause that slot and read it back:
+
+```
+AT+C0PAUSE
+OK
+AT+C0S?
++C0S=32913.00
+OK
+```
+
+`32913` = `0b1000000010010001` — the same three bits **plus bit 15
+PAUSED**. Note `RUNNING` is still set: a pause is a held run, not a stop, and
+the direction bit has to survive so a resume knows which way to go. A
+watchdog pause would add bit 17 (`WD_TRIPPED`, +131072) and a boot restore
+bit 18 (`RESTORED`, +262144).
+
+```
+AT+C0CHS?
++C0CHS=412.50        ; seconds charged so far - frozen while paused
+OK
+AT+C0RESUME
+OK
+```
+
+The counters resume from 412.5 rather than restarting. The full bit table is
+in `Docs/api-specification.md` §2.7.
 
 Calibration by hand, one slot:
 

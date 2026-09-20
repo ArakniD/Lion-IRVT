@@ -18,8 +18,8 @@ console, CAN telemetry, WS2812B LEDs) and all non-volatile configuration.
 verified against source, and far more complete than anything that can be
 usefully inlined here. This skill exists to tell you *how the system behaves*,
 *what will bite you*, and *which `Docs/` page to open*. Where a doc and the
-source disagree, the source wins — `Docs/api-specification.md` §2.9 already
-records the known disagreements.
+source disagree, the source wins — `Docs/api-specification.md` §2.11 already
+records the known disagreements, including a live one in the ESP32 mirror.
 
 | Question | Read |
 |---|---|
@@ -36,23 +36,33 @@ records the known disagreements.
 
 ## Read this before touching anything
 
-Six facts that invalidate the obvious guess. Each is confirmed in source.
+Seven facts that invalidate the obvious guess. Each is confirmed in source.
+
+0. **The register map is v2, and every v1 address is wrong.** Three regions
+   — runtime (base 0, stride 48 B, RO), settings (base 384, stride 96 B),
+   unit (1152–1256) — replacing v1's nine scattered blocks. **315 registers,
+   top address 1256.** A slot's live data is now one contiguous 12-register
+   burst, which took the ESP32 poll cycle from 33 transactions to 9. There is
+   no compatibility window: the C2000 and any host flash together. Complete
+   map: `Docs/api-specification.md` §2.8.
 
 1. **`eChX_CellVoltage` / `eChX_CellCurrent` are the 12-bit internal ADC**,
    not the 16-bit ADS131M08 — the opposite of what the naming suggests. The
-   ADS131M08 engineering values (`Vsense_V` / `Isense_A`) live in the **sense
-   block at 1092+**. They were computed at 10 Hz and read by nothing until
-   that block was added (`bts_cpu1.c` `publishStatusToCpu2`,
-   `com_cpu2.c:2032-2036`).
+   ADS131M08 engineering values (`Vsense_V` / `Isense_A`) are the
+   `eChX_SenseVoltage` / `eChX_SenseCurrent` pair, two registers along in the
+   same runtime block. They are what the CC loop regulates against and what
+   the accumulators integrate.
 
 2. **The storage device is an FM24V10 F-RAM, not an EEPROM.** The functions
    are still called `readEEPROM` / `writeEEPROM` and the macros still say
-   `EEPROM_*` (`com_cpu2.c:88-106, 762-780`). It is 128 KiB, byte-writable,
-   with no page-write delay — which is why a save can be a single block write.
+   `EEPROM_*` (`com_cpu2.c:88-106`). It is 128 KiB, byte-writable, with no
+   page-write delay — which is why a save can be a single block write, and
+   why a 6 s periodic state save needs no wear-levelling.
 
 3. **The two header files use identical names for different things.** See the
    collision table below. Copying a line between `registers.h` and
-   `bts_regs.h` compiles and is silently wrong.
+   `bts_regs.h` compiles and is silently wrong. **They have drifted before** —
+   see that section for the failure mode.
 
 4. **The build is CC-only.** `BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_ACMC_IOUT`
    (`bts_user_settings.h:305`) selects `BTS_ISR_CL_MODE_CC`, so the CV loop
@@ -63,17 +73,19 @@ Six facts that invalidate the obvious guess. Each is confirmed in source.
    `BTS_TRIP_HW_CH1..8_ENABLED (false)` (`bts_user_settings.h:113-120`). The
    only over-current protection left is the software check in
    `BTS_tripEpwm()`, which acts within a control period rather than a
-   switching cycle. Do not run unattended high-current tests. See
-   `bts_user_settings.h:74-111` for why they are masked (TZ1/TZ2 are hardwired
-   to Input X-BAR INPUT1/INPUT2, which sit at their GPIO0 reset default —
-   channel 1's trip zone was watching its own gate drive).
+   switching cycle. **The host watchdog is not a substitute** — it is a
+   supervision timeout measured in seconds. Do not run unattended
+   high-current tests. See `bts_user_settings.h:74-111` for why the trips are
+   masked (TZ1/TZ2 are hardwired to Input X-BAR INPUT1/INPUT2, which sit at
+   their GPIO0 reset default — channel 1's trip zone was watching its own
+   gate drive).
 
 6. **The Input X-BAR is device-global, not per-core.** Each core has its own
    PIE vector, but `GPIO_setInterruptPin()` writes the **single shared Input
    X-BAR**. Both cores used to claim XINT1/XINT2, so CPU2's `initADS1119()`
-   ran last and silently disconnected the SPI ADCs' DRDY interrupts. Fixed
-   2026-09-19: CPU1 now owns XINT3/XINT5, CPU2 keeps XINT1/XINT2. Allocation
-   table and the remaining INPUT14 contention:
+   ran last and silently disconnected the SPI ADCs' DRDY interrupts. Fixed:
+   CPU1 now owns XINT3/XINT5, CPU2 keeps XINT1/XINT2. Allocation table and
+   the remaining INPUT14 contention:
    `references/ipc-and-core-responsibilities.md` §6.1.
 
 ---
@@ -109,13 +121,18 @@ whole data-flow design.
 
 | Block | Address | Writer | Contents |
 |---|---|---|---|
-| `CPU2TOCPU1RAM` | `0x03F800` | CPU2 | `ipcMsg`, `calValidFlags[8]`, `registers[TOTAL_REGISTERS]` |
+| `CPU2TOCPU1RAM` | `0x03F800` | CPU2 | `ipcMsg`, `supervision`, `calValidFlags[8]`, `registers[TOTAL_REGISTERS]` |
 | `CPU1TOCPU2RAM` | `0x03FC00` | CPU1 | `startup_mode`, `startup_enable`, `canData[8]`, `cpu1Status` |
 
 CPU1 **never writes** `registers[]`, with exactly one deliberate exception:
 `modeCallback()` sets `eCalSlot` when mode bit 2 routes a channel into
-calibration (`bts_cpu1.c:1031`). Everything else CPU1 produces travels through
-`cpu1Status` under its `seq` seqlock and is mirrored in by CPU2.
+calibration. Everything else CPU1 produces travels through `cpu1Status` under
+its `seq` seqlock and is mirrored in by CPU2.
+
+`supervision` is the CPU2 → CPU1 mailbox that carries the watchdog and the
+boot restore: `wdPauseSeq`, bumped once per watchdog expiry, and
+`restoreFlags`, three bits per slot. CPU2 writes it; **CPU1 performs the
+actual pause**, because CPU2 must never touch a slot's control state.
 
 `calibrationData[]` is **no longer shared** — it is CPU2-private `.bss`
 (`registers.c:39`, at `0x0000a000` in both maps). Only the persisted validity
@@ -123,18 +140,23 @@ flags cross, as `calValidFlags[8]`, because CPU1 needs them for the display
 ticks after a power cycle.
 
 **`CPU2TOCPU1RAM` is the binding constraint on any new shared register.** The
-30 registers added this session plus two new struct fields overflowed it
-(`#10099-D ... section "MSGRAM_CPU2_TO_CPU1"`), which is what forced
-`calibrationData[]` out. Current occupancy, from the map files:
+v2 map's 315 registers cost 630 words on their own. Current occupancy, read
+from the map files after the v2 build:
 
 | Block | Used | Free |
 |---|---|---|
-| `CPU2TOCPU1RAM` | 766 words (`0x2FE`) | 258 words (`0x102`) |
-| `CPU1TOCPU2RAM` | 476 words (`0x1DC`) | 548 words (`0x224`) |
+| `CPU2TOCPU1RAM` | 790 words (`0x316`) | **234 words** (`0x0EA`) |
+| `CPU1TOCPU2RAM` | 508 words (`0x1FC`) | 516 words (`0x204`) |
 
-Overflow is a link-time failure, not a runtime one — but check the `.map`
-after adding anything shared, and confirm every shared symbol resolves to the
-same address in `cpu1/*.map` and `cpu2/*.map`.
+Overflow is a link-time failure (`#10099-D ... section
+"MSGRAM_CPU2_TO_CPU1"`), not a runtime one — but check the `.map` after
+adding anything shared, and confirm every shared symbol resolves to the same
+address in `cpu1/*.map` and `cpu2/*.map`.
+
+**Verified after the v2 build:** both cores build clean and all eight shared
+symbols — `registers`, `ipcMsg`, `calValidFlags`, `supervision`, `canData`,
+`cpu1Status`, `startup_mode`, `startup_enable` — resolve to identical
+addresses in both map files.
 
 Full IPC contract, flag allocation, boot and calibration data flows, interrupt
 ownership, register strides and trip-source identification:
@@ -148,10 +170,12 @@ ownership, register strides and trip-source identification:
 and discharge with independent voltage/current limits, a min/max cell
 temperature window and trip protection.
 
-- `eChX_Mode` (per channel) encodes run + direction + calibration entry.
-  Bit 0 = run, bit 1 = **charge** (clear = discharge), bit 2 = enter
-  calibration. Note the asymmetry: `0x00` is stop and `0x01` is *start a
-  discharge*, one bit apart.
+- `eChX_Mode` (settings offset 0) encodes run + direction + calibration entry
+  + pause/resume. Bit 0 = run, bit 1 = **charge** (clear = discharge), bit 2 =
+  enter calibration, bit 3 = **pause**, bit 4 = **resume**. Note the
+  asymmetry: `0x00` is stop and `0x01` is *start a discharge*, one bit apart.
+  Bits 3 and 4 are **edge commands** — acted on at the write, not retained,
+  handled before the run/stop decode.
 - Setpoints arrive over I2C/UART/CAN into `registers[]`; CPU2 validates access
   and raises `IPC_FLAG0`; CPU1 applies them through
   `BTS_updateReference` → DCL → HRPWM duty.
@@ -165,10 +189,151 @@ temperature window and trip protection.
   calibration is exempt from both; missing either one stops the slot a
   fraction of a second after it starts.
 - WS2812B LEDs reflect running / charging / discharging / trip, plus a white
-  flash for the slot under calibration. **`BTS_LED_DRIVER_ENABLED` is
-  currently `false`** — see the console note below.
-- Calibration coefficients and global voltage thresholds persist in the
-  FM24V10 F-RAM and load at boot.
+  flash for the slot under calibration and a flash for a paused slot. **`BTS_LED_DRIVER_ENABLED`
+  is currently `false`** — see the console note below.
+- Calibration coefficients, global voltage thresholds **and per-slot run
+  state** persist in the FM24V10 F-RAM and load at boot.
+
+### The slot state model
+
+A slot is in exactly one of **five** states. `PAUSED` is **not a direction**:
+it sits alongside `CHARGING` or `DISCHARGING`, so a host sees both that the
+slot is held and what a resume would do.
+
+| State | Meaning | Bits |
+|---|---|---|
+| **STOPPED** | Idle. Converter off. Counters hold their last values | `STOPPED` |
+| **CHARGING** | Running, delivering charge | `RUNNING` + `CHARGING` |
+| **DISCHARGING** | Running, drawing charge | `RUNNING` + `DISCHARGING` |
+| **PAUSED** | Converter off, direction remembered, counters frozen and intact | `RUNNING` + `PAUSED` + direction (+ `WD_TRIPPED` or `RESTORED`) |
+| **END** | Test finished normally. Converter off, counters hold final values | `STOPPED` + `FINISHED` |
+
+`slotIsRunning(ch)` is `running && !paused` (`bts_cpu1.c:161`) — that is the
+test for "actually delivering power", and it gates the counters.
+
+```
+  STOPPED ──start(charge)──────> CHARGING
+  STOPPED ──start(discharge)───> DISCHARGING
+
+  CHARGING/DISCHARGING ──watchdog timeout──> PAUSED (+WD_TRIPPED)
+  CHARGING/DISCHARGING ──pause command─────> PAUSED
+  CHARGING/DISCHARGING ──trip/fault────────> STOPPED
+  CHARGING/DISCHARGING ──termination───────> END
+
+  PAUSED ──resume command──> CHARGING or DISCHARGING  (whichever it held)
+  PAUSED ──stop command────> STOPPED
+  END    ──start───────────> CHARGING or DISCHARGING
+  boot with a saved run ───> PAUSED (+RESTORED)
+```
+
+Three rules that are easy to break:
+
+- **Entering PAUSED zeroes the converter reference first**, then clears
+  `enable_logic`. Same ordering as a trip exit — the control loop may run
+  between the two writes (`slotPause()`, `bts_cpu1.c:171`).
+- **`RUNNING` stays set through a pause.** A pause is a held run, not a stop,
+  and the direction bit has to survive so a resume knows which way to go.
+- **`slotStop()` clears the pause and END indications too**, so a host that
+  stops a paused slot gets a clean STOPPED rather than a mixture.
+
+> **`END` is bit 2, not bit 16.** `BTS_STATUS_END` is an **alias for
+> `BTS_STATUS_FINISHED`** — that bit was declared from the start and never
+> driven, so it was given the END meaning rather than spending a second bit.
+> Bit 16 is unused and reads a constant 0. An early revision of the ESP32
+> header defined END at bit 16; that is stale.
+>
+> The bit is now driven end to end, but **no C2000 path currently asserts
+> it**: `status[].finished` is cleared on start, pause and stop, and restored
+> from F-RAM at boot, but termination is still the ESP32's job.
+> `iref_cuttout_A` is loaded from `eChX_ChargeCurrentMin` and never read.
+
+### Counters
+
+Six per slot, two independent sets of {mAh, mWh, seconds}, all in the runtime
+block and all RO. Integrated on CPU1 in `C1()` at 6.667 Hz from `Isense_A` /
+`Vsense_V` — the **16-bit ADS131M08**, not the 12-bit path. Each direction
+accumulates **positive magnitude** into its own set, so a charge then a
+discharge leaves two separate totals. The seconds counter advances on the
+same timestep as its set's mAh and mWh.
+
+- **Advance only while `slotIsRunning(ch)` and not calibrating.** Paused,
+  stopped, ended and tripped slots freeze.
+- **Reset only on a fresh start**, and only the starting direction's set:
+  `STOPPED → run` and `END → run` zero one set; a **resume zeroes nothing**,
+  and so do a trip, a fault and a watchdog pause (`accResetDirection()`,
+  `bts_cpu1.c:139`). In a group the leader's reset propagates to followers.
+- **Survive a reset**, through the F-RAM state block below.
+
+### Host watchdog
+
+A 30 s supervision timeout (`eHostWatchdog_s`, 1196, RW; **0 disables**). On
+expiry every slot that is `CHARGING` or `DISCHARGING` pauses with
+`WD_TRIPPED` set. The live countdown is `eWatchdogRemaining_s` (1220, RO),
+which reads 0 both when fired **and** when disabled — read the timeout beside
+it to tell them apart.
+
+**Four reload hooks, one per interface**, and the fourth is the one that
+matters:
+
+| Interface | Hook |
+|---|---|
+| I2C register **write** | `applyHostRegisterWrite()` (`com_cpu2.c:2553`) |
+| I2C register **read** | `i2cSlaveFifoISR()` **transmit branch** (`com_cpu2.c:2915`) |
+| UART AT | via `applyHostRegisterWrite()` |
+| CAN | via `applyHostRegisterWrite()` |
+
+The read hook exists because a polling host proves it is alive by **reading**.
+The ESP32's steady state is nine read transactions every 250 ms and not a
+single write, so a unit that reloaded on writes alone would pause every
+running slot 30 s after the last mode command while the link was healthy.
+**Verified on hardware:** `eWatchdogRemaining_s` holds at 30.0 while the
+ESP32 polls.
+
+**CPU2 owns the countdown, CPU1 performs the pause.** CPU2 has the interfaces
+and the timebase (`hostWatchdogTick()` in the 8 Hz `timerISR`), but it must
+never write a slot's control state — it bumps `supervision.wdPauseSeq` and
+`serviceHostWatchdog()` on CPU1 acts on it.
+
+> **Not a substitute for the trip system.** Seconds, not switching cycles.
+> Hardware trips are off and `BTS_tripEpwm()` is still the only fast
+> protection.
+
+### F-RAM slot state persistence
+
+Every **6 s** and on each state transition, CPU2 saves a per-slot record —
+direction, END flag and all six counters, with a CRC-32.
+
+```
+0x0000 - 0x03FF   calibration, 8 channels x 128 B stride
+0x0400 - 0x040F   global voltage thresholds
+0x0500 - 0x05FF   slot runtime state, 8 slots x 32 B stride
+```
+
+`STATE_FRAM_BASE 0x0500`, `STATE_FRAM_STRIDE 32` — a fixed stride decoupled
+from `sizeof`, for the same reason as the calibration block. Writes are
+deferred to `BTS_serviceDeferredWork()`, one slot per pass, so the eight
+stagger across the window and never hold the I2C controller for eight
+transfers at once. A **paused** slot is saved as running in its held
+direction.
+
+Boot restore (`loadSlotStates()`, `com_cpu2.c:1272`):
+
+| Record | Result |
+|---|---|
+| Invalid or absent | `STOPPED`, counters zeroed. **The normal first-boot case — do not log it as an error** |
+| Valid, was STOPPED or END | Counters and that state restored |
+| Valid, was CHARGING or DISCHARGING | Counters restored, slot comes back **`PAUSED` + `RESTORED`**, converter off |
+
+> ### A slot never resumes power by itself after a reset
+>
+> The safety-critical rule. The cell may have been swapped while the unit was
+> off. `applyRestoredSlotStates()` calls `slotStop()` then `slotPause()` — it
+> cannot re-energise a slot. **Verified on hardware:** a slot came back
+> `PAUSED` + `RESTORED` with its counters kept and refused to auto-resume.
+
+One IPC flag is raised after the whole file is consistent, not one per slot.
+Periodic saves are **armed only once CPU1 acknowledges the restore**, so a
+6 s tick cannot overwrite a record before it has been applied.
 
 ---
 
@@ -216,8 +381,42 @@ GPIO28/29 do, and the two roles are mutually exclusive:
 
 | `BTS_DEBUG_CONSOLE` | GPIO28 | GPIO29 | Console | LEDs | Ch1 GPIO trip |
 |---|---|---|---|---|---|
-| `true` (current) | SCIRXDA | SCITXDA | **SCIA @ 115200 8N1** | off | off |
+| `true` (current) | SCIRXDA | SCITXDA | **SCIA, see the baud warning** | off | off |
 | `false` | ch1 trip in | WS2812B TX | **none** | on | on |
+
+> ### The console's real baud rate is ~7267, not 115200
+>
+> **Open-issue, root cause not established.** `BTS_CONSOLE_BAUDRATE` is
+> `115200` and `SCI_setConfig()` computes BRR = 42 from
+> `DEVICE_LSPCLK_FREQ` — which by the arithmetic should give about
+> 145 kbaud, already not 115200. In practice the console only works when the
+> host connects at **approximately 7267 baud**; at 115200 every received byte
+> is framing garbage (observed 254, 248, 254, 245 … where `A`, `T`, `+` were
+> sent).
+>
+> The working rate implies the real LSPCLK is far lower than
+> `DEVICE_LSPCLK_FREQ` claims. This has **not** been confirmed: reading
+> `ClkCfgRegs` over JTAG returned all zeros, a known artefact on this part
+> when the registers are read while the core is running. **Halt the core
+> before judging the PLL**, and do not change the baud constant until the
+> clock tree has been read properly — the same LSPCLK feeds SPI and the LED
+> driver's 800 kbaud timing.
+
+New registers become addressable through `uartRegConfig[]` automatically, so
+v2's additions already have names: `C<n>CHS` / `C<n>DHS` for the per-slot
+run-time seconds, `WD` for the watchdog timeout and `WDREM` for the
+countdown. Pause and resume have explicit commands —
+**`AT+C<n>PAUSE` / `AT+C<n>RESUME`** — rather than making an operator compute
+a mode bitmask to stop a cell safely.
+
+**Verified on hardware:** `AT+WD?` → `+WD=30.00`; `AT+C0CHS?`, `AT+C0PAUSE`
+and `AT+C0RESUME` all answer `OK`.
+
+> **Known bug:** the console periodically prints `WARNING: host watchdog
+> DISABLED` even when `eHostWatchdog_s` reads 30.0 and the countdown is
+> healthy. `hostWdDisableWarn` is set only where a write of `0.0` arrives
+> (`com_cpu2.c:2573`) and reads 0 when sampled, so the trigger has not been
+> found. Cosmetic — supervision is verifiably armed — but alarming and wrong.
 
 There is no SCIB console: GPIO18 is SPICLKA and GPIO19 is the ADC1 chip
 select. In a production build the host must use I2C or CAN.
@@ -256,7 +455,7 @@ physical stimulus at the same instant. `CAL_CMD_COMPUTE_SAVE` runs the
 two-point maths, validates against gain windows, and hands the result to CPU2,
 which writes the F-RAM **from the idle loop, never from an ISR**. Progress is
 a bitfield in `eCalStatus`, failures a code in `eCalResult`, and live
-telemetry streams through the window at 1056-1088.
+telemetry streams through the window at 1224-1256.
 
 Safety properties that must survive any edit: trips stay armed; the
 fixed-current setpoint is clamped to 0.8 pu (≈8 A); the input-voltage
@@ -278,43 +477,60 @@ header/CRC contract, the load/save flow and the defaults.
 
 `registers.h` (C2000) and `esp32-btle-proxy/components/bts_link/include/bts_regs.h`
 (ESP32) are two hand-maintained transcriptions of the same map, with **no
-build coupling**. Every address, stride, base, count, opcode and result code
-agrees; `TOTAL_REGISTERS` / `BTS_TOTAL_REGISTERS` is 305 on both sides.
+build coupling**.
 
-But four identifier families mean different things in the two files:
+> ### They have drifted before — check the mirror when either changes
+>
+> In the v2 reorder `bts_regs.h` lost `eWatchdogRemaining_s` (1220), which put
+> every calibration telemetry address in it 4 bytes low: telemetry at
+> 1220–1252 against the C2000's 1224–1256, `BTS_TOTAL_REGISTERS` 314 against
+> 315, and `BTS_CAL_WINDOW_COUNT` 14 against a 15-register window.
+>
+> `poll_cal_window()` would have misdecoded every telemetry value during a
+> bench calibration, shifted by one register — and **only** during one, since
+> that window is read only while calibration is live. Normal polling looked
+> perfectly healthy. Found and fixed 2026-09-20.
+>
+> The lesson stands: when either file changes, diff them register by register.
+> `registers.h` is authoritative; fix the mirror against it, never the
+> reverse. Details: `Docs/api-specification.md` §2.11.
+
+Every region base, stride and per-slot offset otherwise agrees, and so do the
+opcode, result-code and status-bit numbering. But three identifier families
+mean different things in the two files:
 
 | Identifier | `registers.h` (C2000) | `bts_regs.h` (ESP32) |
 |---|---|---|
 | `BTS_STATUS_*` | bit **positions** (`0U`, `1U`, …) | bit **masks** (`1u << 0`, …) |
 | `BTS_CAL_ST_*` | bit **positions** | bit **masks** |
-| `BTS_CAL_F28V_GAIN` … `BTS_CAL_VOUT_OFFSET_V` | register **indices**, 0-11 | **byte** offsets, 0-44 |
-| `BTS_SENSE_VOLTAGE` / `BTS_SENSE_CURRENT` | indices, 0 and 1 | byte offsets, 0 and 4 |
-| `BTS_SENSE_BASE` | function-like macro returning an **index** | a bare constant `1092`, a **byte address** |
+| `BTS_RT_*`, `BTS_SET_*`, `BTS_CAL_F28V_GAIN` … | register **index** offsets (0, 1, 2 …) | **byte** offsets (0, 4, 8 …) |
+| `BTS_RT_BASE`, `BTS_SET_BASE` | function-like macros returning an **index** | bare constants `0` and `384`, **byte addresses** |
 
 Each convention is self-consistent — the C2000 indexes `registers[]`, the
-ESP32 addresses the wire. `BTS_SENSE_BASE` is the sharpest case: the same
-spelling is a macro on one side and a constant on the other. **Copying a line
-between these files compiles and is silently wrong.** When you change one,
-change the other, and check the whole family rather than the one line you
-came for.
+ESP32 addresses the wire — and the v2 reorder sharpened the trap rather than
+softening it: `BTS_RT_STATUS` is `0U` in both files, while
+`BTS_RT_CELL_VOLTAGE` is `1U` on the C2000 and `4` on the ESP32. **Copying a
+line between these files compiles and is silently wrong.** When you change
+one, change the other, and check the whole family rather than the one line
+you came for.
 
 ---
 
 ## Status word
 
 `eChX_Status`, packed by `publishStatusToCpu2()` and carried to hosts as a
-`float32`.
+`float32`. Authoritative table: `Docs/api-specification.md` §2.7.
 
 | Bit | Name | Populated? |
 |---|---|---|
-| 0 | `RUNNING` | yes |
+| 0 | `RUNNING` | yes — **stays set while PAUSED** |
 | 1 | `STOPPED` | yes |
-| 2 | `FINISHED` | **never written** |
-| 3 | `OVERCURRENT_TRIP` | yes |
+| 2 | `FINISHED` / `END` | **driven since v2** — but nothing asserts it yet |
+| 3 | `OVERCURRENT_TRIP` | never in this build |
 | 4 | `CHARGING` | yes |
 | 5 | `DISCHARGING` | yes |
-| 6 | `CONST_VOLTAGE` | yes — now driven from `ctrlMode_logic` |
-| 7 | `CONST_CURRENT` | yes — now driven from `ctrlMode_logic` |
+| 6 | `CONST_VOLTAGE` | always 0 — CC-only build |
+| 7 | `CONST_CURRENT` | always 1 — CC-only build |
 | 8 | `SLAVE_MODE` | yes |
 | 9 | `GROUP_DISCONNECT` | yes |
 | 10 | `REVERSE_POLARITY` | yes |
@@ -322,72 +538,49 @@ came for.
 | 12 | `CALIBRATING` | yes |
 | 13 | `CAL_V_VALID` | yes, from **persisted** `calFlags` |
 | 14 | `CAL_I_VALID` | yes, from **persisted** `calFlags` |
+| 15 | `PAUSED` | **yes — new in v2** |
+| 16 | — | **unused, reads a constant 0** |
+| 17 | `WD_TRIPPED` | **yes — new in v2** |
+| 18 | `RESTORED` | **yes — new in v2** |
 
 Bits 6/7 were tracked in the ISR all along but never copied out, so they read
-0 on every earlier build. Bits 13/14 come from `calValidFlags[]` rather than
-the in-session capture, so a slot calibrated in an earlier session still shows
-its ticks after a power cycle.
+0 on every build before the calibration work. Bits 13/14 come from
+`calValidFlags[]` rather than the in-session capture, so a slot calibrated in
+an earlier session still shows its ticks after a power cycle.
 
 > **The hard ceiling is bit 23.** The word reaches the host as a `float32`,
 > whose 24-bit significand makes integers exact only to bit 23
-> (`registers.h:420-424`). Bits 15-23 are free. Never go past 23.
+> (`registers.h:418-421`). Bits 19-23 are free. Never go past 23.
 
 ---
 
 ## Declared but never written
 
-Do not mistake any of these for a bug you introduced. They read back as a
-constant `0.0`, and because they are `REG_ACCESS_RO` a host cannot clear them
-either.
+Under v2 this list is nearly empty — most of it was either deleted or
+brought to life.
 
-| What | Where | Note |
-|---|---|---|
-| `eChX_MinVoltage` (324 + ch×24) | stats block | Intended per-run voltage floor |
-| `eChX_MaxVoltage` (328 + ch×24) | stats block | Intended per-run voltage ceiling |
-| Status bit 2 (`FINISHED`) | `status[].finished` | Read into the bitset, never set |
-| `iref_cuttout_A` | `BTS_userInput` | Loaded from `ChargeCurrentMin`, read by nothing |
-| `eTripStatus` (988) | unit block | See below |
-| `canData[].mAh` / `.mWh` | CAN struct | Populated now, but still not transmitted |
+| What | Status |
+|---|---|
+| `eChX_MinVoltage`, `eChX_MaxVoltage` | **Deleted from the map.** RO and never written on either core, 16 registers of permanent 0.0. Removing them paid for most of the 16 new run-time-seconds registers. If per-run extremes are wanted back, use the settings block's spare register — and actually write them |
+| The four accumulators + two seconds counters | **Live.** All six per slot, in the runtime block. See the counters section above |
+| Status bit 2 (`FINISHED` / `END`) | **Driven**, but no termination path asserts it yet |
+| `eChX_SettingsSpare` | Reserved by design. RO, reads 0.0, one per slot at settings offset 23 — the place to put a future per-slot setting without moving anything |
+| `iref_cuttout_A` | Still loaded from `eChX_ChargeCurrentMin` and read by nothing. CC-to-cutoff taper is the ESP32's job |
+| `eTripStatus` (1180) | Still always 0. See below |
+| `canData[].mAh` / `.mWh` | Populated, but `sendCANData()` still does not transmit them |
 
 `eTripStatus` is mirrored from `cpu1Status.tripStatus`, which is only ever
 written by `epwmTripISR`. That ISR is registered and enabled unconditionally,
 but `BTS_HAL_setupEPWMTripZone()` masks the one-shot trip **signals** and
-disables the trip-zone **interrupt** on any slot whose `BTS_TRIP_HW_CHn_ENABLED`
-is false (`bts_hal.c:1057-1105`) — which is all eight. So the word stays 0
+disables the trip-zone **interrupt** on any slot whose
+`BTS_TRIP_HW_CHn_ENABLED` is false — which is all eight. So the word stays 0
 until the trip links are wired and those flags are turned back on. The
 software trip path forces the outputs low through the same trip zone without
 going near this ISR.
 
-The two accumulator slots that used to sit in this table — 320 and 332 — are
-now live as `eChX_ChargeAcc_mAh` / `_mWh`, with the discharge pair appended at
-1156 + ch×8. See the accumulator note below. The ESP32 still integrates
-charge and energy itself (`coulomb_counter.c`) and reports the BTS figures
-beside its own.
-
-### Charge / energy accumulators
-
-Four registers per slot, all `REG_ACCESS_RO`:
-
-| Register | Address |
-|---|---|
-| `eChX_ChargeAcc_mAh` | 320 + ch×24 |
-| `eChX_ChargeAcc_mWh` | 332 + ch×24 |
-| `eChX_DischargeAcc_mAh` | 1156 + ch×8 |
-| `eChX_DischargeAcc_mWh` | 1160 + ch×8 |
-
-Integrated on CPU1 in `C1()` from `Isense_A` / `Vsense_V` — the **16-bit
-ADS131M08**, not the 12-bit path in the stats block — at the C1 rate of
-6.667 Hz (`TASKC_FREQ_HZ / 3`, since the C tasks rotate C1→C2→C3 off one
-20 Hz timer). Published through `cpu1Status` and mirrored by CPU2 like every
-other CPU1-produced value.
-
-Each direction accumulates **positive magnitude** into its own pair, so a
-charge then a discharge on one slot leaves two separate totals. **A pair is
-zeroed only when its own direction starts** (`modeCallback()`, propagated to
-group followers) — never on stop, on trip, or on a mode write that does not
-start the slot. Accumulation runs only while `status[ch].running` and the
-slot is not calibrating. They stay RO, so a host cannot zero them on demand;
-the start-of-direction reset is what replaces that.
+The ESP32 still integrates charge and energy itself (`coulomb_counter.c`) and
+reports the BTS figures beside its own, because it samples on real elapsed
+time rather than the BTS's fixed 150 ms step.
 
 ---
 
@@ -411,30 +604,58 @@ the start-of-direction reset is what replaces that.
 ## Development rules
 
 - **Never insert a register mid-map.** Hosts hard-code byte addresses; every
-  addition appends above the current top (1216). Adding one means updating,
-  together: the enum, the `NUM_*` count, `TOTAL_REGISTERS`, `regConfig[]`,
-  `uartRegConfig[]` (both are sized `TOTAL_REGISTERS` and must stay
-  index-aligned), the ESP32 `bts_regs.h` mirror, and `Docs/api-specification.md`.
-- **Index through the `BTS_*_BASE(ch)` macros.** The blocks do not share a
-  stride (control 10/ch, stats 6/ch, temperature 2/ch, calibration 12/ch,
-  sense 2/ch, cell-temp 1/ch, plus three unit-scoped blocks). Assuming ten
-  registers per channel everywhere is the single most common bug in this
-  codebase and produced silent cross-channel corruption.
-- **A new CPU1-visible register costs `CPU2TOCPU1RAM`.** Check the map.
+  addition goes into the spare space its region already carries, or above the
+  current top (1256). Adding one means updating, together: the enum, the
+  `NUM_*` count, `TOTAL_REGISTERS`, `regConfig[]`, `uartRegConfig[]` (both are
+  sized `TOTAL_REGISTERS` and must stay index-aligned), the ESP32
+  `bts_regs.h` mirror, and `Docs/api-specification.md`.
+  - A per-slot field goes in its region's spare space — runtime has none, so
+    a new runtime field means a stride change and another breaking reorder;
+    settings has one spare register per slot precisely so it does not.
+- **Index through the `BTS_RT_BASE(ch)` / `BTS_SET_BASE(ch)` macros.** The two
+  per-slot regions have **different strides** — 12 registers and 24. Mixing
+  them is the single most common bug in this codebase and produces silent
+  cross-channel corruption rather than an error.
+- **A new CPU1-visible register costs `CPU2TOCPU1RAM`** — two words each,
+  234 words free. Check the map.
 - **If CPU1 needs to act on a register write, add it to the decode.**
-  `BTS_HandleRegisterWrite()` only decodes the control block, the calibration
-  block and `eCalCommand`. Everything else — including `eCalibrationMode` —
-  has its `IPC_FLAG0` acked and silently discarded.
+  `BTS_HandleRegisterWrite()` decodes the settings region (the mode register
+  and the calibration group) and `eCalCommand`. Everything else — including
+  `eCalibrationMode` and `eHostWatchdog_s` — has its `IPC_FLAG0` acked and
+  silently discarded. The runtime region is RO and never reaches the decode.
 - **Never write F-RAM from an ISR.** Set a pending flag and let
-  `BTS_serviceDeferredWork()` in the idle loop do it. Both the
-  `eCalibrationMode` commit and `CAL_CMD_COMPUTE_SAVE` use this pattern; a
-  synchronous write inside the I2C target ISR held off the host mid-transaction.
+  `BTS_serviceDeferredWork()` in the idle loop do it. The `eCalibrationMode`
+  commit, `CAL_CMD_COMPUTE_SAVE` and the 6 s slot-state save all use this
+  pattern; a synchronous write inside the I2C target ISR held off the host
+  mid-transaction.
+- **CPU2 must never write a slot's control state.** The single-writer rule
+  applies to control as well as to memory. The watchdog and the boot restore
+  both go through `supervision` as a flag, and CPU1 performs the action.
 - **Validate before every F-RAM write.** `validateCalibration()` checks the
   two-field header, the temperature window, the F28 gains, the Iout/Vout gain
-  windows, the reciprocal-pair agreement and the CRC-32. All of it.
+  windows, the reciprocal-pair agreement and the CRC-32. All of it. The slot
+  state block has its own header + CRC check with the same discipline.
 - **Do not hard-code pins outside the HAL / init functions** — the `#define`s
   in `bts_user_settings.h` exist for this. Note that all pin muxing for
   *both* cores happens on CPU1 (`BTS_HAL_setupCpu2Pins`); the mux registers
   are not writable from CPU2.
-- **Build through the CCS MCP `buildProject` tool.** Both configurations, then
-  check the maps.
+- **Build through the CCS MCP `buildProject` tool.** Both configurations,
+  then check the maps.
+
+### Build and debug notes
+
+- **Starting a debug session loads only `cpu1`.** CPU2 keeps running whatever
+  was in its RAM. Since CPU2 owns I2CA, a CPU1-only reload leaves the ESP32
+  link dead while CPU1 looks perfectly healthy. Load CPU2's `.out`
+  explicitly, then restart.
+- **Do not halt CPU2 mid-I2C-transaction.** A breakpoint that stops the core
+  while the host-facing target is part way through a transfer leaves the I2C
+  target **wedged**: SCL held low with `BUS_BUSY` set and no interrupt
+  pending. `serviceI2CTargetWatchdog()` cannot recover it, because that runs
+  from the idle loop of the core you just stopped. The ESP32 link does not
+  come back without a reload or a power cycle. If you must break on CPU2,
+  break somewhere the I2C ISR is not active.
+- **After building, confirm every shared symbol resolves to the same address
+  in `cpu1/*.map` and `cpu2/*.map`** — there are eight: `registers`,
+  `ipcMsg`, `calValidFlags`, `supervision`, `canData`, `cpu1Status`,
+  `startup_mode`, `startup_enable`.

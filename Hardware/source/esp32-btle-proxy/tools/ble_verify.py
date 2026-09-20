@@ -19,10 +19,16 @@ from bleak import BleakClient, BleakScanner
 
 DEVICE_NAME = "BTS-Tester"
 
-# Must match BLE_PROTO_VERSION in components/ble_svc/include/ble_proto.h.
-# A mismatch means the structs below no longer describe what the firmware
-# sends, so decoding would report plausible-looking rubbish rather than fail.
-EXPECTED_PROTO_VERSION = 3
+# The lowest BLE_PROTO_VERSION whose records the structs below describe.
+#
+# This is a MINIMUM, not an equality test. The interface is append-only: a
+# newer firmware adds characteristics and appends fields, so every offset
+# this script decodes stays put. Version 4 added characteristic 000d
+# (register access), which this script does not exercise.
+#
+# An OLDER firmware is the real hazard - proto 2's ble_slot_status_t is 40 B
+# where this decodes 68, so it would be rejected here rather than misread.
+MIN_PROTO_VERSION = 3
 
 # e5f1xxxx-9a4c-4b7d-8f2e-1c3a5b7d9f01
 def uuid(disc):
@@ -160,10 +166,13 @@ async def main():
         if unit is None:
             print("FAIL: unit status too short to decode")
             return 1
-        if unit["proto_version"] != EXPECTED_PROTO_VERSION:
+        if unit["proto_version"] < MIN_PROTO_VERSION:
             print(f"FAIL: proto version {unit['proto_version']}, "
-                  f"this script decodes {EXPECTED_PROTO_VERSION}")
+                  f"this script needs {MIN_PROTO_VERSION} or newer")
             return 1
+        if unit["proto_version"] > MIN_PROTO_VERSION:
+            print(f"note: firmware is proto {unit['proto_version']}; this "
+                  f"script verifies the proto {MIN_PROTO_VERSION} surface")
 
         # Walk every slot through the select characteristic.
         print()

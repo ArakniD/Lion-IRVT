@@ -1,0 +1,18 @@
+# Full Home Assistant test harness.
+#
+# Needs Python 3.12 or newer - Home Assistant does not support 3.11 or below.
+# On an older interpreter the protocol, transport and device tests still run
+# (they never import Home Assistant); tests/test_homeassistant.py skips with
+# a message saying why.
+#
+#     python -m pip install -r requirements-test.txt
+#     python -m pytest
+
+pytest>=8.0
+pytest-asyncio>=0.24
+pytest-homeassistant-custom-component>=0.13.180
+
+# Transport dependencies. bleak is pulled in by Home Assistant itself; the
+# CAN transport is optional at runtime and imported lazily, but the tests
+# exercise its codec, which needs no hardware.
+python-can>=4.3.0

@@ -407,7 +407,7 @@ static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_
 }
 
 /*
- * Refreshes the calibration window, registers 1200-1252, as one burst.
+ * Refreshes the calibration window, registers 1200-1256, as one burst.
  *
  * Called only when calibration is live or a command has just been issued:
  * this feature is idle almost all of the time and there is no reason to
@@ -424,19 +424,29 @@ static void poll_cal_window(bts_cal_state_t *cal, const bts_channel_state_t *cha
 
     const uint32_t slot = (uint32_t)w[0];
 
+    /*
+     * Indices are offsets from BTS_REG_CAL_SLOT (1200), four bytes apart:
+     *   0 eCalSlot      1 eCalCommand   2 eCalArgument  3 eCalStatus
+     *   4 eCalResult    5 eWatchdogRemaining_s          6.. telemetry
+     *
+     * Index 5 is the watchdog countdown, NOT ads_v_pu. It used to be read as
+     * ads_v_pu because this mirror was missing eWatchdogRemaining_s, which
+     * shifted all nine telemetry floats one register low - a plausible but
+     * wrong pu that would land a capture in the wrong window.
+     */
     cal->slot        = (slot < BTS_NUM_CHANNELS) ? (uint8_t)slot : BTS_CAL_SLOT_NONE;
     /* w[1] is eCalCommand, which self-clears and carries nothing for a host. */
     cal->status_bits = (uint32_t)w[3];
     cal->result      = (uint32_t)w[4];
-    cal->ads_v_pu    = w[5];
-    cal->ads_i_pu    = w[6];
-    cal->ads_v_v     = w[7];
-    cal->ads_i_a     = w[8];
-    cal->f28_v_pu    = w[9];
-    cal->f28_i_pu    = w[10];
-    cal->f28_v_v     = w[11];
-    cal->f28_i_a     = w[12];
-    cal->temp_c      = w[13];
+    cal->ads_v_pu    = w[6];
+    cal->ads_i_pu    = w[7];
+    cal->ads_v_v     = w[8];
+    cal->ads_i_a     = w[9];
+    cal->f28_v_pu    = w[10];
+    cal->f28_i_pu    = w[11];
+    cal->f28_v_v     = w[12];
+    cal->f28_i_a     = w[13];
+    cal->temp_c      = w[14];
     cal->active      = (cal->status_bits & BTS_CAL_ST_ACTIVE) != 0;
 
     /* Ticks come from the slot's own status word, which reflects what is

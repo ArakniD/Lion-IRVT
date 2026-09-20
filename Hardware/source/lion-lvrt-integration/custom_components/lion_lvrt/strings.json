@@ -1,0 +1,124 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Lion LVRT battery tester",
+        "description": "Choose how Home Assistant reaches the tester. Bluetooth works through an ESPHome or Shelly Bluetooth proxy as well as a local adapter.",
+        "data": {
+          "transport": "Connection"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Add {name}",
+        "description": "Found {name} at {address}.\n\nOptionally add a CAN interface or the proxy's HTTP address. Either one grants register access, which is what enables direct charge and discharge commands on firmware whose BLE service has no register characteristic.",
+        "data": {
+          "slot_count": "Number of slots",
+          "can_interface": "CAN interface (optional, e.g. can0)",
+          "http_host": "HTTP address (optional, e.g. 192.168.1.50)"
+        }
+      },
+      "ble": {
+        "title": "Bluetooth connection",
+        "description": "Enter the tester's Bluetooth address.",
+        "data": {
+          "address": "Bluetooth address",
+          "slot_count": "Number of slots",
+          "can_interface": "CAN interface (optional)",
+          "http_host": "HTTP address (optional)"
+        }
+      },
+      "can": {
+        "title": "CAN connection",
+        "description": "SocketCAN reaches the C2000 controller directly. Note that it does not reach the ESP32's test engine, so characterisation tests are unavailable on a CAN-only setup - charge, discharge and configuration all work.",
+        "data": {
+          "can_interface": "Interface",
+          "can_bitrate": "Bit rate",
+          "slot_count": "Number of slots"
+        }
+      },
+      "http": {
+        "title": "HTTP connection",
+        "description": "The proxy's web API. Requires the tester to have joined a WiFi network.",
+        "data": {
+          "http_host": "Host or IP address",
+          "slot_count": "Number of slots"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This tester is already configured"
+    },
+    "error": {
+      "cannot_connect": "Could not reach the tester",
+      "unknown": "Unexpected error"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "voltage": { "name": "Voltage" },
+      "current": { "name": "Current" },
+      "temperature": { "name": "Cell temperature" },
+      "slot_state": { "name": "State" },
+      "fault": { "name": "Fault" },
+      "live_charge": { "name": "Charge moved" },
+      "live_energy": { "name": "Energy moved" },
+      "progress": { "name": "Progress" },
+      "elapsed": { "name": "Elapsed" },
+      "bts_charge_mah": { "name": "Unit charge total" },
+      "bts_charge_mwh": { "name": "Unit charge energy" },
+      "bts_discharge_mah": { "name": "Unit discharge total" },
+      "bts_discharge_mwh": { "name": "Unit discharge energy" },
+      "bts_charge_seconds": { "name": "Unit charge time" },
+      "bts_discharge_seconds": { "name": "Unit discharge time" },
+      "input_voltage": { "name": "Input voltage" },
+      "unit_state": { "name": "Unit state" },
+      "uptime": { "name": "Uptime" },
+      "watchdog_timeout": { "name": "Host watchdog timeout" }
+    },
+    "binary_sensor": {
+      "running": { "name": "Running" },
+      "charging": { "name": "Charging" },
+      "paused": { "name": "Paused" },
+      "needs_operator": { "name": "Needs operator" },
+      "fault": { "name": "Fault" },
+      "reverse_polarity": { "name": "Reverse polarity" },
+      "calibrating": { "name": "Calibrating" },
+      "calibration_valid": { "name": "Calibration valid" },
+      "group_follower": { "name": "Group follower" },
+      "slot_disabled": { "name": "Slot disabled" },
+      "overcurrent_trip": { "name": "Over-current trip" },
+      "online": { "name": "Online" },
+      "charge_allowed": { "name": "Charge allowed" },
+      "discharge_allowed": { "name": "Discharge allowed" },
+      "watchdog_armed": { "name": "Host watchdog armed" },
+      "wifi_connected": { "name": "WiFi connected" }
+    },
+    "select": {
+      "slot_mode": { "name": "Mode" }
+    },
+    "button": {
+      "start": { "name": "Start test" },
+      "stop": { "name": "Stop" },
+      "pause": { "name": "Pause" },
+      "resume": { "name": "Resume" },
+      "clear_fault": { "name": "Clear fault" },
+      "abort_all": { "name": "Abort all slots" }
+    },
+    "number": {
+      "charge_voltage_max": { "name": "Charge voltage max" },
+      "charge_voltage_min": { "name": "Charge voltage min" },
+      "discharge_voltage_min": { "name": "Discharge voltage min" },
+      "discharge_voltage_max": { "name": "Discharge voltage max" },
+      "charge_current_max": { "name": "Charge current max" },
+      "discharge_current_max": { "name": "Discharge current max" },
+      "min_cell_temp": { "name": "Cell temperature min" },
+      "max_cell_temp": { "name": "Cell temperature max" },
+      "charge_disable_v": { "name": "Charge disable threshold" },
+      "charge_restrict_v": { "name": "Charge restrict threshold" },
+      "discharge_restrict_v": { "name": "Discharge restrict threshold" },
+      "discharge_disable_v": { "name": "Discharge disable threshold" },
+      "host_watchdog": { "name": "Host watchdog timeout" }
+    }
+  }
+}

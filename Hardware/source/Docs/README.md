@@ -115,6 +115,32 @@ If a slot tripped earlier, clearing the fault does nothing until you remove
 whatever is asserting the trip. A clear that "doesn't take" is this, not a
 dead slot. Fix the cause, then clear.
 
+**3. Slots may come back from a reset as `PAUSED` + `RESTORED`.**
+
+The unit saves each slot's run state to F-RAM every 6 s. If it was power-cycled
+or reset while a slot was running, that slot comes back **paused, with its
+counters intact, and deliberately refuses to resume on its own** — the cell
+may have been swapped while the unit was off.
+
+Calibration is refused while any slot is running a test, and a restored slot
+still counts as running for that check. `/api/status` shows it as
+`bts.restored: true`. Stop it (`POST /api/abort_all`) before you calibrate;
+resuming it is the wrong move if you are about to pull the cell out anyway.
+
+**4. The host watchdog will pause running slots after 30 s of silence.**
+
+If nothing is polling the unit — no ESP32, no script — every slot that is
+charging or discharging pauses after 30 seconds, with `bts.watchdog_tripped`
+set. This does **not** affect the slot you are calibrating: a calibrating slot
+is not "running" in that sense and the watchdog leaves it alone. It affects
+any *other* slot that happened to be mid-test, which is another reason to stop
+everything before a calibration session.
+
+`calibrate.py` drives the unit over BLE, and each of its commands becomes an
+I2C write through the proxy, so the traffic does reach the watchdog. But the
+thing that keeps it fed reliably is the proxy's own 250 ms I2C poll — **leave
+the ESP32 powered and connected** for the whole session.
+
 ---
 
 ## Wiring
@@ -302,7 +328,7 @@ to the log; the procedure is driven over BLE or HTTP.
 |---|---|---|
 | `per-unit reading outside the required window` | The supply is set so the slot reads between 0.2 and 0.8 pu — the firmware cannot tell which point you meant. | Follow the live pu number the script prints. Below 0.2 for the low point, above 0.8 for the high. Roughly 0.85 V and 4.25 V. |
 | `busy - another slot is already in calibration` | Only one slot calibrates at a time. | `CAL_CMD_EXIT` the other slot. `CAL_CMD_ENTER` force-exits the others, so this usually means a stale session from a crashed script. |
-| `slot is running a test - stop it first` | A charge or discharge test is active somewhere on the unit. | Stop it: `POST /api/abort_all`. |
+| `slot is running a test - stop it first` | A charge or discharge test is active somewhere on the unit. **A slot that came back `PAUSED` + `RESTORED` after a reset counts as running.** | Stop it: `POST /api/abort_all`. |
 | `slot is disabled by its ENABLE strap, or is a group follower` | The ENABLE dip switch masks this slot off, or it follows a lower-numbered leader and has no control loop of its own. | Check the MODE/ENABLE straps. In a group, calibrate the leader. |
 | `insufficient captures` | Voltage needs both points; current needs the zero plus one loaded point. | Capture the missing point. Save computes and stores whichever of the two is complete, so a partial result is normal, not a failure. |
 | `computed gain failed validation` | The fit landed outside its expected window — `IoutGain_pu` outside 0.05–0.20, or `VoutGain_pu` outside 0.10–0.40. | Almost always a wiring error: DMM on the wrong terminals, in the wrong jack, or measuring a different slot. Check and redo. |
@@ -312,6 +338,10 @@ to the log; the procedure is driven over BLE or HTTP.
 | The slot trips during the current phase | Real over-current, or a trip source still asserted. Calibration exits and zeroes the reference — as designed. | Check the wiring for a short. A latched `TZOSTFLG` will not clear while its source is asserted. |
 | Nothing happens for two minutes, then the slot stops | The dead-man timeout. If no calibration command arrives for 120 s while a slot is driving current, it auto-exits. | Expected. Re-enter and continue. |
 | DMM reads 0 A in the current phase | The lead is in the volts jack. | Move it to the amps jack. |
+| Another slot paused itself partway through the session | The host watchdog. Nothing talked to the unit for 30 s, so every *running* slot paused. The slot under calibration is unaffected. | Expected. Check the ESP32 is powered and its I2C link is up (`GET /api/i2c_diag`), then resume or stop the slot. |
+| A slot shows `restored` after you power-cycled the unit | The F-RAM state block. It was mid-run when the unit went down, and came back paused with its counters rather than resuming into a cell that may have been changed. | Working as designed. Stop it before calibrating; resume it only if you know the same cell is still in the slot. |
+| The AT console prints `WARNING: host watchdog DISABLED` repeatedly | **Known bug.** The message is spurious — supervision is armed. | Ignore it. Confirm with `AT+WD?`, which should answer `+WD=30.00`. |
+| The AT console answers only garbage at 115200 | **Known bug.** The console's real baud rate is not what the build configures. | Connect at **~7267 baud**. See the console note below. |
 | Current reads the right size with the wrong sign afterwards | A signed value was entered where a magnitude was wanted. | Recalibrate that slot's current. Enter the absolute value. |
 | `unsupported DMM` on connect | `*IDN?` returned a model the script does not know. | Check it is the right instrument. `--allow-unknown-dmm` overrides, if you are sure it speaks the same SCPI. |
 | Both ticks stay grey after a successful save | The save reported bit 7 but the status bits did not follow. | Re-read `/api/calibration`. If it persists, the F-RAM image may have failed validation on reload — power-cycle and check. |
@@ -342,12 +372,61 @@ Verify the result independently before you trust the unit:
 
 - **Hardware over-current trips are disabled.** The bench supply's current
   limit is your fast backstop. Set it. Stay at the bench.
+- **The host watchdog is not over-current protection.** It pauses running
+  slots 30 s after the host goes quiet — a supervision timeout measured in
+  seconds, not a fast trip. It does not make unattended high-current testing
+  safe.
 - Calibration current is **discharge** — the external supply is the sink.
 - Enter DMM currents as **magnitudes**.
 - Only one slot calibrates at a time. Entering on one force-exits the others.
-- Calibration is refused while any slot is running a test.
+- Calibration is refused while any slot is running a test — including a slot
+  restored as `PAUSED` after a reset.
+- **A slot never resumes power by itself after a reset.** A restored slot
+  holds its counters and waits for an explicit command. Do not script around
+  this.
 - The fixed-current setpoint is clamped to 0.8 pu (about 8 A).
 - A trip, an exit, a host disconnect or a unit state change all zero the
   reference before anything else changes.
 - A slot driving current with no command for 120 s auto-exits.
 - Remove cells from the slot before calibrating it.
+
+---
+
+## Known issues
+
+Two defects in the debug console, both found during hardware verification and
+neither yet fixed. Neither affects calibration accuracy or the safety paths,
+but both will waste your time if you meet them cold.
+
+### The AT console's baud rate is not 115200
+
+**Connect at approximately 7267 baud.** At 115200 every received byte is
+framing garbage — the console answers, but with bytes like 254, 248, 254, 245
+where `A`, `T`, `+` were sent.
+
+`BTS_CONSOLE_BAUDRATE` is `115200` and `SCI_setConfig()` computes BRR = 42
+from `DEVICE_LSPCLK_FREQ`, which should give roughly 145 kbaud — already not
+115200. The rate that actually works implies the real LSPCLK is far lower than
+`DEVICE_LSPCLK_FREQ` claims. **The root cause is not established.** Reading
+`ClkCfgRegs` over JTAG returned all zeros, which is a known artefact on this
+part when the registers are read while the core is running, so the PLL
+configuration has not yet been confirmed either way.
+
+Do not "fix" this by changing the baud constant until the clock tree has been
+read properly with the core halted. Set your terminal to 7267 and carry on.
+
+### A spurious watchdog-disabled warning
+
+The console periodically prints:
+
+```
+WARNING: host watchdog DISABLED - slots will not pause if the host stops responding
+```
+
+**This is wrong.** `AT+WD?` answers `+WD=30.00` and the countdown at
+`eWatchdogRemaining_s` is healthy. The flag that raises the message is set
+only where a write of `0.0` arrives at `eHostWatchdog_s`, and it reads 0 when
+sampled, so the trigger has not been identified.
+
+Cosmetic — supervision is verifiably armed — but alarming and wrong. Confirm
+with `AT+WD?` rather than believing the banner.

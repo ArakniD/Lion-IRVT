@@ -1,0 +1,230 @@
+configure_slot:
+  name: Configure slot
+  description: >-
+    Apply a cell profile to one slot. Every field except the chemistry is
+    optional; a zero means "use the chemistry or model default". Refused while
+    the slot is running.
+  fields:
+    slot:
+      name: Slot
+      description: Zero-based slot index. Front-panel slot 3 is slot 2.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 7
+          mode: box
+    chemistry:
+      name: Chemistry
+      required: true
+      selector:
+        select:
+          options: [lco, lto, lfp, nmc, nca]
+    model_name:
+      name: Model name
+      selector:
+        text:
+    serial:
+      name: Serial
+      description: Cell barcode. Can also be set later, up to the moment the result is stored.
+      selector:
+        text:
+    capacity_mah:
+      name: Capacity
+      description: Rated capacity in mAh. 0 uses the model default.
+      selector:
+        number:
+          min: 0
+          max: 100000
+          unit_of_measurement: mAh
+          mode: box
+    charge_c:
+      name: Charge C-rate
+      description: 0 uses the chemistry default.
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 0.05
+          mode: box
+    discharge_c:
+      name: Discharge C-rate
+      description: 0 uses the chemistry default.
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 0.05
+          mode: box
+    auto_recharge:
+      name: Recharge to shipping state
+      description: Put back a fraction of the removed charge after the discharge.
+      selector:
+        boolean:
+    shipping_pct:
+      name: Shipping state of charge
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+          mode: box
+    max_duration_minutes:
+      name: Timeout
+      description: Abort the test after this long. 0 means no limit.
+      selector:
+        number:
+          min: 0
+          max: 100000
+          unit_of_measurement: min
+          mode: box
+    entry_id:
+      name: Tester
+      description: Required only when more than one tester is configured.
+      selector:
+        text:
+
+set_serial:
+  name: Set serial
+  description: >-
+    Assign a barcode to a slot. Allowed at any point up to the moment the
+    result is persisted, so a cell can be scanned after the test starts.
+  fields:
+    slot:
+      name: Slot
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 7
+          mode: box
+    serial:
+      name: Serial
+      required: true
+      selector:
+        text:
+    entry_id:
+      name: Tester
+      selector:
+        text:
+
+resume_slot:
+  name: Resume slot
+  description: >-
+    Resume a paused run. A slot paused by the host watchdog or restored from
+    F-RAM after a unit reset is refused unless 'force' is set: the unit lost
+    contact with the host mid-run, so the cell in the holder may not be the
+    cell the counters belong to.
+  fields:
+    slot:
+      name: Slot
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 7
+          mode: box
+    force:
+      name: Force
+      description: >-
+        Resume even though the pause needs an operator decision. Confirm the
+        cell in the holder is the one the run started with.
+      selector:
+        boolean:
+    entry_id:
+      name: Tester
+      selector:
+        text:
+
+set_mode:
+  name: Set slot mode
+  description: >-
+    Command the converter directly - charge, discharge or stop. This is not
+    the characterisation test; it runs until stopped or until a limit trips.
+    Needs a register-capable transport (CAN, HTTP, or BLE firmware with the
+    register characteristic).
+  fields:
+    slot:
+      name: Slot
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 7
+          mode: box
+    mode:
+      name: Mode
+      required: true
+      selector:
+        select:
+          options: [stop, charge, discharge]
+    entry_id:
+      name: Tester
+      selector:
+        text:
+
+calibration_command:
+  name: Calibration command
+  description: >-
+    Drive the two-point calibration state machine, one opcode at a time.
+    Returns the live telemetry so a bench supply can be adjusted against it.
+    Only 'enter' takes a slot; every other command applies to whichever slot
+    the unit already has in calibration.
+  fields:
+    command:
+      name: Command
+      required: true
+      selector:
+        select:
+          options:
+            - enter
+            - exit
+            - capture_voltage
+            - zero_current
+            - set_fixed_current
+            - capture_current
+            - compute_save
+            - clear
+    slot:
+      name: Slot
+      description: Read only by 'enter'.
+      selector:
+        number:
+          min: 0
+          max: 7
+          mode: box
+    value:
+      name: Value
+      description: >-
+        Measured volts for capture_voltage, measured amps for capture_current,
+        or a per-unit setpoint (0.0-0.8, where 1.0 pu is about 10 A) for
+        set_fixed_current. Ignored by the others.
+      selector:
+        number:
+          min: -100
+          max: 100
+          step: 0.0001
+          mode: box
+    entry_id:
+      name: Tester
+      selector:
+        text:
+
+get_result:
+  name: Get slot result
+  description: >-
+    Read a slot's stored test result. Note that completed_uptime_s is seconds
+    of proxy uptime, not a wall clock - the device has no real-time clock.
+  fields:
+    slot:
+      name: Slot
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 7
+          mode: box
+    entry_id:
+      name: Tester
+      selector:
+        text:

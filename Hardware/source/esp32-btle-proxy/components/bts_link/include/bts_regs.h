@@ -69,7 +69,7 @@ extern "C" {
 #define BTS_I2C_ADDRESS         0x50
 #define BTS_NUM_CHANNELS        8
 #define BTS_REGISTER_SIZE       4
-#define BTS_TOTAL_REGISTERS     314
+#define BTS_TOTAL_REGISTERS     315
 
 /* Region bases and per-channel byte strides. */
 #define BTS_RT_BASE             0
@@ -151,19 +151,32 @@ extern "C" {
 #define BTS_REG_CAL_STATUS              1212
 #define BTS_REG_CAL_RESULT              1216
 
-/* Calibration live telemetry for the slot named by eCalSlot. */
-#define BTS_REG_CAL_ADS_V_PU            1220
-#define BTS_REG_CAL_ADS_I_PU            1224
-#define BTS_REG_CAL_ADS_V_V             1228
-#define BTS_REG_CAL_ADS_I_A             1232
-#define BTS_REG_CAL_F28_V_PU            1236
-#define BTS_REG_CAL_F28_I_PU            1240
-#define BTS_REG_CAL_F28_V_V             1244
-#define BTS_REG_CAL_F28_I_A             1248
-#define BTS_REG_CAL_TEMP_C              1252
+/*
+ * Live host-watchdog countdown, seconds, RO. Reads 0 both when the watchdog
+ * has FIRED and when it is DISABLED - distinguish the two by reading
+ * BTS_REG_HOST_WATCHDOG_S, which is in the same burst.
+ *
+ * This register was missing from this mirror while it existed on the C2000
+ * (registers.h, eWatchdogRemaining_s = 1220). Its absence shifted every
+ * calibration telemetry address below by one register, so ads_v_pu actually
+ * carried this countdown and every captured pu value was wrong. Fixed
+ * 2026-09-20 - the telemetry block now starts at 1224, matching the C2000.
+ */
+#define BTS_REG_WATCHDOG_REMAINING_S    1220
 
-/* Registers 1200..1252 inclusive, readable as one burst. */
-#define BTS_CAL_WINDOW_COUNT            14
+/* Calibration live telemetry for the slot named by eCalSlot. */
+#define BTS_REG_CAL_ADS_V_PU            1224
+#define BTS_REG_CAL_ADS_I_PU            1228
+#define BTS_REG_CAL_ADS_V_V             1232
+#define BTS_REG_CAL_ADS_I_A             1236
+#define BTS_REG_CAL_F28_V_PU            1240
+#define BTS_REG_CAL_F28_I_PU            1244
+#define BTS_REG_CAL_F28_V_V             1248
+#define BTS_REG_CAL_F28_I_A             1252
+#define BTS_REG_CAL_TEMP_C              1256
+
+/* Registers 1200..1256 inclusive, readable as one burst. */
+#define BTS_CAL_WINDOW_COUNT            15
 
 /*
  * Unit poll window: eCalibrationMode (1168) .. eHostWatchdog_s (1196), the

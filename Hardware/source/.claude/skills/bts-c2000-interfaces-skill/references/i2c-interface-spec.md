@@ -73,7 +73,7 @@ when adding a new read path.
 | Write to an `REG_ACCESS_RO` register | Silently dropped — no NACK, no error |
 | Write to an address ≥ `TOTAL_REGISTERS` | Silently dropped |
 | Read of an address ≥ `TOTAL_REGISTERS` | Returns `-1.0f`, a valid float, not an error |
-| Auto-increment past the top (1216) | Stops advancing; a continuing read repeats register 1216 |
+| Auto-increment past the top (1256) | Stops advancing; a continuing read repeats register 1256 |
 | Read with no preceding address write | Continues from wherever the last transaction left off |
 | Concurrent I2C / UART / CAN writes | Last writer wins; CPU1 is notified of the final value only |
 | NaN / Inf written to an RW register | Stored verbatim; the device does not sanitise |
@@ -114,33 +114,71 @@ interrupt pending. Nothing on the target side clears that: the ISR only runs
 when the module asks, and a wedged module never asks. The bus then jams for
 every device on it.
 
-`serviceI2CTargetWatchdog()` (`com_cpu2.c`, called from the idle loop) watches
-for `BUS_BUSY` persisting with no address-match activity and reinitialises.
-Note it does a **full `SysCtl_resetPeripheral()`**, not just the module reset
-bit: clearing `IRS` releases SCL, but the module comes back still believing it
-is an addressed target transmitter (`TARGET_DIR` set) and clamps the clock
-again. Only the system-controller reset drops that latched state.
+`serviceI2CTargetWatchdog()` (`com_cpu2.c:2615`, called from the idle loop)
+watches for `BUS_BUSY` persisting with no address-match activity and
+reinitialises. Note it does a **full `SysCtl_resetPeripheral()`**, not just
+the module reset bit: clearing `IRS` releases SCL, but the module comes back
+still believing it is an addressed target transmitter (`TARGET_DIR` set) and
+clamps the clock again. Only the system-controller reset drops that latched
+state.
+
+> ### Halting CPU2 in the debugger wedges the target, and the watchdog
+> ### cannot rescue it
+>
+> The recovery above runs from **CPU2's idle loop**. A breakpoint that stops
+> CPU2 part way through an I2C transaction stops the very loop that would
+> clear the jam, so the target is left holding SCL with `BUS_BUSY` set and
+> nothing running to notice.
+>
+> The ESP32 link does **not** recover when you resume — it needs a reload or
+> a power cycle. This is a debugging artefact, not a firmware fault, but it
+> costs a bring-up session every time. If you must break on CPU2, break
+> somewhere the I2C ISR is not active.
 
 ### What a write actually does
 
-`applyHostRegisterWrite()` (`com_cpu2.c:2162-2185`) is the single funnel for
+`applyHostRegisterWrite()` (`com_cpu2.c:2553`) is the single funnel for
 I2C, UART and CAN writes:
 
 1. `registers[regIdx] = value`
 2. `notifyCpu1RegisterWrite()` → `IPC_FLAG0` with `ipcMsg` as payload —
    **non-blocking**, skipped if the previous flag is unacknowledged, because
    CPU1 re-reads the affected block from `registers[]` anyway.
-3. If the register is `eCalibrationMode` and the value is exactly `2.0f`, set
+3. **`hostWatchdogFeed()`** — this is the reload hook for all three write
+   paths. See the watchdog section below.
+4. If the register is `eCalibrationMode` and the value is exactly `2.0f`, set
    `calibrationSavePending` for the idle loop.
-4. If the register is `eCalCommand` and the value is non-zero, **self-clear it
+5. If the register is `eCalCommand` and the value is non-zero, **self-clear it
    to 0** and clear `eCalStatus` bit 7. The opcode already travelled to CPU1
    in the IPC payload, so clearing the register cannot lose it — and a host
    polling `eCalCommand` sees 0 as soon as the write is accepted.
+6. If the register is `eHostWatchdog_s` and the value is `0.0f`, raise a
+   deferred warning — supervision has just been turned off.
 
-CPU1 only *decodes* a subset: the control block, the per-channel calibration
-block, and `eCalCommand`. Anything else has its flag acked and is silently
-discarded. **A new register that CPU1 must act on needs an explicit branch in
-`BTS_HandleRegisterWrite()`.**
+CPU1 only *decodes* a subset: the settings region's mode register and
+calibration group, and `eCalCommand`. Anything else — including
+`eHostWatchdog_s` — has its flag acked and is silently discarded. The runtime
+region is RO and never reaches the decode at all. **A new register that CPU1
+must act on needs an explicit branch in `BTS_HandleRegisterWrite()`.**
+
+### A READ also reloads the host watchdog
+
+The fourth reload hook, and the one that is easy to miss: `i2cSlaveFifoISR()`
+calls `hostWatchdogFeed()` on its **transmit** branch
+(`com_cpu2.c:2915`), so a host that only ever reads still proves it is alive.
+
+That is not an optimisation. The ESP32's steady state is nine read
+transactions every 250 ms and **not a single write**, so a unit that reloaded
+on writes alone would pause every running slot 30 s after the last mode
+command while the link was perfectly healthy.
+
+The hook is on the transmit side rather than the address phase because that is
+where a read is unambiguous — the address phase is shared with a write. It
+sits before the `txCount == 0` guard, so it runs once per transmitted byte
+rather than once per register; harmless, since the feed is idempotent.
+
+**Verified on hardware:** `eWatchdogRemaining_s` (1220) holds steady at 30.0
+while the ESP32 polls, with no writes on the bus.
 
 ---
 
@@ -187,35 +225,82 @@ scale is the 2.50 V external reference. Both are properties of the analogue
 front end, not of the code.
 
 Measured temperatures are written straight into
-`registers[BTS_CELLTEMP_IDX(ch)]` (992 + ch×4). There is no separate buffer.
-Note this block is the **measurement**; the min/max limit pair at 512 + ch×8
-is the configured trip window and is what goes into the F-RAM image.
+`registers[BTS_CELLTEMP_IDX(ch)]`, which under v2 resolves into the **runtime
+block** at `20 + ch*48`. There is no separate buffer. Note this is the
+**measurement**; the configured min/max trip window is a separate pair in the
+settings block at `420 + ch*96`, and that pair is what goes into the F-RAM
+calibration image.
+
+### The slot runtime state block
+
+The F-RAM also carries per-slot run state, written every 6 s and on each state
+transition, and restored at boot:
+
+```
+0x0000 - 0x03FF   calibration, 8 channels x 128 B stride
+0x0400 - 0x040F   global voltage thresholds
+0x0500 - 0x05FF   slot runtime state, 8 slots x 32 B stride
+```
+
+`STATE_FRAM_BASE 0x0500`, `STATE_FRAM_STRIDE 32` — fixed and decoupled from
+`sizeof`, for the same reason as the calibration block. Each record holds a
+header, the running direction and END flag, all six counters, a save counter
+and a CRC-32.
+
+Same discipline as everything else here: **never written from an ISR**.
+`mirrorCpu1Status()` in the 8 Hz timer sets `stateSavePending[ch]`, and
+`BTS_serviceDeferredWork()` writes **one slot per pass**, so the eight stagger
+across the 6 s window and a save never holds the I2C controller — and
+therefore the host bus — for eight transfers at once.
+
+At boot, an invalid or absent record is the **normal first-boot case**: the
+slot starts STOPPED with zeroed counters and nothing is logged. A record that
+was saved mid-run brings the counters back and the slot comes up **PAUSED +
+RESTORED** with the converter off. A slot never resumes power by itself.
 
 ---
 
 ## Working with the ESP32 mirror
 
 `esp32-btle-proxy/components/bts_link/include/bts_regs.h` is a hand-maintained
-transcription of `registers.h` with **no build coupling**. Every address,
-stride, base, count, opcode and result code currently agrees, and
-`BTS_TOTAL_REGISTERS` is 305 on both sides.
+transcription of `registers.h` with **no build coupling**.
 
-**But the same identifiers mean different things in the two files.** See the
-collision table in `SKILL.md` — `BTS_STATUS_*` and `BTS_CAL_ST_*` are bit
-*positions* on the C2000 and bit *masks* on the ESP32; the `BTS_CAL_*` and
-`BTS_SENSE_*` offsets are register *indices* on the C2000 and *byte* offsets
-on the ESP32; and `BTS_SENSE_BASE` is a function-like macro on one side and a
-bare constant on the other. Copying a line between the files compiles and is
-silently wrong.
+> **They have drifted before.** In the v2 reorder the mirror lost
+> `eWatchdogRemaining_s` (1220), putting its calibration telemetry at
+> 1220-1252 where the C2000 has 1224-1256, `BTS_TOTAL_REGISTERS` 314 against
+> `TOTAL_REGISTERS` 315, and `BTS_CAL_WINDOW_COUNT` 14 against a 15-register
+> window. `poll_cal_window()` would have misdecoded every telemetry value
+> during a bench calibration — shifted by one register, with `temp_c` picking
+> up `eCalF28I_A` — and only during one, since that window is read only while
+> calibration is live. Normal polling looked healthy throughout. Found and
+> fixed 2026-09-20; details in `Docs/api-specification.md` §2.11.
+>
+> When either file changes, diff them register by register. `registers.h` is
+> authoritative.
+
+Every region base, stride and per-slot offset otherwise agrees, as do the
+opcode, result-code and status-bit numbering. **But the same identifiers mean
+different things in the two files.** See the collision table in `SKILL.md` —
+`BTS_STATUS_*` and `BTS_CAL_ST_*` are bit *positions* on the C2000 and bit
+*masks* on the ESP32; `BTS_RT_*`, `BTS_SET_*` and the `BTS_CAL_*` offsets are
+register *indices* on the C2000 and *byte* offsets on the ESP32; and
+`BTS_RT_BASE` / `BTS_SET_BASE` are function-like macros returning an index on
+one side and bare byte-address constants on the other. Copying a line between
+the files compiles and is silently wrong.
 
 When you add a register, update both files, and check the whole identifier
 family rather than the one line you came for.
 
-The proxy's poll task runs a **33-transaction cycle every 250 ms**
-(`bts_link.c`). The calibration window at 1036-1088 is polled as one extra
-burst, and **only while calibration is active** (or once after a calibration
-command, via `s_cal_poll_due`), so a feature used on a bench once per unit
-does not cost the normal cycle anything.
+The proxy's poll task runs a **9-transaction cycle every 250 ms**
+(`bts_link.c`) — one 12-register burst per slot plus the unit window. That is
+down from 33 under the v1 map, and the reduction is the whole point of the v2
+reorder. The calibration window at 1200-1256 is one extra burst, taken **only
+while calibration is active** (or once after a calibration command, via
+`s_cal_poll_due`), so a feature used on a bench once per unit does not cost
+the normal cycle anything.
+
+**Those nine reads are also what feeds the unit's host watchdog** — see the
+read hook above. A poll cycle that stops for 30 s pauses every running slot.
 
 ---
 

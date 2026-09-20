@@ -1,0 +1,19 @@
+{
+  "domain": "lion_lvrt",
+  "name": "Lion LVRT Battery Tester",
+  "version": "1.0.0",
+  "documentation": "https://github.com/Lion-IRVT/Hardware",
+  "issue_tracker": "https://github.com/Lion-IRVT/Hardware/issues",
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "local_push",
+  "integration_type": "device",
+  "dependencies": ["bluetooth_adapters"],
+  "requirements": ["bleak-retry-connector>=3.5.0", "python-can>=4.3.0"],
+  "bluetooth": [
+    {
+      "local_name": "BTS-Tester"
+    }
+  ],
+  "after_dependencies": ["http"]
+}

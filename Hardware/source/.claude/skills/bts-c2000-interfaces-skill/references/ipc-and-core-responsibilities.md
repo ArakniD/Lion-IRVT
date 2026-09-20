@@ -32,6 +32,11 @@ Owns everything with a hard deadline.
 - Slot grouping: latches the MODE/ENABLE dip straps and derives leader/follower
 - **The runtime calibration state machine** — `calState`, the capture set, the
   two-point maths, the dead-man timeout
+- **The slot state machine** — `slotPause()` / `slotResume()` / `slotStop()`,
+  and the six per-direction counters. CPU1 owns `enable_logic`, so **every**
+  state change goes through it, including the ones CPU2 detects: a watchdog
+  timeout and a boot restore both arrive as data in `supervision` and are
+  acted on here
 - Boots CPU2 (`Device_bootCPU2`) and mux-configures the pins for **both** cores
 - Recalculates program variables when CPU2 signals a calibration change
 
@@ -54,7 +59,15 @@ Owns everything external-facing and non-volatile.
 - CANA at 500 kbit/s, extended IDs from `0x1C000000` — telemetry and register
   access
 - Boot-time calibration load, runtime calibration save, deferred F-RAM writes
+- **The host watchdog countdown** — CPU2 owns the interfaces and the
+  timebase, so it detects the timeout. It does **not** perform the pause
+- **Slot state persistence** — the 6 s F-RAM save and the boot restore
 - **Sole writer of `registers[]`**
+
+> CPU2 detects two events that change a slot's state — a watchdog timeout and
+> a boot restore — and performs **neither**. It publishes each into
+> `supervision` and CPU1 acts. The single-writer rule covers control state,
+> not just memory.
 
 ---
 
@@ -74,8 +87,9 @@ foundation of the whole design, and is why the register file lives on CPU2.
 | Symbol | Address | Purpose |
 |--------|---------|---------|
 | `ipcMsg` | `0x03F800` | Single-register mailbox: `{regAddr, value}` |
-| `calValidFlags[8]` | `0x03F804` | Persisted `calFlags` per channel, for status bits 13/14 |
-| `registers[TOTAL_REGISTERS]` | `0x03F814` | The register file — the single source of truth |
+| `supervision` | `0x03F804` | Watchdog / boot-restore mailbox — see §2.3 |
+| `calValidFlags[8]` | `0x03F808` | Persisted `calFlags` per channel, for status bits 13/14 |
+| `registers[TOTAL_REGISTERS]` | `0x03F818` | The register file — the single source of truth |
 
 ### Objects in CPU1 → CPU2 RAM (CPU1 writes)
 
@@ -102,17 +116,22 @@ Every float in `calibrationData[]` is also published through `registers[]`,
 which is what CPU1 actually reads, so the full image had no reason to be
 shared. Only the persisted validity flags cross, as `calValidFlags[8]`.
 
-**Current occupancy, read from the map files:**
+**Current occupancy, read from the map files after the v2 build:**
 
 | Block | Used | Free |
 |---|---|---|
-| `CPU2TOCPU1RAM` | 734 words (`0x2DE`) | **290 words** (`0x122`) |
-| `CPU1TOCPU2RAM` | 412 words (`0x19C`) | **612 words** (`0x264`) |
+| `CPU2TOCPU1RAM` | 790 words (`0x316`) | **234 words** (`0x0EA`) |
+| `CPU1TOCPU2RAM` | 508 words (`0x1FC`) | **516 words** (`0x204`) |
 
-`CPU2TOCPU1RAM` is the binding constraint on any new shared register: 30
-registers cost 60 words. Overflow is a link-time failure, not a runtime one,
-so the cost of getting it wrong is a rebuild — but **check the map** rather
-than guessing.
+`CPU2TOCPU1RAM` is the binding constraint on any new shared register: each
+costs two words, and v2's 315 registers account for 630 of the 790 used.
+Overflow is a link-time failure, not a runtime one, so the cost of getting it
+wrong is a rebuild — but **check the map** rather than guessing.
+
+**Verified after the v2 build:** both cores build clean and all eight shared
+symbols — `registers`, `ipcMsg`, `calValidFlags`, `supervision`, `canData`,
+`cpu1Status`, `startup_mode`, `startup_enable` — resolve to identical
+addresses in `cpu1/*.map` and `cpu2/*.map`.
 
 ### 2.2 `BTS_cpu1Status`
 
@@ -134,8 +153,52 @@ carries, in addition to the obvious status/measurement fields:
   `calSaveSeq`**; CPU2 compares against its own `calRuntimeSaveSeqSeen` and
   acts exactly once. A sequence counter rather than a flag, so a missed poll
   does not lose the result and a repeated poll does not double-write.
+- `chargeMah/Mwh/Seconds[8]` and `dischargeMah/Mwh/Seconds[8]` — the six
+  per-direction counters, integrated in `C1()` and mirrored into the runtime
+  block by CPU2.
 
-### 2.3 Linker requirements
+### 2.3 The supervision mailbox
+
+`supervision` is the other CPU2 → CPU1 structure, and it exists because of a
+rule rather than a convenience:
+
+```c
+typedef struct {
+    uint32_t wdPauseSeq;     // bumped once per watchdog expiry
+    uint32_t restoreFlags;   // 3 bits per slot: BTS_STATE_F_* << (ch * 3)
+} BTS_supervision;
+```
+
+**CPU2 owns the host interfaces and the timebase, so it is the core that
+detects a watchdog timeout and the core that reads the F-RAM state block. But
+it must never write a slot's control state.** The single-writer rule covers
+control as well as memory. So in both cases CPU2 only publishes a fact here,
+and CPU1 performs the action:
+
+| Event | CPU2 does | CPU1 does |
+|---|---|---|
+| Watchdog expiry | `wdPauseSeq++` in `hostWatchdogTick()` (8 Hz timer ISR) | `serviceHostWatchdog()` sees the change and calls `slotPause(ch, wdTripped=1, …)` for every running slot |
+| Boot restore | Writes the counters into `registers[]`, packs `restoreFlags`, raises `IPC_FLAG3` | `applyRestoredSlotStates()` reconstructs each slot: `slotStop()` then, if it was running, `slotPause(ch, …, restored=1)` |
+
+A **sequence counter** for the watchdog rather than a flag: CPU1 keeps its own
+`wdSeqSeen` and compares, so a missed poll cannot lose the pause and a
+repeated poll cannot double-apply it. There is nothing to acknowledge.
+
+`restoreFlags` packs three bits per slot (`BTS_STATE_F_RUNNING`,
+`_CHARGING`, `_END`) into one word — 24 bits for eight slots, inside the
+float-safe range if it ever had to cross as one. It is published **once**,
+after the whole file is consistent.
+
+> The restore path is the safety-critical one: a slot that was running comes
+> back **PAUSED + RESTORED**, never running. `applyRestoredSlotStates()`
+> calls `slotStop()` first and `slotPause()` second, so there is no code path
+> through it that re-energises a slot. **Verified on hardware.**
+
+CPU2 arms its periodic state saves only after CPU1 has acknowledged
+`IPC_FLAG3` (`stateSaveArmed`), so a 6 s tick cannot overwrite a record
+before it has been applied.
+
+### 2.4 Linker requirements
 
 Both `2837xD_RAM_lnk_cpu1.cmd` and `2837xD_RAM_lnk_cpu2.cmd` declare the
 **same origins and lengths**, and place the application sections plus the
@@ -164,12 +227,13 @@ RAM powered up holding. Both `strapsValid` and the explicit
 reason.
 
 **Verification:** after building both configurations, confirm every shared
-symbol resolves to the same address in `cpu1/*.map` and `cpu2/*.map`. They
-currently agree:
+symbol resolves to the same address in `cpu1/*.map` and `cpu2/*.map`. All
+eight currently agree:
 
 ```
-ipcMsg          0003f800    calValidFlags   0003f804
-registers       0003f814    startup_mode    0003fc00
+ipcMsg          0003f800    supervision     0003f804
+calValidFlags   0003f808    registers       0003f818
+startup_mode    0003fc00    startup_enable  0003fc02
 canData         0003fc04    cpu1Status      0003fc80
 ```
 
@@ -182,14 +246,27 @@ the other core's RAM.
 
 ## 3. IPC flags
 
-`IPC_FLAG0`–`IPC_FLAG31` are hardware flag bits; the BTS uses three, all in
-the CPU2 → CPU1 direction. Symbolic names are in `registers.h:620-622`:
+`IPC_FLAG0`–`IPC_FLAG31` are hardware flag bits; the BTS uses **four**, all in
+the CPU2 → CPU1 direction. Symbolic names are in `registers.h:697-700`:
 
 | Macro | Flag | Meaning | Payload |
 |-------|------|---------|---------|
 | `BTS_IPC_FLAG_REG_WRITE` | `IPC_FLAG0` | One register changed | `ipcMsg` |
 | `BTS_IPC_FLAG_TEMP_UPDATE` | `IPC_FLAG1` | Cell temperature refreshed | `ipcMsg` |
 | `BTS_IPC_FLAG_CAL_RELOAD` | `IPC_FLAG2` | Whole calibration block reloaded | none |
+| `BTS_IPC_FLAG_STATE_RESTORE` | `IPC_FLAG3` | Slot runtime state came back from F-RAM | `supervision.restoreFlags` |
+
+`IPC_FLAG3` follows the same one-flag-per-logical-change discipline as
+`IPC_FLAG2`: `loadSlotStates()` populates every slot's counters in
+`registers[]` and the whole of `supervision.restoreFlags`, **then** raises the
+flag once. CPU1's `applyRestoredSlotStates()` reconstructs all eight slots
+from a file it knows is consistent.
+
+The **watchdog** does not use a flag at all. CPU2 bumps
+`supervision.wdPauseSeq` and CPU1 polls it in `serviceHostWatchdog()`, called
+unconditionally at the end of `BTS_HandleRegisterWrite()`. A counter rather
+than a flag, for the same reason as `calSaveSeq`: a missed poll cannot lose
+the event, and there is nothing for CPU1 to acknowledge.
 
 CPU1 → CPU2 has **no flags at all**. Everything in that direction travels
 through `cpu1Status` under the seqlock and is polled by CPU2's 8 Hz timer ISR.
@@ -232,16 +309,28 @@ declaration) and fails at link with `#10234-D: unresolved symbols remain`.
 `BTS_HandleRegisterWrite()` (`bts_cpu1.c`) decodes exactly three cases:
 
 ```c
-if (regIdx < BTS_REG_IDX(eCh0_ChargeAcc_mAh))           → control block, modeCallback()
-else if (regIdx within BTS_CAL_BASE(0)..+96)            → calibration block reload
-else if (regIdx == BTS_REG_IDX(eCalCommand))            → calHandleCommand()
+if (regIdx in BTS_SET_BASE(0) .. BTS_SET_BASE(NUM_CHANNELS)) {
+    offset = (regIdx - BTS_SET_BASE(0)) % BTS_SET_REGS_PER_CH;
+    if (offset == BTS_SET_MODE)              → modeCallback()
+    else if (offset in the calibration group) → BTS_loadCalibrationFromRegisters()
+}
+else if (regIdx == BTS_REG_IDX(eCalCommand)) → calHandleCommand()
 ```
 
-Everything else — including `eCalibrationMode` at index 244 — has its flag
-acked and is **silently discarded**. That is correct for registers CPU2 acts
-on itself, and a trap for anything new: a register CPU1 must react to needs an
-explicit branch here, or every write will be accepted by CPU2 and quietly
-ignored by CPU1.
+**The decode is by index range, so it has to be re-derived every time the map
+moves** — which v2 did. Note what this means under v2: the whole runtime
+region (indices 0–95) is read-only and a write there never reaches here at
+all, so a write is either in the settings region or in the unit region.
+
+Everything else — including `eCalibrationMode` and `eHostWatchdog_s` — has its
+flag acked and is **silently discarded**. That is correct for registers CPU2
+acts on itself (the watchdog timeout is one: CPU2 owns the countdown), and a
+trap for anything new: a register CPU1 must react to needs an explicit branch
+here, or every write will be accepted by CPU2 and quietly ignored by CPU1.
+
+`BTS_HandleRegisterWrite()` also handles `IPC_FLAG3` and then calls
+`serviceHostWatchdog()` unconditionally, so the supervision work rides on the
+same B3-task cadence as the register decode.
 
 ---
 
@@ -261,12 +350,24 @@ CPU2: Device_init() -> initI2C_Master()
         read global voltage thresholds at F-RAM 0x0400
           invalid -> 9 / 10 / 15 / 16 V defaults
         init the calibration control block (eCalSlot = 255, rest 0)
+        seed eHostWatchdog_s / eWatchdogRemaining_s = 30.0, hostWatchdogFeed()
         notifyCpu1CalibrationReload()             <-- one IPC_FLAG2
+      loadSlotStates():
+        for each slot: readSlotState() -> validateSlotState()
+          valid   -> restore the six counters into registers[],
+                     pack BTS_STATE_F_* into supervision.restoreFlags
+          invalid -> zero the counters  (the normal first-boot case,
+                     NOT logged as an error)
+        IPC_setFlagLtoR(BTS_IPC_FLAG_STATE_RESTORE)   <-- one IPC_FLAG3
 CPU2: bring up I2CA / console / CAN / timer / LEDs, then EINT, banner,
       then initADS1119() last
 CPU1: B3 task -> BTS_HandleRegisterWrite() sees IPC_FLAG2
         -> BTS_loadCalibrationFromRegisters(ch) for all 8 channels
         -> pendingUpdate = 1
+      ... and sees IPC_FLAG3
+        -> applyRestoredSlotStates(): counters into the acc[] arrays,
+           slotStop(ch), then slotPause(ch, restored=1) if it was running
+CPU2: timerISR arms stateSaveArmed once IPC_FLAG3 is acknowledged
 CPU1: C2 task -> BTS_monitor_program_update(ch)
         -> BTS_calcUserProgramVariables(ch)  (trip thresholds, meas gains)
 ```
@@ -275,6 +376,14 @@ Interrupts on CPU2 are enabled only *after* `loadCalibration()`, so a host
 write can never race the boot-time load. `initADS1119()` runs last because its
 DRDY ISRs drive I2CB continuously — everything else is already up before they
 start.
+
+**The watchdog is armed from boot, not from the host's first command**
+(`com_cpu2.c:1050-1055`). A unit that comes up with a slot restored and no
+host ever appearing does not sit with supervision disabled.
+
+**Periodic state saves are armed only after CPU1 acknowledges `IPC_FLAG3`.**
+Otherwise a 6 s tick could overwrite a slot's record with the not-yet-applied
+zeroes of a half-restored file.
 
 ### 4.2 Runtime configuration change
 
@@ -285,13 +394,21 @@ Host (I2C / console / CAN)
        notifyCpu1RegisterWrite()            <-- IPC_FLAG0
        [eCalibrationMode == 2.0f  -> calibrationSavePending]
        [eCalCommand != 0          -> self-clear, clear eCalStatus bit 7]
+       hostWatchdogFeed()                   <-- reload, every write path
+       [eHostWatchdog_s == 0.0f   -> hostWdDisableWarn, printed from the idle loop]
   -> CPU1 BTS_HandleRegisterWrite()
-       control register  -> modeCallback()
-       calibration block -> BTS_loadCalibrationFromRegisters(ch), pendingUpdate = 1
+       settings +0       -> modeCallback()   (run / direction / cal / pause / resume)
+       calibration group -> BTS_loadCalibrationFromRegisters(ch), pendingUpdate = 1
        eCalCommand       -> calHandleCommand(opcode, registers[eCalArgument])
+       IPC_FLAG3         -> applyRestoredSlotStates()
+       then always       -> serviceHostWatchdog()
   -> CPU1 C2 task -> BTS_monitor_program_update(ch)
                        -> BTS_calcUserProgramVariables(ch)
 ```
+
+A host **read** has its own reload hook, in `i2cSlaveFifoISR()`'s transmit
+branch. That is the path the ESP32 actually exercises — its steady state is
+nine reads every 250 ms and no writes at all.
 
 `BTS_monitor_program_update` updates **in-memory program variables only**.
 CPU1 has no F-RAM access — persistence is CPU2's job.
@@ -312,22 +429,36 @@ CPU2 timerISR (8 Hz)    -> mirrorCpu1Status()
                              seqlock read, up to 4 attempts, give up and
                              retry next tick on a torn snapshot
                           -> registers[] status / cell V/I / sense V/I /
-                             input V / unit state / trip status / straps /
-                             calibration window
+                             the six counters / input V / unit state /
+                             trip status / straps / calibration window
+                          -> detect a state transition, mark stateSavePending[ch]
                           -> stage calComputed[] if calSaveSeq changed
+                        -> hostWatchdogTick()   (countdown, 8 ticks per second)
                           sendCANData(channel)    (round robin)
-CPU2 idle loop          -> BTS_serviceDeferredWork()  (the F-RAM write)
+CPU2 idle loop          -> BTS_serviceDeferredWork()
+                             one slot's state record per pass, plus any
+                             pending calibration write
 ```
 
 `cpu1Status.seq` is a seqlock: the reader retries while the counter is odd or
 changed across the read. This avoids needing a lock between the cores.
 
-Two ownership subtleties in `mirrorCpu1Status()`:
+Four ownership subtleties in `mirrorCpu1Status()`:
 
 - `eCalStatus` bit 7 ("written to F-RAM") is **CPU2's**, so it is OR-ed back
   over whatever CPU1 published rather than overwritten.
-- `eCalTemp_C` is filled by CPU2 from its own cell-temperature block — the
-  ADS1119 converters are on CPU2's I2CB, so CPU1 has no reading to publish.
+- The runtime block's **cell-temperature** register is deliberately *not*
+  touched. The ADS1119 converters are on CPU2's I2CB, so that register is
+  written directly by `publishCellTemp()` and has no CPU1 source. Same for
+  `eCalTemp_C` in the calibration window.
+- The **six counters** are mirrored only once the boot restore has been
+  applied. Before that CPU1's accumulators are still zero, and copying them
+  would erase exactly what `loadSlotStates()` just restored.
+- A **state transition** is detected here, from the mirrored status word
+  rather than from a mode write — two reasons. The bits here are the ones
+  that will be saved, whereas a mode write is seen before CPU1 has acted on
+  it; and a transition CPU1 made on its own (a trip, a termination, a
+  watchdog pause) has no host write to hang off at all.
 
 ### 4.4 Calibration commit
 
@@ -336,41 +467,58 @@ The rule that matters here: **F-RAM is never written from an ISR.** The
 request arrives in the I2C target interrupt or the 8 Hz timer ISR, sets a
 pending flag, and `BTS_serviceDeferredWork()` does the transfer.
 
+The 6 s slot-state save follows the same rule and adds one of its own: it
+writes **one slot per pass**, so the eight stagger across the window and a
+save never holds the I2C controller — and therefore the host bus — for eight
+transfers at once.
+
 ---
 
-## 5. Register map strides
+## 5. Register map strides — v2
 
-The register file is indexed by `byte address / 4`. The blocks do **not** share
-a stride — assuming 10 registers per channel everywhere is the single most
-common bug in this codebase, and produced silent cross-channel corruption of
-the calibration and temperature blocks.
+The register file is indexed by `byte address / 4`. Under **map v2** the
+nine scattered blocks collapsed into **three regions**, each with a fixed,
+generous per-slot stride so a future field does not move everything again:
 
-| Block | Regs/channel | First address | Helper |
-|-------|--------------|---------------|--------|
-| Control | 10 | `eCh0_Mode` = 0 | `BTS_CTRL_BASE(ch)` |
-| Stats | 6 | `eCh0_ChargeAcc_mAh` = 320 | `BTS_STATS_BASE(ch)` |
-| Temperature limits | 2 | `eCh0_MinCellTemp` = 512 | `BTS_TEMP_BASE(ch)` |
-| Global voltages | 4 total | `eChargeDisableV` = 576 | direct |
-| Calibration | 12 | `eCh0_F28V_Gain` = 592 | `BTS_CAL_BASE(ch)` |
-| Unit | 4 total | `eCalibrationMode` = 976 | direct |
-| Cell temperature | 1 | `eCh0_CellTemp` = 992 | `BTS_CELLTEMP_IDX(ch)` |
-| Slot grouping | 3 total | `eSlotMode` = 1024 | direct |
-| Calibration control | 5 total | `eCalSlot` = 1036 | direct |
-| Calibration telemetry | 9 total | `eCalAdsV_pu` = 1056 | direct |
-| Sense (ADS131M08) | 2 | `eCh0_SenseVoltage` = 1092 | `BTS_SENSE_BASE(ch)` |
-| Discharge accumulators | 2 | `eCh0_DischargeAcc_mAh` = 1156 | `BTS_DISCHACC_BASE(ch)` |
+| Region | Base | Regs/slot | Stride | Access | Helper |
+|---|---|---|---|---|---|
+| Runtime | 0 | **12** | 48 B | all RO | `BTS_RT_BASE(ch)` |
+| Settings | 384 | **24** | 96 B | mostly RW | `BTS_SET_BASE(ch)` |
+| Unit | 1152 | 27 total | — | mixed | direct |
 
-`TOTAL_REGISTERS` = **305**, top byte address **1216**.
+`TOTAL_REGISTERS` = **315**, top byte address **1256**. Runtime ch7 ends at
+383, immediately before the settings base; settings ch7 ends at 1151,
+immediately before the unit base.
 
-Always index through the `BTS_*_BASE(ch)` macros in `registers.h`. Note that
-`BTS_TEMP_BASE(ch)` is the configured **limit** pair and `BTS_CELLTEMP_IDX(ch)`
-is the **measurement** — two different blocks with confusingly similar names.
+Sub-blocks within a slot, as offsets from their region's base — these are
+what the named macros resolve to:
+
+| Sub-block | Regs | Offset | Helper |
+|---|---|---|---|
+| Measured cell temperature | 1 | runtime +5 | `BTS_CELLTEMP_IDX(ch)` |
+| Charge / discharge counters | 6 | runtime +6..+11 | direct |
+| Mode register | 1 | settings +0 | `BTS_SET_BASE(ch)` |
+| Temperature **limits** | 2 | settings +9 | `BTS_TEMP_BASE(ch)` |
+| Calibration group | 12 | settings +11 | `BTS_CAL_BASE(ch)` |
+| Spare | 1 | settings +23 | — |
+
+**The two regions have different strides — 12 and 24.** Mixing them is the
+single most common bug in this codebase and produces silent cross-channel
+corruption rather than an error. Always index through the macros.
+
+`BTS_TEMP_BASE(ch)` is the configured **limit** pair and
+`BTS_CELLTEMP_IDX(ch)` the **measurement** — two different regions now, with
+confusingly similar names. `BTS_CAL_BASE(ch)` is still `BTS_SET_BASE(ch) + 11`
+and the calibration group keeps its internal order, so
+`saveCalibration()` / `loadCalibration()` needed no change across the reorder.
 
 Adding a register means updating, together: the enum, the `NUM_*` count,
 `TOTAL_REGISTERS`, `regConfig[]`, `uartRegConfig[]` (both sized
 `TOTAL_REGISTERS`, both must stay index-aligned), the ESP32 `bts_regs.h`
-mirror, and `Docs/api-specification.md`. Append above 1152; never insert
-mid-map, because external hosts hard-code byte addresses.
+mirror, and `Docs/api-specification.md`. Put a new per-slot setting in the
+settings region's **spare** register; a new runtime field has no spare and
+would mean another breaking stride change. Never insert mid-map — external
+hosts hard-code byte addresses.
 
 ---
 
@@ -589,6 +737,24 @@ floating-point is a hard compile error (`#1558-D`). In practice:
 
 `eChX_Status` is a `uint32_t` on both cores, but it reaches the host as a
 `float32`. A 24-bit significand makes integers exact only to bit 23
-(`registers.h:420-424`). Bits 0–14 are in use; **15–23 are free; 24–31 are
-not usable at all**. The same applies to `eTripStatus`, `eCalStatus` and every
-other bitfield that crosses as a float.
+(`registers.h:418-421`). The same applies to `eTripStatus`, `eCalStatus` and
+every other bitfield that crosses as a float.
+
+Current allocation after v2:
+
+| Bits | State |
+|---|---|
+| 0–14 | In use since v1 |
+| 15 | `PAUSED` — new in v2 |
+| **16** | **Unused, reads a constant 0** |
+| 17 | `WD_TRIPPED` — new in v2 |
+| 18 | `RESTORED` — new in v2 |
+| 19–23 | Free |
+| 24–31 | **Not usable at all** |
+
+> Bit 16 is free but deliberately skipped. An early revision defined
+> `BTS_STATUS_END` there; the shipped design makes END an **alias for bit 2**
+> (`BTS_STATUS_FINISHED`) instead, because that bit was declared from the
+> start and never driven. Anything that polls bit 16 reads a constant 0. Bit 2
+> is now driven — cleared on start, pause and stop, and restored from the
+> F-RAM state block — though no termination path asserts it yet.

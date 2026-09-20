@@ -30,7 +30,7 @@ never actually writes, that is called out rather than glossed over.
 > ever sees the C2000's byte order**.
 >
 > This matters because the same quantity — say `ads_v_pu` — appears in both
-> formats: at register 1056 over I2C as big-endian, and at offset 12 of
+> formats: at register 1224 over I2C as big-endian, and at offset 12 of
 > characteristic `000c` as little-endian. A client that reads one and assumes
 > the other's order gets a plausible-looking but wrong float. Python clients
 > should use `"<"` prefixes throughout (as `ble_verify.py` and `calibrate.py`
@@ -45,7 +45,7 @@ never actually writes, that is called out rather than glossed over.
 |---|---|
 | **Service UUID** | `e5f10001-9a4c-4b7d-8f2e-1c3a5b7d9f01` |
 | **Type** | Primary |
-| **Characteristic count** | 11 |
+| **Characteristic count** | 12 |
 
 ### 1.1 UUID derivation
 
@@ -85,12 +85,12 @@ client's contract (`ble_svc.c:543-545`).
 
 ## 2. Characteristic table
 
-All 11 characteristics of service `e5f10001-…`, in GATT declaration order
+All 12 characteristics of service `e5f10001-…`, in GATT declaration order
 (`s_gatt_svcs[]`, `ble_svc.c:499-562`).
 
 | # | Discriminator | Name | Properties | Payload struct | Size |
 |---|---|---|---|---|---|
-| 1 | `0002` | Unit status | READ, NOTIFY | `ble_unit_status_t` | 20 B |
+| 1 | `0002` | Unit status | READ, NOTIFY | `ble_unit_status_t` | **24 B** |
 | 2 | `0003` | Command | WRITE | `ble_cmd_t` | 4 B |
 | 3 | `0004` | Slot select | READ, WRITE | `uint8_t` | 1 B |
 | 4 | `0005` | Slot config | READ, WRITE | `ble_slot_config_t` | 80 B |
@@ -98,12 +98,19 @@ All 11 characteristics of service `e5f10001-…`, in GATT declaration order
 | 6 | `0007` | Slot serial | WRITE | UTF-8 text, no NUL | 1–31 B |
 | 7 | `0008` | Catalogue index | READ, WRITE | `uint8_t` | 1 B |
 | 8 | `0009` | Catalogue entry | READ | `ble_catalog_entry_t` | 96 B |
-| 9 | `000a` | Slot status | READ, NOTIFY | `ble_slot_status_t` | 40 B |
+| 9 | `000a` | Slot status | READ, NOTIFY | `ble_slot_status_t` | **68 B** |
 | 10 | `000b` | Calibration control | WRITE | `ble_cal_cmd_t` | 8 B |
 | 11 | `000c` | Calibration status | READ, NOTIFY | `ble_cal_status_t` | 48 B |
+| 12 | `000d` | Register access | READ, WRITE | `ble_register_cmd_t` | 8 B |
 
 Characteristics 1–9 are the pre-existing surface (`BLE_PROTO_VERSION` 1);
-10 and 11 were added for version 2.
+10 and 11 were added for version 2, and 12 for version 4. **Version 3 grew two of the existing
+records** rather than adding characteristics — the first release that is not
+purely additive at the struct level. See §7.
+
+**Hardware-verified:** all 11 characteristics present, proto version 3
+reported, `watchdog_timeout_s` carried, both notify characteristics flowing.
+`tools/ble_verify.py` passes.
 
 No characteristic has WRITE-WITHOUT-RESPONSE, INDICATE, or any security
 property. There is **no pairing, bonding or encryption** — the link is open,
@@ -127,26 +134,40 @@ multi-byte fields are **little**-endian. Every struct is
 `__attribute__((packed))` and hand-padded to a multiple of 4, so no compiler
 inserts anything.
 
-### 3.1 `0002` — Unit status (READ, NOTIFY), 20 B
+### 3.1 `0002` — Unit status (READ, NOTIFY), 24 B
 
 `ble_unit_status_t`. Built by `build_unit_status()` from the `bts_link`
 snapshot.
 
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
-| 0 | 1 | `uint8` | `version` | `BLE_PROTO_VERSION`, currently **2**. See §7. |
+| 0 | 1 | `uint8` | `version` | `BLE_PROTO_VERSION`, currently **3**. See §7. |
 | 1 | 1 | `uint8` | `slot_count` | `SLOT_COUNT` = 8 |
 | 2 | 1 | `uint8` | `online` | 1 = the last I2C poll cycle to the BTS completed |
 | 3 | 1 | `uint8` | `unit_state` | `bts_unit_state_t`, see §3.1.1 |
 | 4 | 4 | `uint32` | `trip_status` | Two bits per channel, CMPSS then GPIO. See §3.1.2 |
-| 8 | 4 | `float32` | `input_voltage_v` | DC input bus volts, from register 984 |
+| 8 | 4 | `float32` | `input_voltage_v` | DC input bus volts, from register 1176 |
 | 12 | 4 | `uint32` | `uptime_s` | ESP32 uptime in seconds, not a wall clock |
-| 16 | 1 | `uint8` | `stats_live` | 1 if the BTS populates its own mAh/mWh accumulators. **Always 0** — see §3.1.3 |
+| 16 | 1 | `uint8` | `stats_live` | 1 if the BTS populates its own mAh/mWh accumulators. Positive test only — see §3.1.3 |
 | 17 | 1 | `uint8` | `wifi_connected` | 1 when the ESP32 is joined to a station network |
 | 18 | 2 | `uint16` | `reserved` | Zero |
-| | **20** | | | |
+| 20 | 4 | `float32` | `watchdog_timeout_s` | **New in proto 3.** The unit's configured host-watchdog timeout in seconds, register 1196. **0 = disabled** |
+| | **24** | | | |
 
-Python: `struct.unpack("<BBBBIfIBBH", data)`
+Python: `struct.unpack("<BBBBIfIBBHf", data)`
+
+Offsets sum to 24: 4×1 + 4 + 4 + 4 + 1 + 1 + 2 + 4. `tools/ble_verify.py`
+asserts `struct.calcsize(UNIT_FMT) == 24`.
+
+> **There is no remaining-seconds field.** The BTS publishes a live countdown
+> at `eWatchdogRemaining_s` (register 1220), but the ESP32's register mirror
+> does not yet know that register exists, so nothing on this interface
+> carries it — a client can show whether supervision is armed and at what
+> timeout, but not a countdown. See `api-specification.md` §2.11.
+>
+> `watchdog_timeout_s` reading 0 means the watchdog has been **disabled**, not
+> that it has fired. A disabled watchdog means no slot will be paused if this
+> client's link dies; surface it.
 
 #### 3.1.1 `unit_state` values
 
@@ -183,16 +204,17 @@ bits 16-31     reserved, zero
 #### 3.1.3 `stats_live`
 
 `bts_link_stats_are_live()` probes the BTS accumulators at start-up — the
-charge pair at `eChX_ChargeAcc_mAh` / `_mWh` and the discharge pair at
-`eChX_DischargeAcc_mAh` / `_mWh`. The current C2000 firmware does populate
-them, but the probe is a **positive test only**: a unit that has been idle
-since power-up reads all-zero and the flag stays **false**, exactly as it did
-on the older firmware that never wrote them at all.
+charge set at `eChX_ChargeAcc_mAh` / `_mWh` / `_ChargeRuntime_s` and the
+discharge set alongside it in the same runtime block. The current C2000
+firmware does populate them, but the probe is a **positive test only**: a unit
+that has been idle since power-up reads all-zero and the flag stays **false**,
+exactly as it did on the older firmware that never wrote them at all.
 
 Either way the ESP32 keeps its own integration (`coulomb_counter.c`) as the
 reported figure, so `live_mah` / `live_mwh` in the slot record are still the
 ones to use. The flag only says whether the BTS values are worth comparing
-against.
+against — the values themselves are always carried, in the `bts_*` fields
+added to the slot record in proto 3 (§3.9).
 
 ---
 
@@ -214,6 +236,16 @@ slot-select.
 | 2 | `BLE_CMD_ABORT` | `test_engine_abort(slot)` |
 | 3 | `BLE_CMD_CLEAR_FAULT` | `test_engine_clear_fault(slot)` |
 | 4 | `BLE_CMD_ABORT_ALL` | `test_engine_abort_all()` |
+| 5 | `BLE_CMD_PAUSE` | `test_engine_pause(slot)` — **new in proto 3** |
+| 6 | `BLE_CMD_RESUME` | `test_engine_resume(slot)` — **new in proto 3** |
+
+`PAUSE` holds a running slot: the converter reference goes to zero, the
+direction is remembered, and the counters **freeze without being lost**.
+`RESUME` releases it into whichever direction it held, zeroing nothing and
+clearing the watchdog and restore reasons. Both are no-ops on a slot in the
+wrong state and return `BLE_ATT_ERR_UNLIKELY` — read `000a` back rather than
+inferring from the ATT result. See `api-specification.md` §2.7 for the
+underlying mode-register edge commands.
 
 Any other opcode returns `BLE_ATT_ERR_REQ_NOT_SUPPORTED` (0x06). A refusal by
 the test engine returns `BLE_ATT_ERR_UNLIKELY` (0x0E); the reason is not
@@ -362,7 +394,7 @@ first.
 
 ---
 
-### 3.9 `000a` — Slot status (READ, NOTIFY), 40 B
+### 3.9 `000a` — Slot status (READ, NOTIFY), 68 B
 
 `ble_slot_status_t`. A **read** returns the slot named by slot-select; a
 **notification** may be for any slot, so always decode the `slot` field
@@ -383,15 +415,50 @@ rather than assuming the selected one.
 | 28 | 4 | `uint32` | `elapsed_s` | Seconds since the test started |
 | 32 | 4 | `uint32` | `state_elapsed_s` | Seconds in the current state |
 | 36 | 4 | `uint32` | `status_bits` | Raw BTS status word, see §3.9.3 |
-| | **40** | | | |
+| 40 | 1 | `uint8` | `bts_paused` | **New in 3.** Status bit 15 — the slot is held |
+| 41 | 1 | `uint8` | `bts_wd_tripped` | **New in 3.** Status bit 17 — paused because the host link went quiet |
+| 42 | 1 | `uint8` | `bts_restored` | **New in 3.** Status bit 18 — paused because the unit reset mid-run |
+| 43 | 1 | `uint8` | `bts_ended` | **New in 3.** Status bit 2 — test finished normally |
+| 44 | 4 | `float32` | `bts_charge_mah` | **New in 3.** The BTS's own charge-direction total |
+| 48 | 4 | `float32` | `bts_charge_mwh` | **New in 3.** |
+| 52 | 4 | `float32` | `bts_charge_seconds` | **New in 3.** Seconds spent charging this run |
+| 56 | 4 | `float32` | `bts_discharge_mah` | **New in 3.** Discharge-direction total |
+| 60 | 4 | `float32` | `bts_discharge_mwh` | **New in 3.** |
+| 64 | 4 | `float32` | `bts_discharge_seconds` | **New in 3.** Seconds spent discharging this run |
+| | **68** | | | |
 
-Python: `struct.unpack("<BBBBffffffIII", data)`
+Python: `struct.unpack("<BBBBffffffIIIBBBBffffff", data)`
+
+Offsets sum to 68: 4×1 + 6×4 + 3×4 + 4×1 + 6×4 = 4 + 24 + 12 + 4 + 24.
+`tools/ble_verify.py` asserts `struct.calcsize(SLOT_FMT) == 68`.
+
+> **This record grew by 28 bytes in proto 3**, from 40. Every pre-existing
+> field kept its offset, so a version-2 client decoding the first 40 bytes
+> still reads correctly — but a client that checks for length equality will
+> now reject it. See §7.1.
 
 > `voltage_v` and `current_a` are the **12-bit on-chip ADC** values, not the
-> 16-bit ADS131M08. The 16-bit converter's engineering values live in
-> registers 1092–1152 (`eChX_SenseVoltage` / `eChX_SenseCurrent`) and are
-> reachable over HTTP or the generic register read; there is no GATT
-> characteristic for them.
+> 16-bit ADS131M08. The 16-bit converter's engineering values live in the
+> runtime block at `eChX_SenseVoltage` / `eChX_SenseCurrent` (offsets 12 and
+> 16 of each slot) and are reachable over HTTP or the generic register read;
+> there is no GATT characteristic for them. The `bts_*` counters above **are**
+> integrated from the 16-bit pair.
+
+#### 3.9.0 Reading the four flags together
+
+`bts_paused` is not a direction. A paused slot keeps its `CHARGING` or
+`DISCHARGING` bit set in `status_bits`, so those say what a resume would do,
+while `bts_wd_tripped` and `bts_restored` say **why** it is held:
+
+| Flags | Meaning | What a client should do |
+|---|---|---|
+| `paused` alone | A deliberate pause, from this or another host | Resume is safe |
+| `paused` + `wd_tripped` | The BTS lost contact with its host for 30 s and paused every running slot | Investigate the link first; the cell is where it was |
+| `paused` + `restored` | The **unit reset** mid-run and came back holding the counters | **Do not auto-resume.** The cell may have been swapped while the unit was off — make it an operator decision |
+| `ended` | Test finished normally | Terminal; a start zeroes the new direction's counters |
+
+The ESP32's test engine does not auto-resume a restored slot, and a client
+must not either.
 
 #### 3.9.1 `slot_state_t`
 
@@ -416,14 +483,15 @@ Python: `struct.unpack("<BBBBffffffIII", data)`
 
 #### 3.9.3 `status_bits` — the BTS status word
 
-Packed by `publishStatusToCpu2()` on C2000 CPU1 (`bts_cpu1.c:950-964`) and
-carried through unchanged.
+Packed by `publishStatusToCpu2()` on C2000 CPU1 (`bts_cpu1.c:1108`) and
+carried through unchanged. Authoritative table:
+[`api-specification.md`](api-specification.md) §2.7.
 
 | Bit | Name | Set when | Written? |
 |---|---|---|---|
-| 0 | `RUNNING` | Slot is executing a charge or discharge | yes |
+| 0 | `RUNNING` | Slot is executing a charge or discharge. **Stays set while paused** | yes |
 | 1 | `STOPPED` | Slot is not running | yes |
-| 2 | `FINISHED` | — | **never** |
+| 2 | `FINISHED` / `END` | Test finished normally | **yes — new in v2** |
 | 3 | `OVERCURRENT` | An over-current trip latched | **never in this build** |
 | 4 | `CHARGING` | Mode bit 1 set at the last start | yes |
 | 5 | `DISCHARGING` | Mode bit 1 clear at the last start | yes |
@@ -436,13 +504,28 @@ carried through unchanged.
 | 12 | `CALIBRATING` | Slot is in the runtime calibration state | yes |
 | 13 | `CAL_V_VALID` | Persisted voltage calibration is valid | yes |
 | 14 | `CAL_I_VALID` | Persisted current calibration is valid | yes |
-| 15–23 | — | Reserved. **Bit 23 is the hard ceiling.** See below | — |
+| 15 | `PAUSED` | Converter off, direction remembered, counters frozen | **yes — new in v2** |
+| 16 | — | **Unused, reads a constant 0** — see below | no |
+| 17 | `WD_TRIPPED` | Paused by the host watchdog | **yes — new in v2** |
+| 18 | `RESTORED` | Paused by a FRAM boot restore | **yes — new in v2** |
+| 19–23 | — | Reserved. **Bit 23 is the hard ceiling.** See below | — |
+
+Bits 15, 17 and 18 are also decoded into the `bts_paused` / `bts_wd_tripped`
+/ `bts_restored` bytes at offsets 40–42, and bit 2 into `bts_ended` at 43.
+Decoding the bits yourself and reading the bytes give the same answer; the
+bytes exist so a thin client does not have to carry a bit table.
+
+> ### Bit 16 is not END
+>
+> An early revision of the ESP32's `bts_regs.h` defined `BTS_STATUS_END` at
+> bit **16**. That is not what shipped, and if you saw that definition it is
+> stale. `BTS_STATUS_END` is an **alias for bit 2** on both sides — bit 2 was
+> declared from the start and never driven, so it was given the END meaning
+> rather than spending another bit. **Bit 16 is unused and reads a constant
+> 0.** Test bit 2, or read `bts_ended`.
 
 Three of these are not what their names suggest:
 
-- **Bit 2 (`FINISHED`) is never set.** `status[].finished` is read in
-  `publishStatusToCpu2()` but assigned nowhere in the firmware. Use
-  `state == COMPLETE` from the ESP32's own test engine instead.
 - **Bit 3 (`OVERCURRENT`) is never set in this build**, for the same reason
   `trip_status` is always zero — see §3.1.2.
 - **Bits 6 and 7 are constant.** The build is CC-only
@@ -452,12 +535,19 @@ Three of these are not what their names suggest:
   compiled out. Bit 7 is therefore always 1 and bit 6 always 0 whenever the
   slot is running. They are genuinely reported now — before the calibration
   work they were both stuck at 0 — but they cannot vary.
+- **Bit 2 is wired but nothing asserts it yet.** The C2000 drives it from
+  `status[].finished`, which is cleared on start, pause and stop and
+  **restored from F-RAM** at boot — so a slot that ended before a reset comes
+  back showing END. No termination path sets it: termination is still the
+  ESP32 engine's job, against its own `state == COMPLETE`. A future
+  C2000-side termination will light the bit without any client change.
 
 > **Why bit 23 is the ceiling.** The status word reaches a host as a
 > `float32`, whose 24-bit significand represents integers exactly only up to
 > 2²⁴ − 1. Bit 23 is the last bit that survives the conversion intact; bit 24
 > and above would be silently rounded. The C2000 side must never publish past
-> bit 23 (`registers.h:420-424`), which leaves bits 15–23 free for future use.
+> bit 23 (`registers.h:418-421`), which leaves bits 19–23 free for future
+> use.
 
 ---
 
@@ -504,7 +594,7 @@ calibration (`eCalSlot`), and is unaffected by slot-select.
 
 Python: `struct.unpack("<BBBBII" + "f" * 9, data)`
 
-The nine floats are exactly registers 1056–1088 in order. `_pu` means the
+The nine floats are exactly registers 1224–1256 in order. `_pu` means the
 normalised converter reading **before** any calibration gain or offset — that
 is the quantity the two-point fit consumes, and it is what the `< 0.2` /
 `> 0.8` capture windows are checked against. All nine are zero when no slot
@@ -523,6 +613,54 @@ is selected.
 > It now uses the layout in this table. The lesson generalises: verify a
 > client's `struct` format against `ble_proto.h` field by field — a `--dry-run`
 > never serialises a byte, so it cannot catch this class of drift.
+
+---
+
+### 3.12 `000d` — Register access (READ, WRITE), 8 B
+
+`ble_register_cmd_t`. Added in `BLE_PROTO_VERSION` 4.
+
+**Why it exists.** Characteristic `0003` drives the ESP32's *test engine* —
+start a whole characterisation, abort it, pause it. It has no way to express
+"charge this slot", because that is the BTS's own `eChX_Mode` register, which
+was previously reachable only over CAN, HTTP or I2C. A BLE-only host could
+therefore run a test but not command a bare charge or discharge.
+
+| Offset | Size | Type | Field | Meaning |
+|---|---|---|---|---|
+| 0 | 2 | `uint16` | `addr` | **Byte** address, as on the I2C bus. `index = addr / 4` |
+| 2 | 1 | `uint8` | `write` | 1 = write, 0 = read |
+| 3 | 1 | `uint8` | `count` | Reserved for burst reads. **Must be 1** |
+| 4 | 4 | `float32` | `value` | Value to write; ignored on a read |
+| | **8** | | | |
+
+Python: `struct.pack("<HBBf", addr, write, 1, value)`
+
+**The read and the write are the same characteristic.** Write the request,
+then read the same characteristic back: the reply carries the register's
+value *after* the operation, in the same 8-byte layout.
+
+> **The value is little-endian here**, like every other GATT record — not the
+> big-endian I2C register format. The conversion stays inside `bts_regs.h`.
+
+Errors:
+
+| Condition | ATT code |
+|---|---|
+| Length is not exactly 8 | 0x0D |
+| `addr` unaligned, or `addr/4 >= BTS_TOTAL_REGISTERS` | 0x0D |
+| `count != 1` | 0x06 |
+| The I2C transaction to the BTS failed | 0x0E |
+
+> **A write to a read-only register is silently dropped by the BTS** — it is
+> not an error, it simply does nothing. This is why the handler reads the
+> register back after a write and returns what it actually holds. A client
+> must compare the reply against what it sent rather than treat a successful
+> write as proof the value took effect.
+
+Like slot-select, the reply buffer is a **single global**. The server tracks
+one connection, so this only matters if a client pipelines its own register
+operations — don't.
 
 ---
 
@@ -705,9 +843,10 @@ notifications as a live feed, not as a log.
 ### 6.3 Notifications are not segmented
 
 A notification is capped at `MTU - 3` bytes and is never split across
-packets. With the default 23-byte ATT MTU a 40-byte slot-status notification
-would be **truncated to 20 bytes**. Negotiate the MTU before subscribing
-(§8).
+packets. With the default 23-byte ATT MTU a **68-byte** slot-status
+notification would be truncated to 20 bytes — and since proto 3 grew that
+record from 40 to 68, an MTU that was merely marginal before is now
+comfortably too small. Negotiate the MTU before subscribing (§8).
 
 ---
 
@@ -719,38 +858,46 @@ read it in one operation before it commits to decoding anything else.
 | Version | Characteristics | What changed |
 |---|---|---|
 | 1 | 9 (`0002`–`000a`) | Original interface: unit status, command, slot select/config/result/serial, catalogue index/entry, slot status |
-| **2** | **11** (`0002`–`000c`) | Added `000b` calibration control and `000c` calibration status. **No existing struct changed and no discriminator moved.** Status-word bits 12–14 defined. Notify tick halved to 500 ms so calibration can notify at 2 Hz; the slot and unit cadence stayed at 1 Hz |
+| 2 | **11** (`0002`–`000c`) | Added `000b` calibration control and `000c` calibration status. **No existing struct changed and no discriminator moved.** Status-word bits 12–14 defined. Notify tick halved to 500 ms so calibration can notify at 2 Hz; the slot and unit cadence stayed at 1 Hz |
+| **3** | 11 (unchanged) | **Two existing records grew.** `ble_unit_status_t` 20 → **24 B** (`watchdog_timeout_s` appended); `ble_slot_status_t` 40 → **68 B** (four BTS-state flags and six counters appended). Added command opcodes 5 `PAUSE` and 6 `RESUME`. Status-word bits 2, 15, 17, 18 defined and driven. No discriminator moved and **no existing field changed offset** |
 
 ### 7.1 Handling a mismatch
 
-Version 2 is **purely additive**, which is the property a client should rely
-on rather than the number itself:
+Versions 2 and 3 are both **append-only**, which is the property a client
+should rely on rather than the number itself. Version 3 is the first to
+append *inside* an existing record rather than adding a characteristic, so
+the distinction between "append-only" and "no record changed size" now
+matters:
 
-- **Client knows 2, device reports 1.** The nine original characteristics
-  decode normally. `000b` and `000c` are absent from the GATT table — the
-  device has no calibration interface at all. Do not attempt to drive
-  calibration; the registers do not exist on that firmware either.
-- **Client knows 1, device reports 2.** Everything the client understands
-  still decodes at the same offsets. It will simply not see the two extra
-  characteristics.
+- **Client knows 3, device reports 2.** The two grown records arrive at their
+  old sizes, 20 B and 40 B. Every field the version-2 layout defines is at
+  the same offset, so decode the prefix and treat the appended fields as
+  absent — not as zero. There is no watchdog timeout to show and no BTS
+  counter set; `PAUSE` and `RESUME` will be rejected with
+  `REQ_NOT_SUPPORTED`.
+- **Client knows 2, device reports 3.** Everything it understands still
+  decodes at the same offsets. It will see longer records than it expects and
+  must **not** reject them for length — see below.
+- **Client knows 2 or 3, device reports 1.** `000b` and `000c` are absent
+  from the GATT table; the device has no calibration interface at all.
 - **Device reports something higher.** Assume append-only until proven
   otherwise: decode what you know, and refuse to *write* any record whose
   layout you cannot verify. A write is length-checked for an exact match, so
   a stale client's write of a grown struct is rejected rather than
   misapplied — which is the safe failure.
 
-**Prefer feature detection to version comparison.** `calibrate.py` does the
-right thing (`calibrate.py:370-380`): it enumerates the service's
-characteristics and checks that `000b` and `000c` are present, reporting
-"this firmware predates `BLE_PROTO_VERSION` 2 and has no calibration
-interface" if not. That survives a firmware that backports a feature without
-bumping the number.
+> **Decode the prefix; do not compare lengths for equality.** There is no
+> length field in any record. A client that wants to be robust against a
+> future append must check the received length is **at least** what it
+> expects and decode that much. Rejecting on inequality is exactly the bug
+> that bit `calibrate.py` (§11) — and proto 3's two grown records would trip
+> any version-2 client that did it.
 
-Note there is **no length field** in any record. A client that wants to be
-robust against a future append should check the received length against the
-size it expects and decode only the prefix it knows — not reject on
-inequality, which is what the `calibrate.py` bug in §3.11 ended up doing
-wrong in the other direction.
+**Prefer feature detection to version comparison.** `calibrate.py` does the
+right thing: it enumerates the service's characteristics and checks that
+`000b` and `000c` are present, reporting "this firmware predates
+`BLE_PROTO_VERSION` 2 and has no calibration interface" if not. That survives
+a firmware that backports a feature without bumping the number.
 
 ---
 
@@ -871,7 +1018,7 @@ CAL_STATUS  = uuid(0x000C)
 
 CAL_CMD_FMT    = "<BBHf"                       # ble_cal_cmd_t,    8 B
 CAL_STATUS_FMT = "<BBBBII" + "f" * 9           # ble_cal_status_t, 48 B
-SLOT_FMT       = "<BBBBffffffIII"              # ble_slot_status_t, 40 B
+SLOT_FMT       = "<BBBBffffffIIIBBBBffffff"    # ble_slot_status_t, 68 B
 
 CAL_CMD_ENTER, CAL_CMD_CAPTURE_VOLTAGE, CAL_CMD_EXIT = 1, 3, 2
 SLOT = 2                                       # 0-based: front-panel slot 3
@@ -892,10 +1039,14 @@ async def main():
 
         # --- 2. Select the slot, then read its per-slot records ------------
         await client.write_gatt_char(SLOT_SELECT, bytes([SLOT]), response=True)
-        bits = struct.unpack(SLOT_FMT,
-                             (await client.read_gatt_char(SLOT_STATUS))[:40])[12]
+        rec = struct.unpack(SLOT_FMT,
+                            (await client.read_gatt_char(SLOT_STATUS))[:68])
+        bits, paused, restored = rec[12], rec[13], rec[15]
         print(f"slot {SLOT} status 0x{bits:06X} "
               f"v_tick={bool(bits & 1 << 13)} i_tick={bool(bits & 1 << 14)}")
+        if restored:
+            raise SystemExit("slot came back RESTORED - resume or stop it "
+                             "deliberately before calibrating")
 
         async def cal_cmd(opcode, slot=0, arg=0.0):
             """Write the command, then READ the status back - the ATT
@@ -959,19 +1110,34 @@ Four things this example is written to make obvious:
 
 ## 11. Client-side discrepancies found and fixed
 
-All three were found on 2026-09-19 by diffing the scripts' wire formats against
-`ble_proto.h`, and all three are now corrected. Recorded because the class of
-bug recurs and none of it is caught by testing: a `--dry-run` constructs objects
-directly and never serialises a byte.
+All were found by diffing the scripts' wire formats against `ble_proto.h`,
+and all are corrected. Recorded because the class of bug recurs and none of
+it is caught by testing: a `--dry-run` constructs objects directly and never
+serialises a byte.
 
 | File | Issue | Status |
 |---|---|---|
 | `tools/calibrate.py:66-68` | `CAL_STATUS_FMT` was 44 B with the ticks last and `result` as a `uint8`; the struct is 48 B with the ticks at offsets 2–3 and `result` a `uint32` at offset 8. The length check (`< 44`) passed a 48-byte record, so it misdecoded rather than failing. See §3.11 | fixed |
 | `tools/ble_verify.py:46-50` | `STATUS_BITS` listed 12 names, stopping at `slotDisabled` (bit 11). Bits 12–14 (`calibrating`, `calVoltageValid`, `calCurrentValid`) were missing, so `decode_status_bits()` silently dropped them | fixed |
 | `tools/ble_verify.py:144` | Sliced the model name out of `ble_slot_config_t` at `cfg[28:52]`. `model_name` is at offset **24**, length 24 — the correct slice is `cfg[24:48]` | fixed |
+| `components/bts_link/include/bts_regs.h` | The mirror was missing `eWatchdogRemaining_s` (1220), so `BTS_REG_CAL_ADS_V_PU` started at 1220 instead of 1224 and **all nine calibration telemetry floats read one register low** — `ads_v_pu` actually carried the watchdog countdown. `BTS_TOTAL_REGISTERS` was 314 against the C2000's 315, the same off-by-one. `poll_cal_window()` indices shifted with it. Found and fixed 2026-09-20 | fixed |
 
 The root cause in each case was writing the format from a design document
 rather than from the header. Where the two disagree, the header wins.
 
-None of these ever affected the firmware; the offsets in §3 are what the device
-actually emits.
+`ble_verify.py` now carries the sizes as **assertions** rather than comments:
+
+```python
+UNIT_FMT = "<BBBBIfIBBHf"
+assert struct.calcsize(UNIT_FMT) == 24
+
+SLOT_FMT = "<BBBBffffffIIIBBBBffffff"
+assert struct.calcsize(SLOT_FMT) == 68
+```
+
+That turns a proto bump that changes a struct — as version 3 did to both of
+these — into an import-time failure rather than a silent misdecode. Any new
+decoder should do the same.
+
+None of these ever affected the firmware; the offsets in §3 are what the
+device actually emits, and they are confirmed against hardware.
