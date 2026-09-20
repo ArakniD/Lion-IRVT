@@ -33,6 +33,15 @@
  * If a future BTS build starts asserting BTS_STATUS_FINISHED, the engine
  * honours it as an additional termination condition.
  *
+ * SLOTS THE BTS IS HOLDING
+ * ------------------------
+ * A slot can arrive PAUSED without the engine having started it: the host
+ * watchdog fired while the link was down, or the unit reset and restored the
+ * run from F-RAM. Those land in SLOT_STATE_BTS_PAUSED, which is neither a
+ * fault nor an idle slot the engine may reuse. Nothing auto-resumes - the
+ * cell may have been swapped while the unit was off - and a start or a
+ * reconfigure is refused until an operator resumes or aborts it.
+ *
  * SAFETY
  * ------
  * Every state that has the power stage enabled is subject to per-tick
@@ -70,6 +79,14 @@ typedef enum {
     SLOT_STATE_COMPLETE,
     SLOT_STATE_FAULT,
     SLOT_STATE_ABORTED,
+    /*
+     * The BTS holds a run for this slot that it paused rather than finished:
+     * either the host watchdog fired, or the unit reset and restored the
+     * slot from F-RAM. The engine has no test of its own here - it did not
+     * start this run, or it lost its own state with the reboot - so the
+     * slot is parked, visible, and resumable only by an operator.
+     */
+    SLOT_STATE_BTS_PAUSED,
     SLOT_STATE_COUNT,
 } slot_state_t;
 
@@ -152,6 +169,24 @@ typedef struct {
     float            temp_c;
     uint32_t         status_bits;
 
+    /*
+     * The BTS's own view of the slot, decoded from status_bits. A restored
+     * pause is the one that matters to an operator: the unit reset while the
+     * slot was running, and the cell in the holder may not be the cell the
+     * counters belong to.
+     */
+    bool             bts_paused;
+    bool             bts_wd_tripped;
+    bool             bts_restored;
+    bool             bts_ended;
+    /* The BTS's per-direction counters, which survive a pause. */
+    float            bts_charge_mah;
+    float            bts_charge_mwh;
+    float            bts_charge_seconds;
+    float            bts_discharge_mah;
+    float            bts_discharge_mwh;
+    float            bts_discharge_seconds;
+
     double           live_mah;
     double           live_mwh;
     uint32_t         elapsed_s;
@@ -170,6 +205,18 @@ esp_err_t test_engine_start(uint8_t slot);
 esp_err_t test_engine_abort(uint8_t slot);
 esp_err_t test_engine_abort_all(void);
 esp_err_t test_engine_clear_fault(uint8_t slot);
+
+/*
+ * Pause and resume a slot's run on the BTS.
+ *
+ * These are for a run the BTS is holding - one it paused on a watchdog
+ * timeout or restored from F-RAM at boot. Resuming is deliberately an
+ * operator action and never automatic: a slot that comes back PAUSED |
+ * RESTORED means the unit reset mid-run, and the cell may have been changed
+ * while it was off.
+ */
+esp_err_t test_engine_pause(uint8_t slot);
+esp_err_t test_engine_resume(uint8_t slot);
 
 /*
  * Assigns a barcode/serial to a slot. Allowed at any point up to the moment

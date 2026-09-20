@@ -17,10 +17,37 @@ host controller.
 | Communication | F28379D **CPU2** | I2C slave register file for the host, I2C master for F-RAM and the ADS1119 temperature converters, UART AT console, CAN telemetry, WS2812B status LEDs, calibration persistence. |
 | Supervision | **ESP32** (LOLIN32 v1.0.0) | I2C master. Owns the test sequence and cell limits, integrates mAh/mWh, records results, and exposes BLE GATT, a JSON HTTP API and an ST7789 LCD with a rotary encoder. |
 
+The current ESP32 firmware talks BLE and HTTP directly. Home Assistant
+integration existed only in the superseded ESPHome `esp32-controller/` variant;
+there is no MQTT or native-API client in `esp32-btle-proxy/`.
+
 The two C2000 cores share data through the message RAMs under a single-writer
 rule: **CPU1 never writes the register file.** It publishes measurements into
 `cpu1Status` under a seqlock and CPU2 mirrors them into `registers[]`. Every
-data-flow decision in the firmware follows from that.
+data-flow decision in the firmware follows from that — including supervision:
+CPU2 detects a watchdog timeout and reads the saved slot state at boot, but
+**CPU1 performs every state change**, because CPU1 owns the control loop.
+
+### Unattended-operation safety
+
+The instrument charges lithium cells unattended, so three coupled mechanisms
+decide what happens when something stops going right:
+
+- **A 30 s host watchdog.** Any host command on any interface reloads it —
+  including an I2C register *read*, which is what a polling host actually
+  does. If nothing talks to the unit for 30 seconds, every running slot
+  pauses with the converter off. It is a supervision timeout measured in
+  seconds, **not** over-current protection.
+- **A PAUSED slot state.** A paused slot keeps its direction and its six
+  per-direction counters — mAh, mWh and elapsed seconds for each of charge and
+  discharge — frozen but intact, and resumes exactly where it stopped. The
+  status word says *why* it is paused, which is what decides whether resuming
+  is safe.
+- **F-RAM state persistence.** Each slot's run state and counters are saved
+  every 6 s and restored at boot. A slot that was mid-run when the unit reset
+  comes back **paused, with its counters, and refuses to resume on its own** —
+  the cell may have been changed while the unit was off. That rule is
+  deliberate and hardware-verified; do not script around it.
 
 ---
 
@@ -41,7 +68,7 @@ Inside `Hardware/source/`:
 |---|---|
 | `tida-010086/bts_F2837xD_8ch/` | The C2000 dual-core firmware. This is the instrument. |
 | `esp32-btle-proxy/` | **Current** ESP32 host firmware (ESP-IDF). |
-| `esp32-controller/` | Superseded ESPHome-based controller (2025). |
+| `esp32-controller/` | Superseded ESPHome-based controller (2025), which reported to Home Assistant. |
 | `esp32-bridge/` | Superseded Arduino WiFi bridge (2024). |
 | `Docs/` | The authoritative interface and calibration specifications. Start here. |
 | `references/` | Datasheets and manuals used while writing the firmware: F2837xD TRM, controlCARD guide, ADS131M08, ADS1119, the LOLIN32 schematic, and the XTIDA-010086E3 schematic PDF. |
@@ -58,7 +85,8 @@ code:
 | [`calibration-design.md`](Hardware/source/Docs/calibration-design.md) | The engineering contract: register addresses, opcodes, the two-point mathematics, the state machine, F-RAM layout, RAM budget. |
 | [`calibration-flow.md`](Hardware/source/Docs/calibration-flow.md) | The same, as Mermaid flow, state and sequence diagrams. |
 | [`ble-specification.md`](Hardware/source/Docs/ble-specification.md) | The full GATT service: 11 characteristics, packed layouts, notify behaviour, protocol versioning. |
-| [`api-specification.md`](Hardware/source/Docs/api-specification.md) | Part 1 the HTTP API; Part 2 the complete I2C register map, all 305 registers, with the transaction shapes. |
+| [`api-specification.md`](Hardware/source/Docs/api-specification.md) | Part 1 the HTTP API; Part 2 the complete I2C register map — **v2, all 315 registers** — with the transaction shapes, the supervision watchdog and the slot-state persistence contract. |
+| [`supervision-and-state-design.md`](Hardware/source/Docs/supervision-and-state-design.md) | The design contract for the v2 reorder, the PAUSED state, the host watchdog and F-RAM state persistence. |
 
 ---
 
@@ -69,7 +97,7 @@ There are three, and only one is live.
 | Directory | Added | Toolchain | Status |
 |---|---|---|---|
 | `esp32-bridge/` | Aug 2024 | Arduino `.ino` | **Superseded.** A WiFi/OSC bridge over a packet-oriented I2C protocol that predates the float register map. |
-| `esp32-controller/` | Apr 2025 | ESPHome YAML + C++ components | **Superseded.** Adds a HID barcode scanner and a `bts_i2c` component. Its I2C layer is wrong in two ways: `bytes_to_float()` assembles the float in host order under a comment asserting "BTS uses little-endian float", when the wire format is big-endian; and `read_register()` requests four bytes where five are needed, so it never discards the lead-in pad byte. Do not copy from it. |
+| `esp32-controller/` | Apr 2025 | ESPHome YAML + C++ components | **Superseded.** Built on ESPHome, so it surfaced the unit to **Home Assistant** as sensors, switches and selects - the only variant that ever did. Adds a HID barcode scanner and a `bts_i2c` component. Its I2C layer is wrong in two ways: `bytes_to_float()` assembles the float in host order under a comment asserting "BTS uses little-endian float", when the wire format is big-endian; and `read_register()` requests four bytes where five are needed, so it never discards the lead-in pad byte. Do not copy from it. |
 | `esp32-btle-proxy/` | Sep 2026 | ESP-IDF v6.1 | **Current.** Everything else in this README refers to this one. |
 
 The two superseded trees are retained for the pin assignments and the
@@ -98,7 +126,13 @@ same sources with `--define=CPU1` or `--define=CPU2` and link against different
 
 After building, check the `.map` files. Every shared symbol must land at the
 same address in both, and `CPU2TOCPU1RAM` must not overflow — see the TODO
-section.
+section. There are **eight** shared symbols: `registers`, `ipcMsg`,
+`calValidFlags`, `supervision`, `canData`, `cpu1Status`, `startup_mode` and
+`startup_enable`.
+
+The current tree builds clean on both cores, all eight symbols resolve
+identically in the two map files, and `CPU2TOCPU1RAM` has 234 words free of
+1024.
 
 > **Loading both cores.** Starting a debug session loads only the active
 > configuration (`cpu1`). CPU2 is left running whatever was in its RAM, and
@@ -198,10 +232,10 @@ specifications are authoritative.
 
 | Interface | Where | Authority |
 |---|---|---|
-| **I2C register map** | C2000 CPU2 as slave at `0x50` on I2CA (GPIO32/33); the ESP32 is master. 305 float registers, 16-bit byte addresses, blocks with **differing strides** — always derive through the base macros. A read must fetch `1 + count×4` bytes and **discard the first**: the target clocks out a stale byte before its ISR can run. The bus runs at 50 kHz. | [`api-specification.md`](Hardware/source/Docs/api-specification.md) Part 2 |
-| **BLE GATT** | ESP32, NimBLE. One primary service `e5f10001-…`, 11 characteristics, advertised as `BTS-Tester`. The 128-bit service UUID is in the **scan response**, not the advertising payload, because it will not fit alongside the name. `BLE_PROTO_VERSION` (currently 2) is published so a client can refuse a firmware it cannot decode. Disconnecting does **not** abort running tests. | [`ble-specification.md`](Hardware/source/Docs/ble-specification.md) |
+| **I2C register map** | C2000 CPU2 as slave at `0x50` on I2CA (GPIO32/33); the ESP32 is master. **Map v2: 315 float registers in three regions** — runtime (base 0, stride 48 B, read-only), settings (base 384, stride 96 B), unit (1152–1256). The two per-slot strides **differ** — always derive through the base macros. A slot's live data is one 12-register burst, which is why a poll cycle costs 9 transactions rather than v1's 33. A read must fetch `1 + count×4` bytes and **discard the first**: the target clocks out a stale byte before its ISR can run. The bus runs at 50 kHz. | [`api-specification.md`](Hardware/source/Docs/api-specification.md) Part 2 |
+| **BLE GATT** | ESP32, NimBLE. One primary service `e5f10001-…`, 11 characteristics, advertised as `BTS-Tester`. The 128-bit service UUID is in the **scan response**, not the advertising payload, because it will not fit alongside the name. `BLE_PROTO_VERSION` (currently **3**) is published so a client can refuse a firmware it cannot decode; v3 grew the unit-status record to 24 B and the slot-status record to 68 B, and added pause/resume opcodes. Disconnecting does **not** abort running tests. | [`ble-specification.md`](Hardware/source/Docs/ble-specification.md) |
 | **HTTP API** | ESP32, port 80, JSON, **no authentication and no encryption**. Unit and per-slot status, slot config and control, result history, the cell catalogue, raw register access for bring-up, and the calibration endpoints. WiFi comes up APSTA: stored station credentials are joined if present and the SoftAP stays up either way. | [`api-specification.md`](Hardware/source/Docs/api-specification.md) Part 1 |
-| **UART AT console** | C2000 CPU2, SCIA on the controlCARD FTDI backchannel at 115200 8N1. `AT+<name>?` and `AT+<name>=<value>` against short or long register names. **Only available in the debug build** (`BTS_DEBUG_CONSOLE == true`): the console takes GPIO28/29, which in production carry the WS2812B LED string and channel 1's GPIO trip. | `.claude/skills/bts-c2000-interfaces-skill/references/uart-at-commands.md` |
+| **UART AT console** | C2000 CPU2, SCIA on the controlCARD FTDI backchannel. `AT+<name>?` and `AT+<name>=<value>` against short or long register names, plus `AT+C<n>PAUSE` / `AT+C<n>RESUME`. **Only available in the debug build** (`BTS_DEBUG_CONSOLE == true`): the console takes GPIO28/29, which in production carry the WS2812B LED string and channel 1's GPIO trip. **The working baud rate is ~7267, not the 115200 the build configures** — see the TODO section. | `.claude/skills/bts-c2000-interfaces-skill/references/uart-at-commands.md` |
 | **CAN** | C2000 CPU2, CANA, 500 kbit/s, extended IDs from `0x1C000000`. Message objects 1–8 are per-channel telemetry; object 9 is a host register read/write. | `.claude/skills/bts-c2000-interfaces-skill/SKILL.md` |
 
 ---
@@ -261,18 +295,36 @@ decision or a gap.
   time between polls, which is finer than the BTS's fixed 150 ms step, so it
   stays the reported figure. The BTS totals are read alongside it for
   comparison.
+- **A restored slot is never auto-resumed.** After a reset, a slot that was
+  running comes back `PAUSED` + `RESTORED` and waits for an explicit command,
+  because the cell may have been swapped while the unit was off. Neither the
+  firmware nor the proxy will resume it for you. This is the single most
+  safety-critical rule in the supervision work.
+- **CPU2 detects the watchdog timeout but does not act on it.** It bumps a
+  counter in the `supervision` mailbox and CPU1 performs the pause. The
+  single-writer rule covers control state, not just memory.
+
+### Resolved since the last revision
+
+| | |
+|---|---|
+| ~~The mAh/mWh accumulators are never written~~ | **Live.** Six counters per slot now — mAh, mWh and elapsed seconds for each direction — integrated on CPU1 from the 16-bit ADS131M08 pair, contiguous in the runtime block, and **persisted to F-RAM across a reset**. Each direction's set is zeroed only when that direction starts. |
+| ~~The per-run min/max voltage trackers are never written~~ | **Deleted from the map.** `eChX_MinVoltage` / `eChX_MaxVoltage` were RO and never assigned — 16 registers of permanent 0.0. Removing them paid for most of the 16 new run-time-seconds registers. If per-run extremes are wanted back, the settings region carries a spare register per slot. |
+| ~~The BTS never signals end-of-test~~ | **Bit 2 is now driven.** `BTS_STATUS_END` is an alias for `BTS_STATUS_FINISHED` (bit 2) rather than a new bit; bit 16 is unused and reads 0. The bit is cleared on start, pause and stop and **restored from F-RAM at boot**. It is wired end to end — but see below for what still does not assert it. |
+| ~~There is no supervision timeout anywhere in the firmware~~ | **Closed.** A 30 s host watchdog, reloaded by any command on any interface including an I2C read, pauses every running slot if the host goes quiet. |
 
 ### Not yet implemented
 
 | | |
 |---|---|
-| **The per-run min/max voltage trackers are never written.** | `eChX_MinVoltage` (324) and `eChX_MaxVoltage` (328) are declared `REG_ACCESS_RO` and no code path on either core assigns them — they read back a constant `0.0`. The mAh/mWh accumulators that used to share this defect are now live: 320/332 are the charge pair, 1156 + ch×8 the discharge pair, each zeroed by the BTS when a run starts in that direction. They remain RO, so a host still cannot zero them on demand. |
-| **The BTS never signals end-of-test.** | Status bit 2 (`FINISHED`) is declared and published in the bitfield but never assigned; it is only *read*, in `publishStatusToCpu2()`. The ESP32 engine decides termination, and also honours `BTS_STATUS_FINISHED` and an unexpected `STOPPED` so a future build that does assert them works unchanged. |
-| **No current-taper termination.** | `iref_cuttout_A` is loaded from the register map and propagated across a slot group (`bts_cpu1.c:1077, 1107`) and then **never read**. CC-to-cutoff taper is done on the ESP32 against the configured `charge_term_c`. |
+| **Nothing asserts end-of-test yet.** | Status bit 2 is now driven and persisted, but no C2000 path sets it: termination remains the ESP32 engine's job, against its own `state == COMPLETE`. The bit is only ever observed non-zero across a boot restore. A future C2000-side termination will light it with no host change. |
+| **No current-taper termination.** | `iref_cuttout_A` is loaded from `eChX_ChargeCurrentMin` and propagated across a slot group, then **never read**. CC-to-cutoff taper is done on the ESP32 against the configured `charge_term_c`. This is the missing half of the entry above. |
+| **The AT console's baud rate is wrong, and the cause is unknown.** | `BTS_CONSOLE_BAUDRATE` is `115200` and `SCI_setConfig()` computes BRR = 42 from `DEVICE_LSPCLK_FREQ` — arithmetic that gives roughly 145 kbaud, already not 115200. In practice the console only works at **approximately 7267 baud**; at 115200 every received byte is framing garbage (observed 254, 248, 254, 245 where `A`, `T`, `+` were sent). The working rate implies the real LSPCLK is far below what `DEVICE_LSPCLK_FREQ` claims, but that is **not confirmed** — reading `ClkCfgRegs` over JTAG returned all zeros, a known artefact on this part when read while the core is running. **Halt the core before judging the PLL**, and do not change the baud constant until the clock tree has been read properly: the same LSPCLK feeds SPI and the LED driver's 800 kbaud timing. |
+| **A spurious `WARNING: host watchdog DISABLED` on the AT console.** | Printed periodically even though `eHostWatchdog_s` reads 30.0 and the countdown is healthy. `hostWdDisableWarn` is set only where a write of `0.0` arrives at that register, and it reads 0 when sampled, so the trigger has not been identified. Cosmetic — supervision is verifiably armed — but alarming and wrong. Confirm with `AT+WD?`, which answers `+WD=30.00`. |
 | **All hardware over-current trips are disabled.** | `BTS_TRIP_HW_CH1..8_ENABLED (false)`, `bts_user_settings.h:113-120`. Only the software check in `BTS_tripEpwm()` (`bts.h:350`) is active — one control pass, not one switching cycle. The trip links need wiring and the X-BAR routing needs fixing before these go back to `true`; `bts_hal.c:1200-1216` records exactly what is wrong with the current routing (the one-shot zones read TZ1/TZ2, not TRIPIN9–12, and INPUT15/16 do not exist on this device). |
 | **`eTripStatus` (988) is always zero, and so is status bit 3.** | The bits are set only in `epwmTripISR()`, whose trip-zone interrupt is enabled per channel only when that channel's `BTS_TRIP_HW_CHn_ENABLED` is true (`bts_hal.c:1098-1102`). The software trip path sets the trip-zone flags itself and does not go through the ISR. **Do not use `eTripStatus` as a fault indicator against this firmware.** |
-| **`bts_regs.h` is a hand-maintained mirror of `registers.h` with no build coupling.** | Adding a register means editing both. Worse, the two files use the **same identifiers for different things**: `BTS_STATUS_*` and `BTS_CAL_ST_*` are bit *positions* on the C2000 and bit *masks* on the ESP32; the calibration and sense block offsets are register *indices* on one side and *byte* offsets on the other; and `BTS_SENSE_BASE` is a function-like macro returning an index on the C2000 and a bare byte-address constant on the ESP32. Copying a line between the files compiles and is wrong. |
-| **`CPU2TOCPU1RAM` is the binding constraint on new shared registers.** | 1024 words, **258 free** after the calibration and accumulator blocks. Overflow is a *link-time* failure (`#10099-D`, section `MSGRAM_CPU2_TO_CPU1`), so it fails loudly — but any further addition needs a rebuild and a glance at the map. `CPU1TOCPU2RAM` has 548 free. |
+| **`bts_regs.h` is a hand-maintained mirror of `registers.h` with no build coupling.** | Adding a register means editing both, and they have drifted before: the mirror lost `eWatchdogRemaining_s` in the v2 reorder, shifting every calibration telemetry address by one register (found and fixed 2026-09-20). Worse, the two files use the **same identifiers for different things**: `BTS_STATUS_*` and `BTS_CAL_ST_*` are bit *positions* on the C2000 and bit *masks* on the ESP32; the `BTS_RT_*`, `BTS_SET_*` and `BTS_CAL_*` offsets are register *indices* on one side and *byte* offsets on the other; and `BTS_RT_BASE` / `BTS_SET_BASE` are function-like macros returning an index on the C2000 and bare byte-address constants on the ESP32. The v2 reorder sharpened this: `BTS_RT_STATUS` is `0` in both files, while `BTS_RT_CELL_VOLTAGE` is `1` on the C2000 and `4` on the ESP32. Copying a line between the files compiles and is wrong. |
+| **`CPU2TOCPU1RAM` is the binding constraint on new shared registers.** | 1024 words, **234 free** after the v2 map and the supervision mailbox — v2's 315 registers account for 630 of the 790 used. Overflow is a *link-time* failure (`#10099-D`, section `MSGRAM_CPU2_TO_CPU1`), so it fails loudly — but any further addition needs a rebuild and a glance at the map. `CPU1TOCPU2RAM` has 516 free. |
 | **Every slot must be recalibrated after this change.** | The F-RAM header magic was bumped `0xA5CC` → `0xA5CD` for the `calFlags`/`crc32` revision and the fixed 128-byte stride, so every existing block now fails validation and the slot falls back to compiled defaults with no green ticks. The same change fixes a long-standing bug in which channel 4's block overwrote the global voltage thresholds — which consequently have *never* persisted. |
 | **No mDNS.** | Nothing in the firmware registers a `.local` name. Use the IP address the device logs on connect (`idf.py monitor`). |
 
@@ -294,14 +346,28 @@ feature-by-feature summary of what the firmware implements.
 Two rules the whole firmware design rests on, and that are easy to break:
 
 - **Never insert a register mid-map.** External hosts hard-code byte addresses.
-  Append above the current top, and update the `registers.h` enum, the `NUM_*`
-  counts, `TOTAL_REGISTERS`, `regConfig[]` and `uartRegConfig[]` **together** —
-  the tables are sized by `TOTAL_REGISTERS` and must stay index-aligned.
+  A new per-slot setting goes in the settings region's spare register; a new
+  runtime field has no spare and would mean another breaking stride change.
+  Update the `registers.h` enum, the `NUM_*` counts, `TOTAL_REGISTERS`,
+  `regConfig[]` and `uartRegConfig[]` **together** — the tables are sized by
+  `TOTAL_REGISTERS` and must stay index-aligned — plus the ESP32 `bts_regs.h`
+  mirror, which has no build coupling and is currently already adrift.
+- **The two per-slot regions have different strides**, 12 registers and 24.
+  Always index through `BTS_RT_BASE(ch)` / `BTS_SET_BASE(ch)`. Mixing them
+  produces silent cross-channel corruption rather than an error.
 - **CPU1 does not decode every register it is sent.** `BTS_HandleRegisterWrite()`
-  only handles indices below `eCh0_CurrentAcc` and inside the calibration
-  blocks. Anything else has its IPC flag acked and is silently discarded, so a
+  handles the settings region's mode register and calibration group, plus
+  `eCalCommand`. Anything else — including `eCalibrationMode` and
+  `eHostWatchdog_s` — has its IPC flag acked and is silently discarded, so a
   new register needs an explicit entry or it will be accepted by CPU2 and
-  quietly ignored by CPU1.
+  quietly ignored by CPU1. The decode is **by index range**, so it has to be
+  re-derived every time the map moves.
+- **Do not halt CPU2 in the debugger mid-I2C-transaction.** The recovery for a
+  wedged I2C target runs from CPU2's own idle loop, so stopping that core part
+  way through a transfer leaves the target holding SCL with nothing running to
+  clear it. The ESP32 link does not come back without a reload or a power
+  cycle. A debugging artefact rather than a firmware fault, but it costs a
+  bring-up session every time.
 
 ---
 

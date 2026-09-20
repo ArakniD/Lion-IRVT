@@ -29,21 +29,38 @@ extern "C" {
 typedef struct {
     float    cell_voltage_v;
     float    cell_current_a;
+    /* The ADS131M08 pair, which is what the BTS's CC loop regulates against
+     * and what its own counters integrate. */
+    float    sense_voltage_v;
+    float    sense_current_a;
     float    cell_temp_c;
     /*
      * Per-direction totals from the BTS itself. Each accumulates positive
      * magnitude and is zeroed only when its own direction starts, so a
      * charge and a discharge on one slot leave two independent figures.
+     * The seconds counters advance on the same timestep as the mAh/mWh, so
+     * all three of a direction stay consistent across a pause.
      */
     float    charge_mah;
     float    charge_mwh;
+    float    charge_seconds;
     float    discharge_mah;
     float    discharge_mwh;
-    float    min_voltage_v;
-    float    max_voltage_v;
+    float    discharge_seconds;
     uint32_t status_bits;      /* BTS_STATUS_* */
     bool     cmpss_trip;
     bool     gpio_trip;
+    /*
+     * Decoded from status_bits. `paused` keeps its direction bit set, so
+     * `charging`/`discharging` still say what a resume would do. The two
+     * reasons are mutually informative rather than exclusive: wd_tripped
+     * means the host link died mid-run, restored means the unit reset and
+     * came back holding the counters.
+     */
+    bool     paused;
+    bool     wd_tripped;
+    bool     restored;
+    bool     ended;
     bool     valid;            /* false until the first good read */
 } bts_channel_state_t;
 
@@ -52,17 +69,24 @@ typedef struct {
     float            input_voltage_v;
     bts_unit_state_t unit_state;
     uint32_t         trip_status;
+    /*
+     * The unit's configured host-watchdog timeout in seconds, 0 when it is
+     * disabled. The unit publishes only the timeout, not the remaining
+     * count, so a host cannot show a countdown - see bts_link.h notes and
+     * the README.
+     */
+    float            watchdog_timeout_s;
     bool             online;           /* last poll cycle completed */
     uint32_t         consecutive_errors;
     int64_t          last_poll_us;
 } bts_unit_status_t;
 
 /*
- * Calibration window, registers 1036-1088.
+ * Calibration window, registers 1200-1252.
  *
  * Only refreshed while the unit reports calibration active; the fields hold
  * their last values otherwise, and `active` is what tells them apart. The
- * poll task skips the burst when idle so the normal 33-transaction cycle
+ * poll task skips the burst when idle so the normal 9-transaction cycle
  * does not get longer for a feature that is almost never in use.
  */
 typedef struct {
@@ -124,13 +148,24 @@ esp_err_t bts_link_write_reg(uint16_t reg_addr, float value);
  */
 esp_err_t bts_link_read_block(uint16_t reg_addr, float *out_values, size_t count);
 
-/* Convenience wrappers over the control block. */
+/* Convenience wrappers over the settings block's mode register. */
 esp_err_t bts_link_set_mode(uint8_t channel, uint32_t mode);
 esp_err_t bts_link_stop_channel(uint8_t channel);
 esp_err_t bts_link_stop_all(void);
 
 /*
- * Writes the eight control-block limit registers for a channel.
+ * Pause and resume, as the mode register's edge command bits.
+ *
+ * A pause zeroes the converter reference and freezes the direction's
+ * counters without losing them; the resume picks up where it left off and
+ * clears WD_TRIPPED/RESTORED. Both are no-ops on a slot in the wrong state,
+ * so the caller checks the status bits afterwards rather than the return.
+ */
+esp_err_t bts_link_pause_channel(uint8_t channel);
+esp_err_t bts_link_resume_channel(uint8_t channel);
+
+/*
+ * Writes the ten settings-block limit registers for a channel.
  *
  * The caller is expected to have clamped these to the unit envelope already
  * (cell_profile_to_bts_limits() does that); this function clamps again as a
@@ -179,10 +214,10 @@ const char *bts_link_cal_result_name(uint32_t result);
  * Whether the BTS is populating its own mAh/mWh accumulators.
  *
  * The current F2837xD firmware does: CPU1 integrates the ADS131M08 pair in
- * its 6.67 Hz C1 task and publishes charge totals at 320/332 and discharge
- * totals at 1156+. They remain REG_ACCESS_RO, so a host still cannot zero
- * them on demand - the BTS resets a direction's pair itself when that
- * direction starts, which is what the "reset then discharge" sequence
+ * its 6.67 Hz C1 task and publishes both directions' totals in the runtime
+ * block at BTS_RT_CHARGE_MAH.. . They remain REG_ACCESS_RO, so a host still
+ * cannot zero them on demand - the BTS resets a direction's set itself when
+ * that direction starts, which is what the "reset then discharge" sequence
  * actually needed.
  *
  * They are still advisory here. The test engine keeps its own trapezoidal

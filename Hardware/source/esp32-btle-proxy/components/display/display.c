@@ -15,7 +15,8 @@
  *   <state>  <volts>  <amps>  <mAh>  <mWh>
  *
  * with the state letter colour-coded: D discharge, C charge, R rest,
- * G good/complete, F fault, and a dim dash when the slot is idle.
+ * G good/complete, F fault, P paused, W watchdog-paused, and a dim dash
+ * when the slot is idle.
  *
  * Three other screens replace the table: the waiting screen while the BTS
  * has never answered, the boot self-test, and the calibration screen, which
@@ -331,11 +332,18 @@ static void draw_ble_icon(int x, int y, int band_y, bool up)
  *
  *   D discharge   C charge (and the shipping recharge)
  *   R rest        G complete/good   F fault
+ *   P paused by a command or a boot restore
+ *   W paused because the host watchdog fired
  *
  * CHECK_REST shows 'R' too: from the operator's side it is the same thing,
  * the slot is settling before anything happens.
+ *
+ * P and W are deliberately different letters rather than one colour-coded
+ * badge: a stopped slot and a paused one look alike on the glass otherwise,
+ * and the distinction between "I paused this" and "the link died" is the
+ * whole reason an operator would go and look at the unit.
  */
-static char state_letter(slot_state_t st, uint16_t *colour)
+static char state_letter(slot_state_t st, bool wd_tripped, uint16_t *colour)
 {
     switch (st) {
     case SLOT_STATE_DISCHARGE:
@@ -353,6 +361,11 @@ static char state_letter(slot_state_t st, uint16_t *colour)
         *colour = C_RED;     return 'F';
     case SLOT_STATE_ABORTED:
         *colour = C_RED;     return 'A';
+    case SLOT_STATE_BTS_PAUSED:
+        if (wd_tripped) {
+            *colour = C_RED;    return 'W';
+        }
+        *colour = C_CYAN;    return 'P';
     case SLOT_STATE_IDLE:
     default:
         *colour = C_DIM;     return '-';
@@ -439,7 +452,7 @@ static void draw_slot_row(uint8_t slot)
     band_clear(selected ? C_SELECT_BG : C_BLACK);
 
     uint16_t sc;
-    const char letter = state_letter(st.state, &sc);
+    const char letter = state_letter(st.state, st.bts_wd_tripped, &sc);
 
     /* A caret in the left margin, so the selection survives a colour-blind
      * reading of the background tint. */
@@ -475,6 +488,19 @@ static void draw_slot_row(uint8_t slot)
         band_fill_rect(40, y + 2, s_cfg.width - 42, ROW_H - 4, y,
                        selected ? C_SELECT_BG : C_BLACK);
         band_text(44, y + 7, y, slot_fault_name(st.fault), C_RED, 1);
+    } else if (st.state == SLOT_STATE_BTS_PAUSED) {
+        /*
+         * Why it is paused, not just that it is. A restored pause means the
+         * unit rebooted and the cell in the holder may not be the one the
+         * counters belong to, which is the case an operator must not resume
+         * on reflex - so it is spelled out rather than colour-coded.
+         */
+        const char *why = st.bts_restored   ? "PAUSED - UNIT RESET"
+                          : st.bts_wd_tripped ? "PAUSED - LINK LOST"
+                                              : "PAUSED";
+        band_fill_rect(40, y + 2, s_cfg.width - 42, ROW_H - 4, y,
+                       selected ? C_SELECT_BG : C_BLACK);
+        band_text(44, y + 7, y, why, st.bts_restored ? C_ORANGE : C_CYAN, 1);
     }
 
     band_fill_rect(0, y + ROW_H - 1, s_cfg.width, 1, y, RGB565(0x1082));

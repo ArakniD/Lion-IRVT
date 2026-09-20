@@ -21,9 +21,10 @@ a GATT service (for a Web Bluetooth UI) and a JSON HTTP API.
 | BTS address | `0x50` |
 | Unit envelope | 0–5 V and ±10 A per channel, 8 channels |
 
-The backup cell is why `test_engine_init()` stops every channel at boot: the
+The backup cell is why `test_engine_init()` stops the channels at boot: the
 proxy can outlive a BTS power cycle, so at startup it cannot know what the
-unit is doing and must not assume the channels are idle.
+unit is doing and must not assume the channels are idle. The one exception is
+a slot the BTS reports `PAUSED` — see the watchdog and pause section below.
 
 ---
 
@@ -50,54 +51,121 @@ the same environment itself.
 
 ---
 
-## Two things the BTS firmware cannot currently do
+## Register map v2 and the host watchdog
 
-Both were found by reading the C2000 sources, and both change what this
-firmware had to do. **Neither is a fault in this project — they are
-limitations of the BTS build in `tida-010086/bts_F2837xD_8ch/`.**
+The BTS register map was reorganised in v2, and **every address moved**. Both
+the C2000 and this firmware must be flashed together - there is no
+compatibility window. The authoritative contract is
+`Docs/supervision-and-state-design.md`; `components/bts_link/include/bts_regs.h`
+is the mirror this project builds against.
 
-### 1. The mAh/mWh accumulators cannot be reset on demand (partly resolved)
+Three regions replace the nine scattered blocks of v1:
+
+| Region | Base | Stride | Regs/slot | Range |
+|---|---|---|---|---|
+| runtime (RO) | 0 | 48 B | 12 | 0 – 383 |
+| settings (RW) | 384 | 96 B | 24 | 384 – 1151 |
+| unit | 1152 | — | — | 1152 – 1252 |
+
+**314 registers, top address 1252.** A slot's whole live state - status, both
+measurement paths, temperature and six counters - is one contiguous burst,
+which took the poll cycle from **33 I2C transactions to 9** (8 slots + the
+unit block; 10 while calibration is active). `eChX_MinVoltage`/`MaxVoltage`
+are deleted: they were declared RO and never written.
+
+Always derive addresses with `BTS_RT_ADDR()`, `BTS_SET_ADDR()` and
+`BTS_CAL_ADDR()` rather than open-coding the arithmetic.
+
+### The host watchdog
+
+The unit runs a countdown, 30 s by default, reloaded by **any** host command
+on any interface - including a register **read**, so this firmware's 250 ms
+poll keeps it fed without a dedicated keep-alive. When it expires every
+`CHARGING`/`DISCHARGING` slot is paused with `WD_TRIPPED` and its converter
+off. That is the supervision this instrument previously had nowhere: before
+v2, losing the ESP32 left the converters running.
+
+**The read-path reload is load-bearing here.** This firmware's steady-state
+poll issues nothing but reads, so a BTS build that reloads only in
+`applyHostRegisterWrite()` would pause every running slot 30 s after the last
+mode command, however healthily the proxy is polling. Verify it against the
+I2C target read path, not just the write path, before trusting a long run.
+
+It is **not** over-current protection. Hardware over-current trips are
+disabled on this build and the software check in `BTS_tripEpwm()` remains the
+only fast protection.
+
+The timeout is readable and writable at `eHostWatchdog_s` (1196) and appears
+in `GET /api/status` as `unit.watchdog_timeout_s`. Writing 0 disables it,
+which is for bench work where nothing is polling. The unit publishes only the
+configured timeout, **not the remaining seconds**, so no host can show a live
+countdown - only whether supervision is armed.
+
+### PAUSED, and why a restored slot never auto-resumes
+
+A slot can be `PAUSED` with its `CHARGING` or `DISCHARGING` bit still set:
+the converter is off, the direction is remembered and the counters are frozen
+intact. Two bits say why - `WD_TRIPPED` (the host link died mid-run) and
+`RESTORED` (the unit reset and rebuilt the run from F-RAM at boot).
+
+`RESTORED` is the safety-critical one. **The engine never resumes it.** The
+cell may have been swapped while the unit was off, so the run is parked in
+`SLOT_STATE_BTS_PAUSED` - which is neither a fault nor an idle slot the
+engine may reuse - and only an explicit operator action over HTTP or BLE
+resumes it. `test_engine_init()`'s boot sweep skips a paused slot for the
+same reason: stopping it would discard the state the unit deliberately kept.
+
+Pause and resume are edge command bits in the mode register (3 and 4), acted
+on at the write and not retained.
+
+---
+
+## One thing the BTS firmware still cannot do
+
+Found by reading the C2000 sources. **Not a fault in this project — it is a
+limitation of the BTS build in `tida-010086/bts_F2837xD_8ch/`.**
+
+### The mAh/mWh accumulators cannot be reset on demand
 
 The specified sequence was "reset the watt and current counters in the BTS
 via registers, then initiate the discharge". The **populated** half of that is
-now solved on the BTS side; the **host-commanded reset** half is not:
+solved on the BTS side; the **host-commanded reset** half is not:
 
 - CPU1 integrates `Isense_A`/`Vsense_V` — the 16-bit ADS131M08 pair — in its
-  6.67 Hz `C1()` task and publishes per-direction totals: charge at
-  `eChX_ChargeAcc_mAh`/`_mWh` (320/332, the old `CurrentAcc`/`PowerAcc`
-  addresses, renamed) and discharge at `eChX_DischargeAcc_mAh`/`_mWh`
-  (1156 + ch×8). Both accumulate positive magnitude into their own direction,
-  so a charge and a discharge on one slot give two separate totals.
+  6.67 Hz `C1()` task and publishes both directions' totals in each slot's
+  runtime block, now with a run-time seconds counter beside each mAh/mWh
+  pair. Both accumulate positive magnitude into their own direction, so a
+  charge and a discharge on one slot give two separate totals.
 - They are **still `REG_ACCESS_RO`**, and `i2cSlaveISR()` still drops host
   writes to RO registers, so a host cannot zero them whenever it likes.
-- What replaces that: the BTS resets a direction's pair itself in
-  `modeCallback()` at the moment that direction starts, and only that pair.
-  So by the time a mode write has been accepted the counters for the run
-  about to begin are already at zero — which is the behaviour the
-  reset-then-discharge sequence actually needed.
+- What replaces that: the BTS resets a direction's set itself in
+  `modeCallback()` at the moment that direction starts, and only that set.
+  A pause and resume zeroes nothing, which is the point of the state.
 
 **What this firmware does:** keeps its own trapezoidal integration
 (`coulomb_counter.c`) as the reported figure, because it samples on real
 elapsed time at the 250 ms poll rather than a fixed 150 ms step and does not
 lose a partial interval at the ends of a run. The BTS's own counters are read
-each poll and reported beside it (`bts_raw` in the result JSON) so the two can
-be compared. `try_reset_bts_accumulators()` still issues the write for a
-future build that makes the registers writable.
+each poll and reported beside it (`bts_raw` in the result JSON, `bts` in the
+slot status) so the two can be compared. `try_reset_bts_accumulators()` still
+issues the write for a future build that makes the registers writable.
 
-Note that `bts_link_stats_are_live()` is now a **positive test only**: a unit
-that has been idle since power-up reads all-zero and is indistinguishable
-from the older firmware that never wrote these registers.
+For a slot the BTS is holding paused, the **BTS's** counters are the ones
+reported: the run may predate this boot entirely, and where both exist the
+BTS's kept counting up to the moment of the pause.
 
-### 2. The BTS never signals end-of-test
+Note that `bts_link_stats_are_live()` is a **positive test only**: a unit that
+has been idle since power-up reads all-zero and is indistinguishable from an
+older firmware that never wrote these registers.
 
-`status[].finished` is declared, and published in the status bitfield, but is
-never assigned by any code path on either core — it is only read, in
-`publishStatusToCpu2()` (`bts_cpu1.c:390`).
+### End-of-test is now signalled — but the engine still owns the cutoff
 
-**What this firmware does instead:** the engine watches cell voltage against
-the cutoff itself and issues the stop. It also honours `BTS_STATUS_FINISHED`
-and an unexpected `STOPPED` as additional termination conditions, so a future
-BTS build that does assert them will work without a change here.
+`BTS_STATUS_FINISHED` (bit 2) was declared and never assigned on either core.
+In v2 it carries the `END` semantic and is driven, alongside an explicit
+`BTS_STATUS_END` at bit 16; `BTS_STATUS_ENDED_MASK` accepts either, so the
+engine works against a unit built either way. It still watches cell voltage
+against the cutoff itself and issues the stop rather than depending on the
+unit to do so.
 
 ---
 
@@ -109,33 +177,28 @@ between the two projects — if the C2000 map changes, update `bts_regs.h` to
 match.**
 
 Two details are easy to get wrong, and the older ESPHome component in
-`esp32-controller/components/bts_i2c/` gets both of them wrong:
+`esp32-controller/components/bts_i2c/` gets both of them wrong (it is also
+still on the v1 map and is documented as do-not-use):
 
 **Byte order is big-endian.** `floatGetWireByte()` in `com_cpu2.c` emits
 word1-high, word1-low, word0-high, word0-low, which is the float MSB first.
 A `memcpy` into a `float` on the ESP32 produces garbage. Use
 `bts_wire_to_f32()` / `bts_f32_to_wire()`.
 
-**The blocks do not share a stride.**
-
-| Block | Base | Stride/channel |
-|---|---|---|
-| control | 0 | 40 B (10 regs) |
-| stats | 320 | 24 B (6 regs) |
-| temp limits | 512 | 8 B (2 regs) |
-| global voltage | 576 | — (4 regs total) |
-| calibration | 592 | 48 B (12 regs) |
-| unit | 976 | — (4 regs total) |
-| measured cell temp | 992 | 4 B (1 reg) |
-| sense (ADS131M08) | 1092 | 8 B (2 regs) |
-| discharge accumulators | 1156 | 8 B (2 regs) |
-
-Always derive addresses with `BTS_CTRL_ADDR()`, `BTS_STATS_ADDR()` and
-friends rather than open-coding the arithmetic.
+**Offsets and status bits mean different things on the two sides.** In
+`bts_regs.h` the offsets are **byte** offsets and `BTS_STATUS_*` are
+**masks**; the C2000 header uses register **indices** and bit **positions**.
+Copying a line between the two files compiles and is silently wrong — there
+is a warning block above `BTS_STATUS_RUNNING` saying so.
 
 Register addresses on the wire are **byte** addresses (index × 4). Reads
 auto-increment, so a whole block is one transaction; writes rewind to the
 address phase, so a burst write must not resend the address.
+
+Every read is preceded by one **pad byte**: the C2000 starts clocking out
+whatever its transmit register holds the instant it acknowledges the repeated
+start, before its ISR can run. `bus_read_block()` fetches `1 + count*4` bytes
+and discards the first. A read path that omits this returns shifted garbage.
 
 ---
 
@@ -159,7 +222,11 @@ IDLE
 ```
 
 Any state can go to `FAULT` (which must be cleared explicitly, so an operator
-has to see it) or `ABORTED`.
+has to see it) or `ABORTED`. A slot can also land in `BTS_PAUSED` from any
+state including `IDLE`, when the unit reports the slot paused — a watchdog
+timeout, or a run restored from F-RAM at boot. That is not a fault and not an
+idle slot: starting or reconfiguring it is refused until an operator resumes
+or aborts it.
 
 The recharge target is a percentage of **what this test actually removed**,
 not of the datasheet capacity, so an aged cell still lands at the right state
@@ -175,6 +242,10 @@ allowance), the BTS CMPSS and GPIO trip bits, the unit's input-voltage state,
 a wall-clock ceiling (12 h by default), and the I2C link itself. A sustained
 comms blackout stops every channel, so a dropped link cannot leave a cell on
 load indefinitely.
+
+The BTS's own 30 s host watchdog now backs that up from the other side: if
+this firmware stops polling entirely, the unit pauses every running slot
+itself rather than leaving the converters on.
 
 This is the *slow supervisory* layer. The BTS's own CMPSS and GPIO trips are
 the fast one, in hardware, and they stay authoritative.
@@ -220,7 +291,7 @@ characteristic shares the base with a 16-bit discriminator in bytes 2–3.
 | UUID suffix | Access | Payload |
 |---|---|---|
 | `0002` | read, notify | `ble_unit_status_t` |
-| `0003` | write | `ble_cmd_t` — start / abort / clear fault / abort all |
+| `0003` | write | `ble_cmd_t` — start / abort / clear fault / abort all / pause / resume |
 | `0004` | read, write | `uint8` slot select |
 | `0005` | read, write | `ble_slot_config_t` |
 | `0006` | read | `ble_slot_result_t` |
@@ -228,14 +299,20 @@ characteristic shares the base with a 16-bit discriminator in bytes 2–3.
 | `0008` | read, write | `uint8` catalogue index |
 | `0009` | read | `ble_catalog_entry_t` |
 | `000a` | read, notify | `ble_slot_status_t` |
+| `000b` | write | `ble_cal_cmd_t` |
+| `000c` | read, notify | `ble_cal_status_t` |
 
 All records are packed little-endian, which is what `DataView` with
 `littleEndian=true` reads — note this is the *opposite* of the BTS I2C wire
 format; nothing past `bts_link` sees the C2000's byte order.
 
-`ble_proto.h` is the contract. `BLE_PROTO_VERSION` is published in the
+`ble_proto.h` is the contract. `BLE_PROTO_VERSION` is **3**, published in the
 unit-status record so a client can refuse to decode a firmware it does not
-understand rather than silently misreading a struct.
+understand rather than silently misreading a struct. Proto 3 **appends** to
+`ble_unit_status_t` (the watchdog timeout, 24 B total) and to
+`ble_slot_status_t` (the four pause flags and the six counters, 68 B total);
+no characteristic was renumbered, because the discriminators are the client's
+contract. `tools/ble_verify.py` decodes both and checks the version first.
 
 The slot-status notification carries its slot number, so one subscription
 covers all eight. Notifications fire on every state change, and once a second
@@ -254,10 +331,11 @@ survive an operator walking away with the tablet.
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/status` | unit + all slots |
+| GET | `/api/status` | unit + all slots, with the watchdog timeout and per-slot pause flags and counters |
 | GET | `/api/slot/<n>` | one slot, with its resolved profile and last result |
 | POST | `/api/slot/<n>/config` | all fields optional; unspecified fields keep their current value |
 | POST | `/api/slot/<n>/start` · `/abort` · `/clear` | |
+| POST | `/api/slot/<n>/pause` · `/resume` | pause a running slot, or resume one the BTS is holding |
 | POST | `/api/slot/<n>/serial` | `{"serial":"..."}` |
 | GET | `/api/slot/<n>/result` | |
 | GET | `/api/results?offset=&limit=` | rolling history, 64 deep |
@@ -266,6 +344,12 @@ survive an operator walking away with the tablet.
 | POST | `/api/abort_all` | |
 | POST | `/api/wifi` | `{"ssid":"...","password":"..."}` |
 | GET | `/api/registers?addr=&count=` | raw BTS registers, for bring-up |
+
+Route ordering matters and is not obvious: `httpd_uri_match_wildcard()`
+honours only a **trailing** asterisk, so a pattern with the wildcard in the
+middle never matches. Exact paths are registered before the wildcards, one
+wildcard pattern is registered per method, and the trailing action segment is
+dispatched by hand — see the comment on the route table.
 
 Example. There is no mDNS responder in this firmware, so use the address the
 device logs on connect (`idf.py monitor`) rather than a `.local` name:
@@ -276,6 +360,9 @@ curl -X POST http://$BTS/api/slot/0/config \
   -d '{"model":"VTC6","serial":"ABC123","auto_recharge_to_shipping":true}'
 curl -X POST http://$BTS/api/slot/0/start
 curl http://$BTS/api/status
+
+# A slot that came back paused after a BTS reset, once the cell is confirmed:
+curl -X POST http://$BTS/api/slot/0/resume
 ```
 
 JSON is emitted and parsed by `json_min.c` rather than cJSON: IDF 6.1 no

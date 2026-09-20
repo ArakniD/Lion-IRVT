@@ -43,6 +43,10 @@
 #define LED_CAL_PERIOD          24U   // 300 ms
 #define LED_CAL_ON              12U
 
+// Slower than the fault flashes: a pause is a held state, not an alarm.
+#define LED_PAUSE_PERIOD        80U   // 1000 ms
+#define LED_PAUSE_ON            40U
+
 // Function prototypes
 void LEDDriver_init(void);
 void LEDDriver_update(void);

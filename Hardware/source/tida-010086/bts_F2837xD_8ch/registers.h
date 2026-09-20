@@ -21,45 +21,29 @@
 #include "bts_user_settings.h"
 
 #define NUM_CHANNELS 8
-#define NUM_CONTROL_REGISTERS (NUM_CHANNELS * 10) // 80
-#define NUM_STATS_REGISTERS (NUM_CHANNELS * 6)    // 48 (voltage, current)
-#define NUM_CALIBRATION_REGISTERS (NUM_CHANNELS * 12 + 16 + 4) // 16 + 4 + 96 (min/max temp, F28V/I gains/offsets, Iout/Vout calibrations, global voltages, calibration mode)
-#define NUM_UNIT_REGISTERS (4)
+
 //
-// Measured cell temperature, one per channel, from the two ADS1119
-// converters on I2CB. These are appended after the unit block rather than
-// folded into the stats block on purpose: external hosts (see the ESP32
-// bridge in esp32-controller/components/bts_i2c) hard-code the byte
-// addresses of every block from 336 upward, so inserting a register
-// mid-map would shift them all and change the stats stride.
+//=============================================================================
+// Register map v2
+//=============================================================================
 //
-#define NUM_TEMP_MEAS_REGISTERS (NUM_CHANNELS * 1) // 8
+// Three regions with fixed, generous per-slot strides, so a future field does
+// not shift every address again:
 //
-// Slot grouping, read back from the MODE/ENABLE dip switches. Appended for
-// the same reason as the block above - never inserted mid-map.
+//   runtime   base    0, stride 12 regs (48 B), all RO  - one host burst/slot
+//   settings  base  384, stride 24 regs (96 B)          - one host burst/slot
+//   unit      base 1152
 //
-#define NUM_GROUP_REGISTERS (3)
+// Runtime ch7 ends at 383, immediately before the settings base; settings ch7
+// ends at 1151, immediately before the unit base. Top address is 1256.
 //
-// Runtime slot calibration. Unit-scoped rather than per-slot: only one slot
-// calibrates at a time, and eight copies of the telemetry window would need
-// 144 words of CPU2TOCPU1RAM, which is not available.
-//
-#define NUM_CAL_CONTROL_REGISTERS (5)
-#define NUM_CAL_TELEMETRY_REGISTERS (9)
-//
-// ADS131M08 engineering values, one pair per slot. The stats block at 336
-// carries the 12-bit internal ADC; this is the 16-bit converter, which until
-// now was computed every 100 ms and read by nothing.
-//
-#define NUM_SENSE_REGISTERS (NUM_CHANNELS * 2) // 16
-//
-// Discharge mAh/mWh accumulators. The pair at 320/332 in the stats block is
-// the CHARGE direction; this block is the discharge one. Two blocks rather
-// than one signed pair so a charge followed by a discharge on the same slot
-// yields two separate positive totals instead of cancelling.
-//
-#define NUM_DISCHACC_REGISTERS (NUM_CHANNELS * 2) // 16
-#define TOTAL_REGISTERS (NUM_CONTROL_REGISTERS + NUM_STATS_REGISTERS + NUM_CALIBRATION_REGISTERS + NUM_UNIT_REGISTERS + NUM_TEMP_MEAS_REGISTERS + NUM_GROUP_REGISTERS + NUM_CAL_CONTROL_REGISTERS + NUM_CAL_TELEMETRY_REGISTERS + NUM_SENSE_REGISTERS + NUM_DISCHACC_REGISTERS) // 305
+#define BTS_RT_REGS_PER_CH          (12U)
+#define BTS_SET_REGS_PER_CH         (24U)
+
+#define NUM_RUNTIME_REGISTERS   (NUM_CHANNELS * BTS_RT_REGS_PER_CH)   // 96
+#define NUM_SETTINGS_REGISTERS  (NUM_CHANNELS * BTS_SET_REGS_PER_CH)  // 192
+#define NUM_UNIT_REGISTERS      (27)
+#define TOTAL_REGISTERS (NUM_RUNTIME_REGISTERS + NUM_SETTINGS_REGISTERS + NUM_UNIT_REGISTERS) // 315
 
 // CAN bus configuration
 #define CAN_BITRATE 500000 // 500 kbps
@@ -72,356 +56,343 @@ typedef enum {
 } RegAccessType;
 
 typedef enum {
-    // Control Block (80 registers)
-    eCh0_Mode = 0,
-    eCh0_ChargeVoltageMin = 4,
-    eCh0_ChargeVoltageMax = 8,
-    eCh0_DischargeVoltageMin = 12,
-    eCh0_DischargeVoltageMax = 16,
-    eCh0_ChargeCurrentMin = 20,
-    eCh0_ChargeCurrentMax = 24,
-    eCh0_DischargeCurrentMin = 28,
-    eCh0_DischargeCurrentMax = 32,
-    eCh0_Status = 36,
-    eCh1_Mode = 40,
-    eCh1_ChargeVoltageMin = 44,
-    eCh1_ChargeVoltageMax = 48,
-    eCh1_DischargeVoltageMin = 52,
-    eCh1_DischargeVoltageMax = 56,
-    eCh1_ChargeCurrentMin = 60,
-    eCh1_ChargeCurrentMax = 64,
-    eCh1_DischargeCurrentMin = 68,
-    eCh1_DischargeCurrentMax = 72,
-    eCh1_Status = 76,
-    eCh2_Mode = 80,
-    eCh2_ChargeVoltageMin = 84,
-    eCh2_ChargeVoltageMax = 88,
-    eCh2_DischargeVoltageMin = 92,
-    eCh2_DischargeVoltageMax = 96,
-    eCh2_ChargeCurrentMin = 100,
-    eCh2_ChargeCurrentMax = 104,
-    eCh2_DischargeCurrentMin = 108,
-    eCh2_DischargeCurrentMax = 112,
-    eCh2_Status = 116,
-    eCh3_Mode = 120,
-    eCh3_ChargeVoltageMin = 124,
-    eCh3_ChargeVoltageMax = 128,
-    eCh3_DischargeVoltageMin = 132,
-    eCh3_DischargeVoltageMax = 136,
-    eCh3_ChargeCurrentMin = 140,
-    eCh3_ChargeCurrentMax = 144,
-    eCh3_DischargeCurrentMin = 148,
-    eCh3_DischargeCurrentMax = 152,
-    eCh3_Status = 156,
-    eCh4_Mode = 160,
-    eCh4_ChargeVoltageMin = 164,
-    eCh4_ChargeVoltageMax = 168,
-    eCh4_DischargeVoltageMin = 172,
-    eCh4_DischargeVoltageMax = 176,
-    eCh4_ChargeCurrentMin = 180,
-    eCh4_ChargeCurrentMax = 184,
-    eCh4_DischargeCurrentMin = 188,
-    eCh4_DischargeCurrentMax = 192,
-    eCh4_Status = 196,
-    eCh5_Mode = 200,
-    eCh5_ChargeVoltageMin = 204,
-    eCh5_ChargeVoltageMax = 208,
-    eCh5_DischargeVoltageMin = 212,
-    eCh5_DischargeVoltageMax = 216,
-    eCh5_ChargeCurrentMin = 220,
-    eCh5_ChargeCurrentMax = 224,
-    eCh5_DischargeCurrentMin = 228,
-    eCh5_DischargeCurrentMax = 232,
-    eCh5_Status = 236,
-    eCh6_Mode = 240,
-    eCh6_ChargeVoltageMin = 244,
-    eCh6_ChargeVoltageMax = 248,
-    eCh6_DischargeVoltageMin = 252,
-    eCh6_DischargeVoltageMax = 256,
-    eCh6_ChargeCurrentMin = 260,
-    eCh6_ChargeCurrentMax = 264,
-    eCh6_DischargeCurrentMin = 268,
-    eCh6_DischargeCurrentMax = 272,
-    eCh6_Status = 276,
-    eCh7_Mode = 280,
-    eCh7_ChargeVoltageMin = 284,
-    eCh7_ChargeVoltageMax = 288,
-    eCh7_DischargeVoltageMin = 292,
-    eCh7_DischargeVoltageMax = 296,
-    eCh7_ChargeCurrentMin = 300,
-    eCh7_ChargeCurrentMax = 304,
-    eCh7_DischargeCurrentMin = 308,
-    eCh7_DischargeCurrentMax = 312,
-    eCh7_Status = 316,
-    // Stats Block (48 registers)
-    eCh0_ChargeAcc_mAh = 320,
-    eCh0_MinVoltage = 324,
-    eCh0_MaxVoltage = 328,
-    eCh0_ChargeAcc_mWh = 332,
-    eCh0_CellVoltage = 336,
-    eCh0_CellCurrent = 340,
-    eCh1_ChargeAcc_mAh = 344,
-    eCh1_MinVoltage = 348,
-    eCh1_MaxVoltage = 352,
-    eCh1_ChargeAcc_mWh = 356,
-    eCh1_CellVoltage = 360,
-    eCh1_CellCurrent = 364,
-    eCh2_ChargeAcc_mAh = 368,
-    eCh2_MinVoltage = 372,
-    eCh2_MaxVoltage = 376,
-    eCh2_ChargeAcc_mWh = 380,
-    eCh2_CellVoltage = 384,
-    eCh2_CellCurrent = 388,
-    eCh3_ChargeAcc_mAh = 392,
-    eCh3_MinVoltage = 396,
-    eCh3_MaxVoltage = 400,
-    eCh3_ChargeAcc_mWh = 404,
-    eCh3_CellVoltage = 408,
-    eCh3_CellCurrent = 412,
-    eCh4_ChargeAcc_mAh = 416,
-    eCh4_MinVoltage = 420,
-    eCh4_MaxVoltage = 424,
-    eCh4_ChargeAcc_mWh = 428,
-    eCh4_CellVoltage = 432,
-    eCh4_CellCurrent = 436,
-    eCh5_ChargeAcc_mAh = 440,
-    eCh5_MinVoltage = 444,
-    eCh5_MaxVoltage = 448,
-    eCh5_ChargeAcc_mWh = 452,
-    eCh5_CellVoltage = 456,
-    eCh5_CellCurrent = 460,
-    eCh6_ChargeAcc_mAh = 464,
-    eCh6_MinVoltage = 468,
-    eCh6_MaxVoltage = 472,
-    eCh6_ChargeAcc_mWh = 476,
-    eCh6_CellVoltage = 480,
-    eCh6_CellCurrent = 484,
-    eCh7_ChargeAcc_mAh = 488,
-    eCh7_MinVoltage = 492,
-    eCh7_MaxVoltage = 496,
-    eCh7_ChargeAcc_mWh = 500,
-    eCh7_CellVoltage = 504,
-    eCh7_CellCurrent = 508,
-    // Calibration Block (116 registers)
-    eCh0_MinCellTemp = 512,
-    eCh0_MaxCellTemp = 516,
-    eCh1_MinCellTemp = 520,
-    eCh1_MaxCellTemp = 524,
-    eCh2_MinCellTemp = 528,
-    eCh2_MaxCellTemp = 532,
-    eCh3_MinCellTemp = 536,
-    eCh3_MaxCellTemp = 540,
-    eCh4_MinCellTemp = 544,
-    eCh4_MaxCellTemp = 548,
-    eCh5_MinCellTemp = 552,
-    eCh5_MaxCellTemp = 556,
-    eCh6_MinCellTemp = 560,
-    eCh6_MaxCellTemp = 564,
-    eCh7_MinCellTemp = 568,
-    eCh7_MaxCellTemp = 572,
-    eChargeDisableV = 576,
-    eChargeRestrictV = 580,
-    eDischargeRestrictV = 584,
-    eDischargeDisableV = 588,
-    eCh0_F28V_Gain = 592,
-    eCh0_F28V_Offset = 596,
-    eCh0_F28I_Gain = 600,
-    eCh0_F28I_Offset = 604,
-    eCh0_IoutGain_pu = 608,
-    eCh0_IoutOffset_pu = 612,
-    eCh0_IoutGain_A = 616,
-    eCh0_IoutOffset_A = 620,
-    eCh0_VoutGain_pu = 624,
-    eCh0_VoutOffset_pu = 628,
-    eCh0_VoutGain_V = 632,
-    eCh0_VoutOffset_V = 636,
-    eCh1_F28V_Gain = 640,
-    eCh1_F28V_Offset = 644,
-    eCh1_F28I_Gain = 648,
-    eCh1_F28I_Offset = 652,
-    eCh1_IoutGain_pu = 656,
-    eCh1_IoutOffset_pu = 660,
-    eCh1_IoutGain_A = 664,
-    eCh1_IoutOffset_A = 668,
-    eCh1_VoutGain_pu = 672,
-    eCh1_VoutOffset_pu = 676,
-    eCh1_VoutGain_V = 680,
-    eCh1_VoutOffset_V = 684,
-    eCh2_F28V_Gain = 688,
-    eCh2_F28V_Offset = 692,
-    eCh2_F28I_Gain = 696,
-    eCh2_F28I_Offset = 700,
-    eCh2_IoutGain_pu = 704,
-    eCh2_IoutOffset_pu = 708,
-    eCh2_IoutGain_A = 712,
-    eCh2_IoutOffset_A = 716,
-    eCh2_VoutGain_pu = 720,
-    eCh2_VoutOffset_pu = 724,
-    eCh2_VoutGain_V = 728,
-    eCh2_VoutOffset_V = 732,
-    eCh3_F28V_Gain = 736,
-    eCh3_F28V_Offset = 740,
-    eCh3_F28I_Gain = 744,
-    eCh3_F28I_Offset = 748,
-    eCh3_IoutGain_pu = 752,
-    eCh3_IoutOffset_pu = 756,
-    eCh3_IoutGain_A = 760,
-    eCh3_IoutOffset_A = 764,
-    eCh3_VoutGain_pu = 768,
-    eCh3_VoutOffset_pu = 772,
-    eCh3_VoutGain_V = 776,
-    eCh3_VoutOffset_V = 780,
-    eCh4_F28V_Gain = 784,
-    eCh4_F28V_Offset = 788,
-    eCh4_F28I_Gain = 792,
-    eCh4_F28I_Offset = 796,
-    eCh4_IoutGain_pu = 800,
-    eCh4_IoutOffset_pu = 804,
-    eCh4_IoutGain_A = 808,
-    eCh4_IoutOffset_A = 812,
-    eCh4_VoutGain_pu = 816,
-    eCh4_VoutOffset_pu = 820,
-    eCh4_VoutGain_V = 824,
-    eCh4_VoutOffset_V = 828,
-    eCh5_F28V_Gain = 832,
-    eCh5_F28V_Offset = 836,
-    eCh5_F28I_Gain = 840,
-    eCh5_F28I_Offset = 844,
-    eCh5_IoutGain_pu = 848,
-    eCh5_IoutOffset_pu = 852,
-    eCh5_IoutGain_A = 856,
-    eCh5_IoutOffset_A = 860,
-    eCh5_VoutGain_pu = 864,
-    eCh5_VoutOffset_pu = 868,
-    eCh5_VoutGain_V = 872,
-    eCh5_VoutOffset_V = 876,
-    eCh6_F28V_Gain = 880,
-    eCh6_F28V_Offset = 884,
-    eCh6_F28I_Gain = 888,
-    eCh6_F28I_Offset = 892,
-    eCh6_IoutGain_pu = 896,
-    eCh6_IoutOffset_pu = 900,
-    eCh6_IoutGain_A = 904,
-    eCh6_IoutOffset_A = 908,
-    eCh6_VoutGain_pu = 912,
-    eCh6_VoutOffset_pu = 916,
-    eCh6_VoutGain_V = 920,
-    eCh6_VoutOffset_V = 924,
-    eCh7_F28V_Gain = 928,
-    eCh7_F28V_Offset = 932,
-    eCh7_F28I_Gain = 936,
-    eCh7_F28I_Offset = 940,
-    eCh7_IoutGain_pu = 944,
-    eCh7_IoutOffset_pu = 948,
-    eCh7_IoutGain_A = 952,
-    eCh7_IoutOffset_A = 956,
-    eCh7_VoutGain_pu = 960,
-    eCh7_VoutOffset_pu = 964,
-    eCh7_VoutGain_V = 968,
-    eCh7_VoutOffset_V = 972,
-    // Unit Values (3 registers)
-    eCalibrationMode = 976,
-    eUnitState = 980,
-    eInputVoltage = 984,
-    eTripStatus = 988, // 32-bit bitfield for trip sources
-    // Measured Cell Temperatures (8 registers, RO, degrees C)
     //
-    // The measurement, NOT the configured trip window - the min/max pair in
-    // the calibration block at 512 holds the limits and is mirrored into the
-    // F-RAM image. Written by CPU2 from the ADS1119 DRDY ISRs.
+    // Runtime block, base 0, stride 48 bytes (12 registers per slot).
+    // Everything a host polls, contiguous so a slot is one I2C burst.
+    // All REG_ACCESS_RO.
     //
-    eCh0_CellTemp = 992,
-    eCh1_CellTemp = 996,
-    eCh2_CellTemp = 1000,
-    eCh3_CellTemp = 1004,
-    eCh4_CellTemp = 1008,
-    eCh5_CellTemp = 1012,
-    eCh6_CellTemp = 1016,
-    eCh7_CellTemp = 1020,
+    eCh0_Status = 0,
+    eCh0_CellVoltage = 4,
+    eCh0_CellCurrent = 8,
+    eCh0_SenseVoltage = 12,
+    eCh0_SenseCurrent = 16,
+    eCh0_CellTemp = 20,
+    eCh0_ChargeAcc_mAh = 24,
+    eCh0_ChargeAcc_mWh = 28,
+    eCh0_ChargeRuntime_s = 32,
+    eCh0_DischargeAcc_mAh = 36,
+    eCh0_DischargeAcc_mWh = 40,
+    eCh0_DischargeRuntime_s = 44,
+    eCh1_Status = 48,
+    eCh1_CellVoltage = 52,
+    eCh1_CellCurrent = 56,
+    eCh1_SenseVoltage = 60,
+    eCh1_SenseCurrent = 64,
+    eCh1_CellTemp = 68,
+    eCh1_ChargeAcc_mAh = 72,
+    eCh1_ChargeAcc_mWh = 76,
+    eCh1_ChargeRuntime_s = 80,
+    eCh1_DischargeAcc_mAh = 84,
+    eCh1_DischargeAcc_mWh = 88,
+    eCh1_DischargeRuntime_s = 92,
+    eCh2_Status = 96,
+    eCh2_CellVoltage = 100,
+    eCh2_CellCurrent = 104,
+    eCh2_SenseVoltage = 108,
+    eCh2_SenseCurrent = 112,
+    eCh2_CellTemp = 116,
+    eCh2_ChargeAcc_mAh = 120,
+    eCh2_ChargeAcc_mWh = 124,
+    eCh2_ChargeRuntime_s = 128,
+    eCh2_DischargeAcc_mAh = 132,
+    eCh2_DischargeAcc_mWh = 136,
+    eCh2_DischargeRuntime_s = 140,
+    eCh3_Status = 144,
+    eCh3_CellVoltage = 148,
+    eCh3_CellCurrent = 152,
+    eCh3_SenseVoltage = 156,
+    eCh3_SenseCurrent = 160,
+    eCh3_CellTemp = 164,
+    eCh3_ChargeAcc_mAh = 168,
+    eCh3_ChargeAcc_mWh = 172,
+    eCh3_ChargeRuntime_s = 176,
+    eCh3_DischargeAcc_mAh = 180,
+    eCh3_DischargeAcc_mWh = 184,
+    eCh3_DischargeRuntime_s = 188,
+    eCh4_Status = 192,
+    eCh4_CellVoltage = 196,
+    eCh4_CellCurrent = 200,
+    eCh4_SenseVoltage = 204,
+    eCh4_SenseCurrent = 208,
+    eCh4_CellTemp = 212,
+    eCh4_ChargeAcc_mAh = 216,
+    eCh4_ChargeAcc_mWh = 220,
+    eCh4_ChargeRuntime_s = 224,
+    eCh4_DischargeAcc_mAh = 228,
+    eCh4_DischargeAcc_mWh = 232,
+    eCh4_DischargeRuntime_s = 236,
+    eCh5_Status = 240,
+    eCh5_CellVoltage = 244,
+    eCh5_CellCurrent = 248,
+    eCh5_SenseVoltage = 252,
+    eCh5_SenseCurrent = 256,
+    eCh5_CellTemp = 260,
+    eCh5_ChargeAcc_mAh = 264,
+    eCh5_ChargeAcc_mWh = 268,
+    eCh5_ChargeRuntime_s = 272,
+    eCh5_DischargeAcc_mAh = 276,
+    eCh5_DischargeAcc_mWh = 280,
+    eCh5_DischargeRuntime_s = 284,
+    eCh6_Status = 288,
+    eCh6_CellVoltage = 292,
+    eCh6_CellCurrent = 296,
+    eCh6_SenseVoltage = 300,
+    eCh6_SenseCurrent = 304,
+    eCh6_CellTemp = 308,
+    eCh6_ChargeAcc_mAh = 312,
+    eCh6_ChargeAcc_mWh = 316,
+    eCh6_ChargeRuntime_s = 320,
+    eCh6_DischargeAcc_mAh = 324,
+    eCh6_DischargeAcc_mWh = 328,
+    eCh6_DischargeRuntime_s = 332,
+    eCh7_Status = 336,
+    eCh7_CellVoltage = 340,
+    eCh7_CellCurrent = 344,
+    eCh7_SenseVoltage = 348,
+    eCh7_SenseCurrent = 352,
+    eCh7_CellTemp = 356,
+    eCh7_ChargeAcc_mAh = 360,
+    eCh7_ChargeAcc_mWh = 364,
+    eCh7_ChargeRuntime_s = 368,
+    eCh7_DischargeAcc_mAh = 372,
+    eCh7_DischargeAcc_mWh = 376,
+    eCh7_DischargeRuntime_s = 380,
     //
-    // Slot grouping (3 registers, RO). Latched from the MODE/ENABLE dip
-    // switches by CPU1 at boot and mirrored here so a host can see how the
-    // unit is strapped without reading the switches itself.
+    // Settings block, base 384, stride 96 bytes (24 registers per slot).
+    // 23 used, 1 spare per slot. The 12 calibration registers keep their
+    // internal order at offset 11, which is what BTS_CAL_BASE() indexes.
     //
-    eSlotMode = 1024,
-    eSlotEnable = 1028,
-    eGroupSize = 1032,
+    eCh0_Mode = 384,
+    eCh0_ChargeVoltageMin = 388,
+    eCh0_ChargeVoltageMax = 392,
+    eCh0_DischargeVoltageMin = 396,
+    eCh0_DischargeVoltageMax = 400,
+    eCh0_ChargeCurrentMin = 404,
+    eCh0_ChargeCurrentMax = 408,
+    eCh0_DischargeCurrentMin = 412,
+    eCh0_DischargeCurrentMax = 416,
+    eCh0_MinCellTemp = 420,
+    eCh0_MaxCellTemp = 424,
+    eCh0_F28V_Gain = 428,
+    eCh0_F28V_Offset = 432,
+    eCh0_F28I_Gain = 436,
+    eCh0_F28I_Offset = 440,
+    eCh0_IoutGain_pu = 444,
+    eCh0_IoutOffset_pu = 448,
+    eCh0_IoutGain_A = 452,
+    eCh0_IoutOffset_A = 456,
+    eCh0_VoutGain_pu = 460,
+    eCh0_VoutOffset_pu = 464,
+    eCh0_VoutGain_V = 468,
+    eCh0_VoutOffset_V = 472,
+    eCh0_SettingsSpare = 476,
+    eCh1_Mode = 480,
+    eCh1_ChargeVoltageMin = 484,
+    eCh1_ChargeVoltageMax = 488,
+    eCh1_DischargeVoltageMin = 492,
+    eCh1_DischargeVoltageMax = 496,
+    eCh1_ChargeCurrentMin = 500,
+    eCh1_ChargeCurrentMax = 504,
+    eCh1_DischargeCurrentMin = 508,
+    eCh1_DischargeCurrentMax = 512,
+    eCh1_MinCellTemp = 516,
+    eCh1_MaxCellTemp = 520,
+    eCh1_F28V_Gain = 524,
+    eCh1_F28V_Offset = 528,
+    eCh1_F28I_Gain = 532,
+    eCh1_F28I_Offset = 536,
+    eCh1_IoutGain_pu = 540,
+    eCh1_IoutOffset_pu = 544,
+    eCh1_IoutGain_A = 548,
+    eCh1_IoutOffset_A = 552,
+    eCh1_VoutGain_pu = 556,
+    eCh1_VoutOffset_pu = 560,
+    eCh1_VoutGain_V = 564,
+    eCh1_VoutOffset_V = 568,
+    eCh1_SettingsSpare = 572,
+    eCh2_Mode = 576,
+    eCh2_ChargeVoltageMin = 580,
+    eCh2_ChargeVoltageMax = 584,
+    eCh2_DischargeVoltageMin = 588,
+    eCh2_DischargeVoltageMax = 592,
+    eCh2_ChargeCurrentMin = 596,
+    eCh2_ChargeCurrentMax = 600,
+    eCh2_DischargeCurrentMin = 604,
+    eCh2_DischargeCurrentMax = 608,
+    eCh2_MinCellTemp = 612,
+    eCh2_MaxCellTemp = 616,
+    eCh2_F28V_Gain = 620,
+    eCh2_F28V_Offset = 624,
+    eCh2_F28I_Gain = 628,
+    eCh2_F28I_Offset = 632,
+    eCh2_IoutGain_pu = 636,
+    eCh2_IoutOffset_pu = 640,
+    eCh2_IoutGain_A = 644,
+    eCh2_IoutOffset_A = 648,
+    eCh2_VoutGain_pu = 652,
+    eCh2_VoutOffset_pu = 656,
+    eCh2_VoutGain_V = 660,
+    eCh2_VoutOffset_V = 664,
+    eCh2_SettingsSpare = 668,
+    eCh3_Mode = 672,
+    eCh3_ChargeVoltageMin = 676,
+    eCh3_ChargeVoltageMax = 680,
+    eCh3_DischargeVoltageMin = 684,
+    eCh3_DischargeVoltageMax = 688,
+    eCh3_ChargeCurrentMin = 692,
+    eCh3_ChargeCurrentMax = 696,
+    eCh3_DischargeCurrentMin = 700,
+    eCh3_DischargeCurrentMax = 704,
+    eCh3_MinCellTemp = 708,
+    eCh3_MaxCellTemp = 712,
+    eCh3_F28V_Gain = 716,
+    eCh3_F28V_Offset = 720,
+    eCh3_F28I_Gain = 724,
+    eCh3_F28I_Offset = 728,
+    eCh3_IoutGain_pu = 732,
+    eCh3_IoutOffset_pu = 736,
+    eCh3_IoutGain_A = 740,
+    eCh3_IoutOffset_A = 744,
+    eCh3_VoutGain_pu = 748,
+    eCh3_VoutOffset_pu = 752,
+    eCh3_VoutGain_V = 756,
+    eCh3_VoutOffset_V = 760,
+    eCh3_SettingsSpare = 764,
+    eCh4_Mode = 768,
+    eCh4_ChargeVoltageMin = 772,
+    eCh4_ChargeVoltageMax = 776,
+    eCh4_DischargeVoltageMin = 780,
+    eCh4_DischargeVoltageMax = 784,
+    eCh4_ChargeCurrentMin = 788,
+    eCh4_ChargeCurrentMax = 792,
+    eCh4_DischargeCurrentMin = 796,
+    eCh4_DischargeCurrentMax = 800,
+    eCh4_MinCellTemp = 804,
+    eCh4_MaxCellTemp = 808,
+    eCh4_F28V_Gain = 812,
+    eCh4_F28V_Offset = 816,
+    eCh4_F28I_Gain = 820,
+    eCh4_F28I_Offset = 824,
+    eCh4_IoutGain_pu = 828,
+    eCh4_IoutOffset_pu = 832,
+    eCh4_IoutGain_A = 836,
+    eCh4_IoutOffset_A = 840,
+    eCh4_VoutGain_pu = 844,
+    eCh4_VoutOffset_pu = 848,
+    eCh4_VoutGain_V = 852,
+    eCh4_VoutOffset_V = 856,
+    eCh4_SettingsSpare = 860,
+    eCh5_Mode = 864,
+    eCh5_ChargeVoltageMin = 868,
+    eCh5_ChargeVoltageMax = 872,
+    eCh5_DischargeVoltageMin = 876,
+    eCh5_DischargeVoltageMax = 880,
+    eCh5_ChargeCurrentMin = 884,
+    eCh5_ChargeCurrentMax = 888,
+    eCh5_DischargeCurrentMin = 892,
+    eCh5_DischargeCurrentMax = 896,
+    eCh5_MinCellTemp = 900,
+    eCh5_MaxCellTemp = 904,
+    eCh5_F28V_Gain = 908,
+    eCh5_F28V_Offset = 912,
+    eCh5_F28I_Gain = 916,
+    eCh5_F28I_Offset = 920,
+    eCh5_IoutGain_pu = 924,
+    eCh5_IoutOffset_pu = 928,
+    eCh5_IoutGain_A = 932,
+    eCh5_IoutOffset_A = 936,
+    eCh5_VoutGain_pu = 940,
+    eCh5_VoutOffset_pu = 944,
+    eCh5_VoutGain_V = 948,
+    eCh5_VoutOffset_V = 952,
+    eCh5_SettingsSpare = 956,
+    eCh6_Mode = 960,
+    eCh6_ChargeVoltageMin = 964,
+    eCh6_ChargeVoltageMax = 968,
+    eCh6_DischargeVoltageMin = 972,
+    eCh6_DischargeVoltageMax = 976,
+    eCh6_ChargeCurrentMin = 980,
+    eCh6_ChargeCurrentMax = 984,
+    eCh6_DischargeCurrentMin = 988,
+    eCh6_DischargeCurrentMax = 992,
+    eCh6_MinCellTemp = 996,
+    eCh6_MaxCellTemp = 1000,
+    eCh6_F28V_Gain = 1004,
+    eCh6_F28V_Offset = 1008,
+    eCh6_F28I_Gain = 1012,
+    eCh6_F28I_Offset = 1016,
+    eCh6_IoutGain_pu = 1020,
+    eCh6_IoutOffset_pu = 1024,
+    eCh6_IoutGain_A = 1028,
+    eCh6_IoutOffset_A = 1032,
+    eCh6_VoutGain_pu = 1036,
+    eCh6_VoutOffset_pu = 1040,
+    eCh6_VoutGain_V = 1044,
+    eCh6_VoutOffset_V = 1048,
+    eCh6_SettingsSpare = 1052,
+    eCh7_Mode = 1056,
+    eCh7_ChargeVoltageMin = 1060,
+    eCh7_ChargeVoltageMax = 1064,
+    eCh7_DischargeVoltageMin = 1068,
+    eCh7_DischargeVoltageMax = 1072,
+    eCh7_ChargeCurrentMin = 1076,
+    eCh7_ChargeCurrentMax = 1080,
+    eCh7_DischargeCurrentMin = 1084,
+    eCh7_DischargeCurrentMax = 1088,
+    eCh7_MinCellTemp = 1092,
+    eCh7_MaxCellTemp = 1096,
+    eCh7_F28V_Gain = 1100,
+    eCh7_F28V_Offset = 1104,
+    eCh7_F28I_Gain = 1108,
+    eCh7_F28I_Offset = 1112,
+    eCh7_IoutGain_pu = 1116,
+    eCh7_IoutOffset_pu = 1120,
+    eCh7_IoutGain_A = 1124,
+    eCh7_IoutOffset_A = 1128,
+    eCh7_VoutGain_pu = 1132,
+    eCh7_VoutOffset_pu = 1136,
+    eCh7_VoutGain_V = 1140,
+    eCh7_VoutOffset_V = 1144,
+    eCh7_SettingsSpare = 1148,
     //
-    // Calibration control (5 registers, unit-scoped). The host writes
-    // eCalArgument first, then eCalCommand; the command is consumed on
-    // write and eCalCommand self-clears.
+    // Unit block, base 1152. eWatchdogRemaining_s is the live
+    // countdown; calibration telemetry follows at 1224-1256.
     //
-    eCalSlot = 1036,
-    eCalCommand = 1040,
-    eCalArgument = 1044,
-    eCalStatus = 1048,
-    eCalResult = 1052,
-    //
-    // Calibration live telemetry (9 registers, RO). A window on the slot
-    // named by eCalSlot, zeroed when no slot is selected. The _pu values are
-    // the raw normalised converter readings BEFORE any gain/offset - that is
-    // the quantity the two-point maths consumes.
-    //
-    eCalAdsV_pu = 1056,
-    eCalAdsI_pu = 1060,
-    eCalAdsV_V = 1064,
-    eCalAdsI_A = 1068,
-    eCalF28V_pu = 1072,
-    eCalF28I_pu = 1076,
-    eCalF28V_V = 1080,
-    eCalF28I_A = 1084,
-    eCalTemp_C = 1088,
-    //
-    // ADS131M08 engineering values (16 registers, RO, stride 8).
-    //
-    eCh0_SenseVoltage = 1092,
-    eCh0_SenseCurrent = 1096,
-    eCh1_SenseVoltage = 1100,
-    eCh1_SenseCurrent = 1104,
-    eCh2_SenseVoltage = 1108,
-    eCh2_SenseCurrent = 1112,
-    eCh3_SenseVoltage = 1116,
-    eCh3_SenseCurrent = 1120,
-    eCh4_SenseVoltage = 1124,
-    eCh4_SenseCurrent = 1128,
-    eCh5_SenseVoltage = 1132,
-    eCh5_SenseCurrent = 1136,
-    eCh6_SenseVoltage = 1140,
-    eCh6_SenseCurrent = 1144,
-    eCh7_SenseVoltage = 1148,
-    eCh7_SenseCurrent = 1152,
-    //
-    // Discharge accumulators (16 registers, RO, stride 8). The charge
-    // direction lives at 320/332 in the stats block.
-    //
-    eCh0_DischargeAcc_mAh = 1156,
-    eCh0_DischargeAcc_mWh = 1160,
-    eCh1_DischargeAcc_mAh = 1164,
-    eCh1_DischargeAcc_mWh = 1168,
-    eCh2_DischargeAcc_mAh = 1172,
-    eCh2_DischargeAcc_mWh = 1176,
-    eCh3_DischargeAcc_mAh = 1180,
-    eCh3_DischargeAcc_mWh = 1184,
-    eCh4_DischargeAcc_mAh = 1188,
-    eCh4_DischargeAcc_mWh = 1192,
-    eCh5_DischargeAcc_mAh = 1196,
-    eCh5_DischargeAcc_mWh = 1200,
-    eCh6_DischargeAcc_mAh = 1204,
-    eCh6_DischargeAcc_mWh = 1208,
-    eCh7_DischargeAcc_mAh = 1212,
-    eCh7_DischargeAcc_mWh = 1216,
+    eChargeDisableV = 1152,
+    eChargeRestrictV = 1156,
+    eDischargeRestrictV = 1160,
+    eDischargeDisableV = 1164,
+    eCalibrationMode = 1168,
+    eUnitState = 1172,
+    eInputVoltage = 1176,
+    eTripStatus = 1180,
+    eSlotMode = 1184,
+    eSlotEnable = 1188,
+    eGroupSize = 1192,
+    eHostWatchdog_s = 1196,
+    eCalSlot = 1200,
+    eCalCommand = 1204,
+    eCalArgument = 1208,
+    eCalStatus = 1212,
+    eCalResult = 1216,
+    eWatchdogRemaining_s = 1220,
+    eCalAdsV_pu = 1224,
+    eCalAdsI_pu = 1228,
+    eCalAdsV_V = 1232,
+    eCalAdsI_A = 1236,
+    eCalF28V_pu = 1240,
+    eCalF28I_pu = 1244,
+    eCalF28V_V = 1248,
+    eCalF28I_A = 1252,
+    eCalTemp_C = 1256,
 } RegisterAddress;
 
 //
-// Registers per channel in each block. Defined here rather than with the
-// BTS_*_BASE() macros below because BTS_cpu1Status sizes an array with one.
+// Sub-blocks within a slot's settings region. The calibration group is 12
+// registers at offset 11; BTS_cpu1Status sizes an array with that count.
 //
-#define BTS_CTRL_REGS_PER_CH        (10U)
-#define BTS_STATS_REGS_PER_CH       (6U)
-#define BTS_TEMP_REGS_PER_CH        (2U)
 #define BTS_CAL_REGS_PER_CH         (12U)
-#define BTS_SENSE_REGS_PER_CH       (2U)
-#define BTS_DISCHACC_REGS_PER_CH    (2U)
+#define BTS_TEMP_REGS_PER_CH        (2U)
 
 typedef struct {
     uint16_t virtualAddr;   // Register address (from RegisterAddress enum)
@@ -462,6 +433,14 @@ typedef struct {
     //
     uint32_t calVoltageValid;
     uint32_t calCurrentValid;
+    //
+    // Pause is not a direction: a paused slot keeps its charging/discharging
+    // bit set alongside it, so a host sees both that it is held and what it
+    // will resume into.
+    //
+    uint32_t paused;
+    uint32_t wdTripped;        // paused by the host watchdog
+    uint32_t restored;         // paused by a FRAM boot restore
 } ChannelStatus;
 
 //
@@ -487,6 +466,28 @@ typedef struct {
 #define BTS_STATUS_CALIBRATING       12U
 #define BTS_STATUS_CAL_V_VALID       13U
 #define BTS_STATUS_CAL_I_VALID       14U
+//
+// Slot state model. PAUSED sits alongside the direction bit rather than
+// replacing it.
+//
+// END is an ALIAS for FINISHED (bit 2), not a new bit: that bit was declared
+// from the start and never written, so it is driven now with the END meaning
+// rather than duplicated at bit 16. Bit 16 is therefore free.
+//
+#define BTS_STATUS_PAUSED            15U
+#define BTS_STATUS_END               BTS_STATUS_FINISHED
+#define BTS_STATUS_WD_TRIPPED        17U  /* paused by the host watchdog   */
+#define BTS_STATUS_RESTORED          18U  /* paused by a FRAM boot restore */
+
+//
+// eChX_Mode command bits. Bits 3 and 4 are edge commands: acted on at the
+// write and not retained, so a host never has to clear them afterwards.
+//
+#define BTS_MODE_RUN                 0x01U
+#define BTS_MODE_CHARGE              0x02U
+#define BTS_MODE_CALIBRATE           0x04U
+#define BTS_MODE_PAUSE               0x08U
+#define BTS_MODE_RESUME              0x10U
 
 // Bitfield for eTripStatus register
 typedef struct {
@@ -539,6 +540,53 @@ typedef struct _BTS_channelCalibration
 #define BTS_CAL_FLAG_V_VALID   0x00000001UL
 #define BTS_CAL_FLAG_I_VALID   0x00000002UL
 #define BTS_CAL_FLAG_EXTERNAL  0x00000004UL  // externally referenced, not a compiled default
+
+//
+//=============================================================================
+// Slot runtime state persistence
+//=============================================================================
+//
+// Saved to F-RAM every 6 s and on each state transition, so a slot that was
+// mid-run when the unit reset comes back knowing what it was doing and how
+// far it had got. Restored as PAUSED, never resumed - see loadSlotStates().
+//
+typedef struct _BTS_slotRuntimeState
+{
+    uint32_t  header;           // BTS_STATE_HEADER | channel
+    uint32_t  stateFlags;       // running direction + END, at save time
+    float32_t chargeMah;
+    float32_t chargeMwh;
+    float32_t chargeSeconds;
+    float32_t dischargeMah;
+    float32_t dischargeMwh;
+    float32_t dischargeSeconds;
+    uint32_t  saveCounter;      // increments every save; staleness/wear info
+    uint32_t  crc32;            // over all preceding fields
+} BTS_slotRuntimeState;
+
+#define BTS_STATE_HEADER       0x5A5E0000UL
+#define BTS_STATE_HEADER_MASK  0xFFFF0000UL
+#define BTS_STATE_CHANNEL_MASK 0x0000FFFFUL
+#define BTS_STATE_MAKE_HEADER(ch)  (BTS_STATE_HEADER | ((uint32_t)(ch) & BTS_STATE_CHANNEL_MASK))
+
+// stateFlags, saved and restored. Deliberately a small private set rather
+// than the full status word: only what a restore has to reconstruct.
+#define BTS_STATE_F_RUNNING    0x00000001UL
+#define BTS_STATE_F_CHARGING   0x00000002UL
+#define BTS_STATE_F_END        0x00000004UL
+
+//
+//=============================================================================
+// Host watchdog
+//=============================================================================
+//
+// A supervision timeout, not over-current protection: hardware trips are
+// disabled and the software check in BTS_tripEpwm() is still the only fast
+// protection. Reloaded by any host command on any interface; on expiry every
+// running slot is paused with BTS_STATUS_WD_TRIPPED set.
+//
+#define BTS_HOST_WD_DEFAULT_S  ((float32_t)30.0)
+#define BTS_HOST_WD_MAX_S      ((float32_t)86400.0)
 
 //
 //=============================================================================
@@ -644,10 +692,27 @@ typedef struct {
 //   IPC_FLAG0  CPU2 -> CPU1  single register write, payload in ipcMsg
 //   IPC_FLAG1  CPU2 -> CPU1  cell temperature update, payload in ipcMsg
 //   IPC_FLAG2  CPU2 -> CPU1  whole calibration block reloaded, no payload
+//   IPC_FLAG3  CPU2 -> CPU1  slot runtime state restored from F-RAM
 //
 #define BTS_IPC_FLAG_REG_WRITE   IPC_FLAG0
 #define BTS_IPC_FLAG_TEMP_UPDATE IPC_FLAG1
 #define BTS_IPC_FLAG_CAL_RELOAD  IPC_FLAG2
+#define BTS_IPC_FLAG_STATE_RESTORE IPC_FLAG3
+
+//
+// CPU2 -> CPU1 supervision mailbox. Lives in CPU2TOCPU1RAM.
+//
+// CPU2 owns the host interfaces and the timebase, so it detects the watchdog
+// timeout - but it must never write a slot's control state, so it only bumps
+// a counter here and CPU1 performs the pause. Single-writer rule intact.
+//
+typedef struct {
+    uint32_t wdPauseSeq;     // bumped once per watchdog expiry
+    uint32_t restoreFlags;   // 3 bits per slot: BTS_STATE_F_* << (ch * 3)
+} BTS_supervision;
+
+#define BTS_STATE_FLAGS_SHIFT(ch)  ((uint16_t)(ch) * 3U)
+#define BTS_STATE_FLAGS_MASK       0x7UL
 
 // CPU2 -> CPU1 single register mailbox. Lives in CPU2TOCPU1RAM.
 typedef struct {
@@ -688,8 +753,10 @@ typedef struct {
     //
     float32_t chargeMah[NUM_CHANNELS];
     float32_t chargeMwh[NUM_CHANNELS];
+    float32_t chargeSeconds[NUM_CHANNELS];
     float32_t dischargeMah[NUM_CHANNELS];
     float32_t dischargeMwh[NUM_CHANNELS];
+    float32_t dischargeSeconds[NUM_CHANNELS];
     //
     // Runtime calibration. CPU1 owns the state machine and the captures;
     // CPU2 mirrors these into the 1036+ block and performs the F-RAM write,
@@ -801,42 +868,55 @@ typedef struct
 // Register map helpers
 //=============================================================================
 //
-// The register file is indexed by (byte address / 4). The blocks do NOT share
-// a stride, so always derive an index through these macros rather than
-// assuming 10 registers per channel:
+// The register file is indexed by (byte address / 4). Two per-slot regions,
+// each with its own stride - always derive an index through these macros:
 //
-//   control      10 regs/channel  eCh0_Mode        .. eCh7_Status
-//   stats         6 regs/channel  eCh0_ChargeAcc_mAh  .. eCh7_CellCurrent
-//   temperature   2 regs/channel  eCh0_MinCellTemp .. eCh7_MaxCellTemp
-//   global V      4 regs total    eChargeDisableV  .. eDischargeDisableV
-//   calibration  12 regs/channel  eCh0_F28V_Gain   .. eCh7_VoutOffset_V
-//   unit          4 regs total    eCalibrationMode .. eTripStatus
-//   cell temp     1 reg/channel   eCh0_CellTemp    .. eCh7_CellTemp
-//   discharge acc 2 regs/channel  eCh0_DischargeAcc_mAh .. eCh7_DischargeAcc_mWh
+//   runtime   12 regs/slot  eCh0_Status  .. eCh7_DischargeRuntime_s  (RO)
+//   settings  24 regs/slot  eCh0_Mode    .. eCh7_SettingsSpare
+//   unit      27 regs total eChargeDisableV .. eCalTemp_C
 //
 #define BTS_REG_IDX(addr)           ((uint16_t)((addr) / 4U))
 
-#define BTS_CTRL_BASE(ch)   (BTS_REG_IDX(eCh0_Mode)         + (ch) * BTS_CTRL_REGS_PER_CH)
-#define BTS_STATS_BASE(ch)  (BTS_REG_IDX(eCh0_ChargeAcc_mAh)   + (ch) * BTS_STATS_REGS_PER_CH)
-#define BTS_TEMP_BASE(ch)   (BTS_REG_IDX(eCh0_MinCellTemp)  + (ch) * BTS_TEMP_REGS_PER_CH)
-#define BTS_CAL_BASE(ch)    (BTS_REG_IDX(eCh0_F28V_Gain)    + (ch) * BTS_CAL_REGS_PER_CH)
-#define BTS_SENSE_BASE(ch)  (BTS_REG_IDX(eCh0_SenseVoltage) + (ch) * BTS_SENSE_REGS_PER_CH)
-#define BTS_DISCHACC_BASE(ch) (BTS_REG_IDX(eCh0_DischargeAcc_mAh) + (ch) * BTS_DISCHACC_REGS_PER_CH)
+#define BTS_RT_BASE(ch)     (BTS_REG_IDX(eCh0_Status) + (ch) * BTS_RT_REGS_PER_CH)
+#define BTS_SET_BASE(ch)    (BTS_REG_IDX(eCh0_Mode)   + (ch) * BTS_SET_REGS_PER_CH)
 
-// Offsets within the 2-register accumulator blocks. The charge pair is not
-// contiguous - it is interleaved with min/max voltage in the stats block - so
-// only the discharge block gets a base-plus-offset pair.
-#define BTS_DISCHACC_MAH       0U
-#define BTS_DISCHACC_MWH       1U
+// The 12 calibration registers sit at settings offset 11 and keep their
+// internal BTS_CAL_* order, so saveCalibration()/loadCalibration() index
+// through this exactly as before.
+#define BTS_CAL_BASE(ch)    (BTS_SET_BASE(ch) + 11U)
+#define BTS_TEMP_BASE(ch)   (BTS_SET_BASE(ch) + 9U)
 
-// Offsets within the 2-register sense block at BTS_SENSE_BASE(ch).
-#define BTS_SENSE_VOLTAGE      0U
-#define BTS_SENSE_CURRENT      1U
+// Offsets within a slot's runtime block at BTS_RT_BASE(ch).
+#define BTS_RT_STATUS          0U
+#define BTS_RT_CELL_VOLTAGE    1U
+#define BTS_RT_CELL_CURRENT    2U
+#define BTS_RT_SENSE_VOLTAGE   3U
+#define BTS_RT_SENSE_CURRENT   4U
+#define BTS_RT_CELL_TEMP       5U
+#define BTS_RT_CHARGE_MAH      6U
+#define BTS_RT_CHARGE_MWH      7U
+#define BTS_RT_CHARGE_SECONDS  8U
+#define BTS_RT_DISCHARGE_MAH   9U
+#define BTS_RT_DISCHARGE_MWH  10U
+#define BTS_RT_DISCHARGE_SECONDS 11U
 
-// Measured cell temperature is one register per channel, so the index is the
-// block base plus the channel. Distinct from BTS_TEMP_BASE(), which is the
-// configured min/max limit pair.
-#define BTS_CELLTEMP_IDX(ch) (BTS_REG_IDX(eCh0_CellTemp)     + (ch))
+// Offsets within a slot's settings block at BTS_SET_BASE(ch). Offsets 9-10
+// are the temperature window (BTS_TEMP_BASE) and 11-22 the calibration group
+// (BTS_CAL_BASE); 23 is spare.
+#define BTS_SET_MODE           0U
+#define BTS_SET_CHG_V_MIN      1U
+#define BTS_SET_CHG_V_MAX      2U
+#define BTS_SET_DIS_V_MIN      3U
+#define BTS_SET_DIS_V_MAX      4U
+#define BTS_SET_CHG_I_MIN      5U
+#define BTS_SET_CHG_I_MAX      6U
+#define BTS_SET_DIS_I_MIN      7U
+#define BTS_SET_DIS_I_MAX      8U
+
+// Measured cell temperature now lives in the runtime block with the rest of
+// the per-slot telemetry. The macro is kept so the ADS1119 publish path and
+// the calibration window still index it by name.
+#define BTS_CELLTEMP_IDX(ch) (BTS_RT_BASE(ch) + BTS_RT_CELL_TEMP)
 
 //
 //=============================================================================
@@ -919,6 +999,7 @@ typedef enum {
 extern volatile float32_t              registers[TOTAL_REGISTERS];
 extern volatile BTS_ipcMessage         ipcMsg;
 extern volatile uint32_t               calValidFlags[NUM_CHANNELS];
+extern volatile BTS_supervision        supervision;
 
 // CPU2-private: the full image never crosses to CPU1, only calValidFlags does.
 extern BTS_channelCalibration          calibrationData[NUM_CHANNELS];

@@ -284,6 +284,24 @@ static void emit_slot(json_out_t *j, uint8_t slot, const slot_status_t *st,
     json_kv_u(j, "bts_status", st->status_bits);
     json_kv_str(j, "serial", st->config.serial);
 
+    /*
+     * The BTS's own view of the slot. `restored` is the one an operator has
+     * to act on: the unit reset mid-run and is holding the counters, so
+     * whether resuming is safe depends on whether the cell was changed.
+     */
+    json_obj_open(j, "bts");
+    json_kv_bool(j, "paused", st->bts_paused);
+    json_kv_bool(j, "watchdog_tripped", st->bts_wd_tripped);
+    json_kv_bool(j, "restored", st->bts_restored);
+    json_kv_bool(j, "ended", st->bts_ended);
+    json_kv_f(j, "charge_mah", st->bts_charge_mah, 1);
+    json_kv_f(j, "charge_mwh", st->bts_charge_mwh, 1);
+    json_kv_f(j, "charge_seconds", st->bts_charge_seconds, 0);
+    json_kv_f(j, "discharge_mah", st->bts_discharge_mah, 1);
+    json_kv_f(j, "discharge_mwh", st->bts_discharge_mwh, 1);
+    json_kv_f(j, "discharge_seconds", st->bts_discharge_seconds, 0);
+    json_obj_close(j);
+
     if (st->configured) {
         json_obj_open(j, "config");
         json_kv_str(j, "chemistry", cell_chemistry_name(st->config.chemistry));
@@ -316,6 +334,13 @@ static void emit_unit(json_out_t *j)
     json_kv_f(j, "input_voltage_v", snap.unit.input_voltage_v, 3);
     json_kv_u(j, "trip_status", snap.unit.trip_status);
     json_kv_u(j, "consecutive_errors", snap.unit.consecutive_errors);
+    /*
+     * The unit publishes its configured host-watchdog timeout but not the
+     * remaining count, so a client can show the setting and whether it is
+     * armed, not a countdown. 0 means the watchdog is disabled.
+     */
+    json_kv_f(j, "watchdog_timeout_s", snap.unit.watchdog_timeout_s, 0);
+    json_kv_bool(j, "watchdog_enabled", snap.unit.watchdog_timeout_s > 0.0f);
     json_kv_u(j, "slots", SLOT_COUNT);
     json_kv_f(j, "max_current_a", BTS_UNIT_MAX_CURRENT_A, 1);
     json_kv_f(j, "max_voltage_v", BTS_UNIT_MAX_VOLTAGE_V, 1);
@@ -512,20 +537,36 @@ static esp_err_t h_slot_action(httpd_req_t *req)
         return send_error(req, "404 Not Found", "bad slot");
     }
 
+    /*
+     * Matched on the trailing segment, not with strstr: "/abort" is a
+     * substring of nothing here, but "/pause" and "/resume" would both have
+     * to be tested before "/start" if they were, and the ordering trap is
+     * exactly what the route table's comment warns about.
+     */
+    const char *action = strrchr(req->uri, '/');
+    if (action == NULL || action[1] == '\0') {
+        return send_error(req, "404 Not Found", "unknown action");
+    }
+    action++;
+
     esp_err_t err;
-    if (strstr(req->uri, "/start") != NULL) {
+    if (strcmp(action, "start") == 0) {
         err = test_engine_start((uint8_t)slot);
-    } else if (strstr(req->uri, "/abort") != NULL) {
+    } else if (strcmp(action, "abort") == 0) {
         err = test_engine_abort((uint8_t)slot);
-    } else if (strstr(req->uri, "/clear") != NULL) {
+    } else if (strcmp(action, "clear") == 0) {
         err = test_engine_clear_fault((uint8_t)slot);
+    } else if (strcmp(action, "pause") == 0) {
+        err = test_engine_pause((uint8_t)slot);
+    } else if (strcmp(action, "resume") == 0) {
+        err = test_engine_resume((uint8_t)slot);
     } else {
         return send_error(req, "404 Not Found", "unknown action");
     }
 
     if (err == ESP_ERR_INVALID_STATE) {
         return send_error(req, "409 Conflict",
-                          "slot not startable - configure it, or clear its fault");
+                          "slot is not in a state that accepts this action");
     }
     if (err != ESP_OK) {
         return send_error(req, "500 Internal Server Error", esp_err_to_name(err));
@@ -1087,12 +1128,9 @@ static esp_err_t h_slot_post_dispatch(httpd_req_t *req)
     if (strstr(req->uri, "/serial") != NULL) {
         return h_slot_serial(req);
     }
-    if (strstr(req->uri, "/start") != NULL ||
-        strstr(req->uri, "/abort") != NULL ||
-        strstr(req->uri, "/clear") != NULL) {
-        return h_slot_action(req);
-    }
-    return send_error(req, "404 Not Found", "unknown slot action");
+    /* Everything else is a bare action verb; h_slot_action matches it on the
+     * trailing segment and 404s what it does not recognise. */
+    return h_slot_action(req);
 }
 
 /*

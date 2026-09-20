@@ -7,6 +7,13 @@
  * that file changes, this one must be updated to match - there is no build
  * coupling between the C2000 project and this one.
  *
+ * MAP VERSION 2
+ * -------------
+ * Every address moved in v2. The map is three regions rather than nine
+ * scattered blocks, so a slot's live data is one contiguous burst and a poll
+ * cycle costs ~10 transactions instead of ~33. Both sides must be flashed
+ * together; there is no compatibility window.
+ *
  * WIRE FORMAT
  * -----------
  * The unit is an I2C target at 0x50 on I2CA. A register access is:
@@ -27,6 +34,9 @@
  * com_cpu2.c). A burst WRITE must NOT resend the address for subsequent
  * registers - the target keeps its own pointer across them.
  *
+ * Any register read also reloads the unit's host watchdog, so the poll task
+ * keeps the link supervision alive without a dedicated keep-alive write.
+ *
  * BYTE ORDER
  * ----------
  * The C2000 is a 16-bit-word machine. floatGetWireByte() in com_cpu2.c emits
@@ -36,24 +46,14 @@
  * ESPHome bts_i2c component in esp32-controller/. Use bts_wire_to_f32() and
  * bts_f32_to_wire() below rather than memcpy.
  *
- * BLOCK STRIDES
- * -------------
- * The blocks do not share a stride. Deriving an address by assuming 10
- * registers per channel everywhere is the bug in the old ESPHome component
- * (it used x24 for stats and x8 for temperature against a x40 control map).
+ * REGIONS
+ * -------
+ *   runtime   RO   base 0     stride 48 B (12 regs)    0 - 383
+ *   settings  RW   base 384   stride 96 B (24 regs)    384 - 1151
+ *   unit      mixed base 1152                          1152 - 1252
  *
- *   control      10 regs/channel   40 bytes/channel   base 0
- *   stats         6 regs/channel   24 bytes/channel   base 320
- *   temp limits   2 regs/channel    8 bytes/channel   base 512
- *   global V      4 regs total                        base 576
- *   calibration  12 regs/channel   48 bytes/channel   base 592
- *   unit          4 regs total                        base 976
- *   cell temp     1 reg/channel     4 bytes/channel   base 992
- *   grouping      3 regs total                        base 1024
- *   cal control   5 regs total                        base 1036
- *   cal telemetry 9 regs total                        base 1056
- *   sense         2 regs/channel    8 bytes/channel   base 1092
- *   discharge acc 2 regs/channel    8 bytes/channel   base 1156
+ * The strides are deliberately larger than the fields in use, so adding a
+ * field later does not move every slot again.
  */
 
 #ifndef BTS_REGS_H
@@ -69,81 +69,74 @@ extern "C" {
 #define BTS_I2C_ADDRESS         0x50
 #define BTS_NUM_CHANNELS        8
 #define BTS_REGISTER_SIZE       4
-#define BTS_TOTAL_REGISTERS     305
+#define BTS_TOTAL_REGISTERS     314
 
-/* Block bases, as byte addresses. */
-#define BTS_REG_CTRL_BASE       0
-#define BTS_REG_STATS_BASE      320
-#define BTS_REG_TEMPLIM_BASE    512
-#define BTS_REG_GLOBALV_BASE    576
-#define BTS_REG_CAL_BASE        592
-#define BTS_REG_UNIT_BASE       976
-#define BTS_REG_CELLTEMP_BASE   992
-#define BTS_REG_GROUP_BASE      1024
-#define BTS_REG_CALCTRL_BASE    1036
-#define BTS_REG_CALTLM_BASE     1056
-#define BTS_SENSE_BASE          1092
-#define BTS_DISCHACC_BASE       1156
+/* Region bases and per-channel byte strides. */
+#define BTS_RT_BASE             0
+#define BTS_RT_STRIDE           48
+#define BTS_RT_REG_COUNT        12
 
-/* Per-channel byte strides. */
-#define BTS_CTRL_STRIDE         40
-#define BTS_STATS_STRIDE        24
-#define BTS_TEMPLIM_STRIDE      8
-#define BTS_CAL_STRIDE          48
-#define BTS_CELLTEMP_STRIDE     4
-#define BTS_SENSE_STRIDE        8
-#define BTS_DISCHACC_STRIDE     8
+#define BTS_SET_BASE            384
+#define BTS_SET_STRIDE          96
+#define BTS_SET_REG_COUNT       24
 
-/* Control block, offsets within a channel. */
-#define BTS_CTRL_MODE                   0
-#define BTS_CTRL_CHARGE_V_MIN           4
-#define BTS_CTRL_CHARGE_V_MAX           8
-#define BTS_CTRL_DISCHARGE_V_MIN        12
-#define BTS_CTRL_DISCHARGE_V_MAX        16
-#define BTS_CTRL_CHARGE_I_MIN           20
-#define BTS_CTRL_CHARGE_I_MAX           24
-#define BTS_CTRL_DISCHARGE_I_MIN        28
-#define BTS_CTRL_DISCHARGE_I_MAX        32
-#define BTS_CTRL_STATUS                 36
+#define BTS_UNIT_BASE           1152
+
+/* Runtime block, byte offsets within a channel. All REG_ACCESS_RO. */
+#define BTS_RT_STATUS                   0
+#define BTS_RT_CELL_VOLTAGE             4    /* internal 12-bit ADC       */
+#define BTS_RT_CELL_CURRENT             8    /* internal 12-bit ADC       */
+#define BTS_RT_SENSE_VOLTAGE            12   /* ADS131M08 16-bit          */
+#define BTS_RT_SENSE_CURRENT            16   /* ADS131M08 16-bit          */
+#define BTS_RT_CELL_TEMP                20   /* ADS1119                   */
+#define BTS_RT_CHARGE_MAH               24
+#define BTS_RT_CHARGE_MWH               28
+#define BTS_RT_CHARGE_SECONDS           32
+#define BTS_RT_DISCHARGE_MAH            36
+#define BTS_RT_DISCHARGE_MWH            40
+#define BTS_RT_DISCHARGE_SECONDS        44
 
 /*
- * Stats block, offsets within a channel.
+ * Settings block, byte offsets within a channel.
  *
- * The two accumulators here are the CHARGE direction only. The discharge
- * pair is a separate block at BTS_DISCHACC_BASE: each direction keeps its
- * own positive total, so a charge and a discharge on one slot do not cancel.
+ * 21 of the 24 registers are used; +92 is spare. The 12 calibration
+ * registers keep their internal order, so BTS_CAL_* below remain offsets
+ * 0..44 relative to BTS_CAL_ADDR(ch, 0).
  */
-#define BTS_STATS_CHARGE_ACC_MAH        0
-#define BTS_STATS_MIN_VOLTAGE           4
-#define BTS_STATS_MAX_VOLTAGE           8
-#define BTS_STATS_CHARGE_ACC_MWH        12
-#define BTS_STATS_CELL_VOLTAGE          16
-#define BTS_STATS_CELL_CURRENT          20
-
-/* Discharge accumulator block, offsets within a channel. */
-#define BTS_DISCHACC_MAH                0
-#define BTS_DISCHACC_MWH                4
-
-/* Temperature limit block, offsets within a channel. */
-#define BTS_TEMPLIM_MIN                 0
-#define BTS_TEMPLIM_MAX                 4
-
-/* Global voltage thresholds (unit-wide, not per channel). */
-#define BTS_REG_CHARGE_DISABLE_V        576
-#define BTS_REG_CHARGE_RESTRICT_V       580
-#define BTS_REG_DISCHARGE_RESTRICT_V    584
-#define BTS_REG_DISCHARGE_DISABLE_V     588
+#define BTS_SET_MODE                    0
+#define BTS_SET_CHARGE_V_MIN            4
+#define BTS_SET_CHARGE_V_MAX            8
+#define BTS_SET_DISCHARGE_V_MIN         12
+#define BTS_SET_DISCHARGE_V_MAX         16
+#define BTS_SET_CHARGE_I_MIN            20
+#define BTS_SET_CHARGE_I_MAX            24
+#define BTS_SET_DISCHARGE_I_MIN         28
+#define BTS_SET_DISCHARGE_I_MAX         32
+#define BTS_SET_MIN_CELL_TEMP           36
+#define BTS_SET_MAX_CELL_TEMP           40
+#define BTS_SET_CAL_FIRST               44
 
 /* Unit block. */
-#define BTS_REG_CALIBRATION_MODE        976
-#define BTS_REG_UNIT_STATE              980
-#define BTS_REG_INPUT_VOLTAGE           984
-#define BTS_REG_TRIP_STATUS             988
-
+#define BTS_REG_CHARGE_DISABLE_V        1152
+#define BTS_REG_CHARGE_RESTRICT_V       1156
+#define BTS_REG_DISCHARGE_RESTRICT_V    1160
+#define BTS_REG_DISCHARGE_DISABLE_V     1164
+#define BTS_REG_CALIBRATION_MODE        1168
+#define BTS_REG_UNIT_STATE              1172
+#define BTS_REG_INPUT_VOLTAGE           1176
+#define BTS_REG_TRIP_STATUS             1180
 /* Slot grouping, latched from the MODE/ENABLE straps by CPU1 at boot. */
-#define BTS_REG_SLOT_MODE               1024
-#define BTS_REG_SLOT_ENABLE             1028
-#define BTS_REG_GROUP_SIZE              1032
+#define BTS_REG_SLOT_MODE               1184
+#define BTS_REG_SLOT_ENABLE             1188
+#define BTS_REG_GROUP_SIZE              1192
+/*
+ * Host watchdog timeout in seconds, RW, default 30. Any host command -
+ * including a register READ - reloads the unit's countdown; when it expires
+ * every running slot is paused with BTS_STATUS_WD_TRIPPED. Writing 0
+ * disables it, which is a bench-only setting and is logged loudly by the
+ * unit. There is no register for the remaining seconds, only the timeout.
+ */
+#define BTS_REG_HOST_WATCHDOG_S         1196
 
 /*
  * Calibration control block (unit-level).
@@ -152,38 +145,37 @@ extern "C" {
  * time - the per-slot form would not fit in CPU2TOCPU1RAM. eCalSlot names
  * the slot the telemetry block below refers to.
  */
-#define BTS_REG_CAL_SLOT                1036
-#define BTS_REG_CAL_COMMAND             1040
-#define BTS_REG_CAL_ARGUMENT            1044
-#define BTS_REG_CAL_STATUS              1048
-#define BTS_REG_CAL_RESULT              1052
+#define BTS_REG_CAL_SLOT                1200
+#define BTS_REG_CAL_COMMAND             1204
+#define BTS_REG_CAL_ARGUMENT            1208
+#define BTS_REG_CAL_STATUS              1212
+#define BTS_REG_CAL_RESULT              1216
 
 /* Calibration live telemetry for the slot named by eCalSlot. */
-#define BTS_REG_CAL_ADS_V_PU            1056
-#define BTS_REG_CAL_ADS_I_PU            1060
-#define BTS_REG_CAL_ADS_V_V             1064
-#define BTS_REG_CAL_ADS_I_A             1068
-#define BTS_REG_CAL_F28_V_PU            1072
-#define BTS_REG_CAL_F28_I_PU            1076
-#define BTS_REG_CAL_F28_V_V             1080
-#define BTS_REG_CAL_F28_I_A             1084
-#define BTS_REG_CAL_TEMP_C              1088
+#define BTS_REG_CAL_ADS_V_PU            1220
+#define BTS_REG_CAL_ADS_I_PU            1224
+#define BTS_REG_CAL_ADS_V_V             1228
+#define BTS_REG_CAL_ADS_I_A             1232
+#define BTS_REG_CAL_F28_V_PU            1236
+#define BTS_REG_CAL_F28_I_PU            1240
+#define BTS_REG_CAL_F28_V_V             1244
+#define BTS_REG_CAL_F28_I_A             1248
+#define BTS_REG_CAL_TEMP_C              1252
 
-/* Registers 1036..1088 inclusive, readable as one burst. */
+/* Registers 1200..1252 inclusive, readable as one burst. */
 #define BTS_CAL_WINDOW_COUNT            14
 
-/* External ADC (ADS131M08) engineering values, offsets within a channel. */
-#define BTS_SENSE_VOLTAGE               0
-#define BTS_SENSE_CURRENT               4
+/*
+ * Unit poll window: eCalibrationMode (1168) .. eHostWatchdog_s (1196), the
+ * eight consecutive registers the poll task needs every cycle.
+ */
+#define BTS_UNIT_WINDOW_FIRST           BTS_REG_CALIBRATION_MODE
+#define BTS_UNIT_WINDOW_COUNT           8
 
 /* Address helpers. Prefer these over open-coded arithmetic. */
-#define BTS_CTRL_ADDR(ch, off)      (BTS_REG_CTRL_BASE     + (ch) * BTS_CTRL_STRIDE     + (off))
-#define BTS_STATS_ADDR(ch, off)     (BTS_REG_STATS_BASE    + (ch) * BTS_STATS_STRIDE    + (off))
-#define BTS_TEMPLIM_ADDR(ch, off)   (BTS_REG_TEMPLIM_BASE  + (ch) * BTS_TEMPLIM_STRIDE  + (off))
-#define BTS_CAL_ADDR(ch, off)       (BTS_REG_CAL_BASE      + (ch) * BTS_CAL_STRIDE      + (off))
-#define BTS_CELLTEMP_ADDR(ch)       (BTS_REG_CELLTEMP_BASE + (ch) * BTS_CELLTEMP_STRIDE)
-#define BTS_SENSE_ADDR(ch, off)     (BTS_SENSE_BASE        + (ch) * BTS_SENSE_STRIDE    + (off))
-#define BTS_DISCHACC_ADDR(ch, off)  (BTS_DISCHACC_BASE     + (ch) * BTS_DISCHACC_STRIDE + (off))
+#define BTS_RT_ADDR(ch, off)    (BTS_RT_BASE  + (ch) * BTS_RT_STRIDE  + (off))
+#define BTS_SET_ADDR(ch, off)   (BTS_SET_BASE + (ch) * BTS_SET_STRIDE + (off))
+#define BTS_CAL_ADDR(ch, off)   (BTS_SET_ADDR((ch), BTS_SET_CAL_FIRST) + (off))
 
 /*
  * Per-channel calibration block, byte offsets within BTS_CAL_ADDR(ch, .).
@@ -261,11 +253,18 @@ typedef enum {
  * Bit 2 is a second entry point into calibration, equivalent to writing
  * eCalSlot then CAL_CMD_ENTER. Both route to the same handler on CPU1, so
  * the one-slot-at-a-time rule is enforced once.
+ *
+ * Bits 3 and 4 are EDGE commands: acted on at the write and not retained, so
+ * there is no matching "un-pause" bit to clear afterwards. Resume on a slot
+ * that is not paused is a no-op, and writing plain RUN to a paused slot also
+ * resumes it, so a host that predates v2 still works.
  */
 #define BTS_MODE_STOP               0x00u
 #define BTS_MODE_RUN                0x01u
 #define BTS_MODE_CHARGE             0x02u
 #define BTS_MODE_CALIBRATE          0x04u
+#define BTS_MODE_PAUSE              0x08u
+#define BTS_MODE_RESUME             0x10u
 #define BTS_MODE_RUN_DISCHARGE      (BTS_MODE_RUN)
 #define BTS_MODE_RUN_CHARGE         (BTS_MODE_RUN | BTS_MODE_CHARGE)
 
@@ -277,7 +276,7 @@ typedef enum {
  *
  * NOTE these are MASKS, while the identically-named BTS_STATUS_* in the
  * C2000 registers.h are bit POSITIONS (RUNNING is 0U there, 1u<<0 here).
- * The same split applies to BTS_CAL_ST_*, and to the BTS_CAL_ and BTS_SENSE_
+ * The same split applies to BTS_CAL_ST_*, and to the BTS_CAL_ and BTS_RT_
  * offsets, which are register indices on the C2000 and byte offsets here.
  * Copying a line between the two files compiles and is silently wrong.
  */
@@ -301,6 +300,29 @@ typedef enum {
  */
 #define BTS_STATUS_CAL_V_VALID      (1u << 13)
 #define BTS_STATUS_CAL_I_VALID      (1u << 14)
+/*
+ * PAUSED is not a direction of its own: the slot keeps its CHARGING or
+ * DISCHARGING bit set alongside it, so a host can see both that it is paused
+ * and what it would resume into. WD_TRIPPED and RESTORED say WHY, which is
+ * what decides whether resuming is safe - a watchdog pause means the link
+ * died mid-run, a restore means the unit reset and the cell may have been
+ * swapped while it was off. Both clear on resume.
+ */
+#define BTS_STATUS_PAUSED           (1u << 15)
+#define BTS_STATUS_WD_TRIPPED       (1u << 17)
+#define BTS_STATUS_RESTORED         (1u << 18)
+
+/*
+ * A normally terminated test is FINISHED, bit 2. That bit was declared but
+ * never driven before v2; the firmware now drives it and defines its own
+ * BTS_STATUS_END as an alias for it rather than spending a second bit on the
+ * same state. Bit 16 is unused and reads a constant 0 - do not test for it.
+ *
+ * The mask is kept as the single thing consumers test, so if END ever does
+ * become a distinct bit this is the one line that changes.
+ */
+#define BTS_STATUS_END              BTS_STATUS_FINISHED
+#define BTS_STATUS_ENDED_MASK       (BTS_STATUS_FINISHED)
 
 /* Trip status bitfield: two bits per channel, CMPSS then GPIO. */
 #define BTS_TRIP_CMPSS(ch)          (1u << ((ch) * 2u))

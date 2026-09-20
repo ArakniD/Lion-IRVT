@@ -19,6 +19,11 @@ from bleak import BleakClient, BleakScanner
 
 DEVICE_NAME = "BTS-Tester"
 
+# Must match BLE_PROTO_VERSION in components/ble_svc/include/ble_proto.h.
+# A mismatch means the structs below no longer describe what the firmware
+# sends, so decoding would report plausible-looking rubbish rather than fail.
+EXPECTED_PROTO_VERSION = 3
+
 # e5f1xxxx-9a4c-4b7d-8f2e-1c3a5b7d9f01
 def uuid(disc):
     return f"e5f1{disc:04x}-9a4c-4b7d-8f2e-1c3a5b7d9f01"
@@ -42,12 +47,14 @@ UNIT_STATES = {
     4: "INPUT_HIGH_DISCHARGE_DISABLED",
 }
 
-# BTS_STATUS_* bit positions, from registers.h
+# BTS_STATUS_* bit positions, from registers.h.
+# Bit 2 "finished" carries the END semantic; bit 16 is unused and always 0.
 STATUS_BITS = [
-    "running", "stopped", "finished", "overCurrentTrip",
+    "running", "stopped", "finished(end)", "overCurrentTrip",
     "charging", "discharging", "constVoltage", "constCurrent",
     "slaveMode", "groupDisconnect", "reversePolarity", "slotDisabled",
     "calibrating", "calVoltageValid", "calCurrentValid",
+    "paused", "-", "watchdogTripped", "restored",
 ]
 
 
@@ -56,26 +63,38 @@ def decode_status_bits(v):
     return ",".join(on) if on else "-"
 
 
-# ble_unit_status_t: B B B B I f I B B H  -> little-endian, packed
-UNIT_FMT = "<BBBBIfIBBH"
+# ble_unit_status_t, field for field:
+#   B version  B slot_count  B online  B unit_state
+#   I trip_status  f input_voltage_v  I uptime_s
+#   B stats_live  B wifi_connected  H reserved  f watchdog_timeout_s
+UNIT_FMT = "<BBBBIfIBBHf"
 UNIT_LEN = struct.calcsize(UNIT_FMT)
+assert UNIT_LEN == 24, UNIT_LEN
 
-# ble_slot_status_t: B B B B f f f f f f I I I
-SLOT_FMT = "<BBBBffffffIII"
+# ble_slot_status_t, field for field:
+#   B slot  B state  B fault  B configured
+#   f voltage_v  f current_a  f temp_c  f live_mah  f live_mwh  f progress
+#   I elapsed_s  I state_elapsed_s  I status_bits
+#   B bts_paused  B bts_wd_tripped  B bts_restored  B bts_ended
+#   f bts_charge_mah  f bts_charge_mwh  f bts_charge_seconds
+#   f bts_discharge_mah  f bts_discharge_mwh  f bts_discharge_seconds
+SLOT_FMT = "<BBBBffffffIIIBBBBffffff"
 SLOT_LEN = struct.calcsize(SLOT_FMT)
+assert SLOT_LEN == 68, SLOT_LEN
 
 
 def decode_unit(b):
     if len(b) < UNIT_LEN:
         return None
     (ver, slots, online, state, trip, vin, uptime,
-     stats_live, wifi, _r) = struct.unpack(UNIT_FMT, b[:UNIT_LEN])
+     stats_live, wifi, _r, wd) = struct.unpack(UNIT_FMT, b[:UNIT_LEN])
     return {
         "proto_version": ver, "slot_count": slots, "online": bool(online),
         "unit_state": UNIT_STATES.get(state, f"?{state}"),
         "trip_status": f"0x{trip:08X}", "input_voltage_v": round(vin, 4),
         "uptime_s": uptime, "stats_live": bool(stats_live),
         "wifi_connected": bool(wifi),
+        "watchdog_timeout_s": round(wd, 1),
     }
 
 
@@ -83,7 +102,9 @@ def decode_slot(b):
     if len(b) < SLOT_LEN:
         return None
     (slot, state, fault, configured, v, i, t, mah, mwh, prog,
-     elapsed, state_elapsed, status) = struct.unpack(SLOT_FMT, b[:SLOT_LEN])
+     elapsed, state_elapsed, status,
+     paused, wd_tripped, restored, ended,
+     c_mah, c_mwh, c_s, d_mah, d_mwh, d_s) = struct.unpack(SLOT_FMT, b[:SLOT_LEN])
     return {
         "slot": slot, "state": state, "fault": fault,
         "configured": bool(configured),
@@ -91,6 +112,10 @@ def decode_slot(b):
         "temp_c": round(t, 3), "mah": round(mah, 3), "mwh": round(mwh, 3),
         "progress": round(prog, 4), "elapsed_s": elapsed,
         "status_bits": f"0x{status:08X} ({decode_status_bits(status)})",
+        "bts_paused": bool(paused), "bts_watchdog_tripped": bool(wd_tripped),
+        "bts_restored": bool(restored), "bts_ended": bool(ended),
+        "bts_charge": [round(c_mah, 2), round(c_mwh, 2), round(c_s, 0)],
+        "bts_discharge": [round(d_mah, 2), round(d_mwh, 2), round(d_s, 0)],
     }
 
 
@@ -134,6 +159,10 @@ async def main():
         print(f"unit_status ({len(raw)}B): {unit}")
         if unit is None:
             print("FAIL: unit status too short to decode")
+            return 1
+        if unit["proto_version"] != EXPECTED_PROTO_VERSION:
+            print(f"FAIL: proto version {unit['proto_version']}, "
+                  f"this script decodes {EXPECTED_PROTO_VERSION}")
             return 1
 
         # Walk every slot through the select characteristic.

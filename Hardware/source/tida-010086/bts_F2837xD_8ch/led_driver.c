@@ -62,8 +62,8 @@ void LEDDriver_update(void) {
     tick++;
 
     for (uint16_t ch = 0; ch < NUM_LEDS; ch++) {
-        // Status registers are 10 per channel, not one per LED.
-        uint16_t regIdx = BTS_CTRL_BASE(ch) + BTS_REG_IDX(eCh0_Status);
+        // The status register is the first of a slot's 12 runtime registers.
+        uint16_t regIdx = BTS_RT_BASE(ch) + BTS_RT_STATUS;
         uint32_t status = (uint32_t)registers[regIdx];
         uint16_t* ledData = &ledBuffer[ch * 3]; // GRB order
         const uint16_t* color = 0;
@@ -83,6 +83,16 @@ void LEDDriver_update(void) {
             // during calibration must still read as tripped.
             //
             color = ((tick % LED_CAL_PERIOD) < LED_CAL_ON) ? colorWhite : 0;
+        } else if (status & (1UL << BTS_STATUS_PAUSED)) {
+            //
+            // Ranked below the faults and above running, like the
+            // calibration flash. A watchdog or restore pause flashes red -
+            // the link died or the unit reset - a deliberate one blue.
+            //
+            const uint16_t* pauseColor =
+                (status & ((1UL << BTS_STATUS_WD_TRIPPED) |
+                           (1UL << BTS_STATUS_RESTORED))) ? colorRed : colorBlue;
+            color = ((tick % LED_PAUSE_PERIOD) < LED_PAUSE_ON) ? pauseColor : 0;
         } else if (status & ((1UL << BTS_STATUS_CHARGING) |
                              (1UL << BTS_STATUS_DISCHARGING))) {
             if (status & (1UL << BTS_STATUS_RUNNING)) {

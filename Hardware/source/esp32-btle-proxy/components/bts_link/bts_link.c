@@ -21,14 +21,6 @@ static const char *TAG = "bts_link";
 #define BTS_XFER_TIMEOUT_MS     100
 #define BTS_POLL_TASK_STACK     4096
 #define BTS_POLL_TASK_PRIO      6
-/*
- * Reads per channel per poll: the whole 6-register stats block in one burst,
- * the 2-register discharge accumulator block in a second, plus status and
- * cell temperature. Each lives in a different block, so none of them can be
- * folded into one transaction.
- */
-#define BTS_STATS_REG_COUNT     6
-#define BTS_DISCHACC_REG_COUNT  2
 
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
@@ -143,12 +135,27 @@ esp_err_t bts_link_set_mode(uint8_t channel, uint32_t mode)
     if (channel >= BTS_NUM_CHANNELS) {
         return ESP_ERR_INVALID_ARG;
     }
-    return bts_link_write_reg(BTS_CTRL_ADDR(channel, BTS_CTRL_MODE), (float)mode);
+    return bts_link_write_reg(BTS_SET_ADDR(channel, BTS_SET_MODE), (float)mode);
 }
 
 esp_err_t bts_link_stop_channel(uint8_t channel)
 {
     return bts_link_set_mode(channel, BTS_MODE_STOP);
+}
+
+/*
+ * Pause and resume are edge commands: the bit is acted on at the write and
+ * not retained, so there is nothing to clear afterwards and no read-modify
+ * of the mode register is needed.
+ */
+esp_err_t bts_link_pause_channel(uint8_t channel)
+{
+    return bts_link_set_mode(channel, BTS_MODE_PAUSE);
+}
+
+esp_err_t bts_link_resume_channel(uint8_t channel)
+{
+    return bts_link_set_mode(channel, BTS_MODE_RESUME);
 }
 
 esp_err_t bts_link_stop_all(void)
@@ -185,24 +192,24 @@ esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim)
     const float imax = BTS_UNIT_MAX_CURRENT_A;
 
     struct { uint16_t addr; float value; } writes[] = {
-        { BTS_CTRL_ADDR(channel, BTS_CTRL_CHARGE_V_MIN),
+        { BTS_SET_ADDR(channel, BTS_SET_CHARGE_V_MIN),
           clampf(lim->charge_voltage_min, 0.0f, vmax) },
-        { BTS_CTRL_ADDR(channel, BTS_CTRL_CHARGE_V_MAX),
+        { BTS_SET_ADDR(channel, BTS_SET_CHARGE_V_MAX),
           clampf(lim->charge_voltage_max, 0.0f, vmax) },
-        { BTS_CTRL_ADDR(channel, BTS_CTRL_DISCHARGE_V_MIN),
+        { BTS_SET_ADDR(channel, BTS_SET_DISCHARGE_V_MIN),
           clampf(lim->discharge_voltage_min, 0.0f, vmax) },
-        { BTS_CTRL_ADDR(channel, BTS_CTRL_DISCHARGE_V_MAX),
+        { BTS_SET_ADDR(channel, BTS_SET_DISCHARGE_V_MAX),
           clampf(lim->discharge_voltage_max, 0.0f, vmax) },
-        { BTS_CTRL_ADDR(channel, BTS_CTRL_CHARGE_I_MIN),
+        { BTS_SET_ADDR(channel, BTS_SET_CHARGE_I_MIN),
           clampf(lim->charge_current_min, 0.0f, imax) },
-        { BTS_CTRL_ADDR(channel, BTS_CTRL_CHARGE_I_MAX),
+        { BTS_SET_ADDR(channel, BTS_SET_CHARGE_I_MAX),
           clampf(lim->charge_current_max, 0.0f, imax) },
-        { BTS_CTRL_ADDR(channel, BTS_CTRL_DISCHARGE_I_MIN),
+        { BTS_SET_ADDR(channel, BTS_SET_DISCHARGE_I_MIN),
           clampf(lim->discharge_current_min, 0.0f, imax) },
-        { BTS_CTRL_ADDR(channel, BTS_CTRL_DISCHARGE_I_MAX),
+        { BTS_SET_ADDR(channel, BTS_SET_DISCHARGE_I_MAX),
           clampf(lim->discharge_current_max, 0.0f, imax) },
-        { BTS_TEMPLIM_ADDR(channel, BTS_TEMPLIM_MIN), lim->min_cell_temp },
-        { BTS_TEMPLIM_ADDR(channel, BTS_TEMPLIM_MAX), lim->max_cell_temp },
+        { BTS_SET_ADDR(channel, BTS_SET_MIN_CELL_TEMP), lim->min_cell_temp },
+        { BTS_SET_ADDR(channel, BTS_SET_MAX_CELL_TEMP), lim->max_cell_temp },
     };
 
     if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -213,9 +220,9 @@ esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim)
     for (size_t i = 0; i < sizeof(writes) / sizeof(writes[0]); i++) {
         /*
          * Deliberately one transaction per register rather than a burst.
-         * Each RW write raises an IPC flag to CPU1, and the control-block
-         * writes land in the limit registers that modeCallback() will latch;
-         * keeping them separate keeps the failure granularity per-register.
+         * Each RW write raises an IPC flag to CPU1, and these land in the
+         * limit registers that modeCallback() will latch; keeping them
+         * separate keeps the failure granularity per-register.
          */
         err = bus_write_reg(writes[i].addr, writes[i].value);
         if (err != ESP_OK) {
@@ -358,56 +365,53 @@ const char *bts_link_cal_result_name(uint32_t result)
 /* Poll task                                                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * One channel, one transaction.
+ *
+ * The whole runtime block is 12 consecutive RO registers in map v2, which is
+ * the entire point of the reorder: the target auto-increments on read, so
+ * status, both measurement paths, the temperature and all six counters
+ * arrive in a single burst.
+ */
 static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_bits)
 {
-    float stats[BTS_STATS_REG_COUNT];
-    float dischacc[BTS_DISCHACC_REG_COUNT];
-    float status_raw = 0.0f;
-    float temp_raw = 0.0f;
+    float rt[BTS_RT_REG_COUNT];
 
-    esp_err_t err = bus_read_block(BTS_STATS_ADDR(ch, BTS_STATS_CHARGE_ACC_MAH),
-                                   stats, BTS_STATS_REG_COUNT);
-    if (err != ESP_OK) {
+    if (bus_read_block(BTS_RT_ADDR(ch, 0), rt, BTS_RT_REG_COUNT) != ESP_OK) {
         st->valid = false;
         return;
     }
 
-    if (bus_read_block(BTS_DISCHACC_ADDR(ch, BTS_DISCHACC_MAH),
-                       dischacc, BTS_DISCHACC_REG_COUNT) != ESP_OK) {
-        st->valid = false;
-        return;
-    }
+    const uint32_t status = (uint32_t)rt[BTS_RT_STATUS / BTS_REGISTER_SIZE];
 
-    if (bus_read_block(BTS_CTRL_ADDR(ch, BTS_CTRL_STATUS), &status_raw, 1) != ESP_OK) {
-        st->valid = false;
-        return;
-    }
-    if (bus_read_block(BTS_CELLTEMP_ADDR(ch), &temp_raw, 1) != ESP_OK) {
-        st->valid = false;
-        return;
-    }
+    st->status_bits       = status;
+    st->cell_voltage_v    = rt[BTS_RT_CELL_VOLTAGE      / BTS_REGISTER_SIZE];
+    st->cell_current_a    = rt[BTS_RT_CELL_CURRENT      / BTS_REGISTER_SIZE];
+    st->sense_voltage_v   = rt[BTS_RT_SENSE_VOLTAGE     / BTS_REGISTER_SIZE];
+    st->sense_current_a   = rt[BTS_RT_SENSE_CURRENT     / BTS_REGISTER_SIZE];
+    st->cell_temp_c       = rt[BTS_RT_CELL_TEMP         / BTS_REGISTER_SIZE];
+    st->charge_mah        = rt[BTS_RT_CHARGE_MAH        / BTS_REGISTER_SIZE];
+    st->charge_mwh        = rt[BTS_RT_CHARGE_MWH        / BTS_REGISTER_SIZE];
+    st->charge_seconds    = rt[BTS_RT_CHARGE_SECONDS    / BTS_REGISTER_SIZE];
+    st->discharge_mah     = rt[BTS_RT_DISCHARGE_MAH     / BTS_REGISTER_SIZE];
+    st->discharge_mwh     = rt[BTS_RT_DISCHARGE_MWH     / BTS_REGISTER_SIZE];
+    st->discharge_seconds = rt[BTS_RT_DISCHARGE_SECONDS / BTS_REGISTER_SIZE];
 
-    st->charge_mah     = stats[BTS_STATS_CHARGE_ACC_MAH / BTS_REGISTER_SIZE];
-    st->min_voltage_v  = stats[BTS_STATS_MIN_VOLTAGE    / BTS_REGISTER_SIZE];
-    st->max_voltage_v  = stats[BTS_STATS_MAX_VOLTAGE    / BTS_REGISTER_SIZE];
-    st->charge_mwh     = stats[BTS_STATS_CHARGE_ACC_MWH / BTS_REGISTER_SIZE];
-    st->cell_voltage_v = stats[BTS_STATS_CELL_VOLTAGE   / BTS_REGISTER_SIZE];
-    st->cell_current_a = stats[BTS_STATS_CELL_CURRENT   / BTS_REGISTER_SIZE];
-    st->discharge_mah  = dischacc[BTS_DISCHACC_MAH / BTS_REGISTER_SIZE];
-    st->discharge_mwh  = dischacc[BTS_DISCHACC_MWH / BTS_REGISTER_SIZE];
-    st->cell_temp_c    = temp_raw;
-    st->status_bits    = (uint32_t)status_raw;
-    st->cmpss_trip     = (trip_bits & BTS_TRIP_CMPSS(ch)) != 0;
-    st->gpio_trip      = (trip_bits & BTS_TRIP_GPIO(ch)) != 0;
-    st->valid          = true;
+    st->paused     = (status & BTS_STATUS_PAUSED) != 0;
+    st->wd_tripped = (status & BTS_STATUS_WD_TRIPPED) != 0;
+    st->restored   = (status & BTS_STATUS_RESTORED) != 0;
+    st->ended      = (status & BTS_STATUS_ENDED_MASK) != 0;
+    st->cmpss_trip = (trip_bits & BTS_TRIP_CMPSS(ch)) != 0;
+    st->gpio_trip  = (trip_bits & BTS_TRIP_GPIO(ch)) != 0;
+    st->valid      = true;
 }
 
 /*
- * Refreshes the calibration window, registers 1036-1088, as one burst.
+ * Refreshes the calibration window, registers 1200-1252, as one burst.
  *
  * Called only when calibration is live or a command has just been issued:
- * the normal cycle is already 33 transactions in 250 ms, and this feature
- * is idle almost all of the time.
+ * this feature is idle almost all of the time and there is no reason to
+ * lengthen the normal cycle for it.
  */
 static void poll_cal_window(bts_cal_state_t *cal, const bts_channel_state_t *chans)
 {
@@ -455,17 +459,27 @@ static void bts_poll_task(void *arg)
     /* Zero is slot 0, so the "none" sentinel has to be set explicitly. */
     local.cal.slot = BTS_CAL_SLOT_NONE;
 
+    /*
+     * This cycle is what feeds the unit's 30 s host watchdog, and it issues
+     * nothing but reads - 9 transactions, one per slot plus the unit block.
+     * So the BTS's reload hook must cover the I2C READ path, not only
+     * applyHostRegisterWrite(): a unit that reloads on writes alone would
+     * pause every running slot 30 s after the last mode command, however
+     * healthily this task is polling.
+     */
     for (;;) {
         bool cycle_ok = true;
 
         if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
             /*
-             * Unit block first: eCalibrationMode .. eTripStatus are four
-             * consecutive registers, so one burst covers all of them and the
-             * trip bitfield is then available for the per-channel decode.
+             * Unit block first: eCalibrationMode .. eHostWatchdog_s are
+             * eight consecutive registers, so one burst covers all of them
+             * and the trip bitfield is then available for the per-channel
+             * decode.
              */
-            float unit[4];
-            esp_err_t unit_err = bus_read_block(BTS_REG_CALIBRATION_MODE, unit, 4);
+            float unit[BTS_UNIT_WINDOW_COUNT];
+            esp_err_t unit_err = bus_read_block(BTS_UNIT_WINDOW_FIRST, unit,
+                                                BTS_UNIT_WINDOW_COUNT);
             if (unit_err != ESP_OK) {
                 static uint32_t err_log;
                 if ((err_log++ % 40u) == 0u) {
@@ -474,9 +488,12 @@ static void bts_poll_task(void *arg)
                 }
             }
             if (unit_err == ESP_OK) {
-                local.unit.unit_state      = (bts_unit_state_t)(uint32_t)unit[1];
-                local.unit.input_voltage_v = unit[2];
-                local.unit.trip_status     = (uint32_t)unit[3];
+                local.unit.unit_state         = (bts_unit_state_t)(uint32_t)unit[1];
+                local.unit.input_voltage_v    = unit[2];
+                local.unit.trip_status        = (uint32_t)unit[3];
+                /* unit[4..6] are the strap-latched slot mode/enable/group
+                 * size, which CPU1 fixes at boot and nothing here consumes. */
+                local.unit.watchdog_timeout_s = unit[7];
             } else {
                 cycle_ok = false;
                 /* Periodic bus scan while the link is down: tells a wiring
@@ -516,8 +533,8 @@ static void bts_poll_task(void *arg)
              * The calibration burst is conditional: a slot reporting
              * BTS_STATUS_CALIBRATING, the window already active, or a
              * command just issued. Reading it unconditionally would add a
-             * transaction to every 250 ms cycle for a feature used at the
-             * bench a few times in a unit's life.
+             * tenth transaction to every 250 ms cycle for a feature used at
+             * the bench a few times in a unit's life.
              */
             bool cal_wanted = local.cal.active || s_cal_poll_due;
             for (uint8_t ch = 0; ch < BTS_NUM_CHANNELS && !cal_wanted; ch++) {
@@ -596,30 +613,26 @@ bool bts_link_stats_are_live(void)
 /*
  * Probes whether the BTS is populating its own accumulators.
  *
- * Reads the charge pair and the discharge pair on every channel. A firmware
- * that integrates leaves a non-zero total behind on any slot that has run
- * since power-up, so this is a positive test only: a unit that is genuinely
- * idle from cold reads all-zero and is indistinguishable from the older
- * firmware that never wrote these registers at all. The result only gates
- * whether the BTS figures are reported beside the local ones, so failing
- * closed costs nothing.
+ * One runtime-block read per channel covers both directions' totals. A
+ * firmware that integrates leaves a non-zero total behind on any slot that
+ * has run since power-up, so this is a positive test only: a unit that is
+ * genuinely idle from cold reads all-zero and is indistinguishable from the
+ * older firmware that never wrote these registers at all. The result only
+ * gates whether the BTS figures are reported beside the local ones, so
+ * failing closed costs nothing.
  */
 static void probe_stats_liveness(void)
 {
     s_stats_live = false;
     for (uint8_t ch = 0; ch < BTS_NUM_CHANNELS; ch++) {
-        float chg[4];
-        float dch[2];
+        float rt[BTS_RT_REG_COUNT];
 
-        if (bts_link_read_block(BTS_STATS_ADDR(ch, BTS_STATS_CHARGE_ACC_MAH), chg, 4) == ESP_OK) {
-            /* ChargeAcc_mAh, MinVoltage, MaxVoltage, ChargeAcc_mWh. */
-            if (chg[0] != 0.0f || chg[3] != 0.0f) {
-                s_stats_live = true;
-                return;
-            }
+        if (bts_link_read_block(BTS_RT_ADDR(ch, 0), rt, BTS_RT_REG_COUNT) != ESP_OK) {
+            continue;
         }
-        if (bts_link_read_block(BTS_DISCHACC_ADDR(ch, BTS_DISCHACC_MAH), dch, 2) == ESP_OK) {
-            if (dch[0] != 0.0f || dch[1] != 0.0f) {
+        for (int i = BTS_RT_CHARGE_MAH / BTS_REGISTER_SIZE;
+             i < BTS_RT_REG_COUNT; i++) {
+            if (rt[i] != 0.0f) {
                 s_stats_live = true;
                 return;
             }

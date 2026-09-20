@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define BLE_PROTO_VERSION       2
+#define BLE_PROTO_VERSION       3
 
 /* Attribute value sizes are bounded by the negotiated MTU (247 - 3). */
 #define BLE_PROTO_MAX_PAYLOAD   244
@@ -38,6 +38,8 @@ typedef enum {
     BLE_CMD_ABORT        = 2,
     BLE_CMD_CLEAR_FAULT  = 3,
     BLE_CMD_ABORT_ALL    = 4,
+    BLE_CMD_PAUSE        = 5,
+    BLE_CMD_RESUME       = 6,
 } ble_cmd_op_t;
 
 typedef struct __attribute__((packed)) {
@@ -58,6 +60,12 @@ typedef struct __attribute__((packed)) {
                             /* bts_link_stats_are_live()             */
     uint8_t  wifi_connected;
     uint16_t reserved;
+    /*
+     * The unit's configured host-watchdog timeout, 0 when disabled. The BTS
+     * does not publish the remaining count, only the setting, so a client
+     * can show whether supervision is armed but not a countdown.
+     */
+    float    watchdog_timeout_s;
 } ble_unit_status_t;
 
 typedef struct __attribute__((packed)) {
@@ -76,6 +84,24 @@ typedef struct __attribute__((packed)) {
     uint32_t elapsed_s;
     uint32_t state_elapsed_s;
     uint32_t status_bits;   /* BTS_STATUS_*                          */
+
+    /*
+     * The BTS's own view, appended in proto 3. `restored` says the unit
+     * reset mid-run and is holding this slot's counters - the client must
+     * make resuming an explicit operator choice, because the cell may have
+     * been changed while the unit was off.
+     */
+    uint8_t  bts_paused;
+    uint8_t  bts_wd_tripped;
+    uint8_t  bts_restored;
+    uint8_t  bts_ended;
+
+    float    bts_charge_mah;
+    float    bts_charge_mwh;
+    float    bts_charge_seconds;
+    float    bts_discharge_mah;
+    float    bts_discharge_mwh;
+    float    bts_discharge_seconds;
 } ble_slot_status_t;
 
 typedef struct __attribute__((packed)) {

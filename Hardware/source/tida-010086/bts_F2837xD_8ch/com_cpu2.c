@@ -106,6 +106,14 @@
 #define EEPROM_GLOBAL_V_ADDR  0x0400   // 16 bytes = 4 floats (was 0x0100)
 
 //
+// Slot runtime state, 8 slots x 32 B, ends 0x05FF. Clear of both the
+// calibration blocks and the globals, and a fixed stride for the same reason
+// as the calibration block - adding a field must not move every slot.
+//
+#define STATE_FRAM_BASE       0x0500U
+#define STATE_FRAM_STRIDE     32U
+
+//
 // Polling bound for the blocking I2C helpers. At 160 MHz this is a few
 // hundred microseconds - long enough for a 400 kHz transfer to complete,
 // short enough that a DRDY ISR talking to an absent device does not stall
@@ -261,6 +269,8 @@ void BTS_serviceDeferredWork(void);
 void uartSendResponse(const char* response);
 void saveCalibration(uint16_t channel);
 void loadCalibration(void);
+static void loadSlotStates(void);
+static void hostWatchdogFeed(void);
 static void notifyCpu1RegisterWrite(uint16_t regIdx, float32_t value);
 static void notifyCpu1CalibrationReload(void);
 #if (BTS_CONSOLE_ENABLED == true)
@@ -1036,6 +1046,14 @@ void loadCalibration(void)
     registers[BTS_REG_IDX(eCalStatus)]   = 0.0f;
     registers[BTS_REG_IDX(eCalResult)]   = 0.0f;
 
+    //
+    // The watchdog is armed from boot, not from the host's first command:
+    // a host that never appears is exactly the case it exists to catch.
+    //
+    registers[BTS_REG_IDX(eHostWatchdog_s)]      = BTS_HOST_WD_DEFAULT_S;
+    registers[BTS_REG_IDX(eWatchdogRemaining_s)] = BTS_HOST_WD_DEFAULT_S;
+    hostWatchdogFeed();
+
     notifyCpu1CalibrationReload();
 }
 
@@ -1121,6 +1139,169 @@ static void saveAllCalibration(void)
     for (ch = 0; ch < NUM_CHANNELS; ch++) {
         saveCalibration(ch);
     }
+}
+
+//
+//=============================================================================
+// Slot runtime state persistence
+//=============================================================================
+//
+// Same word-pair packing as the calibration image: a C28x "byte" is 16 bits,
+// so each struct word contributes its two wire bytes low half first.
+//
+#define STATE_EEPROM_BYTES (2U * (uint16_t)sizeof(BTS_slotRuntimeState))
+
+//
+// Same generator and seed as calibrationCrc32(), over a different struct.
+//
+static uint32_t slotStateCrc32(const BTS_slotRuntimeState *st)
+{
+    const uint16_t *words = (const uint16_t *)st;
+    uint16_t nWords = (uint16_t)sizeof(BTS_slotRuntimeState) - 2U;
+    uint32_t crc = 0xFFFFFFFFUL;
+    uint16_t i;
+    uint16_t b;
+    uint16_t bit;
+
+    for (i = 0; i < nWords; i++) {
+        for (b = 0; b < 2U; b++) {
+            crc ^= (uint32_t)((words[i] >> (b * 8U)) & 0xFFU);
+            for (bit = 0; bit < 8U; bit++) {
+                crc = (crc & 1UL) ? ((crc >> 1) ^ 0xEDB88320UL) : (crc >> 1);
+            }
+        }
+    }
+    return crc ^ 0xFFFFFFFFUL;
+}
+
+static bool writeSlotState(uint16_t channel, const BTS_slotRuntimeState *st)
+{
+    uint16_t bytes[STATE_EEPROM_BYTES];
+    const uint16_t *words = (const uint16_t *)st;
+    uint16_t addr = STATE_FRAM_BASE + channel * STATE_FRAM_STRIDE;
+    uint16_t i;
+
+    for (i = 0; i < (uint16_t)sizeof(BTS_slotRuntimeState); i++) {
+        bytes[i * 2U]      = words[i] & 0xFFU;
+        bytes[i * 2U + 1U] = (words[i] >> 8) & 0xFFU;
+    }
+    return i2cWriteBlock(EEPROM_I2C_ADDR, addr, bytes, STATE_EEPROM_BYTES);
+}
+
+static bool readSlotState(uint16_t channel, BTS_slotRuntimeState *st)
+{
+    uint16_t bytes[STATE_EEPROM_BYTES];
+    uint16_t *words = (uint16_t *)st;
+    uint16_t addr = STATE_FRAM_BASE + channel * STATE_FRAM_STRIDE;
+    uint16_t i;
+
+    if (!i2cReadBlock(EEPROM_I2C_ADDR, addr, bytes, STATE_EEPROM_BYTES)) {
+        return false;
+    }
+    for (i = 0; i < (uint16_t)sizeof(BTS_slotRuntimeState); i++) {
+        words[i] = (bytes[i * 2U] & 0xFFU) | ((bytes[i * 2U + 1U] & 0xFFU) << 8);
+    }
+    return true;
+}
+
+static bool validateSlotState(const BTS_slotRuntimeState *st, uint16_t channel)
+{
+    if ((st->header & BTS_STATE_HEADER_MASK) != BTS_STATE_HEADER) {
+        return false;
+    }
+    if ((st->header & BTS_STATE_CHANNEL_MASK) != (uint32_t)channel) {
+        return false;
+    }
+    return (st->crc32 == slotStateCrc32(st));
+}
+
+//
+// Per-slot save counter, kept across saves so a host can tell a fresh record
+// from a stale one and see how much writing the block has taken.
+//
+static uint32_t slotStateSaveCounter[NUM_CHANNELS];
+
+//
+// Composes and writes one slot's record from the register file. Called only
+// from BTS_serviceDeferredWork() - F-RAM is never written from an ISR.
+//
+static bool saveSlotState(uint16_t channel)
+{
+    BTS_slotRuntimeState st;
+    uint16_t rtBase = BTS_RT_BASE(channel);
+    uint32_t bits   = (uint32_t)registers[rtBase + BTS_RT_STATUS];
+    uint32_t flags  = 0UL;
+
+    //
+    // A paused slot is saved as running in its held direction: that is what
+    // the restore has to reconstruct, and it is what a power cut mid-pause
+    // should come back as.
+    //
+    if ((bits & (1UL << BTS_STATUS_RUNNING)) != 0UL) {
+        flags |= BTS_STATE_F_RUNNING;
+        if ((bits & (1UL << BTS_STATUS_CHARGING)) != 0UL) {
+            flags |= BTS_STATE_F_CHARGING;
+        }
+    }
+    if ((bits & (1UL << BTS_STATUS_END)) != 0UL) {
+        flags |= BTS_STATE_F_END;
+    }
+
+    st.header           = BTS_STATE_MAKE_HEADER(channel);
+    st.stateFlags       = flags;
+    st.chargeMah        = registers[rtBase + BTS_RT_CHARGE_MAH];
+    st.chargeMwh        = registers[rtBase + BTS_RT_CHARGE_MWH];
+    st.chargeSeconds    = registers[rtBase + BTS_RT_CHARGE_SECONDS];
+    st.dischargeMah     = registers[rtBase + BTS_RT_DISCHARGE_MAH];
+    st.dischargeMwh     = registers[rtBase + BTS_RT_DISCHARGE_MWH];
+    st.dischargeSeconds = registers[rtBase + BTS_RT_DISCHARGE_SECONDS];
+    st.saveCounter      = ++slotStateSaveCounter[channel];
+    st.crc32            = slotStateCrc32(&st);
+
+    return writeSlotState(channel, &st);
+}
+
+//
+// Boot restore. Populates the runtime counters and supervision.restoreFlags,
+// then raises one IPC flag once the whole file is consistent - the same
+// discipline as the calibration reload, not one flag per slot.
+//
+// An absent or invalid record is the normal first-boot case: the slot starts
+// STOPPED with zeroed counters and nothing is logged.
+//
+static void loadSlotStates(void)
+{
+    uint32_t restoreFlags = 0UL;
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        BTS_slotRuntimeState st;
+        uint16_t rtBase = BTS_RT_BASE(ch);
+
+        if (readSlotState(ch, &st) && validateSlotState(&st, ch)) {
+            registers[rtBase + BTS_RT_CHARGE_MAH]        = st.chargeMah;
+            registers[rtBase + BTS_RT_CHARGE_MWH]        = st.chargeMwh;
+            registers[rtBase + BTS_RT_CHARGE_SECONDS]    = st.chargeSeconds;
+            registers[rtBase + BTS_RT_DISCHARGE_MAH]     = st.dischargeMah;
+            registers[rtBase + BTS_RT_DISCHARGE_MWH]     = st.dischargeMwh;
+            registers[rtBase + BTS_RT_DISCHARGE_SECONDS] = st.dischargeSeconds;
+
+            slotStateSaveCounter[ch] = st.saveCounter;
+            restoreFlags |= (st.stateFlags & BTS_STATE_FLAGS_MASK)
+                            << BTS_STATE_FLAGS_SHIFT(ch);
+        } else {
+            registers[rtBase + BTS_RT_CHARGE_MAH]        = 0.0f;
+            registers[rtBase + BTS_RT_CHARGE_MWH]        = 0.0f;
+            registers[rtBase + BTS_RT_CHARGE_SECONDS]    = 0.0f;
+            registers[rtBase + BTS_RT_DISCHARGE_MAH]     = 0.0f;
+            registers[rtBase + BTS_RT_DISCHARGE_MWH]     = 0.0f;
+            registers[rtBase + BTS_RT_DISCHARGE_SECONDS] = 0.0f;
+            slotStateSaveCounter[ch] = 0UL;
+        }
+    }
+
+    supervision.restoreFlags = restoreFlags;
+    IPC_setFlagLtoR(IPC_CPU2_L_CPU1_R, BTS_IPC_FLAG_STATE_RESTORE);
 }
 
 void initCAN(void)
@@ -1959,6 +2140,30 @@ static volatile uint32_t calRuntimeSaveFlags   = 0U;
 static uint32_t calRuntimeSaveSeqSeen = 0U;
 
 //
+// Pending per-slot state writes, one flag per slot rather than a bitmask:
+// the flags are set from interrupts and cleared from the idle loop, and
+// distinct array elements cannot lose each other's updates the way a
+// read-modify-write on a shared word can.
+//
+static volatile uint16_t stateSavePending[NUM_CHANNELS];
+
+static void stateSaveRequestAll(void)
+{
+    uint16_t ch;
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        stateSavePending[ch] = 1U;
+    }
+}
+
+//
+// Cleared until loadSlotStates() has run and CPU1 has acted on the restore.
+// Without it the first mirror pass sees every slot's status change from the
+// power-up contents of the message RAM, and writes that over eight valid
+// records before the restore has been applied.
+//
+static volatile uint16_t stateSaveArmed = 0U;
+
+//
 // Mirrors the measurements and status CPU1 published in CPU1TOCPU2RAM into
 // the register file, so the external interfaces see current data. The seq
 // counter is even and unchanged across a consistent snapshot.
@@ -1973,8 +2178,10 @@ static void mirrorCpu1Status(void)
     float32_t senseI[NUM_CHANNELS];
     float32_t chgMah[NUM_CHANNELS];
     float32_t chgMwh[NUM_CHANNELS];
+    float32_t chgSec[NUM_CHANNELS];
     float32_t dchMah[NUM_CHANNELS];
     float32_t dchMwh[NUM_CHANNELS];
+    float32_t dchSec[NUM_CHANNELS];
     float32_t calTelemetry[8];
     float32_t calComputed[BTS_CAL_REGS_PER_CH];
     uint32_t calActiveSlot;
@@ -1993,6 +2200,17 @@ static void mirrorCpu1Status(void)
     uint16_t ch;
     uint16_t i;
     uint16_t attempts = 0;
+    uint16_t restoreDone;
+
+    //
+    // Until CPU1 has acknowledged the boot restore its accumulators are
+    // still zero, and mirroring them would erase the counters loadSlotStates()
+    // just put in the register file - which is exactly what CPU1 is about to
+    // read them back from. Hold the counter mirror off until the handshake
+    // completes; everything else mirrors from the first pass.
+    //
+    restoreDone = IPC_isFlagBusyLtoR(IPC_CPU2_L_CPU1_R,
+                                     BTS_IPC_FLAG_STATE_RESTORE) ? 0U : 1U;
 
     do {
         seqBefore = cpu1Status.seq;
@@ -2007,8 +2225,10 @@ static void mirrorCpu1Status(void)
             senseI[ch] = cpu1Status.senseCurrent[ch];
             chgMah[ch] = cpu1Status.chargeMah[ch];
             chgMwh[ch] = cpu1Status.chargeMwh[ch];
+            chgSec[ch] = cpu1Status.chargeSeconds[ch];
             dchMah[ch] = cpu1Status.dischargeMah[ch];
             dchMwh[ch] = cpu1Status.dischargeMwh[ch];
+            dchSec[ch] = cpu1Status.dischargeSeconds[ch];
         }
         for (i = 0; i < 8U; i++) {
             calTelemetry[i] = cpu1Status.calTelemetry[i];
@@ -2036,15 +2256,50 @@ static void mirrorCpu1Status(void)
     }
 
     for (ch = 0; ch < NUM_CHANNELS; ch++) {
-        registers[BTS_CTRL_BASE(ch) + BTS_REG_IDX(eCh0_Status)] = (float32_t)statusBits[ch];
-        registers[BTS_STATS_BASE(ch) + (BTS_REG_IDX(eCh0_CellVoltage) - BTS_REG_IDX(eCh0_ChargeAcc_mAh))] = cellV[ch];
-        registers[BTS_STATS_BASE(ch) + (BTS_REG_IDX(eCh0_CellCurrent) - BTS_REG_IDX(eCh0_ChargeAcc_mAh))] = cellI[ch];
-        registers[BTS_SENSE_BASE(ch) + BTS_SENSE_VOLTAGE] = senseV[ch];
-        registers[BTS_SENSE_BASE(ch) + BTS_SENSE_CURRENT] = senseI[ch];
-        registers[BTS_STATS_BASE(ch)] = chgMah[ch];
-        registers[BTS_STATS_BASE(ch) + (BTS_REG_IDX(eCh0_ChargeAcc_mWh) - BTS_REG_IDX(eCh0_ChargeAcc_mAh))] = chgMwh[ch];
-        registers[BTS_DISCHACC_BASE(ch) + BTS_DISCHACC_MAH] = dchMah[ch];
-        registers[BTS_DISCHACC_BASE(ch) + BTS_DISCHACC_MWH] = dchMwh[ch];
+        uint16_t rtBase = BTS_RT_BASE(ch);
+
+        //
+        // A state transition is due a save. Detected from the mirrored status
+        // word rather than from a mode write, for two reasons: the bits here
+        // are the ones that will be saved, whereas a mode write is seen
+        // before CPU1 has acted on it; and a transition CPU1 made on its own
+        // - a trip, a termination, a watchdog pause - has no host write to
+        // hang off at all.
+        //
+        {
+            static uint32_t lastSavedBits[NUM_CHANNELS];
+            uint32_t stateBits = statusBits[ch] &
+                ((1UL << BTS_STATUS_RUNNING)  | (1UL << BTS_STATUS_STOPPED) |
+                 (1UL << BTS_STATUS_CHARGING) | (1UL << BTS_STATUS_DISCHARGING) |
+                 (1UL << BTS_STATUS_PAUSED)   | (1UL << BTS_STATUS_END));
+
+            if (stateBits != lastSavedBits[ch]) {
+                lastSavedBits[ch] = stateBits;
+                if (stateSaveArmed) {
+                    stateSavePending[ch] = 1U;
+                }
+            }
+        }
+
+        registers[rtBase + BTS_RT_STATUS]        = (float32_t)statusBits[ch];
+        registers[rtBase + BTS_RT_CELL_VOLTAGE]  = cellV[ch];
+        registers[rtBase + BTS_RT_CELL_CURRENT]  = cellI[ch];
+        registers[rtBase + BTS_RT_SENSE_VOLTAGE] = senseV[ch];
+        registers[rtBase + BTS_RT_SENSE_CURRENT] = senseI[ch];
+        if (restoreDone) {
+            registers[rtBase + BTS_RT_CHARGE_MAH]    = chgMah[ch];
+            registers[rtBase + BTS_RT_CHARGE_MWH]    = chgMwh[ch];
+            registers[rtBase + BTS_RT_CHARGE_SECONDS] = chgSec[ch];
+            registers[rtBase + BTS_RT_DISCHARGE_MAH] = dchMah[ch];
+            registers[rtBase + BTS_RT_DISCHARGE_MWH] = dchMwh[ch];
+            registers[rtBase + BTS_RT_DISCHARGE_SECONDS] = dchSec[ch];
+        }
+        //
+        // BTS_RT_CELL_TEMP is deliberately not touched: the ADS1119
+        // converters are on this core's I2CB, so the temperature register is
+        // written directly by publishCellTemp() and has no CPU1 source to
+        // mirror from.
+        //
     }
 
     registers[BTS_REG_IDX(eInputVoltage)] = inputV;
@@ -2103,11 +2358,135 @@ static void mirrorCpu1Status(void)
 
 static volatile uint16_t canTxChannel = 0;
 
+//
+//=============================================================================
+// Host watchdog and state-save scheduling
+//=============================================================================
+//
+// CPU Timer 1 runs at 8 Hz (DEVICE_SYSCLK_FREQ / 8 period), which is the
+// timebase for both. Derived rather than written out so a change to the timer
+// period carries into the seconds arithmetic.
+//
+#define BTS_TIMER_TICKS_PER_S  8U
+#define BTS_STATE_SAVE_PERIOD_S 6U
+
+//
+// The eight slots are staggered one per tick across the 6 s window rather
+// than written in one pass, so a save never holds the I2C controller - and
+// therefore the host bus - for eight transfers at once.
+//
+#define BTS_STATE_SAVE_TICKS   (BTS_STATE_SAVE_PERIOD_S * BTS_TIMER_TICKS_PER_S)
+
+static volatile uint16_t hostWdTicks = 0U;
+static volatile uint16_t hostWdRemaining_s = 0U;
+static volatile uint16_t hostWdExpired = 0U;
+
+//
+// Set when a host disables the watchdog. The warning is printed from the
+// idle loop, not from the interrupt the write arrives in - uartSendResponse()
+// blocks per character and would hold off the host mid-transaction.
+//
+static volatile uint16_t hostWdDisableWarn = 0U;
+
+//
+// Reloads the host watchdog. Called from exactly one place per interface:
+// applyHostRegisterWrite() covers the I2C, UART and CAN write paths, and
+// i2cSlaveFifoISR()'s transmit path covers an I2C read.
+//
+// A polling host proves it is alive by reading, so a read must reload too -
+// the ESP32's steady state is reads only, and without this the watchdog
+// would pause every slot 30 s after the last mode command while the link was
+// perfectly healthy.
+//
+static void hostWatchdogFeed(void)
+{
+    uint16_t timeout = (uint16_t)registers[BTS_REG_IDX(eHostWatchdog_s)];
+
+    //
+    // Remaining before expired: the 8 Hz tick can land between these two
+    // writes, and in that order it sees the stale expired flag and returns
+    // rather than counting down from a half-reloaded zero.
+    //
+    hostWdTicks       = 0U;
+    hostWdRemaining_s = timeout;
+    hostWdExpired     = 0U;
+}
+
+//
+// One 8 Hz tick of the countdown. Never touches slot control state - it only
+// bumps supervision.wdPauseSeq, and CPU1 performs the pause.
+//
+static void hostWatchdogTick(void)
+{
+    uint16_t timeout = (uint16_t)registers[BTS_REG_IDX(eHostWatchdog_s)];
+
+    if (timeout == 0U) {
+        //
+        // Disabled. Zero remaining, so a host reading the countdown beside
+        // the timeout can tell "disabled" from "fired".
+        //
+        hostWdTicks       = 0U;
+        hostWdRemaining_s = 0U;
+        registers[BTS_REG_IDX(eWatchdogRemaining_s)] = 0.0f;
+        return;
+    }
+
+    if (hostWdExpired) {
+        registers[BTS_REG_IDX(eWatchdogRemaining_s)] = 0.0f;
+        return;
+    }
+
+    if (++hostWdTicks < BTS_TIMER_TICKS_PER_S) {
+        return;
+    }
+    hostWdTicks = 0U;
+
+    if (hostWdRemaining_s > timeout) {
+        hostWdRemaining_s = timeout;   // the host shortened the timeout
+    }
+
+    if (hostWdRemaining_s > 0U) {
+        hostWdRemaining_s--;
+    }
+    registers[BTS_REG_IDX(eWatchdogRemaining_s)] = (float32_t)hostWdRemaining_s;
+
+    if (hostWdRemaining_s == 0U) {
+        hostWdExpired = 1U;
+        supervision.wdPauseSeq++;
+        //
+        // A pause is a state transition, so every slot's record is due.
+        //
+        stateSaveRequestAll();
+    }
+}
+
 #pragma CODE_SECTION(timerISR, "isrcodefuncs")
 #pragma INTERRUPT(timerISR, HPI)
 __interrupt void timerISR(void)
 {
+    static uint16_t stateSaveTick = 0U;
+
     mirrorCpu1Status();
+    hostWatchdogTick();
+
+    //
+    // One slot marked per tick: eight slots spread across the 6 s window.
+    // Armed only once CPU1 has acknowledged the boot restore, so a periodic
+    // save cannot overwrite a record before it has been applied.
+    //
+    if (!stateSaveArmed) {
+        if (!IPC_isFlagBusyLtoR(IPC_CPU2_L_CPU1_R, BTS_IPC_FLAG_STATE_RESTORE)) {
+            stateSaveArmed = 1U;
+        }
+    } else {
+        if (++stateSaveTick >= BTS_STATE_SAVE_TICKS) {
+            stateSaveTick = 0U;
+        }
+        if (stateSaveTick < NUM_CHANNELS) {
+            stateSavePending[stateSaveTick] = 1U;
+        }
+    }
+
     sendCANData(canTxChannel);
     canTxChannel = (canTxChannel + 1) % NUM_CHANNELS;
     CPUTimer_clearOverflowFlag(CPUTIMER1_BASE);
@@ -2175,6 +2554,25 @@ static void applyHostRegisterWrite(uint16_t regIdx, float32_t value)
 {
     registers[regIdx] = value;
     notifyCpu1RegisterWrite(regIdx, value);
+
+    //
+    // The reload hook for all three write paths: I2C target, UART AT and CAN
+    // all funnel through here. The I2C read path has its own hook in
+    // i2cSlaveFifoISR().
+    //
+    hostWatchdogFeed();
+
+    if (regIdx == BTS_REG_IDX(eHostWatchdog_s)) {
+        //
+        // Disabling supervision on a machine that charges lithium cells
+        // unattended is worth saying out loud - it is a legitimate bench
+        // setting and a dangerous production one. Printed from the idle
+        // loop; this runs inside an interrupt.
+        //
+        if (value == 0.0f) {
+            hostWdDisableWarn = 1U;
+        }
+    }
 
     if (regIdx == BTS_REG_IDX(eCalibrationMode) && value == 2.0f) {
         calibrationSavePending = 1U;
@@ -2297,6 +2695,32 @@ static void serviceI2CTargetWatchdog(void)
 void BTS_serviceDeferredWork(void)
 {
     serviceI2CTargetWatchdog();
+
+    //
+    // Slot runtime state. One slot per pass, so a periodic save never holds
+    // the I2C controller for eight transfers at once.
+    //
+    {
+        uint16_t ch;
+        for (ch = 0; ch < NUM_CHANNELS; ch++) {
+            if (stateSavePending[ch] != 0U) {
+                stateSavePending[ch] = 0U;
+                (void)saveSlotState(ch);
+                break;
+            }
+        }
+    }
+
+    //
+    // Deferred from applyHostRegisterWrite(): uartSendResponse() blocks per
+    // character, far too long to run inside the interrupt the write arrived
+    // in.
+    //
+    if (hostWdDisableWarn != 0U) {
+        hostWdDisableWarn = 0U;
+        uartSendResponse("WARNING: host watchdog DISABLED - slots will not "
+                         "pause if the host stops responding");
+    }
 
     //
     // Runtime calibration commit. F-RAM is never written from an ISR - the
@@ -2589,6 +3013,19 @@ __interrupt void i2cSlaveFifoISR(void)
             dbgSlaveTx++;
 
             //
+            // The I2C read reload hook - the fourth and last of them, and the
+            // one the design doc calls out separately. A polling host proves
+            // it is alive by reading, and the ESP32's steady state is reads
+            // only: without this the watchdog would pause every running slot
+            // 30 s after the last mode command while the link was healthy.
+            //
+            // Placed on the transmit side rather than the address phase
+            // because that is where a read is unambiguous - the address
+            // phase is shared with a write.
+            //
+            hostWatchdogFeed();
+
+            //
             // Load the register only at the start of a four-byte group.
             //
             // bufferValid is cleared as each register finishes so the
@@ -2783,6 +3220,33 @@ __interrupt void uartRxISR(void)
                 strncpy(regName, cmd, sizeof(regName) - 1);
                 regName[sizeof(regName) - 1] = '\0';
 
+                //
+                // AT+C<n>PAUSE / AT+C<n>RESUME. Reachable by writing the mode
+                // register, but an operator at a console should not have to
+                // compute a bitmask to stop a cell safely.
+                //
+                if ((regName[0] == 'C') && (regName[1] >= '0') &&
+                    (regName[1] <= '7') && !valueStr && !query) {
+                    uint16_t slot = (uint16_t)(regName[1] - '0');
+                    uint32_t bit  = 0U;
+
+                    if (strcmp(&regName[2], "PAUSE") == 0) {
+                        bit = BTS_MODE_PAUSE;
+                    } else if (strcmp(&regName[2], "RESUME") == 0) {
+                        bit = BTS_MODE_RESUME;
+                    }
+
+                    if (bit != 0U) {
+                        applyHostRegisterWrite(BTS_SET_BASE(slot) + BTS_SET_MODE,
+                                               (float32_t)bit);
+                        uartSendResponse("OK");
+                        uartBufIdx = 0;
+                        SCI_clearInterruptStatus(BTS_CONSOLE_SCI_BASE, intSource);
+                        Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP9);
+                        return;
+                    }
+                }
+
                 for (uint16_t i = 0; i < TOTAL_REGISTERS; i++) {
                     if (strcmp(regName, uartRegConfig[i].shortName) == 0 ||
                         strcmp(regName, uartRegConfig[i].longName) == 0) {
@@ -2845,6 +3309,12 @@ void main(void)
     // Establish the register file before anything can observe or modify it.
     //
     loadCalibration();
+
+    //
+    // Slot runtime state, after the calibration load so the whole register
+    // file settles before either IPC flag goes up.
+    //
+    loadSlotStates();
 
     initI2C_Slave();
     initUART();

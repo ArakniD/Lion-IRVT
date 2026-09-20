@@ -67,15 +67,16 @@ static void build_unit_status(ble_unit_status_t *out)
     bts_link_get_snapshot(&snap);
 
     memset(out, 0, sizeof(*out));
-    out->version         = BLE_PROTO_VERSION;
-    out->slot_count      = SLOT_COUNT;
-    out->online          = snap.unit.online ? 1 : 0;
-    out->unit_state      = (uint8_t)snap.unit.unit_state;
-    out->trip_status     = snap.unit.trip_status;
-    out->input_voltage_v = snap.unit.input_voltage_v;
-    out->uptime_s        = (uint32_t)(esp_timer_get_time() / 1000000);
-    out->stats_live      = bts_link_stats_are_live() ? 1 : 0;
-    out->wifi_connected  = s_wifi_connected ? 1 : 0;
+    out->version            = BLE_PROTO_VERSION;
+    out->slot_count         = SLOT_COUNT;
+    out->online             = snap.unit.online ? 1 : 0;
+    out->unit_state         = (uint8_t)snap.unit.unit_state;
+    out->trip_status        = snap.unit.trip_status;
+    out->input_voltage_v    = snap.unit.input_voltage_v;
+    out->uptime_s           = (uint32_t)(esp_timer_get_time() / 1000000);
+    out->stats_live         = bts_link_stats_are_live() ? 1 : 0;
+    out->wifi_connected     = s_wifi_connected ? 1 : 0;
+    out->watchdog_timeout_s = snap.unit.watchdog_timeout_s;
 }
 
 static void build_slot_status(uint8_t slot, const slot_status_t *st,
@@ -95,6 +96,17 @@ static void build_slot_status(uint8_t slot, const slot_status_t *st,
     out->elapsed_s       = st->elapsed_s;
     out->state_elapsed_s = st->state_elapsed_s;
     out->status_bits     = st->status_bits;
+
+    out->bts_paused            = st->bts_paused ? 1 : 0;
+    out->bts_wd_tripped        = st->bts_wd_tripped ? 1 : 0;
+    out->bts_restored          = st->bts_restored ? 1 : 0;
+    out->bts_ended             = st->bts_ended ? 1 : 0;
+    out->bts_charge_mah        = st->bts_charge_mah;
+    out->bts_charge_mwh        = st->bts_charge_mwh;
+    out->bts_charge_seconds    = st->bts_charge_seconds;
+    out->bts_discharge_mah     = st->bts_discharge_mah;
+    out->bts_discharge_mwh     = st->bts_discharge_mwh;
+    out->bts_discharge_seconds = st->bts_discharge_seconds;
 }
 
 static void build_slot_config(uint8_t slot, ble_slot_config_t *out)
@@ -262,6 +274,8 @@ static int handle_command(struct os_mbuf *om)
     case BLE_CMD_ABORT:       err = test_engine_abort(cmd.slot);       break;
     case BLE_CMD_CLEAR_FAULT: err = test_engine_clear_fault(cmd.slot); break;
     case BLE_CMD_ABORT_ALL:   err = test_engine_abort_all();           break;
+    case BLE_CMD_PAUSE:       err = test_engine_pause(cmd.slot);       break;
+    case BLE_CMD_RESUME:      err = test_engine_resume(cmd.slot);      break;
     default:
         ESP_LOGW(TAG, "unknown command opcode %u", cmd.opcode);
         return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
@@ -642,6 +656,8 @@ static void notify_task(void *arg)
             case SLOT_STATE_ABORTED:
                 continue;
             default:
+                /* BTS_PAUSED is included: a client watching a held run needs
+                 * to see it appear without re-reading every characteristic. */
                 break;
             }
             notify_slot(slot, &st);

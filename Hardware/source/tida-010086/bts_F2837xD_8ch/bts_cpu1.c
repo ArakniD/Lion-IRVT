@@ -115,8 +115,10 @@ volatile uint32_t adcbEocTimeouts = 0;
 //
 static float32_t accChargeMah[NUM_CHANNELS];
 static float32_t accChargeMwh[NUM_CHANNELS];
+static float32_t accChargeSeconds[NUM_CHANNELS];
 static float32_t accDischargeMah[NUM_CHANNELS];
 static float32_t accDischargeMwh[NUM_CHANNELS];
+static float32_t accDischargeSeconds[NUM_CHANNELS];
 
 //
 // The C tasks rotate C1 -> C2 -> C3 off one TASKC_FREQ_HZ timer, so C1 sees
@@ -124,21 +126,162 @@ static float32_t accDischargeMwh[NUM_CHANNELS];
 // rate carries into the integration.
 //
 #define BTS_ACC_DT_HOURS  ((float32_t)3.0 / ((float32_t)TASKC_FREQ_HZ * (float32_t)3600.0))
+#define BTS_ACC_DT_SECONDS ((float32_t)3.0 / (float32_t)TASKC_FREQ_HZ)
 
 //
-// Zeroes one direction's pair at the moment that direction starts. The
-// opposite pair is left alone so the two totals from a charge/discharge
-// cycle survive independently.
+// Zeroes one direction's counters at the moment that direction starts. The
+// opposite set is left alone so the two totals from a charge/discharge cycle
+// survive independently.
+//
+// Called ONLY on a fresh start - STOPPED->run or END->run. A resume from
+// PAUSED, a trip, a fault and a watchdog pause all reset nothing.
 //
 static void accResetDirection(uint16_t ch, uint16_t charging)
 {
     if (charging) {
         accChargeMah[ch] = (float32_t)0.0;
         accChargeMwh[ch] = (float32_t)0.0;
+        accChargeSeconds[ch] = (float32_t)0.0;
     } else {
         accDischargeMah[ch] = (float32_t)0.0;
         accDischargeMwh[ch] = (float32_t)0.0;
+        accDischargeSeconds[ch] = (float32_t)0.0;
     }
+}
+
+//
+//=============================================================================
+// Slot state model
+//=============================================================================
+//
+// A slot is exactly one of STOPPED, CHARGING, DISCHARGING, PAUSED or END.
+// PAUSED keeps the direction bit set alongside it, so a host sees both that
+// the slot is held and which way it will resume.
+//
+static uint16_t slotIsRunning(uint16_t ch)
+{
+    return (status[ch].running && !status[ch].paused) ? 1U : 0U;
+}
+
+//
+// Enters PAUSED from a running state. The converter reference goes to zero
+// BEFORE enable_logic is cleared, the same ordering a trip exit uses - the
+// control loop may run between the two writes.
+//
+static void slotPause(uint16_t ch, uint16_t wdTripped, uint16_t restored)
+{
+    BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
+    BTS_userInputs[ch].enable_logic = 0;
+
+    status[ch].paused    = 1;
+    status[ch].wdTripped = wdTripped;
+    status[ch].restored  = restored;
+    //
+    // running stays set: PAUSED is a held run, not a stop, and the direction
+    // bit has to survive so a resume knows which way to go.
+    //
+    status[ch].stopped   = 0;
+    status[ch].finished  = 0;
+}
+
+//
+// Leaves PAUSED back into whichever direction the slot held. Resets nothing:
+// the counters picking up where they stopped is the point of the state.
+//
+static void slotResume(uint16_t ch)
+{
+    if (!status[ch].paused) {
+        return;
+    }
+
+    status[ch].paused    = 0;
+    status[ch].wdTripped = 0;
+    status[ch].restored  = 0;
+    status[ch].running   = 1;
+    status[ch].stopped   = 0;
+
+    BTS_userInputs[ch].direction_logic = status[ch].charging;
+    BTS_userInputs[ch].enable_logic    = 1;
+}
+
+//
+// Full stop. Clears the pause and END indications too, so a host that stops a
+// paused slot gets a clean STOPPED rather than a mixture.
+//
+static void slotStop(uint16_t ch)
+{
+    BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
+    BTS_userInputs[ch].enable_logic = 0;
+
+    status[ch].running   = 0;
+    status[ch].stopped   = 1;
+    status[ch].paused    = 0;
+    status[ch].wdTripped = 0;
+    status[ch].restored  = 0;
+}
+
+//
+// Host watchdog, CPU1 half. CPU2 owns the countdown but must never touch a
+// slot's control state, so it bumps supervision.wdPauseSeq and the pause
+// happens here.
+//
+static void serviceHostWatchdog(void)
+{
+    static uint32_t wdSeqSeen = 0U;
+    uint32_t seq = supervision.wdPauseSeq;
+    uint16_t ch;
+
+    if (seq == wdSeqSeen) {
+        return;
+    }
+    wdSeqSeen = seq;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        if (slotIsRunning(ch)) {
+            slotPause(ch, 1U, 0U);
+        }
+    }
+    updateStatusRegisters();
+}
+
+//
+// Boot restore, CPU1 half. CPU2 has already written the counters into the
+// runtime registers and the per-slot flags into supervision.restoreFlags;
+// this reconstructs the slot state from them.
+//
+// A slot that was mid-run comes back PAUSED + RESTORED with the converter
+// off - never running. The cell may have been swapped while the unit was
+// down, so nothing here may re-energise a slot on its own.
+//
+static void applyRestoredSlotStates(void)
+{
+    uint32_t flags = supervision.restoreFlags;
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        uint32_t f = (flags >> BTS_STATE_FLAGS_SHIFT(ch)) & BTS_STATE_FLAGS_MASK;
+
+        accChargeMah[ch]        = registers[BTS_RT_BASE(ch) + BTS_RT_CHARGE_MAH];
+        accChargeMwh[ch]        = registers[BTS_RT_BASE(ch) + BTS_RT_CHARGE_MWH];
+        accChargeSeconds[ch]    = registers[BTS_RT_BASE(ch) + BTS_RT_CHARGE_SECONDS];
+        accDischargeMah[ch]     = registers[BTS_RT_BASE(ch) + BTS_RT_DISCHARGE_MAH];
+        accDischargeMwh[ch]     = registers[BTS_RT_BASE(ch) + BTS_RT_DISCHARGE_MWH];
+        accDischargeSeconds[ch] = registers[BTS_RT_BASE(ch) + BTS_RT_DISCHARGE_SECONDS];
+
+        slotStop(ch);
+        status[ch].finished = ((f & BTS_STATE_F_END) != 0UL) ? 1U : 0U;
+
+        if ((f & BTS_STATE_F_RUNNING) != 0UL) {
+            status[ch].charging    = ((f & BTS_STATE_F_CHARGING) != 0UL) ? 1U : 0U;
+            status[ch].discharging = !status[ch].charging;
+            status[ch].running     = 1;
+            slotPause(ch, 0U, 1U);
+        }
+    }
+
+    updateStatusRegisters();
 }
 
 //
@@ -990,7 +1133,13 @@ static void publishStatusToCpu2(void)
 
         bitset |= (status[ch].running & 0x1) << 0;
         bitset |= (status[ch].stopped & 0x1) << 1;
-        bitset |= (status[ch].finished & 0x1) << 2;
+        //
+        // END. Bit 2 is BTS_STATUS_FINISHED, declared from the start and
+        // never driven until now; the design gives it the END meaning rather
+        // than adding a second bit for the same thing. BTS_STATUS_END is an
+        // alias for it, so this one assignment drives both names.
+        //
+        bitset |= (status[ch].finished & 0x1) << BTS_STATUS_END;
         bitset |= (status[ch].overCurrentTrip & 0x1) << 3;
         bitset |= (status[ch].charging & 0x1) << 4;
         bitset |= (status[ch].discharging & 0x1) << 5;
@@ -1003,6 +1152,9 @@ static void publishStatusToCpu2(void)
         bitset |= (status[ch].calibrating & 0x1) << BTS_STATUS_CALIBRATING;
         bitset |= (status[ch].calVoltageValid & 0x1) << BTS_STATUS_CAL_V_VALID;
         bitset |= (status[ch].calCurrentValid & 0x1) << BTS_STATUS_CAL_I_VALID;
+        bitset |= (status[ch].paused & 0x1) << BTS_STATUS_PAUSED;
+        bitset |= (status[ch].wdTripped & 0x1) << BTS_STATUS_WD_TRIPPED;
+        bitset |= (status[ch].restored & 0x1) << BTS_STATUS_RESTORED;
         cpu1Status.statusBits[ch] = bitset;
 
         cpu1Status.cellVoltage[ch] = BTS_measValues[ch].CellVoltage_V;
@@ -1017,8 +1169,10 @@ static void publishStatusToCpu2(void)
 
         cpu1Status.chargeMah[ch]    = accChargeMah[ch];
         cpu1Status.chargeMwh[ch]    = accChargeMwh[ch];
+        cpu1Status.chargeSeconds[ch] = accChargeSeconds[ch];
         cpu1Status.dischargeMah[ch] = accDischargeMah[ch];
         cpu1Status.dischargeMwh[ch] = accDischargeMwh[ch];
+        cpu1Status.dischargeSeconds[ch] = accDischargeSeconds[ch];
 
         canData[ch].channel = ch;
         canData[ch].voltage = BTS_measValues[ch].CellVoltage_V;
@@ -1079,9 +1233,45 @@ void modeCallback(float value, uint16_t channel)
         // against eChargeRestrictV / eDischargeRestrictV below. The 10 Hz
         // half lives in C1().
         //
-        if (mode & 0x04) {
+        if (mode & BTS_MODE_CALIBRATE) {
             registers[BTS_REG_IDX(eCalSlot)] = (float32_t)channel;
             calHandleCommand((uint16_t)eCalCmdEnter, (float32_t)0.0);
+            return;
+        }
+
+        //
+        // Pause and resume are edge commands, handled before the run/stop
+        // decode and not retained - a host never has to clear them. They
+        // carry across a group the same way a start does.
+        //
+        if (mode & BTS_MODE_PAUSE) {
+            uint16_t m;
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if ((btsSlotLeader[m] == channel) && (btsSlotEnabled[m] != 0U) &&
+                    slotIsRunning(m)) {
+                    slotPause(m, 0U, 0U);
+                }
+            }
+            updateStatusRegisters();
+            return;
+        }
+
+        //
+        // Writing run=1 to a paused slot is also a resume, so a host that
+        // only knows the old protocol still works.
+        //
+        if ((mode & BTS_MODE_RESUME) ||
+            ((mode & BTS_MODE_RUN) && status[channel].paused)) {
+            uint16_t m;
+            if (!status[channel].paused) {
+                return;   // nothing to resume
+            }
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if ((btsSlotLeader[m] == channel) && (btsSlotEnabled[m] != 0U)) {
+                    slotResume(m);
+                }
+            }
+            updateStatusRegisters();
             return;
         }
 
@@ -1097,42 +1287,49 @@ void modeCallback(float value, uint16_t channel)
         float dischargeRestrictV = registers[BTS_REG_IDX(eDischargeRestrictV)];
 
         float inputV = registers[BTS_REG_IDX(eInputVoltage)];
-        if ((mode & 0x02) && (inputV <= chargeRestrictV)) {
-            status[channel].running = 0;
-            status[channel].stopped = 1;
-            BTS_userInputs[channel].enable_logic = 0;
+        if ((mode & BTS_MODE_CHARGE) && (inputV <= chargeRestrictV)) {
+            slotStop(channel);
             updateStatusRegisters();
             return;
         }
-        if (!(mode & 0x02) && (inputV >= dischargeRestrictV)) {
-            status[channel].running = 0;
-            status[channel].stopped = 1;
-            BTS_userInputs[channel].enable_logic = 0;
+        if (!(mode & BTS_MODE_CHARGE) && (inputV >= dischargeRestrictV)) {
+            slotStop(channel);
             updateStatusRegisters();
             return;
         }
 
-        status[channel].running = mode & 0x01;
-        status[channel].stopped = !(mode & 0x01);
-        status[channel].charging = (mode & 0x02) >> 1;
-        status[channel].discharging = !((mode & 0x02) >> 1);
-        if (mode & 0x01) {
-            uint16_t regBase = BTS_CTRL_BASE(channel);
-            uint16_t vMinIdx = (mode & 0x02) ? BTS_REG_IDX(eCh0_ChargeVoltageMin)  : BTS_REG_IDX(eCh0_DischargeVoltageMin);
-            uint16_t vMaxIdx = (mode & 0x02) ? BTS_REG_IDX(eCh0_ChargeVoltageMax)  : BTS_REG_IDX(eCh0_DischargeVoltageMax);
-            uint16_t iMinIdx = (mode & 0x02) ? BTS_REG_IDX(eCh0_ChargeCurrentMin)  : BTS_REG_IDX(eCh0_DischargeCurrentMin);
-            uint16_t iMaxIdx = (mode & 0x02) ? BTS_REG_IDX(eCh0_ChargeCurrentMax)  : BTS_REG_IDX(eCh0_DischargeCurrentMax);
+        status[channel].charging = (mode & BTS_MODE_CHARGE) >> 1;
+        status[channel].discharging = !((mode & BTS_MODE_CHARGE) >> 1);
+        if (mode & BTS_MODE_RUN) {
+            uint16_t regBase = BTS_SET_BASE(channel);
+            uint16_t vMinOff = (mode & BTS_MODE_CHARGE) ? BTS_SET_CHG_V_MIN : BTS_SET_DIS_V_MIN;
+            uint16_t vMaxOff = (mode & BTS_MODE_CHARGE) ? BTS_SET_CHG_V_MAX : BTS_SET_DIS_V_MAX;
+            uint16_t iMinOff = (mode & BTS_MODE_CHARGE) ? BTS_SET_CHG_I_MIN : BTS_SET_DIS_I_MIN;
+            uint16_t iMaxOff = (mode & BTS_MODE_CHARGE) ? BTS_SET_CHG_I_MAX : BTS_SET_DIS_I_MAX;
 
-            BTS_userInputs[channel].vref_charge_V    = registers[regBase + vMaxIdx];
-            BTS_userInputs[channel].vref_discharge_V = registers[regBase + vMinIdx];
-            BTS_userInputs[channel].iref_A           = registers[regBase + iMaxIdx];
-            BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + iMinIdx];
+            status[channel].running   = 1;
+            status[channel].stopped   = 0;
+            status[channel].paused    = 0;
+            status[channel].wdTripped = 0;
+            status[channel].restored  = 0;
+
+            BTS_userInputs[channel].vref_charge_V    = registers[regBase + vMaxOff];
+            BTS_userInputs[channel].vref_discharge_V = registers[regBase + vMinOff];
+            BTS_userInputs[channel].iref_A           = registers[regBase + iMaxOff];
+            BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + iMinOff];
             BTS_userInputs[channel].direction_logic  = status[channel].charging;
             BTS_userInputs[channel].enable_logic     = 1;
 
+            //
+            // A fresh start - STOPPED->run or END->run. This is the only
+            // place a counter set is zeroed, and only the starting
+            // direction's set. Clearing END here is what makes the next
+            // termination distinguishable from this one.
+            //
+            status[channel].finished = 0;
             accResetDirection(channel, status[channel].charging);
         } else {
-            BTS_userInputs[channel].enable_logic = 0;
+            slotStop(channel);
         }
 
         //
@@ -1154,6 +1351,9 @@ void modeCallback(float value, uint16_t channel)
                 status[m].stopped     = status[channel].stopped;
                 status[m].charging    = status[channel].charging;
                 status[m].discharging = status[channel].discharging;
+                status[m].paused      = status[channel].paused;
+                status[m].wdTripped   = status[channel].wdTripped;
+                status[m].restored    = status[channel].restored;
 
                 BTS_userInputs[m].vref_charge_V    = BTS_userInputs[channel].vref_charge_V;
                 BTS_userInputs[m].vref_discharge_V = BTS_userInputs[channel].vref_discharge_V;
@@ -1170,6 +1370,7 @@ void modeCallback(float value, uint16_t channel)
                 //
                 if (status[channel].running) {
                     status[m].groupDisconnect = 0;
+                    status[m].finished = 0;
                     accResetDirection(m, status[m].charging);
                 }
             }
@@ -1185,9 +1386,10 @@ void modeCallback(float value, uint16_t channel)
 //
 // Handles messages from the communications CPU.
 //
-//   BTS_IPC_FLAG_REG_WRITE   one register changed; ipcMsg carries the index
-//   BTS_IPC_FLAG_TEMP_UPDATE a cell temperature was refreshed
-//   BTS_IPC_FLAG_CAL_RELOAD  the whole calibration block was reloaded
+//   BTS_IPC_FLAG_REG_WRITE     one register changed; ipcMsg carries the index
+//   BTS_IPC_FLAG_TEMP_UPDATE   a cell temperature was refreshed
+//   BTS_IPC_FLAG_CAL_RELOAD    the whole calibration block was reloaded
+//   BTS_IPC_FLAG_STATE_RESTORE slot runtime state came back from F-RAM
 //
 // registers[] itself lives in CPU2's message RAM and has already been
 // updated by CPU2 before the flag was raised - CPU1 only reacts to the
@@ -1198,22 +1400,27 @@ void BTS_HandleRegisterWrite(void)
     if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_REG_WRITE)) {
         uint16_t regIdx = ipcMsg.regAddr;
 
-        if (regIdx < BTS_REG_IDX(eCh0_ChargeAcc_mAh)) {
-            //
-            // Control block: 10 registers per channel, mode is the first.
-            //
-            uint16_t channel = regIdx / BTS_CTRL_REGS_PER_CH;
-            if ((regIdx % BTS_CTRL_REGS_PER_CH) == 0) {
+        //
+        // The decode is by index range, so it has to be re-derived from the
+        // map every time the map moves. Under v2 the whole runtime region
+        // (0 .. 95) is read-only and never reaches here; a write is either
+        // in the settings region or in the unit region.
+        //
+        if ((regIdx >= BTS_SET_BASE(0)) && (regIdx < BTS_SET_BASE(NUM_CHANNELS))) {
+            uint16_t channel = (regIdx - BTS_SET_BASE(0)) / BTS_SET_REGS_PER_CH;
+            uint16_t offset  = (regIdx - BTS_SET_BASE(0)) % BTS_SET_REGS_PER_CH;
+
+            if (offset == BTS_SET_MODE) {
                 modeCallback(ipcMsg.value, channel);
+            } else if ((offset >= (BTS_CAL_BASE(0) - BTS_SET_BASE(0))) &&
+                       (offset <  (BTS_CAL_BASE(0) - BTS_SET_BASE(0)) +
+                                  BTS_CAL_REGS_PER_CH)) {
+                //
+                // Calibration group: pull the whole channel in and schedule
+                // a recalculation on the next C2 task.
+                //
+                BTS_loadCalibrationFromRegisters(channel);
             }
-        } else if (regIdx >= BTS_CAL_BASE(0) &&
-                   regIdx <  BTS_CAL_BASE(0) + NUM_CHANNELS * BTS_CAL_REGS_PER_CH) {
-            //
-            // Calibration block: pull the whole channel in and schedule a
-            // recalculation on the next C2 task.
-            //
-            uint16_t channel = (regIdx - BTS_CAL_BASE(0)) / BTS_CAL_REGS_PER_CH;
-            BTS_loadCalibrationFromRegisters(channel);
         } else if (regIdx == BTS_REG_IDX(eCalCommand)) {
             //
             // The runtime calibration command. This decode is not optional:
@@ -1247,6 +1454,13 @@ void BTS_HandleRegisterWrite(void)
         }
         IPC_ackFlagRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_CAL_RELOAD);
     }
+
+    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_STATE_RESTORE)) {
+        applyRestoredSlotStates();
+        IPC_ackFlagRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_STATE_RESTORE);
+    }
+
+    serviceHostWatchdog();
 }
 
 // Update BTS_monitor_Iout_Vout
@@ -1449,11 +1663,13 @@ void C1(void)
     BTS_monitor_Iout_Vout(&BTS_measValues_ch8);
 
     //
-    // Integrate charge and energy from the measurements just refreshed. A
-    // stopped, tripped or calibrating slot contributes nothing.
+    // Integrate charge, energy and run time from the measurements just
+    // refreshed. Counters advance only while a slot is genuinely running:
+    // a paused, stopped, ended, tripped or calibrating slot contributes
+    // nothing and its totals freeze exactly where they were.
     //
     for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
-        if ((status[ch].running == 0U) || calSlotIsCalibrating(ch)) {
+        if ((slotIsRunning(ch) == 0U) || calSlotIsCalibrating(ch)) {
             continue;
         }
 
@@ -1463,9 +1679,11 @@ void C1(void)
         if (status[ch].charging) {
             accChargeMah[ch] += i_A * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
             accChargeMwh[ch] += p_W * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
+            accChargeSeconds[ch] += BTS_ACC_DT_SECONDS;
         } else {
             accDischargeMah[ch] += i_A * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
             accDischargeMwh[ch] += p_W * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
+            accDischargeSeconds[ch] += BTS_ACC_DT_SECONDS;
         }
     }
 
@@ -1485,17 +1703,13 @@ void C1(void)
         if (calSlotIsCalibrating(ch)) {
             continue;
         }
-        if (status[ch].running) {
+        if (slotIsRunning(ch)) {
             if (status[ch].charging && inputV <= chargeRestrictV) {
-                status[ch].running = 0;
-                status[ch].stopped = 1;
-                BTS_userInputs[ch].enable_logic = 0;
+                slotStop(ch);
                 updateStatusRegisters();
             }
             if (status[ch].discharging && inputV >= dischargeRestrictV) {
-                status[ch].running = 0;
-                status[ch].stopped = 1;
-                BTS_userInputs[ch].enable_logic = 0;
+                slotStop(ch);
                 updateStatusRegisters();
             }
         }
@@ -1509,9 +1723,7 @@ void C1(void)
         if (BTS_measValues[ch].CellVoltage_V < BTS_REVERSE_POLARITY_V) {
             status[ch].reversePolarity = 1;
             if (status[ch].running) {
-                status[ch].running = 0;
-                status[ch].stopped = 1;
-                BTS_userInputs[ch].enable_logic = 0;
+                slotStop(ch);
             }
         } else {
             status[ch].reversePolarity = 0;
@@ -1586,7 +1798,7 @@ static void checkGroupIntegrity(void)
         // Ungrouped, disabled, or not running: nothing to compare against.
         //
         if ((btsSlotIsLeader[ch] != 0U) || (btsSlotEnabled[ch] == 0U) ||
-            (status[ch].running == 0U)) {
+            (slotIsRunning(ch) == 0U)) {
             vdiffCount[ch] = 0U;
             continue;
         }
@@ -1629,9 +1841,7 @@ static void checkGroupIntegrity(void)
                     continue;
                 }
                 status[m].groupDisconnect = 1;
-                status[m].running = 0;
-                status[m].stopped = 1;
-                BTS_userInputs[m].enable_logic = 0;
+                slotStop(m);
                 BTS_ctrlLoopVariables[m].tripFlag = 1;
                 vdiffCount[m] = 0U;
             }
@@ -1797,9 +2007,7 @@ __interrupt void epwmTripISR(void) {
         }
 
         status[channel].overCurrentTrip = 1;
-        status[channel].running = 0;
-        status[channel].stopped = 1;
-        BTS_userInputs[channel].enable_logic = 0;
+        slotStop(channel);
         BTS_ctrlLoopVariables[channel].tripFlag = 1;
 
         //
@@ -1834,6 +2042,7 @@ __interrupt void epwmTripISR(void) {
                 }
                 status[m].running = 0;
                 status[m].stopped = 1;
+                status[m].paused  = 0;
                 BTS_userInputs[m].enable_logic = 0;
                 BTS_ctrlLoopVariables[m].tripFlag = 1;
             }

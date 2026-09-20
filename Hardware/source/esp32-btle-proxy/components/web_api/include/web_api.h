@@ -16,6 +16,8 @@
  *   POST /api/slot/<n>/start
  *   POST /api/slot/<n>/abort
  *   POST /api/slot/<n>/clear
+ *   POST /api/slot/<n>/pause         pause a running slot on the BTS
+ *   POST /api/slot/<n>/resume        resume a paused one - operator action
  *   POST /api/slot/<n>/serial        {"serial":"..."}
  *   GET  /api/slot/<n>/result        the slot's latest result
  *   GET  /api/results?offset=&limit= rolling history across all slots

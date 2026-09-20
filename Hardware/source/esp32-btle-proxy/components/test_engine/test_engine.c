@@ -110,6 +110,7 @@ static bool              s_ready;
 static const char *k_state_names[SLOT_STATE_COUNT] = {
     "IDLE", "CHECK_REST", "CHARGE", "REST", "DISCHARGE",
     "DISCHARGE_REST", "RECHARGE", "COMPLETE", "FAULT", "ABORTED",
+    "BTS_PAUSED",
 };
 
 static const char *k_fault_names[SLOT_FAULT_COUNT] = {
@@ -210,14 +211,15 @@ static esp_err_t start_power(uint8_t slot, uint32_t mode)
  *
  * The registers are REG_ACCESS_RO and i2cSlaveISR() drops host writes to
  * them, so this cannot succeed - but it no longer needs to. The BTS zeroes
- * a direction's pair itself the moment that direction starts, so by the time
+ * a direction's set itself the moment that direction starts, so by the time
  * the mode write below lands the counters are already at zero. The write is
  * kept so a later build that does make them writable needs no change here.
  */
 static void try_reset_bts_accumulators(uint8_t slot)
 {
-    (void)bts_link_write_reg(BTS_DISCHACC_ADDR(slot, BTS_DISCHACC_MAH), 0.0f);
-    (void)bts_link_write_reg(BTS_DISCHACC_ADDR(slot, BTS_DISCHACC_MWH), 0.0f);
+    (void)bts_link_write_reg(BTS_RT_ADDR(slot, BTS_RT_DISCHARGE_MAH), 0.0f);
+    (void)bts_link_write_reg(BTS_RT_ADDR(slot, BTS_RT_DISCHARGE_MWH), 0.0f);
+    (void)bts_link_write_reg(BTS_RT_ADDR(slot, BTS_RT_DISCHARGE_SECONDS), 0.0f);
 }
 
 /* ------------------------------------------------------------------ */
@@ -304,6 +306,9 @@ static slot_fault_t check_safety(uint8_t slot, const bts_snapshot_t *snap)
  * because status[].finished is never asserted by the current BTS firmware
  * (see test_engine.h). It does catch the case where the BTS stops a channel
  * on its own, e.g. an input-voltage excursion.
+ *
+ * A pause is explicitly NOT "done": the run is intact and resumable, and
+ * treating it as a termination would write a truncated result.
  */
 static bool bts_says_done(const slot_ctx_t *c, const bts_channel_state_t *ch)
 {
@@ -313,7 +318,10 @@ static bool bts_says_done(const slot_ctx_t *c, const bts_channel_state_t *ch)
     if ((esp_timer_get_time() - c->mode_issued_us) < (MODE_GRACE_MS * 1000LL)) {
         return false;
     }
-    if (ch->status_bits & BTS_STATUS_FINISHED) {
+    if (ch->paused) {
+        return false;
+    }
+    if (ch->status_bits & BTS_STATUS_ENDED_MASK) {
         return true;
     }
     if ((ch->status_bits & BTS_STATUS_STOPPED) &&
@@ -599,16 +607,72 @@ static void tick_recharge(uint8_t slot, const bts_channel_state_t *ch,
 /* Tick                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Parks a slot the BTS is holding paused.
+ *
+ * Reached either from a running engine state (the watchdog fired while the
+ * link was down and the BTS pulled the slot's power) or from IDLE at boot
+ * (the unit reset and restored the run from F-RAM). Both stop the local
+ * integrators - their totals no longer track the BTS's, which kept counting
+ * up to the pause - and neither resumes anything.
+ */
+static void enter_bts_paused(uint8_t slot, const bts_channel_state_t *ch)
+{
+    slot_ctx_t *c = &s_slot[slot];
+
+    coulomb_stop(&c->discharge_cc);
+    coulomb_stop(&c->charge_cc);
+    c->power_started = false;
+
+    ESP_LOGW(TAG, "slot %u held PAUSED by the BTS (%s), was %s; counters kept "
+                  "(%.0f mAh in / %.0f mAh out) - resume is an operator action",
+             slot,
+             ch->restored     ? "restored from F-RAM after a unit reset"
+             : ch->wd_tripped ? "host watchdog timed out"
+                              : "paused by command",
+             (ch->status_bits & BTS_STATUS_CHARGING) ? "charging" : "discharging",
+             ch->charge_mah, ch->discharge_mah);
+
+    enter_state(slot, SLOT_STATE_BTS_PAUSED);
+}
+
 static void tick_slot(uint8_t slot, const bts_snapshot_t *snap)
 {
     slot_ctx_t                *c  = &s_slot[slot];
     const bts_channel_state_t *ch = &snap->channel[slot];
+
+    /*
+     * A paused slot outranks everything below, including the safety checks:
+     * the converter is already off and the counters are intact, so faulting
+     * it would only lose the reason it is paused. IDLE is included because
+     * that is how a run the engine never started - restored from F-RAM at
+     * boot - becomes visible. FAULT and ABORTED are not: an operator has to
+     * see those, and the engine stopped the channel on the way in, so the
+     * BTS cannot be holding a run for one of them.
+     */
+    const bool adoptable = (c->state == SLOT_STATE_IDLE) ||
+                           state_is_powered(c->state) ||
+                           c->state == SLOT_STATE_CHECK_REST ||
+                           c->state == SLOT_STATE_REST ||
+                           c->state == SLOT_STATE_DISCHARGE_REST;
+    if (ch->valid && ch->paused && adoptable) {
+        enter_bts_paused(slot, ch);
+        return;
+    }
 
     switch (c->state) {
     case SLOT_STATE_IDLE:
     case SLOT_STATE_COMPLETE:
     case SLOT_STATE_FAULT:
     case SLOT_STATE_ABORTED:
+        return;
+    case SLOT_STATE_BTS_PAUSED:
+        /* Leaves only when the BTS itself says the slot is no longer
+         * paused: an operator resume, or an abort that stopped it. */
+        if (ch->valid && !ch->paused) {
+            ESP_LOGI(TAG, "slot %u no longer paused on the BTS", slot);
+            enter_state(slot, SLOT_STATE_IDLE);
+        }
         return;
     default:
         break;
@@ -660,6 +724,17 @@ static void fill_status_locked(uint8_t slot, const bts_snapshot_t *snap,
     out->status_bits = ch->status_bits;
     out->last_result = c->result;
 
+    out->bts_paused            = ch->paused;
+    out->bts_wd_tripped        = ch->wd_tripped;
+    out->bts_restored          = ch->restored;
+    out->bts_ended             = ch->ended;
+    out->bts_charge_mah        = ch->charge_mah;
+    out->bts_charge_mwh        = ch->charge_mwh;
+    out->bts_charge_seconds    = ch->charge_seconds;
+    out->bts_discharge_mah     = ch->discharge_mah;
+    out->bts_discharge_mwh     = ch->discharge_mwh;
+    out->bts_discharge_seconds = ch->discharge_seconds;
+
     out->elapsed_s       = seconds_since(c->test_started_us);
     out->state_elapsed_s = seconds_since(c->state_entered_us);
 
@@ -700,6 +775,20 @@ static void fill_status_locked(uint8_t slot, const bts_snapshot_t *snap,
         out->live_mah = c->result.discharge_mah;
         out->live_mwh = c->result.discharge_mwh;
         out->progress = 1.0f;
+        break;
+    case SLOT_STATE_BTS_PAUSED:
+        /*
+         * Report the BTS's figures, not the local integrator's: the run may
+         * predate this boot entirely, and where both exist the BTS's are the
+         * ones that kept counting up to the pause.
+         */
+        out->live_mah = (ch->status_bits & BTS_STATUS_CHARGING)
+                            ? ch->charge_mah : ch->discharge_mah;
+        out->live_mwh = (ch->status_bits & BTS_STATUS_CHARGING)
+                            ? ch->charge_mwh : ch->discharge_mwh;
+        out->progress = (c->profile.capacity_mah > 0.0f)
+                            ? (float)(out->live_mah / c->profile.capacity_mah)
+                            : 0.0f;
         break;
     default:
         break;
@@ -861,7 +950,12 @@ esp_err_t test_engine_start(uint8_t slot)
         err = ESP_ERR_INVALID_STATE;
     } else if (c->state != SLOT_STATE_IDLE && c->state != SLOT_STATE_COMPLETE &&
                c->state != SLOT_STATE_ABORTED) {
-        /* A FAULT must be cleared explicitly, so an operator has to see it. */
+        /*
+         * A FAULT must be cleared explicitly, so an operator has to see it.
+         * BTS_PAUSED is refused for the same reason and one more: the slot
+         * holds a live run with intact counters, and starting a new test
+         * over the top would discard it.
+         */
         err = ESP_ERR_INVALID_STATE;
     } else {
         memset(&c->result, 0, sizeof(c->result));
@@ -936,6 +1030,57 @@ esp_err_t test_engine_clear_fault(uint8_t slot)
     return ESP_OK;
 }
 
+/*
+ * Pause and resume a run the BTS is holding.
+ *
+ * Both go straight to the unit's mode register; the engine's own state
+ * follows on the next tick from the status bits, so there is exactly one
+ * place that decides what a paused slot means. A resume is only offered for
+ * a slot the BTS reports paused - in particular it must never be issued
+ * automatically for a RESTORED slot, because the cell may have been changed
+ * while the unit was off.
+ */
+esp_err_t test_engine_pause(uint8_t slot)
+{
+    if (!s_ready || slot >= SLOT_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bts_snapshot_t snap;
+    bts_link_get_snapshot(&snap);
+    if (!snap.channel[slot].valid) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (snap.channel[slot].paused) {
+        return ESP_OK;
+    }
+    if (!(snap.channel[slot].status_bits & BTS_STATUS_RUNNING)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "slot %u: pause requested", slot);
+    return bts_link_pause_channel(slot);
+}
+
+esp_err_t test_engine_resume(uint8_t slot)
+{
+    if (!s_ready || slot >= SLOT_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bts_snapshot_t snap;
+    bts_link_get_snapshot(&snap);
+    if (!snap.channel[slot].valid || !snap.channel[slot].paused) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGW(TAG, "slot %u: operator resume of a %s pause", slot,
+             snap.channel[slot].restored     ? "restored"
+             : snap.channel[slot].wd_tripped ? "watchdog"
+                                             : "commanded");
+    return bts_link_resume_channel(slot);
+}
+
 esp_err_t test_engine_set_serial(uint8_t slot, const char *serial)
 {
     if (!s_ready || slot >= SLOT_COUNT || serial == NULL) {
@@ -975,6 +1120,49 @@ void test_engine_set_change_callback(slot_change_cb_t cb)
 /* Init                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Boot-time channel sweep.
+ *
+ * The proxy runs on a backup battery and can come up while the BTS is
+ * mid-test from a previous session, so the default assumption is that
+ * nothing should be on load until an operator says so.
+ *
+ * The exception is a slot the BTS reports PAUSED. Its converter is already
+ * off and its counters are intact; a stop here would discard the run the
+ * unit deliberately preserved - which is exactly what a restored slot is
+ * for. Leave it alone and let the first tick park it in BTS_PAUSED.
+ *
+ * Deciding that needs one good poll, and bts_link_init() only starts the
+ * poll task, so wait briefly for it. A unit that never answers falls through
+ * and every slot is stopped - the safe direction, and a stop aimed at an
+ * unreachable unit does nothing anyway.
+ */
+#define BOOT_SNAPSHOT_WAIT_MS   1500
+
+static void stop_unheld_channels(void)
+{
+    bts_snapshot_t snap;
+    const int64_t deadline = esp_timer_get_time() + (BOOT_SNAPSHOT_WAIT_MS * 1000LL);
+
+    for (;;) {
+        bts_link_get_snapshot(&snap);
+        if (snap.channel[0].valid || esp_timer_get_time() >= deadline) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    for (uint8_t slot = 0; slot < SLOT_COUNT; slot++) {
+        if (snap.channel[slot].valid && snap.channel[slot].paused) {
+            ESP_LOGW(TAG, "slot %u came up PAUSED%s - left held, "
+                          "awaiting an operator resume", slot,
+                     snap.channel[slot].restored ? " (restored)" : "");
+            continue;
+        }
+        bts_link_stop_channel(slot);
+    }
+}
+
 esp_err_t test_engine_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
@@ -996,13 +1184,7 @@ esp_err_t test_engine_init(void)
         }
     }
 
-    /*
-     * Everything is stopped at boot. The proxy runs on a backup battery and
-     * can come up while the BTS is mid-test from a previous session with no
-     * idea what state it is in; the only safe assumption is that nothing
-     * should be on load until an operator says so.
-     */
-    bts_link_stop_all();
+    stop_unheld_channels();
 
     s_ready = true;
 

@@ -68,7 +68,10 @@ CAL_CMD_FMT = "<BBHf"
 CAL_STATUS_FMT = "<BBBBII" + "f" * 9
 CAL_STATUS_LEN = struct.calcsize(CAL_STATUS_FMT)
 
-# ble_slot_status_t, from ble_proto.h
+# The leading fields of ble_slot_status_t, up to status_bits. Proto 3 appends
+# the pause flags and counters after these; this script only needs the status
+# word, so it decodes the prefix and ignores the tail rather than tracking
+# every field the record grows.
 SLOT_FMT = "<BBBBffffffIII"
 SLOT_LEN = struct.calcsize(SLOT_FMT)
 
@@ -127,9 +130,10 @@ BTS_STATUS_CALIBRATING = 12
 BTS_STATUS_CAL_V_VALID = 13
 BTS_STATUS_CAL_I_VALID = 14
 
-# Register map: the per-channel calibration block, for the before/after table.
-REG_CAL_BASE = 592
-REG_CAL_STRIDE = 48
+# Register map v2: the calibration block sits inside each slot's settings
+# block, at BTS_SET_BASE + ch * BTS_SET_STRIDE + BTS_SET_CAL_FIRST.
+REG_CAL_BASE = 384 + 44
+REG_CAL_STRIDE = 96
 CAL_FIELDS = [
     "F28V_Gain", "F28V_Offset", "F28I_Gain", "F28I_Offset",
     "IoutGain_pu", "IoutOffset_pu", "IoutGain_A", "IoutOffset_A",
