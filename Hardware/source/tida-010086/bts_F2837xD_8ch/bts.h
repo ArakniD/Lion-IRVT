@@ -381,20 +381,40 @@ static inline void BTS_tripEpwm(uint32_t EPWM_BASE, BTS_DCL_CTRL_TYPE* ctrl_cc, 
 
 }
 
-// Update BTS_storeValuesAds for cell current
+//
+// Store one ADS131M08 sample pair.
+//
+// The argument is int32_t: the ADS131M08 is a 24-bit converter, and taking
+// it through an int16_t here would discard the low 8 bits of every reading
+// and clip the range.
+//
+// SIGN EXTENSION. BTS_ADC1/2.channelN are int32_t but the SPI frame delivers
+// the sample as a bare 16-bit word in WLENGTH=00 mode, so a negative reading
+// arrives as 0x0000FFEA rather than 0xFFFFFFEA. This used to be corrected by
+// accident - the old int16_t parameter truncated it, and the compiler
+// sign-extended on the way back out. Widening the parameter removed that, so
+// the extension has to be explicit or every near-zero reading reads as
+// +65514 instead of -22, which is +2.0 pu instead of 0.
+//
+// BTS_ADS131_SIGN_EXTEND is keyed to the configured word length, so raising
+// WLENGTH to 24-bit changes one macro rather than this function.
+//
 #pragma FUNC_ALWAYS_INLINE(BTS_storeValuesAds)
-static inline void BTS_storeValuesAds(BTS_measValue* measValue, int16_t current_16b, int16_t voltage_16b)
+static inline void BTS_storeValuesAds(BTS_measValue* measValue, int32_t current_raw, int32_t voltage_raw)
 {
     if (measValue->Index < BTS_senseAverageFactor) {
-        measValue->Isense_16b[measValue->Index] = current_16b;
-        measValue->Vsense_16b[measValue->Index] = voltage_16b;
+        measValue->Isense_24b[measValue->Index] = BTS_ADS131_SIGN_EXTEND(current_raw);
+        measValue->Vsense_24b[measValue->Index] = BTS_ADS131_SIGN_EXTEND(voltage_raw);
         measValue->Index = measValue->Index + 1U;
     } else {
         measValue->Index = 0U;
     }
 }
 
-// Update BTS_storeValuesF28 for cell current
+//
+// Store one on-chip ADC sample pair. 12-bit single-ended, so int16_t is
+// exact - the width only needs widening on the ADS path above.
+//
 #pragma FUNC_ALWAYS_INLINE(BTS_storeValuesF28)
 static inline void BTS_storeValuesF28(BTS_measValue* measValue, int16_t cell_voltage_16b, int16_t cell_current_16b)
 {
@@ -781,7 +801,14 @@ static inline void BTS_runISR_ch1_4(void){
 
 #endif
 
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);                    // Acknowledge the interrupt
+    //
+    // GROUP12, not GROUP1: this runs from ISR1 on the SPI ADC1 DRDY edge,
+    // which is XINT3 (PIE 12.1) since CPU1 moved off XINT1/XINT2 - those
+    // belong to CPU2's ADS1119 lines in the shared Input X-BAR. Acking the
+    // wrong group leaves group 12 blocked, so DRDY fires exactly once and
+    // the whole external-ADC ring then freezes.
+    //
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP12);
 
 }
 
@@ -830,7 +857,9 @@ static inline void BTS_runISR_ch5_8(void){
 
 #endif
 
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);                    // Acknowledge the interrupt
+    // GROUP12: ISR3 runs on SPI ADC2 DRDY = XINT5 (PIE 12.3). See the note
+    // on the ch1-4 handler above.
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP12);
 
 }
 

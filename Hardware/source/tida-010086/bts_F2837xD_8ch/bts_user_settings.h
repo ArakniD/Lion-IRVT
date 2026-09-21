@@ -630,6 +630,62 @@
 
 #define BTS_senseAverageFactor 32 //32U
 
+//
+// Full-scale divisor for the ADS131M08 sample ring.
+//
+// This tracks the configured SPI WORD length, NOT the converter's silicon
+// width. The part is 24-bit, but BTS_HAL_setupExAdc_ch1_4/5_8() write the
+// MODE register as 0x0000 (WLENGTH = 00), so every sample arrives as 16-bit
+// two's complement and full scale is 2^15.
+//
+// If WLENGTH is ever raised to 24-bit (MODE 0x0100), change this to
+// 8388608.0 in the same commit - the sample storage is already int32_t, so
+// nothing else has to move. Getting the two out of step scales every
+// current and voltage reading by 256.
+//
+#define BTS_ADS131_FULLSCALE ((float32_t)32768.0)
+
+//
+// Input bus-voltage sense scaling.
+//
+// updateInputVoltage() measures ratiometrically against ADC-A0, which carries
+// an external 1.25 V taken from the reference divider. Working from the ratio
+// means the ADC's own reference cancels and never has to be assumed - this
+// controlCARD runs 3.0 V, not the 3.3 V an earlier hard-coded formula used,
+// which alone put every reading ~10% high.
+//
+// BTS_VIN_SENSE_GAIN is the external amplifier's gain, derived from its
+// attenuation rather than from the nominal "17.9 V gives 2.5 V at the pin"
+// figure: (1 / 0.139) - 1 = 6.1942. The naive 17.9/2.5 = 7.16 ignores the
+// amplifier's own attenuation and reads ~16% high.
+//
+// Verified on hardware 2026-09-21: A0 = 1696 counts (so VREFHI = 3.019 V,
+// and A0 agrees to 0.3% with the current-sense mid-rail, an independent
+// 1.25 V source); the sense pin measured 2.4204 V, giving 14.99 V against a
+// bench meter reading 14.88 V - 0.76%, within divider and meter tolerance.
+//
+// The charge/discharge guards compare against this value, so an error here
+// moves the restrict/disable thresholds.
+//
+#define BTS_VIN_REF_VOLTS  ((float32_t)1.25)
+#define BTS_VIN_SENSE_ATTEN ((float32_t)0.139)
+#define BTS_VIN_SENSE_GAIN ((float32_t)((1.0 / BTS_VIN_SENSE_ATTEN) - 1.0))
+
+//
+// Sign-extend one ADS131M08 sample to the full int32_t.
+//
+// The SPI frame delivers the sample as a bare word with no sign extension
+// above the configured WLENGTH, so a small negative reading arrives as
+// 0x0000FFEA rather than 0xFFFFFFEA. Without this every value just below
+// zero reads as ~+65514, i.e. +2.0 pu instead of 0.
+//
+// Keyed to the 16-bit word mode set in BTS_HAL_setupExAdc_*. For 24-bit
+// words this becomes a sign test against 0x00800000 with a 0xFF000000 fill.
+//
+#define BTS_ADS131_SIGN_EXTEND(x) \
+    ((int32_t)(((uint32_t)(x) & 0x8000UL) ? ((uint32_t)(x) | 0xFFFF0000UL) \
+                                          : ((uint32_t)(x) & 0x0000FFFFUL)))
+
 #define VIN ((float32_t)12)
 
 

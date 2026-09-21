@@ -920,6 +920,11 @@ void main(void)
     Interrupt_enable(INT_ADCA1);
 
     //
+    // Every vector is populated now, so it is safe to let interrupts run.
+    //
+    BTS_HAL_enableGlobalInterrupts();
+
+    //
     // Switch actuation pins over to ePWM function
     //
     BTS_HAL_setupSyncBuckPinsEpwm();
@@ -982,6 +987,7 @@ void main(void)
     GPIO_setControllerCore(43, GPIO_CORE_CPU2);   // ADS1119 #2 DRDY
     GPIO_setControllerCore(30, GPIO_CORE_CPU2);   // CANA RX
     GPIO_setControllerCore(31, GPIO_CORE_CPU2);   // CANA TX
+    GPIO_setControllerCore(BTS_RUN_LED_GPIO, GPIO_CORE_CPU2); // heartbeat LED
 
     //
     // GPIO29 is CPU2's in both modes: console TX when debugging, WS2812B LED
@@ -1474,16 +1480,22 @@ void BTS_monitor_Iout_Vout(BTS_measValue* measValues)
     uint16_t index;
     float32_t avgValue = 0.0;
     for (index = 0U; index < BTS_senseAverageFactor; index++) {
-        measValues->Sum_I += measValues->Isense_16b[index];
-        measValues->Sum_V += measValues->Vsense_16b[index];
+        measValues->Sum_I += measValues->Isense_24b[index];
+        measValues->Sum_V += measValues->Vsense_24b[index];
     }
     for (index = 0U; index < BTS_f28AverageFactor; index++) {
         measValues->Sum_CellV += measValues->CellVoltage_16b[index];
         measValues->Sum_CellI += measValues->CellCurrent_16b[index];
     }
-    avgValue = (float32_t)measValues->Sum_I / ((float32_t)BTS_senseAverageFactor * 32768.0);
+    //
+    // Normalise each converter against its own full scale. The ADS131M08 is
+    // 24-bit two's complement, so +/-full scale is 2^23, not the 2^15 a
+    // 16-bit part would use - dividing by 32768 here would report a reading
+    // 256x too large.
+    //
+    avgValue = (float32_t)measValues->Sum_I / ((float32_t)BTS_senseAverageFactor * BTS_ADS131_FULLSCALE);
     measValues->Isense_A = measValues->IoutGain_A * avgValue + measValues->IoutOffset_A;
-    avgValue = (float32_t)measValues->Sum_V / ((float32_t)BTS_senseAverageFactor * 32768.0);
+    avgValue = (float32_t)measValues->Sum_V / ((float32_t)BTS_senseAverageFactor * BTS_ADS131_FULLSCALE);
     measValues->Vsense_V = measValues->VoutGain_V * avgValue + measValues->VoutOffset_V;
     avgValue = (float32_t)measValues->Sum_CellV / ((float32_t)BTS_f28AverageFactor * 4096.0);
     measValues->CellVoltage_V = (avgValue * 2.5f) * measValues->F28V_Gain + measValues->F28V_Offset;
@@ -1878,9 +1890,30 @@ static void updateInputVoltage(void)
     }
 
     uint16_t busVoltageRaw = (adcWait >= BTS_ADCB_EOC_MAX_POLLS) ? 0U :
-                             ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER1);
+                             ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER1);
 
-    float busVoltage = (busVoltageRaw * 17.9f * 3.3f) / (4096.0f * 2.5f);
+    //
+    // Ratiometric against the external 1.25 V on ADC-A0, so the ADC's own
+    // reference cancels and never has to be assumed.
+    //
+    //   busVoltage = (raw / refRaw) * 1.25 V * BTS_VIN_SENSE_GAIN
+    //
+    // The previous form hard-coded 3.3 V for VREFHI and took the gain as
+    // 17.9/2.5. Both were wrong: this controlCARD runs a 3.0 V reference, and
+    // that gain ignores the sense amplifier's own attenuation. Together they
+    // read ~27% high, which looked like a sensor fault rather than two
+    // arithmetic errors. A0 is a genuine divider off the same reference, so
+    // the ratio is exact whatever the reference actually is.
+    //
+    // refRaw of 0 means the reference conversion has not completed yet -
+    // report 0 V rather than dividing by it, which the input-voltage guard
+    // reads as "supply absent" and refuses to start a slot. That is the safe
+    // direction.
+    //
+    uint16_t vinRefRaw = ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER6);
+    float busVoltage = (vinRefRaw == 0U) ? 0.0f
+                     : (((float)busVoltageRaw / (float)vinRefRaw)
+                        * BTS_VIN_REF_VOLTS * BTS_VIN_SENSE_GAIN);
 
     //
     // registers[] is CPU2-owned; publish through the CPU1->CPU2 block and
@@ -1931,27 +1964,34 @@ static void updateInputVoltage(void)
 #pragma INTERRUPT(adcCellVoltageISR, HPI)
 __interrupt void adcCellVoltageISR(void)
 {
+    //
+    // ADC_readResult() takes the RESULT base (ADCxRESULT_BASE, 0x0B00..),
+    // not the peripheral control base (ADCx_BASE, 0x7400..). Passing the
+    // control base compiles and runs, but returns configuration registers:
+    // every slot read back ADCCTL1/ADCCTL2 as if they were conversions,
+    // which is where the constant 8320 (0x2080) came from.
+    //
     int16_t vRaw[8] = {
-        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER0), // Ch1: A3
-        ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER0), // Ch2: B3
-        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER1), // Ch3: A5
-        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER2), // Ch4: IN15
-        ADC_readResult(ADCD_BASE, ADC_SOC_NUMBER0), // Ch5: D1
-        ADC_readResult(ADCC_BASE, ADC_SOC_NUMBER0), // Ch6: C3
-        ADC_readResult(ADCD_BASE, ADC_SOC_NUMBER1), // Ch7: D3
-        ADC_readResult(ADCC_BASE, ADC_SOC_NUMBER1)  // Ch8: C5
+        ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER0), // Ch1: A3
+        ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER0), // Ch2: B3
+        ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER1), // Ch3: A5
+        ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER2), // Ch4: IN15
+        ADC_readResult(ADCDRESULT_BASE, ADC_SOC_NUMBER0), // Ch5: D1
+        ADC_readResult(ADCCRESULT_BASE, ADC_SOC_NUMBER0), // Ch6: C3
+        ADC_readResult(ADCDRESULT_BASE, ADC_SOC_NUMBER1), // Ch7: D3
+        ADC_readResult(ADCCRESULT_BASE, ADC_SOC_NUMBER1)  // Ch8: C5
     };
     int16_t iRaw[8] = {
-        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER3), // Ch1: A2
-        ADC_readResult(ADCB_BASE, ADC_SOC_NUMBER3), // Ch2: B2
-        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER4), // Ch3: A4
-        ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER5), // Ch4: IN14
-        ADC_readResult(ADCD_BASE, ADC_SOC_NUMBER2), // Ch5: D0
-        ADC_readResult(ADCC_BASE, ADC_SOC_NUMBER2), // Ch6: C2
-        ADC_readResult(ADCD_BASE, ADC_SOC_NUMBER3), // Ch7: D2
-        ADC_readResult(ADCC_BASE, ADC_SOC_NUMBER3)  // Ch8: C4
+        ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER3), // Ch1: A2
+        ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER3), // Ch2: B2
+        ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER4), // Ch3: A4
+        ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER5), // Ch4: IN14
+        ADC_readResult(ADCDRESULT_BASE, ADC_SOC_NUMBER2), // Ch5: D0
+        ADC_readResult(ADCCRESULT_BASE, ADC_SOC_NUMBER2), // Ch6: C2
+        ADC_readResult(ADCDRESULT_BASE, ADC_SOC_NUMBER3), // Ch7: D2
+        ADC_readResult(ADCCRESULT_BASE, ADC_SOC_NUMBER3)  // Ch8: C4
     };
-    int16_t refRaw = ADC_readResult(ADCA_BASE, ADC_SOC_NUMBER6); // A0
+    int16_t refRaw = ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER6); // A0
 
     for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
         int16_t cellCurrent = iRaw[ch] - refRaw;

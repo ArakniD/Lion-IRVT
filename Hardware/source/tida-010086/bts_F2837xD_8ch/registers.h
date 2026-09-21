@@ -648,8 +648,23 @@ typedef struct
     float32_t Vsense_V;
     float32_t CellVoltage_V;
     float32_t CellCurrent_I;
-    int16_t Isense_16b[BTS_senseAverageFactor];
-    int16_t Vsense_16b[BTS_senseAverageFactor];
+    //
+    // Raw sample rings. The two converters have different widths, and the
+    // storage must not narrow either of them:
+    //
+    //   ADS131M08  24-bit silicon, but this firmware configures it into
+    //              16-bit WORD mode (MODE register written 0x0000,
+    //              WLENGTH = 00, in BTS_HAL_setupExAdc_*). Samples arrive
+    //              as 16-bit two's complement. int32_t is used anyway so
+    //              raising WLENGTH to 24-bit later needs no storage change -
+    //              and so the sum below cannot silently narrow.
+    //   F2837xD    12-bit single-ended, so int16_t is exact and sufficient.
+    //
+    // BTS_ADS131_FULLSCALE must track the configured WORD length, not the
+    // converter's silicon width. See the note on it in bts_user_settings.h.
+    //
+    int32_t Isense_24b[BTS_senseAverageFactor];
+    int32_t Vsense_24b[BTS_senseAverageFactor];
     int16_t CellVoltage_16b[BTS_f28AverageFactor];
     int16_t CellCurrent_16b[BTS_f28AverageFactor];
     int32_t Sum_I;

@@ -99,6 +99,12 @@ void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE);
 void BTS_HAL_setupInterruptTrigger_Adc1(void);
 void BTS_HAL_setupInterruptTrigger_Adc2(void);
 void BTS_HAL_setupInterrupt(void);
+//
+// Call LAST, after every Interrupt_register(). Enabling interrupts while any
+// vector is still the default handler drops CPU1 into an infinite loop with
+// its PIE group unacknowledged - see the comment on the definition.
+//
+void BTS_HAL_enableGlobalInterrupts(void);
 void BTS_HAL_setupInterrupt_Adc1(void);
 void BTS_HAL_setupInterrupt_Adc2(void);
 void BTS_HAL_setupGPIO(void);

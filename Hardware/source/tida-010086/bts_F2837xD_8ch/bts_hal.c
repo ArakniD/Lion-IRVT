@@ -1023,6 +1023,16 @@ void BTS_HAL_setupCpu2Pins(void)
     GPIO_setPadConfig(28, GPIO_PIN_TYPE_PULLUP);
     GPIO_setQualificationMode(28, GPIO_QUAL_ASYNC);
 #endif
+
+    //
+    // Heartbeat LED (GPIO47). Driven by CPU2 from its 8 Hz timer ISR, so it
+    // reports the state of the core that owns the host interfaces: a stalled
+    // CPU2 freezes the LED, which is the failure worth seeing.
+    //
+    GPIO_setPinConfig(BTS_RUN_LED_PIN_CONFIG);
+    GPIO_setDirectionMode(BTS_RUN_LED_GPIO, GPIO_DIR_MODE_OUT);
+    GPIO_setPadConfig(BTS_RUN_LED_GPIO, GPIO_PIN_TYPE_STD);
+    GPIO_writePin(BTS_RUN_LED_GPIO, 0);
 }
 
 // Function to configure GPIO for trip input
@@ -1472,6 +1482,26 @@ void BTS_HAL_setupInterrupt(void)
         Interrupt_register(INT_EPWM1_TZ + (i - 1), &epwmTripISR);
         Interrupt_enable(INT_EPWM1_TZ + (i - 1));
     }
+    EDIS;
+}
+
+//
+// EINT is deliberately NOT in BTS_HAL_setupInterrupt(): the ADC is already
+// converting and raising ADCINT1 by the time that runs (BTS_HAL_setupADC()
+// arms the interrupt, BTS_HAL_setupAdcTrigger() starts ePWM1 driving SOCA),
+// and adcCellVoltageISR is not registered until after it returns.
+//
+// Enabling interrupts in between let ADCINT1 fire against the still-default
+// PIE vector. That vector is the driverlib illegal-operation handler, which
+// is an infinite loop - so CPU1 vanished into it with PIE group 1 never
+// acknowledged, blocking every group-1 interrupt from then on. The symptom
+// was not a hang: the background tasks had already stopped, so the register
+// file simply froze with stale internal-ADC values and a shorted slot still
+// reporting 5.078 V.
+//
+void BTS_HAL_enableGlobalInterrupts(void)
+{
+    EALLOW;
     EINT;  // Enable Global interrupt INTM
     ERTM;  // Enable Global real-time interrupt DBGM
     EDIS;

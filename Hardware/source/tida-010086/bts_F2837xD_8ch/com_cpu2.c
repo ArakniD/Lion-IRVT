@@ -2377,6 +2377,13 @@ static volatile uint16_t canTxChannel = 0;
 //
 #define BTS_STATE_SAVE_TICKS   (BTS_STATE_SAVE_PERIOD_S * BTS_TIMER_TICKS_PER_S)
 
+//
+// Heartbeat LED half-periods, in 8 Hz ticks. The LED toggles every N ticks,
+// so a "5 second flash" is a 5 s period: 2.5 s on, 2.5 s off.
+//
+#define BTS_HEARTBEAT_IDLE_TICKS ((BTS_TIMER_TICKS_PER_S * 5U) / 2U)  // 5 s period
+#define BTS_HEARTBEAT_RUN_TICKS  ((BTS_TIMER_TICKS_PER_S * 1U) / 2U)  // 1 s period
+
 static volatile uint16_t hostWdTicks = 0U;
 static volatile uint16_t hostWdRemaining_s = 0U;
 static volatile uint16_t hostWdExpired = 0U;
@@ -2460,6 +2467,59 @@ static void hostWatchdogTick(void)
     }
 }
 
+//
+// Heartbeat LED on GPIO47, one tick of the 8 Hz timer.
+//
+//   watchdog tripped  solid ON   - the host stopped talking and every slot
+//                                  was paused; this is the state an operator
+//                                  needs to spot across a room
+//   any slot running  1 s period - something is drawing or delivering current
+//   idle             5 s period - alive, host link healthy, nothing running
+//
+// Driven from CPU2's timer ISR rather than the background loop so it reports
+// the health of the core that owns the host interfaces: if CPU2 stalls the
+// LED freezes, which is exactly the failure worth seeing. A frozen LED and a
+// solid LED mean different things - solid is deliberate, frozen is a fault -
+// so the ON state is never entered except for the watchdog.
+//
+static void heartbeatTick(void)
+{
+    static uint16_t tick = 0U;
+    uint16_t period;
+    uint16_t ch;
+    uint16_t running = 0U;
+
+    if (hostWdExpired) {
+        //
+        // Solid on. Reset the counter so that clearing the watchdog restarts
+        // the blink from a full period rather than mid-cycle.
+        //
+        tick = 0U;
+        GPIO_writePin(BTS_RUN_LED_GPIO, 1);
+        return;
+    }
+
+    for (ch = 0U; ch < NUM_CHANNELS; ch++) {
+        uint32_t status = (uint32_t)registers[BTS_RT_BASE(ch) + BTS_RT_STATUS];
+        //
+        // Running means actually converting: a paused slot holds its
+        // direction bits, so testing those alone would blink for a slot
+        // that is stopped.
+        //
+        if ((status & (1UL << BTS_STATUS_RUNNING)) != 0UL) {
+            running = 1U;
+            break;
+        }
+    }
+
+    period = running ? BTS_HEARTBEAT_RUN_TICKS : BTS_HEARTBEAT_IDLE_TICKS;
+
+    if (++tick >= period) {
+        tick = 0U;
+        GPIO_togglePin(BTS_RUN_LED_GPIO);
+    }
+}
+
 #pragma CODE_SECTION(timerISR, "isrcodefuncs")
 #pragma INTERRUPT(timerISR, HPI)
 __interrupt void timerISR(void)
@@ -2468,6 +2528,7 @@ __interrupt void timerISR(void)
 
     mirrorCpu1Status();
     hostWatchdogTick();
+    heartbeatTick();
 
     //
     // One slot marked per tick: eight slots spread across the 6 s window.
