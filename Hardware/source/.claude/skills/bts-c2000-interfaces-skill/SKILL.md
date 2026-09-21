@@ -27,6 +27,7 @@ records the known disagreements, including a live one in the ESP32 mirror.
 | Full GATT spec, characteristic layouts, notify behaviour | `Docs/ble-specification.md` |
 | The calibration contract — opcodes, maths, safety rules, RAM budget | `Docs/calibration-design.md` |
 | Operator bench procedure, wiring, troubleshooting | `Docs/README.md`, `Docs/calibration-flow.md` |
+| **PIE / ACK / XINT / Input X-BAR / ADC base allocation — who owns what** | **`Docs/hardware-resources.md`** |
 | IPC mechanics, core split, message-RAM discipline, trip identification | `references/ipc-and-core-responsibilities.md` |
 | I2C operational notes, pad byte, target watchdog, ESP32 patterns | `references/i2c-interface-spec.md` |
 | AT console — and why it may not exist in your build | `references/uart-at-commands.md` |
@@ -36,7 +37,7 @@ records the known disagreements, including a live one in the ESP32 mirror.
 
 ## Read this before touching anything
 
-Seven facts that invalidate the obvious guess. Each is confirmed in source.
+Nine facts that invalidate the obvious guess. Each is confirmed in source.
 
 0. **The register map is v2, and every v1 address is wrong.** Three regions
    — runtime (base 0, stride 48 B, RO), settings (base 384, stride 96 B),
@@ -84,9 +85,27 @@ Seven facts that invalidate the obvious guess. Each is confirmed in source.
    PIE vector, but `GPIO_setInterruptPin()` writes the **single shared Input
    X-BAR**. Both cores used to claim XINT1/XINT2, so CPU2's `initADS1119()`
    ran last and silently disconnected the SPI ADCs' DRDY interrupts. Fixed:
-   CPU1 now owns XINT3/XINT5, CPU2 keeps XINT1/XINT2. Allocation table and
-   the remaining INPUT14 contention:
-   `references/ipc-and-core-responsibilities.md` §6.1.
+   CPU1 now owns XINT3/XINT5, CPU2 keeps XINT1/XINT2. Allocation tables, the
+   remaining INPUT14 contention and the rest of the device-global resources:
+   **`Docs/hardware-resources.md`**.
+
+7. **`ADC_readResult()` takes the RESULT base, not the control base.**
+   `ADCxRESULT_BASE` (`0x0B00`, `0x0B20`, …), not `ADCx_BASE` (`0x7400`, …).
+   Every *other* ADC API takes the control base, so the wrong one reads
+   naturally and **compiles, links and runs** — driverlib only `ASSERT`s it.
+   What comes back is ADCCTL1/ADCCTL2, which is where a constant **8320
+   (0x2080)**, identical on all eight slots and never moving, came from. A
+   value that quiet is never a real conversion.
+
+8. **The ACK group follows the interrupt's PIE group, not the handler's
+   work.** `Interrupt_clearACKGroup()` re-opens one group; ack the wrong one
+   and the real group stays latched forever — the interrupt fires **exactly
+   once** and then stops, with no fault and no log. CPU1's DRDY handlers ack
+   `GROUP12` because `INT_XINT3`/`INT_XINT5` are 12.1/12.3, regardless of the
+   SPI peripheral they service. Read the group out of the `hw_ints.h`
+   constant. **CPU Timer 1/2 go direct to INT13/INT14 and must not ack at
+   all**; Timer 0 is a PIE interrupt and must. Table:
+   `Docs/hardware-resources.md` §2.
 
 ---
 
@@ -160,7 +179,9 @@ addresses in both map files.
 
 Full IPC contract, flag allocation, boot and calibration data flows, interrupt
 ownership, register strides and trip-source identification:
-`references/ipc-and-core-responsibilities.md`.
+`references/ipc-and-core-responsibilities.md`. The allocation tables it points
+at — PIE, ACK groups, XINT, Input X-BAR, ePWM/CMPSS routing, ADC bases — live
+in `Docs/hardware-resources.md`, which is authoritative for all of them.
 
 ---
 

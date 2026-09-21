@@ -13,6 +13,7 @@ Sources used for verification:
 | Message RAM ownership | `2837xD_RAM_lnk_cpu1.cmd` / `..._cpu2.cmd` (the `PUTBUFFER` / `GETBUFFER` GROUPs) |
 | IPC API surface | `driverlib/f2837xd/driverlib/ipc.h` |
 | PIE group assignments | `driverlib/f2837xd/driverlib/inc/hw_ints.h` |
+| Hardware resource allocation (PIE, ACK, XINT, X-BAR, ADC bases) | **`Docs/hardware-resources.md`** — authoritative; §6 below summarises rather than duplicates |
 | Trip-zone flag semantics | `driverlib/f2837xd/driverlib/epwm.h` |
 | RAM occupancy | `cpu1/bts_F2837xD_8ch_cpu1.map`, `cpu2/bts_F2837xD_8ch_cpu2.map` |
 
@@ -524,103 +525,118 @@ hosts hard-code byte addresses.
 
 ## 6. Interrupt ownership
 
-No PIE vector may be claimed by both cores. Current allocation, with the group
-numbers taken from `hw_ints.h`:
+> **`Docs/hardware-resources.md` is the authority for every allocation
+> table** — PIE interrupts per core, ACK groups, XINT assignments, the Input
+> X-BAR, the ePWM X-BAR/CMPSS routing, ePWM module usage and the ADC base
+> addresses, each row traced to a file and line. Read it before claiming any
+> of them. This section covers only what you have to *understand*; it does not
+> repeat the tables.
 
-### CPU1
+Three facts shape everything here.
 
-| Interrupt | PIE group | Handler |
-|-----------|-----------|---------|
-| `INT_ADCA1` | 1.1 | `adcCellVoltageISR` |
-| `INT_EPWM1_TZ` … `INT_EPWM8_TZ` | 2.1–2.8 | `epwmTripISR` |
-| `INT_EPWM1` | 3.1 | `epwm1ISR` (SFRA only; `BTS_SFRA_ENABLED` is false) |
-| `INT_SPIA_RX` | 6.1 | `ISR2` — SPI ADC1 RX FIFO |
-| `INT_SPIC_RX` | 6.9 | `ISR4` — SPI ADC2 RX FIFO |
-| `INT_XINT3` | 12.1 | `ISR1` — SPI ADC1 DRDY (see §6.1) |
-| `INT_XINT5` | 12.3 | `ISR3` — SPI ADC2 DRDY (see §6.1) |
+**No PIE vector may be claimed by both cores.** Each core has its own PIE and
+its own vector table, so the same vector number on the two cores is not itself
+a conflict — but a device-global resource feeding that vector is (see §6.1).
 
-### CPU2
+**The ACK group must match the PIE group of the interrupt that invoked the
+handler**, not of anything the handler happens to touch.
+`Interrupt_clearACKGroup()` re-opens one PIE group; ack the wrong one and the
+real group stays latched forever. The interrupt fires exactly once and then
+stops, with no fault, no trap and no log — while the group you did ack is
+re-opened spuriously. Look the vector up in `hw_ints.h` and read the group out
+of the constant: `INT_XINT3 = 0x00780C01` is group `0x0C` = **12**.
 
-| Interrupt | PIE group | Handler |
-|-----------|-----------|---------|
-| `INT_XINT1`, `INT_XINT2` | 1.4, 1.5 | `ads1119Drdy1ISR`, `ads1119Drdy2ISR` |
-| `INT_TIMER0` | 1.7 | `ledTimerISR` |
-| `INT_I2CA` | 8.1 | `i2cSlaveISR` (framing) |
-| `INT_I2CA_FIFO` | 8.2 | `i2cSlaveFifoISR` (data bytes) |
-| `INT_SCIA_RX` | 9.1 | `uartRxISR` (debug-console build only) |
-| `INT_CANA0` | 9.5 | `canISR` |
-| `INT_TIMER1` | *direct to CPU INT13* | `timerISR` |
+CPU1's SPI DRDY handlers are the live example. `ISR1`/`ISR3` run on
+`INT_XINT3` (**12.1**) and `INT_XINT5` (**12.3**), so `BTS_runISR_ch1_4()` and
+`BTS_runISR_ch5_8()` ack `INTERRUPT_ACK_GROUP12` (`bts.h:811`, `:862`). They
+used to ack group 1 — correct for the XINT1/XINT2 they were moved off, wrong
+after the move — and group 12 was left permanently blocked, freezing the whole
+external-ADC sample ring after a single DRDY edge.
 
 **CPU Timer 1 and Timer 2 are wired directly to CPU INT13/INT14, not through
-the PIE.** Their handlers must **not** call `Interrupt_clearACKGroup` — there
-is no acknowledge group to clear. Timer 0 *is* a PIE interrupt (group 1) and
-does need the ACK.
+the PIE.** `INT_TIMER1 = 0x000D0000` has no group/channel bytes at all;
+`Interrupt_enable()` sets `IER` directly (`driverlib/interrupt.c:323-326`).
+There is no acknowledge group, and calling `Interrupt_clearACKGroup()` from
+such a handler re-opens an unrelated group. CPU2's `timerISR` correctly does
+not ack. **Timer 0 is different** — it *is* a PIE interrupt at 1.7 and does
+need `INTERRUPT_ACK_GROUP1`.
 
-The I2CA split across 8.1 and 8.2 is not optional: with the FIFO enabled the
-TRM forbids the basic RRDY/XRDY interrupts, and the FIFO sources arrive on
-`INT_I2CA_FIFO`, a different vector from `INT_I2CA`.
+Two further ordering rules, both of which have cost a debugging session:
 
-`INT_SCIA_RX` is PIE **9.1**, not 9.3 — 9.3 is SCIB, which this project does
-not use for a console (GPIO18/19 are SPICLKA and the ADC1 chip select).
+- **`EINT` goes last, after every `Interrupt_register()`** — not after most of
+  them. Enabling interrupts while any vector is still
+  `Interrupt_defaultHandler` sends the core into an infinite loop with that
+  PIE group never acknowledged. On CPU1 this is what
+  `BTS_HAL_enableGlobalInterrupts()` exists for; it is called from
+  `bts_cpu1.c:925`, after the last registration. The general form is *register
+  before enable*, which is why CPU2's `initADS1119()` can safely run after
+  `EINT`.
+- **`INT_I2CA` (8.1) and `INT_I2CA_FIFO` (8.2) are two different vectors**,
+  and the split is not optional: with the FIFO enabled the TRM forbids the
+  basic RRDY/XRDY interrupts. Mixing them lets a data byte be parsed as an
+  address byte.
 
-### 6.1 The Input X-BAR is device-global — XINT allocation
+> **There is a live latent defect in the trip-zone registration.**
+> `bts_hal.c:1482` does `Interrupt_register(INT_EPWM1_TZ + (i - 1), ...)`, but
+> the `INT_*` stride is `0x00010001`, not `1` — so all eight iterations write
+> the **ePWM1** vector and 2.2–2.8 keep the default handler. It is masked only
+> because every hardware trip is compiled out. See
+> `Docs/hardware-resources.md` §7.1 before setting any
+> `BTS_TRIP_HW_CHn_ENABLED` true.
+
+### 6.1 The Input X-BAR is device-global
 
 Each core has its own PIE, so `INT_XINT1` at 1.4 can legitimately have a
 different handler on each. **The X-BAR that decides which pin drives XINT1
 cannot.**
 
 `GPIO_setInterruptPin()` is not a per-core GPIO operation: it resolves the
-XINT to an Input X-BAR input and writes that select register in the **single
-shared Input X-BAR at `0x7900`** (`driverlib/gpio.c`, `xbar.c`). There is one
-instance for the device. `GPIO_setInterruptType()` is the same — it writes
-`XINT*CR` in the shared `XINT_BASE` block.
+XINT to an Input X-BAR input — a fixed mapping in `driverlib/gpio.c:127-147`,
+XINT1→`INPUT4`, XINT2→`INPUT5`, XINT3→`INPUT6`, XINT4→`INPUT13`,
+XINT5→`INPUT14` — and writes that select register in the **single shared Input
+X-BAR at `0x7900`**. There is one instance for the device.
+`GPIO_setInterruptType()` is the same: it writes `XINT*CR` in the shared
+`XINT_BASE` block at `0x7070`. This device has `INPUT1`..`INPUT14` only.
 
-| XINT | X-BAR input | PIE |
-|---|---|---|
-| XINT1 | `XBAR_INPUT4` | 1.4 |
-| XINT2 | `XBAR_INPUT5` | 1.5 |
-| XINT3 | `XBAR_INPUT6` | 12.1 |
-| XINT4 | `XBAR_INPUT13` | 12.2 |
-| XINT5 | `XBAR_INPUT14` | 12.3 |
+**Last writer wins, and CPU2 boots last.**
 
-This device has `INPUT1`..`INPUT14` only.
+That is precisely the trap: `GPIO_setInterruptPin()` is callable from CPU2 —
+unlike `GPIO_setPinConfig()`, which is silently discarded there — so it looks
+like a per-core operation and behaves like a global one.
 
 **The bug this caused, fixed 2026-09-19.** Both cores used to write XINT1 and
 XINT2: CPU1 pointed them at the external SPI ADC DRDY pins (GPIO25/GPIO49),
-CPU2 at the ADS1119 DRDY pins (GPIO42/43). CPU1 configures first
-(`bts_cpu1.c:704-730`) and boots CPU2 afterwards, so CPU2's `initADS1119()`
-overwrote both selects and won. The SPI ADCs' DRDY lines were disconnected
-from their interrupts and `ISR1`/`ISR3` never fired on a DRDY edge.
+CPU2 at the ADS1119 DRDY pins (GPIO42/43). CPU1 configures first and boots
+CPU2 afterwards, so CPU2's `initADS1119()` overwrote both selects and won. The
+SPI ADCs' DRDY lines were disconnected from their interrupts and `ISR1`/`ISR3`
+never fired on a DRDY edge.
 
 It was invisible because acquisition never depended on them:
 `BTS_HAL_setupInterrupt_Adc1/2()` also registers `INT_SPIA_RX` (6.1) and
 `INT_SPIC_RX` (6.9) — the RX-FIFO interrupts, `ISR2`/`ISR4` — which are
-genuinely per-core and unaffected. Two registered ISRs were simply dead.
+genuinely per-core and unaffected. Two registered, enabled ISRs were simply
+dead code.
 
-**Current allocation:**
-
-| Input | XINT | Owner | Pin |
-|---|---|---|---|
-| `INPUT4` | XINT1 | CPU2 | GPIO42 — ADS1119 #1 DRDY |
-| `INPUT5` | XINT2 | CPU2 | GPIO43 — ADS1119 #2 DRDY |
-| `INPUT6` | XINT3 | CPU1 | GPIO25 — SPI ADC1 DRDY |
-| `INPUT14` | XINT5 | CPU1 | GPIO49 — SPI ADC2 DRDY |
-| `INPUT9`..`INPUT14` | — | CPU1 | GPIO trips ch1..ch6, all compiled out |
-
-Set in `bts_user_settings.h` (`BTS_SPI_DRDY_XINT_ADC1/2`,
-`BTS_PSI_DRDY_XINT_GPIO1/2`). The PIE group moved from 1.4/1.5 to 12.1/12.3,
-which is safe only because `ISR1`/`ISR3` are `#pragma INTERRUPT(..., HPI)` and
-never call `Interrupt_clearACKGroup`.
+**Now:** CPU1 owns XINT3/`INPUT6` and XINT5/`INPUT14`; CPU2 keeps
+XINT1/`INPUT4` and XINT2/`INPUT5`. Set in `bts_user_settings.h`
+(`BTS_SPI_DRDY_XINT_ADC1/2`, `BTS_PSI_DRDY_XINT_GPIO1/2`, `:513-546`). The PIE
+group moved from 1.4/1.5 to 12.1/12.3 — which is why the ACK group had to move
+with it.
 
 > **`INPUT14` is double-booked** between XINT5 and the channel-6 GPIO trip.
 > Today the trips are all compiled out so XINT5 owns it; re-enabling the
-> channel-6 hardware trip means moving one of them. Free inputs: `INPUT1`,
-> `2`, `3`, `7`, `8`. The allocation table is also in a comment in `bts_hal.c`
-> above the trip X-BAR block — keep both current.
+> channel-6 hardware trip will silently kill slot 5–8 acquisition unless one of
+> them moves first. Free inputs: `INPUT1`, `2`, `3`, `7`, `8` — and note
+> `INPUT1`/`INPUT2` are ePWM TZ1/TZ2, sitting at their GPIO0 reset default.
+> Channels 7 and 8 have **no** X-BAR path at all: their trips target
+> `INPUT15`/`INPUT16`, which do not exist. Full picture:
+> `Docs/hardware-resources.md` §4.
 
 Treat the Input X-BAR and `XINT*CR` as **device-global resources needing an
 allocation table**, the same way the PIE vectors do. A per-core driverlib call
-does not imply per-core hardware.
+does not imply per-core hardware. The allocation also appears as a comment in
+`bts_hal.c` above the trip X-BAR block — `Docs/hardware-resources.md` is
+authoritative over both; keep all three current.
 
 ---
 
@@ -675,7 +691,20 @@ Trip-zone interrupts are `INT_EPWMx_TZ` (**PIE group 2**), not `INT_EPWMx`
 (group 3, the counter/event interrupt). Registering the trip handler on
 `INT_EPWM1 + n` installs it on the wrong vector.
 
+> **`INT_EPWM1_TZ + n` is wrong too, and that is the current code.** The
+> `INT_*` constants pack the vector ID in bits 31:16 and group/channel in bits
+> 15:0, so the stride between adjacent interrupts is `0x00010001`, not `1`.
+> Adding `n` bumps only the channel byte: `Interrupt_enable()` is satisfied,
+> but `Interrupt_register()` reads bits 31:16 alone and writes all eight
+> handlers into the **ePWM1** slot, leaving 2.2–2.8 on the default handler's
+> infinite loop. Masked today only because the trips are disabled — fix it
+> before enabling any. `Docs/hardware-resources.md` §7.1.
+
 ### Why they are masked
+
+(The Input X-BAR allocation this depends on is in
+`Docs/hardware-resources.md` §4 — `INPUT1`/`INPUT2` are listed free there in
+the sense of *unassigned*, which is exactly the problem below.)
 
 TZ1 and TZ2 are hardwired to Input X-BAR INPUT1 and INPUT2 (see `XBAR_InputNum`
 in `xbar.h`), and nothing in this project ever writes
