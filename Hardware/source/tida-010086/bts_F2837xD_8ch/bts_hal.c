@@ -1321,9 +1321,18 @@ void BTS_HAL_setupADC(void)
     // wedges on the first pass - taking the input-voltage guard, reverse
     // polarity check and group supervision down with it.
     //
+    // This is a POLLED flag, not an interrupt. ADC_enableInterrupt() arms the
+    // ADCINT1 flag *and* its route to PIE 1.2, and no ISR is registered for
+    // INT_ADCB1 - so leaving 1.2 unmasked sends the first conversion into
+    // driverlib's Interrupt_defaultHandler, an infinite loop, with PIE group
+    // 1 never acknowledged. That takes ADCA1 down with it, which is the whole
+    // cell-measurement path. Mask the PIE channel explicitly: the status flag
+    // still sets and updateInputVoltage() still sees it.
+    //
     ADC_enableInterrupt(ADCB_BASE, ADC_INT_NUMBER1);
     ADC_clearInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1);
     ADC_setInterruptSource(ADCB_BASE, ADC_INT_NUMBER1, ADC_SOC_NUMBER2);
+    Interrupt_disable(INT_ADCB1);
 
     ADC_enableConverter(ADCA_BASE);
     ADC_enableConverter(ADCB_BASE);
