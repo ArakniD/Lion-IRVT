@@ -1475,12 +1475,28 @@ void BTS_HAL_setupInterrupt(void)
     Interrupt_register(INT_EPWM1, &epwm1ISR);
     Interrupt_enable(INT_EPWM1);
 #endif
-    // Register trip ISR for EPWM1 to EPWM8.
-    // Trip zones raise INT_EPWMx_TZ (PIE group 2), not INT_EPWMx (group 3,
-    // which is the counter/event interrupt used by epwm1ISR for SFRA).
-    for (uint16_t i = 1; i <= 8; i++) {
-        Interrupt_register(INT_EPWM1_TZ + (i - 1), &epwmTripISR);
-        Interrupt_enable(INT_EPWM1_TZ + (i - 1));
+    //
+    // Trip ISR for EPWM1 to EPWM8. Trip zones raise INT_EPWMx_TZ (PIE group
+    // 2), not INT_EPWMx (group 3, the counter/event interrupt SFRA uses).
+    //
+    // The constants must be listed, not computed. An INT_* value packs the
+    // PIE vector ID in bits 31:16 and the group/channel in 15:0, so the
+    // stride between INT_EPWM1_TZ and INT_EPWM2_TZ is 0x00010001 - adding
+    // (i-1) bumps only the channel byte and leaves the vector ID at ePWM1's.
+    // Interrupt_register() reads bits 31:16 alone, so all eight iterations
+    // used to write the *same* vector, leaving 2.2-2.8 on
+    // Interrupt_defaultHandler - an infinite loop. Interrupt_enable() reads
+    // the other half of the word and was correct, so every trip was enabled
+    // and seven of them pointed at a hang. Latent only because every
+    // BTS_TRIP_HW_CHn_ENABLED is currently false.
+    //
+    static const uint32_t tzInts[8] = {
+        INT_EPWM1_TZ, INT_EPWM2_TZ, INT_EPWM3_TZ, INT_EPWM4_TZ,
+        INT_EPWM5_TZ, INT_EPWM6_TZ, INT_EPWM7_TZ, INT_EPWM8_TZ
+    };
+    for (uint16_t i = 0; i < 8U; i++) {
+        Interrupt_register(tzInts[i], &epwmTripISR);
+        Interrupt_enable(tzInts[i]);
     }
     EDIS;
 }
