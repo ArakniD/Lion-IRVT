@@ -27,13 +27,14 @@
       "Read(//C/ti/xdctools_3_51_01_18_core/**)",
       "Read(//C/ti/xdctools_3_32_02_25_core/**)",
       "Read(//C/ti/xdctools_3_32_00_06_core/**)",
+      "Bash(grep -rn \"EPWM4SYNCIN\\\\|EPWM7SYNCIN\\\\|EPWM10SYNCIN\" /c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/common/include/*.h 2>/dev/null | head -10; echo \"====\"; grep -rn -i \"syncin\" /c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/headers/include/f2837xd_syscommon.h 2>/dev/null | head)",
+      "Read(//c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/common/include/**)",
+      "Read(//c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/headers/include/**)",
       "mcp__ccs-debug",
       "mcp__ccs-project",
       "mcp__ccs-sysconfig",
       "mcp__ccs-serial",
-      "Bash(grep -rn \"EPWM4SYNCIN\\\\|EPWM7SYNCIN\\\\|EPWM10SYNCIN\" /c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/common/include/*.h 2>/dev/null | head -10; echo \"====\"; grep -rn -i \"syncin\" /c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/headers/include/f2837xd_syscommon.h 2>/dev/null | head)",
-      "Read(//c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/common/include/**)",
-      "Read(//c/ti/c2000/C2000Ware_5_02_00_00/device_support/f2837xd/headers/include/**)"
+      "Read(//C/ti/C2000Ware_26_01_00_00/**)"
     ],
     "ask": [
       "mcp__ccs-project__changeSysConfigVersion"

@@ -191,24 +191,42 @@ esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim)
     const float vmax = BTS_UNIT_MAX_VOLTAGE_V;
     const float imax = BTS_UNIT_MAX_CURRENT_A;
 
+    /*
+     * The unit's limits became direction-agnostic in the 2026-09-22 register
+     * compression: one VoltageMin/VoltageMax and one CurrentMin/CurrentMax
+     * pair per slot, because the mode register already selects charge or
+     * discharge.
+     *
+     * bts_slot_limits_t keeps the four-way split because the HTTP API, BLE
+     * and the cell profiles all expose it, so the two sides are reconciled
+     * here rather than forcing a host-visible change:
+     *
+     *   VoltageMin = min(charge_voltage_min, discharge_voltage_min)
+     *   VoltageMax = max(charge_voltage_max, discharge_voltage_max)
+     *   CurrentMin = min(charge_current_min, discharge_current_min)
+     *   CurrentMax = max(charge_current_max, discharge_current_max)
+     *
+     * Widest-window semantics: the unit must permit whichever direction the
+     * caller selects, and the per-direction envelope is enforced by the test
+     * sequencer here on the ESP32 rather than by the converter.
+     *
+     * min_cell_temp no longer exists on the unit - only a maximum is
+     * enforced - so it is accepted and dropped.
+     */
+    const float v_min = fminf(clampf(lim->charge_voltage_min, 0.0f, vmax),
+                              clampf(lim->discharge_voltage_min, 0.0f, vmax));
+    const float v_max = fmaxf(clampf(lim->charge_voltage_max, 0.0f, vmax),
+                              clampf(lim->discharge_voltage_max, 0.0f, vmax));
+    const float i_min = fminf(clampf(lim->charge_current_min, 0.0f, imax),
+                              clampf(lim->discharge_current_min, 0.0f, imax));
+    const float i_max = fmaxf(clampf(lim->charge_current_max, 0.0f, imax),
+                              clampf(lim->discharge_current_max, 0.0f, imax));
+
     struct { uint16_t addr; float value; } writes[] = {
-        { BTS_SET_ADDR(channel, BTS_SET_CHARGE_V_MIN),
-          clampf(lim->charge_voltage_min, 0.0f, vmax) },
-        { BTS_SET_ADDR(channel, BTS_SET_CHARGE_V_MAX),
-          clampf(lim->charge_voltage_max, 0.0f, vmax) },
-        { BTS_SET_ADDR(channel, BTS_SET_DISCHARGE_V_MIN),
-          clampf(lim->discharge_voltage_min, 0.0f, vmax) },
-        { BTS_SET_ADDR(channel, BTS_SET_DISCHARGE_V_MAX),
-          clampf(lim->discharge_voltage_max, 0.0f, vmax) },
-        { BTS_SET_ADDR(channel, BTS_SET_CHARGE_I_MIN),
-          clampf(lim->charge_current_min, 0.0f, imax) },
-        { BTS_SET_ADDR(channel, BTS_SET_CHARGE_I_MAX),
-          clampf(lim->charge_current_max, 0.0f, imax) },
-        { BTS_SET_ADDR(channel, BTS_SET_DISCHARGE_I_MIN),
-          clampf(lim->discharge_current_min, 0.0f, imax) },
-        { BTS_SET_ADDR(channel, BTS_SET_DISCHARGE_I_MAX),
-          clampf(lim->discharge_current_max, 0.0f, imax) },
-        { BTS_SET_ADDR(channel, BTS_SET_MIN_CELL_TEMP), lim->min_cell_temp },
+        { BTS_SET_ADDR(channel, BTS_SET_V_MIN), v_min },
+        { BTS_SET_ADDR(channel, BTS_SET_V_MAX), v_max },
+        { BTS_SET_ADDR(channel, BTS_SET_I_MIN), i_min },
+        { BTS_SET_ADDR(channel, BTS_SET_I_MAX), i_max },
         { BTS_SET_ADDR(channel, BTS_SET_MAX_CELL_TEMP), lim->max_cell_temp },
     };
 

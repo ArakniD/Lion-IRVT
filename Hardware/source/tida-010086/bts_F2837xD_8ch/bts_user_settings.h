@@ -151,7 +151,28 @@
 //
 #define BTS_F28V_GAIN_DEFAULT             ((float32_t)1.0)
 #define BTS_F28V_OFFSET_DEFAULT           ((float32_t)0.0)
-#define BTS_F28I_GAIN_DEFAULT             ((float32_t)1.0)
+//
+// Default current gain for the on-chip ADC path.
+//
+// The sense chain is centred on the external 1.25 V reference (ADC-A0):
+//   0.00 V at pin -> -10 A,  1.25 V -> 0 A,  2.50 V -> +10 A
+//
+// adcCellVoltageISR() already subtracts the A0 reference, so Sum_CellI
+// carries (Vpin - 1.25 V) in counts, and BTS_monitor_Iout_Vout() forms
+//   avgValue = Sum_CellI / (N * 4096),  CellCurrent_I = avgValue * 2.5 * gain
+//
+// At +10 A the delta is +1.25 V. With VREFHI measured at 3.019 V (derived
+// from A0 = 1696 counts) that is 1696 counts, so avgValue * 2.5 = 1.0351.
+// The gain that maps it to 10 A is therefore 10 / 1.0351 = 9.66.
+//
+// A gain of 1.0 - the old default - reported 1.035 A at a true 10 A, i.e.
+// ~9.7x low. That is exactly the discrepancy seen during the 1 A charge
+// test, where the host register read 0.106 A against the ADS131M08's 0.995 A.
+//
+// This is a nominal default for an uncalibrated slot; a runtime calibration
+// still overrides it per channel.
+//
+#define BTS_F28I_GAIN_DEFAULT             ((float32_t)9.66)
 #define BTS_F28I_OFFSET_DEFAULT           ((float32_t)0.0)
 
 //
@@ -872,6 +893,33 @@
 #define BTS_DRV_ADC_PERIOD_SEC           ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS / BTS_EPWM_HZ / 2)
 
 #define BTS_DRV_ADC_SWITCHING_FREQUENCY  ((float32_t)8500 * 1000)
+
+//
+// ADC acquisition rate for adcCellVoltageISR (cell V/I on the internal ADC).
+//
+// EPWM1 is shared between channel 1's switching leg and the ADC SOCA
+// trigger, so the sample rate CANNOT be set by its period - that belongs to
+// the converter (BTS_DRV_EPWM_TBPRD = 1002, giving ~99.7 kHz switching at
+// EPWMCLK = SYSCLK/2 = 100 MHz). The SOC event prescaler divides the trigger
+// instead, leaving the PWM untouched:
+//
+//   99.7 kHz / 10 = 9.97 kSPS
+//
+// 10 was chosen for ~10 kSPS: the control loop does not need faster, and at
+// the previous effective rate the ISR read all eight slots every ~10 us,
+// which is a large and unintended CPU1 load.
+//
+// Range is 1..15 (driverlib ASSERTs < 16). 1 restores one sample per
+// switching period.
+//
+//
+// 15 is the SLOWEST the SOC event prescaler can go - driverlib ASSERTs
+// preScaleCount < 16. At EPWM1's 124.5 kHz switching rate that is 8.3 kSPS.
+// A sub-100 Hz acquisition is NOT reachable this way: EPWM1's period belongs
+// to channel 1's converter and cannot be stretched, so the only route to a
+// much slower rate would be a separate timer-triggered SOC source.
+//
+#define BTS_ADC_SOC_PRESCALE              ((uint16_t)15)
 
 // Sampling speed of 33,203.125 Hz
 

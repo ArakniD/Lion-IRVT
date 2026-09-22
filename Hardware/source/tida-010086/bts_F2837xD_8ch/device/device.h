@@ -140,20 +140,37 @@ a single CPU should be defined."
 #else
 
 //
-// 20MHz XTAL on controlCARD. For use with SysCtl_getClock().
+// PLL source: INTOSC2, the 10 MHz internal oscillator.
+//
+// The 20 MHz controlCARD crystal is NOT used. Measured on hardware
+// 2026-09-22: with SYSCTL_OSCSRC_XTAL the device ran at exactly 10.000 MHz -
+// INTOSC2's rate, not the crystal's - so SysCtl_setClock() never got the
+// crystal oscillating and silently fell back. SYSPLLSTS.LOCKS read TRUE
+// throughout while the multiplier was never applied, so the lock bit alone
+// does not prove the clock is good.
+//
+// Proof the hardware clock was unchanged by a config edit: raising IMULT
+// 16 -> 20 moved the SCI divisor 42 -> 53 and the working console baud
+// 7267 -> 5787, exactly the 43/54 ratio. Only the software's BELIEF changed.
+//
+// INTOSC2 is +/-2% over temperature rather than a crystal's ppm, which is
+// acceptable for the control loop and the SCI/CAN bit rates here.
+//
+// NOTE: SYSCTL_OSCSRC_OSC2 is INTOSC2. SYSCTL_OSCSRC_OSC1 is INTOSC1, the
+// backup clock feeding the missing-clock detector - not a PLL source.
 //
 #define DEVICE_OSCSRC_FREQ          20000000U
 
 //
 // Define to pass to SysCtl_setClock(). Will configure the clock as follows:
-// PLLSYSCLK = 20MHz (XTAL_OSC) * 20 (IMULT) * 1 (FMULT) / 2 (PLLCLK_BY_2)
+// PLLSYSCLK = 10MHz (INTOSC2) * 36 (IMULT) * 1 (FMULT) / 2 (PLLCLK_BY_2)
 //
-#define DEVICE_SETCLOCK_CFG         (SYSCTL_OSCSRC_XTAL | SYSCTL_IMULT(16) |  \
+#define DEVICE_SETCLOCK_CFG         (SYSCTL_OSCSRC_XTAL | SYSCTL_IMULT(18) |  \
                                      SYSCTL_FMULT_NONE | SYSCTL_SYSDIV(2) |   \
                                      SYSCTL_PLL_ENABLE)
 
 //
-// 160MHz SYSCLK frequency based on the above DEVICE_SETCLOCK_CFG. Update the
+// 180MHz SYSCLK frequency based on the above DEVICE_SETCLOCK_CFG. Update the
 // code below if a different clock configuration is used!
 //
 //
@@ -163,7 +180,7 @@ a single CPU should be defined."
 // high: the SCI baud divisor came out one count low, putting the console
 // 5.65% off 115200 - outside UART tolerance, so characters arrived corrupted.
 // The I2C and CAN bit rates were skewed by the same factor.
-#define DEVICE_SYSCLK_FREQ          ((DEVICE_OSCSRC_FREQ * 16 * 1) / 2)
+#define DEVICE_SYSCLK_FREQ          ((DEVICE_OSCSRC_FREQ * 18 * 1) / 2)
 
 #endif
 

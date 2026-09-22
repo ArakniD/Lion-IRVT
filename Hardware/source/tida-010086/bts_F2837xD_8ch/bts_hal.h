@@ -65,6 +65,14 @@ typedef struct
 
 extern adc_data  BTS_ADC1;
 extern adc_data  BTS_ADC2;
+extern volatile uint16_t BTS_pllLockFailed;
+extern volatile uint16_t BTS_mcdBefore;
+extern volatile uint16_t BTS_mcdAfter;
+extern volatile uint16_t BTS_mcdLive;
+extern volatile uint16_t BTS_mcdTrips;
+extern volatile uint16_t BTS_setClockOk;
+extern volatile uint32_t BTS_sysclkTicks;
+extern volatile uint32_t BTS_sysclkKHz;
 extern volatile uint16_t BTS_ExAdcRxflag1 ;
 extern volatile uint16_t BTS_ExAdcRxflag2 ;
 extern uint32_t  MEP_ScaleFactor;
@@ -75,6 +83,18 @@ extern uint32_t  MEP_ScaleFactor;
 //=============================================================================
 //
 void BTS_HAL_setupDevice(void);
+//
+// Measures SYSCLK against INTOSC1 and returns kHz. Measured, not inferred
+// from CLKCFG - see the notes in bts_hal.c on why register reads cannot
+// distinguish a running PLL from an MCD failover to INTOSC1.
+//
+uint32_t BTS_HAL_getMeasuredSysclkKHz(void);
+//
+// Samples the missing-clock detector. Call periodically: MCD can fire long
+// after boot, silently dropping SYSCLK to INTOSC1 with every PLL register
+// still reading correct.
+//
+void BTS_HAL_pollClockHealth(void);
 void BTS_HAL_setupExAdc_ch1_4(void);
 void BTS_HAL_setupExAdc_ch5_8(void);
 void delay_ms_2(const uint32_t);

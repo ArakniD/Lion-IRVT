@@ -69,7 +69,7 @@ extern "C" {
 #define BTS_I2C_ADDRESS         0x50
 #define BTS_NUM_CHANNELS        8
 #define BTS_REGISTER_SIZE       4
-#define BTS_TOTAL_REGISTERS     315
+#define BTS_TOTAL_REGISTERS     267
 
 /* Region bases and per-channel byte strides. */
 #define BTS_RT_BASE             0
@@ -77,10 +77,10 @@ extern "C" {
 #define BTS_RT_REG_COUNT        12
 
 #define BTS_SET_BASE            384
-#define BTS_SET_STRIDE          96
-#define BTS_SET_REG_COUNT       24
+#define BTS_SET_STRIDE          72
+#define BTS_SET_REG_COUNT       18
 
-#define BTS_UNIT_BASE           1152
+#define BTS_UNIT_BASE           960
 
 /* Runtime block, byte offsets within a channel. All REG_ACCESS_RO. */
 #define BTS_RT_STATUS                   0
@@ -99,36 +99,36 @@ extern "C" {
 /*
  * Settings block, byte offsets within a channel.
  *
- * 21 of the 24 registers are used; +92 is spare. The 12 calibration
- * registers keep their internal order, so BTS_CAL_* below remain offsets
- * 0..44 relative to BTS_CAL_ADDR(ch, 0).
+ * All 18 registers are used; there is no spare. The 12 calibration registers
+ * keep their internal order, so BTS_CAL_* below remain offsets 0..44
+ * relative to BTS_CAL_ADDR(ch, 0).
+ *
+ * Compressed 2026-09-22 from 24 registers (stride 96 -> 72). Charge and
+ * discharge no longer have separate limits: the mode register already selects
+ * direction, so one voltage pair and one current pair serves both. The
+ * minimum cell temperature and the per-slot spare are gone.
  */
 #define BTS_SET_MODE                    0
-#define BTS_SET_CHARGE_V_MIN            4
-#define BTS_SET_CHARGE_V_MAX            8
-#define BTS_SET_DISCHARGE_V_MIN         12
-#define BTS_SET_DISCHARGE_V_MAX         16
-#define BTS_SET_CHARGE_I_MIN            20
-#define BTS_SET_CHARGE_I_MAX            24
-#define BTS_SET_DISCHARGE_I_MIN         28
-#define BTS_SET_DISCHARGE_I_MAX         32
-#define BTS_SET_MIN_CELL_TEMP           36
-#define BTS_SET_MAX_CELL_TEMP           40
-#define BTS_SET_CAL_FIRST               44
+#define BTS_SET_V_MIN                   4
+#define BTS_SET_V_MAX                   8
+#define BTS_SET_I_MIN                   12
+#define BTS_SET_I_MAX                   16
+#define BTS_SET_MAX_CELL_TEMP           20
+#define BTS_SET_CAL_FIRST               24
 
 /* Unit block. */
-#define BTS_REG_CHARGE_DISABLE_V        1152
-#define BTS_REG_CHARGE_RESTRICT_V       1156
-#define BTS_REG_DISCHARGE_RESTRICT_V    1160
-#define BTS_REG_DISCHARGE_DISABLE_V     1164
-#define BTS_REG_CALIBRATION_MODE        1168
-#define BTS_REG_UNIT_STATE              1172
-#define BTS_REG_INPUT_VOLTAGE           1176
-#define BTS_REG_TRIP_STATUS             1180
+#define BTS_REG_CHARGE_DISABLE_V        960
+#define BTS_REG_CHARGE_RESTRICT_V       964
+#define BTS_REG_DISCHARGE_RESTRICT_V    968
+#define BTS_REG_DISCHARGE_DISABLE_V     972
+#define BTS_REG_CALIBRATION_MODE        976
+#define BTS_REG_UNIT_STATE              980
+#define BTS_REG_INPUT_VOLTAGE           984
+#define BTS_REG_TRIP_STATUS             988
 /* Slot grouping, latched from the MODE/ENABLE straps by CPU1 at boot. */
-#define BTS_REG_SLOT_MODE               1184
-#define BTS_REG_SLOT_ENABLE             1188
-#define BTS_REG_GROUP_SIZE              1192
+#define BTS_REG_SLOT_MODE               992
+#define BTS_REG_SLOT_ENABLE             996
+#define BTS_REG_GROUP_SIZE              1000
 /*
  * Host watchdog timeout in seconds, RW, default 30. Any host command -
  * including a register READ - reloads the unit's countdown; when it expires
@@ -136,7 +136,7 @@ extern "C" {
  * disables it, which is a bench-only setting and is logged loudly by the
  * unit. There is no register for the remaining seconds, only the timeout.
  */
-#define BTS_REG_HOST_WATCHDOG_S         1196
+#define BTS_REG_HOST_WATCHDOG_S         1004
 
 /*
  * Calibration control block (unit-level).
@@ -145,11 +145,11 @@ extern "C" {
  * time - the per-slot form would not fit in CPU2TOCPU1RAM. eCalSlot names
  * the slot the telemetry block below refers to.
  */
-#define BTS_REG_CAL_SLOT                1200
-#define BTS_REG_CAL_COMMAND             1204
-#define BTS_REG_CAL_ARGUMENT            1208
-#define BTS_REG_CAL_STATUS              1212
-#define BTS_REG_CAL_RESULT              1216
+#define BTS_REG_CAL_SLOT                1008
+#define BTS_REG_CAL_COMMAND             1012
+#define BTS_REG_CAL_ARGUMENT            1016
+#define BTS_REG_CAL_STATUS              1020
+#define BTS_REG_CAL_RESULT              1024
 
 /*
  * Live host-watchdog countdown, seconds, RO. Reads 0 both when the watchdog
@@ -157,29 +157,29 @@ extern "C" {
  * BTS_REG_HOST_WATCHDOG_S, which is in the same burst.
  *
  * This register was missing from this mirror while it existed on the C2000
- * (registers.h, eWatchdogRemaining_s = 1220). Its absence shifted every
+ * (registers.h, eWatchdogRemaining_s = 1028). Its absence shifted every
  * calibration telemetry address below by one register, so ads_v_pu actually
  * carried this countdown and every captured pu value was wrong. Fixed
- * 2026-09-20 - the telemetry block now starts at 1224, matching the C2000.
+ * 2026-09-20 - the telemetry block now starts at 1032, matching the C2000.
  */
-#define BTS_REG_WATCHDOG_REMAINING_S    1220
+#define BTS_REG_WATCHDOG_REMAINING_S    1028
 
 /* Calibration live telemetry for the slot named by eCalSlot. */
-#define BTS_REG_CAL_ADS_V_PU            1224
-#define BTS_REG_CAL_ADS_I_PU            1228
-#define BTS_REG_CAL_ADS_V_V             1232
-#define BTS_REG_CAL_ADS_I_A             1236
-#define BTS_REG_CAL_F28_V_PU            1240
-#define BTS_REG_CAL_F28_I_PU            1244
-#define BTS_REG_CAL_F28_V_V             1248
-#define BTS_REG_CAL_F28_I_A             1252
-#define BTS_REG_CAL_TEMP_C              1256
+#define BTS_REG_CAL_ADS_V_PU            1032
+#define BTS_REG_CAL_ADS_I_PU            1036
+#define BTS_REG_CAL_ADS_V_V             1040
+#define BTS_REG_CAL_ADS_I_A             1044
+#define BTS_REG_CAL_F28_V_PU            1048
+#define BTS_REG_CAL_F28_I_PU            1052
+#define BTS_REG_CAL_F28_V_V             1056
+#define BTS_REG_CAL_F28_I_A             1060
+#define BTS_REG_CAL_TEMP_C              1064
 
-/* Registers 1200..1256 inclusive, readable as one burst. */
+/* Registers 1008..1064 inclusive, readable as one burst. */
 #define BTS_CAL_WINDOW_COUNT            15
 
 /*
- * Unit poll window: eCalibrationMode (1168) .. eHostWatchdog_s (1196), the
+ * Unit poll window: eCalibrationMode (976) .. eHostWatchdog_s (1004), the
  * eight consecutive registers the poll task needs every cycle.
  */
 #define BTS_UNIT_WINDOW_FIRST           BTS_REG_CALIBRATION_MODE

@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "bts_F2837xD_8ch",
+            "type": "ccs-debug",
+            "request": "launch",
+            "projectInfo": {
+                "name": "bts_F2837xD_8ch",
+                "resourceId": "/bts_F2837xD_8ch"
+            },
+            "launchSettings": {
+                "coresToLoadForProjectLaunch": [
+                    "C28xx_CPU1",
+                    "C28xx_CPU2"
+                ]
+            },
+            "connections": [
+                {
+                    "name": "Texas Instruments XDS100v2 USB Debug Probe_0",
+                    "cores": [
+                        {
+                            "name": "C28xx_CPU1",
+                            "debuggerSettings": {
+                                "data": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\" ?>\n<PropertyValues>\n\n  <property id=\"FlashCoreSelection\">\n    <curValue>CPU1 (Master)</curValue>\n  </property>\n\n  <property id=\"FlashSPLLIMULT\">\n    <curValue>36</curValue>\n  </property>\n\n  <property id=\"FlashSYSDIVSEL\">\n    <curValue>1 [/2]</curValue>\n  </property>\n\n  <property id=\"FlashUserPLLSYSCLK\">\n    <curValue>180</curValue>\n  </property>\n\n  <property id=\"FlashVerifySetting\">\n    <curValue>0</curValue>\n  </property>\n\n</PropertyValues>\n"
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

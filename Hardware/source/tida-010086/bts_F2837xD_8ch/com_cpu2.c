@@ -144,7 +144,6 @@
 #define DEFAULT_DISCHARGE_DISABLE_V  16.0f
 
 // Default cell temperature window
-#define DEFAULT_MIN_CELL_TEMP        10.0f
 #define DEFAULT_MAX_CELL_TEMP        85.0f
 
 //
@@ -160,7 +159,8 @@
 //
 #define DEFAULT_F28V_GAIN            1.0f
 #define DEFAULT_F28V_OFFSET          0.0f
-#define DEFAULT_F28I_GAIN            1.0f
+/* Must track BTS_F28I_GAIN_DEFAULT - see the derivation there. */
+#define DEFAULT_F28I_GAIN            9.66f
 #define DEFAULT_F28I_OFFSET          0.0f
 
 //
@@ -844,13 +844,20 @@ static bool validateCalibration(const BTS_channelCalibration* cal, uint16_t chan
     if ((cal->header & BTS_CAL_CHANNEL_MASK) != (uint32_t)channel) {
         return false;
     }
-    if (cal->MinCellTemp < -40.0f || cal->MaxCellTemp > 100.0f || cal->MinCellTemp >= cal->MaxCellTemp) {
+    if (cal->MaxCellTemp < -40.0f || cal->MaxCellTemp > 100.0f) {
         return false;
     }
     if (cal->F28V_Gain < 0.5f || cal->F28V_Gain > 2.0f || cal->F28V_Offset < -1.0f || cal->F28V_Offset > 1.0f) {
         return false;
     }
-    if (cal->F28I_Gain < 0.5f || cal->F28I_Gain > 2.0f || cal->F28I_Offset < -2.0f || cal->F28I_Offset > 2.0f) {
+    //
+    // The current gain band spans 20.0 because the on-chip current path is
+    // referenced to 1.25 V and spans +/-10 A, so its nominal gain is ~9.66
+    // (see BTS_F28I_GAIN_DEFAULT). The old 0.5..2.0 band predates that and
+    // would reject the default outright, silently falling back to compiled-in
+    // values and masking a stored calibration.
+    //
+    if (cal->F28I_Gain < 0.5f || cal->F28I_Gain > 20.0f || cal->F28I_Offset < -2.0f || cal->F28I_Offset > 2.0f) {
         return false;
     }
     //
@@ -934,7 +941,6 @@ static void applyDefaultCalibration(uint16_t ch)
     uint16_t tempBase = BTS_TEMP_BASE(ch);
     uint16_t calBase  = BTS_CAL_BASE(ch);
 
-    registers[tempBase + BTS_TEMP_MIN] = DEFAULT_MIN_CELL_TEMP;
     registers[tempBase + BTS_TEMP_MAX] = DEFAULT_MAX_CELL_TEMP;
 
     registers[calBase + BTS_CAL_F28V_GAIN]      = DEFAULT_F28V_GAIN;
@@ -959,7 +965,6 @@ static void applyStoredCalibration(uint16_t ch, const BTS_channelCalibration *ca
     uint16_t tempBase = BTS_TEMP_BASE(ch);
     uint16_t calBase  = BTS_CAL_BASE(ch);
 
-    registers[tempBase + BTS_TEMP_MIN] = cal->MinCellTemp;
     registers[tempBase + BTS_TEMP_MAX] = cal->MaxCellTemp;
 
     registers[calBase + BTS_CAL_F28V_GAIN]      = cal->F28V_Gain;
@@ -1074,7 +1079,6 @@ static bool saveCalibrationFlags(uint16_t channel, uint32_t extraFlags)
     cal.header   = BTS_CAL_MAKE_HEADER(channel);
     cal.dateTime = CPUTimer_getTimerCount(CPUTIMER1_BASE);
 
-    cal.MinCellTemp   = registers[tempBase + BTS_TEMP_MIN];
     cal.MaxCellTemp   = registers[tempBase + BTS_TEMP_MAX];
     cal.F28V_Gain     = registers[calBase + BTS_CAL_F28V_GAIN];
     cal.F28V_Offset   = registers[calBase + BTS_CAL_F28V_OFFSET];

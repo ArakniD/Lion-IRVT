@@ -121,12 +121,38 @@ static float32_t accDischargeMwh[NUM_CHANNELS];
 static float32_t accDischargeSeconds[NUM_CHANNELS];
 
 //
+// Tick at which each slot last accumulated. 0 means "no baseline" - the next
+// pass establishes one and integrates nothing, so a slot can never bank the
+// whole interval since boot on its first sample.
+//
+static uint32_t accLastTick[NUM_CHANNELS];
+
+//
 // The C tasks rotate C1 -> C2 -> C3 off one TASKC_FREQ_HZ timer, so C1 sees
 // every third tick. Derived rather than written out so a change to the task
 // rate carries into the integration.
 //
-#define BTS_ACC_DT_HOURS  ((float32_t)3.0 / ((float32_t)TASKC_FREQ_HZ * (float32_t)3600.0))
-#define BTS_ACC_DT_SECONDS ((float32_t)3.0 / (float32_t)TASKC_FREQ_HZ)
+//
+// Monotonic tick for the accumulators.
+//
+// accTick counts C-task dispatches (C1->C2->C3), incremented once per C0()
+// pass, so one tick is one TASKC period. The accumulator reads the DIFFERENCE
+// between ticks rather than assuming a fixed interval, because the C chain
+// does not run at its nominal rate: measured at ~1.3 Hz against a nominal
+// 6.67 Hz, which made every mAh/mWh/runtime figure ~9x low.
+//
+#define BTS_ACC_TICK_SECONDS  ((float32_t)1.0 / (float32_t)TASKC_FREQ_HZ)
+
+//
+// Reject an implausible interval. A gap this long means the task chain
+// stalled, a debugger halted the core, or a breakpoint was hit - integrating
+// across it would inject a large bogus quantity. The sample is dropped and
+// the timestamp re-baselined, so the counters under-report slightly rather
+// than jumping.
+//
+#define BTS_ACC_MAX_GAP_S     ((float32_t)2.0)
+
+volatile uint32_t accTick = 0U;
 
 //
 // Zeroes one direction's counters at the moment that direction starts. The
@@ -1307,11 +1333,13 @@ void modeCallback(float value, uint16_t channel)
         status[channel].charging = (mode & BTS_MODE_CHARGE) >> 1;
         status[channel].discharging = !((mode & BTS_MODE_CHARGE) >> 1);
         if (mode & BTS_MODE_RUN) {
+            //
+            // The limits are direction-agnostic since the 2026-09-22 register
+            // compression: the mode register already selects charge or
+            // discharge, so one voltage pair and one current pair serves
+            // both and there is nothing to choose between here.
+            //
             uint16_t regBase = BTS_SET_BASE(channel);
-            uint16_t vMinOff = (mode & BTS_MODE_CHARGE) ? BTS_SET_CHG_V_MIN : BTS_SET_DIS_V_MIN;
-            uint16_t vMaxOff = (mode & BTS_MODE_CHARGE) ? BTS_SET_CHG_V_MAX : BTS_SET_DIS_V_MAX;
-            uint16_t iMinOff = (mode & BTS_MODE_CHARGE) ? BTS_SET_CHG_I_MIN : BTS_SET_DIS_I_MIN;
-            uint16_t iMaxOff = (mode & BTS_MODE_CHARGE) ? BTS_SET_CHG_I_MAX : BTS_SET_DIS_I_MAX;
 
             status[channel].running   = 1;
             status[channel].stopped   = 0;
@@ -1319,10 +1347,10 @@ void modeCallback(float value, uint16_t channel)
             status[channel].wdTripped = 0;
             status[channel].restored  = 0;
 
-            BTS_userInputs[channel].vref_charge_V    = registers[regBase + vMaxOff];
-            BTS_userInputs[channel].vref_discharge_V = registers[regBase + vMinOff];
-            BTS_userInputs[channel].iref_A           = registers[regBase + iMaxOff];
-            BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + iMinOff];
+            BTS_userInputs[channel].vref_charge_V    = registers[regBase + BTS_SET_V_MAX];
+            BTS_userInputs[channel].vref_discharge_V = registers[regBase + BTS_SET_V_MIN];
+            BTS_userInputs[channel].iref_A           = registers[regBase + BTS_SET_I_MAX];
+            BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + BTS_SET_I_MIN];
             BTS_userInputs[channel].direction_logic  = status[channel].charging;
             BTS_userInputs[channel].enable_logic     = 1;
 
@@ -1561,6 +1589,15 @@ void C0(void)
         //
         // jump to an C Task (C1,C2,C3,...)
         //
+        //
+        // One tick per C-task dispatch, BEFORE the task runs so the slot it
+        // services sees the current tick. This is the accumulators' time
+        // base: it advances with the TASKC timer regardless of how long the
+        // chain actually takes, so a measured interval stays honest even
+        // when the tasks run slower than nominal.
+        //
+        accTick++;
+
         (*C_Task_Ptr)();
 
         vTimer2[0]++;           // virtual timer 2, instance 0 (spare)
@@ -1680,24 +1717,11 @@ void C1(void)
     // a paused, stopped, ended, tripped or calibrating slot contributes
     // nothing and its totals freeze exactly where they were.
     //
-    for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
-        if ((slotIsRunning(ch) == 0U) || calSlotIsCalibrating(ch)) {
-            continue;
-        }
-
-        float32_t i_A = fabsf(BTS_measValues[ch].Isense_A);
-        float32_t p_W = fabsf(BTS_measValues[ch].Isense_A * BTS_measValues[ch].Vsense_V);
-
-        if (status[ch].charging) {
-            accChargeMah[ch] += i_A * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
-            accChargeMwh[ch] += p_W * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
-            accChargeSeconds[ch] += BTS_ACC_DT_SECONDS;
-        } else {
-            accDischargeMah[ch] += i_A * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
-            accDischargeMwh[ch] += p_W * (float32_t)1000.0 * BTS_ACC_DT_HOURS;
-            accDischargeSeconds[ch] += BTS_ACC_DT_SECONDS;
-        }
-    }
+    //
+    // The accumulators used to live here, integrating all eight slots every
+    // C1 pass with a hard-coded dt. That is now accIntegrateSlot(), called
+    // from C2 one slot at a time - see the note there.
+    //
 
     updateInputVoltage();
 
@@ -1757,6 +1781,82 @@ void C1(void)
     C_Task_Ptr = &C2;
 }
 
+//
+// Integrate one slot's charge, energy and run time.
+//
+// Called from C2, one slot per pass, so the cost is spread across eight C2
+// dispatches instead of landing on every C1. C1 already runs the eight
+// BTS_monitor_Iout_Vout() conversions and the input-voltage guard, and the
+// C chain was measured running far below its nominal rate, so the work is
+// moved off the busiest task rather than added to it.
+//
+// The interval is MEASURED, not assumed. accTick advances once per C-task
+// dispatch; the elapsed time is the tick difference times the TASKC period.
+// The previous code added a fixed 3/TASKC_FREQ_HZ every pass, which is only
+// correct if the chain hits its nominal rate - it does not, and a 60 s charge
+// at 1 A therefore banked 6.45 s and 1.79 mAh instead of 60 s and 16.7 mAh.
+//
+// Counters advance only while a slot is genuinely running: paused, stopped,
+// ended, tripped or calibrating all contribute nothing and freeze the totals
+// exactly where they were.
+//
+static void accIntegrateSlot(uint16_t ch)
+{
+    uint32_t now = accTick;
+
+    if ((slotIsRunning(ch) == 0U) || calSlotIsCalibrating(ch)) {
+        //
+        // Not running: drop the baseline so the pass after a resume
+        // integrates from that moment rather than from when it stopped.
+        //
+        accLastTick[ch] = 0U;
+        return;
+    }
+
+    if (accLastTick[ch] == 0U) {
+        //
+        // First pass for this slot - establish the baseline and integrate
+        // nothing. Without this the slot would bank every tick since boot.
+        //
+        accLastTick[ch] = now;
+        return;
+    }
+
+    //
+    // Unsigned subtraction, so a 32-bit wrap still yields the true delta.
+    //
+    uint32_t dTicks = now - accLastTick[ch];
+    accLastTick[ch] = now;
+
+    if (dTicks == 0U) {
+        return;                     // same tick, nothing elapsed
+    }
+
+    float32_t dt_s = (float32_t)dTicks * BTS_ACC_TICK_SECONDS;
+
+    if (dt_s > BTS_ACC_MAX_GAP_S) {
+        //
+        // Implausible gap - a stall, a debugger halt or a breakpoint. The
+        // baseline is already re-set above, so the next pass resumes cleanly.
+        //
+        return;
+    }
+
+    float32_t dt_h = dt_s / (float32_t)3600.0;
+    float32_t i_A  = fabsf(BTS_measValues[ch].Isense_A);
+    float32_t p_W  = fabsf(BTS_measValues[ch].Isense_A * BTS_measValues[ch].Vsense_V);
+
+    if (status[ch].charging) {
+        accChargeMah[ch] += i_A * (float32_t)1000.0 * dt_h;
+        accChargeMwh[ch] += p_W * (float32_t)1000.0 * dt_h;
+        accChargeSeconds[ch] += dt_s;
+    } else {
+        accDischargeMah[ch] += i_A * (float32_t)1000.0 * dt_h;
+        accDischargeMwh[ch] += p_W * (float32_t)1000.0 * dt_h;
+        accDischargeSeconds[ch] += dt_s;
+    }
+}
+
 void C2(void)
 {
     static uint16_t channel = 0;
@@ -1766,6 +1866,11 @@ void C2(void)
     // touches in-memory program variables; EEPROM persistence lives on CPU2.
     //
     BTS_monitor_program_update(channel);
+
+    //
+    // One slot's accumulators per pass, same rotation.
+    //
+    accIntegrateSlot(channel);
 
     channel = (channel + 1U) % NUM_CHANNELS;
 
@@ -1777,6 +1882,12 @@ void C2(void)
 
 void C3(void)
 {
+    //
+    // Watch for a post-boot clock failover. MCD can fire at any time and the
+    // PLL registers will not show it - see BTS_HAL_pollClockHealth().
+    //
+    BTS_HAL_pollClockHealth();
+
     //
     // Execute task C1 the next time CpuTimer2 decrements to 0
     //

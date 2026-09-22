@@ -4,7 +4,6 @@ MEMORY
 PAGE 0 :  /* Program Memory */
           /* Memory (RAM/FLASH) blocks can be moved to PAGE1 for data allocation */
           /* BEGIN is used for the "boot to Flash" bootloader mode   */
-   RAMLS0           : origin = 0x008000, length = 0x000800
 
    BEGIN           	: origin = 0x080000, length = 0x000002
    RAMM0           	: origin = 0x000122, length = 0x0002DE
@@ -31,19 +30,6 @@ PAGE 0 :  /* Program Memory */
    FLASHG           : origin = 0x098000, length = 0x008000	/* on-chip Flash */
    FLASHH           : origin = 0x0A0000, length = 0x008000	/* on-chip Flash */
    FLASHI           : origin = 0x0A8000, length = 0x008000	/* on-chip Flash */
-   /*
-    * FLASHJ..FLASHN are CPU1's too. Each CPU on the F2837xD has its OWN
-    * complete flash bank, both mapped at the same addresses - CPU2's linker
-    * names the same sectors and they are different silicon, not a shared
-    * region. Verified on hardware: 0x090000 reads code from CPU1 and 0xFFFF
-    * from CPU2. TI's reference MEMORY blocks for the two cores are identical.
-    */
-   FLASHJ           : origin = 0x0B0000, length = 0x008000	/* on-chip Flash */
-   FLASHK           : origin = 0x0B8000, length = 0x002000	/* on-chip Flash */
-   FLASHL           : origin = 0x0BA000, length = 0x002000	/* on-chip Flash */
-   FLASHM           : origin = 0x0BC000, length = 0x002000	/* on-chip Flash */
-   FLASHN           : origin = 0x0BE000, length = 0x001FF0	/* on-chip Flash */
-// FLASHN_RSVD      : origin = 0x0BFFF0, length = 0x000010    /* Reserve and do not use for code as per the errata advisory "Memory: Prefetching Beyond Valid Memory" */
 
 PAGE 1 : /* Data Memory */
          /* Memory (RAM/FLASH) blocks can be moved to PAGE0 for program allocation */
@@ -52,12 +38,7 @@ PAGE 1 : /* Data Memory */
    RAMM1            : origin = 0x000400, length = 0x0003F8     /* on-chip RAM block M1 */
 // RAMM1_RSVD       : origin = 0x0007F8, length = 0x000008     /* Reserve and do not use for code as per the errata advisory "Memory: Prefetching Beyond Valid Memory" */
    RAMD00          	: origin = 0x00B000, length = 0x000800
-   /*
-    * LS0 is split off onto PAGE 0 so CPU1's ramfuncs can RUN from local RAM
-    * rather than a shared GSx block - see the note on the ramfuncs GROUP.
-    * LS1..LS3 stay on PAGE 1 for .bss.
-    */
-   RAMLS1_3         : origin = 0x008800, length = 0x001800
+   RAMLS0_3         : origin = 0x008000, length = 0x002000
 
    RAMGS3     		: origin = 0x00F000, length = 0x001000
    RAMGS4     		: origin = 0x010000, length = 0x001000
@@ -81,34 +62,13 @@ SECTIONS
    .text               : >> FLASHF | FLASHG | FLASHH | FLASHI      PAGE = 0, ALIGN(4)
    codestart           : > BEGIN       PAGE = 0, ALIGN(4)
 
-   /*
-    * RUN = RAMLS0, deliberately NOT a global-shared (GSx) block.
-    *
-    * CCS programs flash by downloading a flash algorithm into target RAM and
-    * executing it there, and for a CPU2 load that algorithm is staged in
-    * RAMGS0 - the GSx blocks are shared silicon reachable from either core's
-    * debug access. These functions used to RUN at RAMGS0 (0x00C000), so
-    * every `loadProgram` on CPU2 overwrote CPU1's live ramfuncs underneath
-    * it. CPU1 then called BTS_monitor_Iout_Vout() from C1(), landed in the
-    * flash algorithm, and took an illegal-instruction trap into
-    * Interrupt_illegalOperationHandler() - an infinite loop that froze
-    * cpu1Status.seq and killed the host link.
-    *
-    * Verified at 0x00C128: correct code 0xB2BD 0xD098 after CPU1's own
-    * memcpy, reverting to the algorithm's 0x01F6 0xFFEF after a CPU2 load.
-    *
-    * RAMLS0 (0x008000-0x0087FF) is CPU1-local - CPU2's linker only claims
-    * LS4/LS5 - so the programmer cannot reach it and the two cores can be
-    * loaded in either order. Shares the block with .bss, which has room:
-    * ramfuncs is 0x2C0 words against LS0's 0x800.
-    */
    GROUP
     {
         .TI.ramfunc
         ramfuncs
     }
         LOAD = FLASHD,
-        RUN = RAMLS0,
+        RUN = RAMGS0,
         LOAD_START(RamfuncsLoadStart),
         LOAD_SIZE(RamfuncsLoadSize),
         LOAD_END(RamfuncsLoadEnd),
@@ -132,7 +92,7 @@ SECTIONS
 
    /* Allocate uninitalized data sections: */
    .stack             : > RAMD00             PAGE = 1
-   .bss               : >> RAMLS1_3          PAGE = 1
+   .bss               : >> RAMLS0_3          PAGE = 1
    .sysmem            : > RAMGS3             PAGE = 1
    .data           	  : >> RAMM1 | RAMD00    PAGE = 1   //added from COFF to EABI
 

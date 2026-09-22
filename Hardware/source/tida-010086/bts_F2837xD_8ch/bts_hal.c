@@ -27,6 +27,61 @@
 
 adc_data  BTS_ADC1;
 adc_data  BTS_ADC2;
+//
+// Non-zero if the SYSPLL never locked. Set just before the unit halts, so a
+// debugger attaching to a dead board can tell a clock failure from a hang.
+//
+volatile uint16_t BTS_pllLockFailed = 0U;
+
+//
+// PLL state captured by CPU1 itself immediately after SysCtl_setClock().
+//
+// The CLKCFG block cannot be read reliably over JTAG on this part - it
+// returns 0x0000 whether the core is halted or running, and a single
+// non-reproducible 0x0010 misled this investigation twice. Latching the
+// values into ordinary RAM from CPU1's own code sidesteps that entirely.
+//
+volatile uint16_t BTS_pllMultAfter   = 0xFFFFU;  // SYSPLLMULT
+volatile uint16_t BTS_pllStsAfter    = 0xFFFFU;  // SYSPLLSTS  (bit0 = LOCKS)
+volatile uint16_t BTS_pllCtl1After   = 0xFFFFU;  // SYSPLLCTL1 (PLLEN/PLLCLKEN)
+volatile uint16_t BTS_clkSrcAfter    = 0xFFFFU;  // CLKSRCCTL1
+volatile uint16_t BTS_sysDivAfter    = 0xFFFFU;  // SYSCLKDIVSEL
+volatile uint16_t BTS_lospcpAfter    = 0xFFFFU;  // LOSPCP  -> LSPCLK divider
+volatile uint16_t BTS_perDivAfter    = 0xFFFFU;  // PERCLKDIVSEL -> EPWMCLKDIV
+volatile uint16_t BTS_tmr2ClkAfter   = 0xFFFFU;  // TMR2CLKCTL -> Timer2 source
+
+//
+// Missing Clock Detect (MCD) state, and a measured - not assumed - SYSCLK.
+//
+// MCD watches OSCCLK. If the selected oscillator stops or glitches, the
+// hardware switches SYSCLK to INTOSC1 (~10 MHz) on its own and latches
+// MCDCR.MCLKSTS. That failover does NOT rewrite SYSPLLMULT, SYSPLLSTS or
+// SYSPLLCTL1 - they keep reading the values they were programmed with. That
+// is exactly why every register read in this investigation looked perfect
+// while the board behaved as if it were running at 10 MHz.
+//
+// MCLKSTS is sticky: only MCLKCLR or a power-on reset clears it. And
+// SysCtl_setClock() begins with
+//     if(SysCtl_isMCDClockFailureDetected()) { status = false; }
+// i.e. if the flag is already latched it returns false having touched no PLL
+// register at all - and device.c discards that return value. So a single
+// oscillator glitch can leave the device on INTOSC1 across every subsequent
+// warm reset, silently.
+//
+volatile uint16_t BTS_mcdBefore      = 0xFFFFU;  // MCDCR as found at entry
+volatile uint16_t BTS_mcdAfter       = 0xFFFFU;  // MCDCR after clock setup
+volatile uint16_t BTS_mcdLive        = 0xFFFFU;  // MCDCR sampled in task C3
+volatile uint16_t BTS_mcdTrips       = 0U;       // runtime MCLKSTS assertions
+volatile uint16_t BTS_setClockOk     = 0xFFFFU;  // SysCtl_setClock() return
+
+//
+// SYSCLK measured against INTOSC1 rather than inferred from CLKCFG. Timer1
+// counts SYSCLK while Timer2 counts INTOSC1 for a fixed window, so the ratio
+// is ground truth taken by the core itself - no JTAG, no debugger, no GEL.
+//
+volatile uint32_t BTS_sysclkTicks    = 0U;       // SYSCLK cycles per window
+volatile uint32_t BTS_sysclkKHz      = 0U;       // derived SYSCLK in kHz
+
 volatile uint16_t BTS_ExAdcRxflag1 ;
 volatile uint16_t BTS_ExAdcRxflag2 ;
 
@@ -48,12 +103,333 @@ volatile uint16_t BTS_ExAdcRxflag2 ;
 // resources (such as PLL) and moving ramfuncs from FLASH to RAM
 //
 
+//
+//=============================================================================
+// PLL start-up
+//=============================================================================
+//
+// The F2837xD has a documented erratum where the SYSPLL intermittently fails
+// to lock after a power cycle, leaving the device running from the raw
+// oscillator. Driverlib's SysCtl_setClock() already re-locks five times with
+// an `RPT #60 || NOP` settle between attempts, but that has proven too short
+// on this board: the device was measured running at ~10 MHz (INTOSC2) instead
+// of the configured 200 MHz - exactly 1/20, i.e. the PLL multiplier never
+// applied. Symptoms were a 16x-slow task chain and an AT console that only
+// answered at ~7267 baud instead of 115200.
+//
+// BTS_HAL_pllSettle() gives the PLL a far longer settle window, and
+// BTS_HAL_pllIsLocked() checks the outcome rather than assuming it.
+//
+// WHY THIS MUST BE FATAL
+//
+// Every timing in this unit derives from SYSCLK: the ePWM switching period
+// and dead time, the control-loop rate, the ADC trigger, the over-current
+// trip response and the host watchdog. Running a bidirectional converter
+// into a lithium cell with a 20x timing error is not a degraded mode, it is
+// a hazard - the dead time alone would be 20x short. So a failure to lock
+// stops the unit before any PWM is configured rather than continuing.
+//
+#define BTS_PLL_SETTLE_REPEATS   256U
+#define BTS_PLL_LOCK_ATTEMPTS    10U
+
+//
+// Long settle delay for the PLL, replacing driverlib's `RPT #60 || NOP`.
+// RPT takes an 8-bit count, so 256 repeats is issued as four blocks of 64.
+//
+static void BTS_HAL_pllSettle(void)
+{
+    uint16_t i;
+    for (i = 0U; i < (BTS_PLL_SETTLE_REPEATS / 64U); i++) {
+        asm(" RPT #63 || NOP");
+    }
+}
+
+static inline bool BTS_HAL_pllIsLocked(void)
+{
+    return ((HWREGH(CLKCFG_BASE + SYSCTL_O_SYSPLLSTS) &
+             SYSCTL_SYSPLLSTS_LOCKS) != 0U);
+}
+
+//
+// True if the missing-clock detector has latched a failure.
+//
+static inline bool BTS_HAL_mcdTripped(void)
+{
+    return ((HWREGH(CLKCFG_BASE + SYSCTL_O_MCDCR) &
+             SYSCTL_MCDCR_MCLKSTS) != 0U);
+}
+
+//
+// Measure SYSCLK against INTOSC1 and return the result in kHz.
+//
+// Timer1 counts SYSCLK, Timer2 counts INTOSC1 (a fixed ~10 MHz that MCD
+// itself falls back to, so it is present in every failure mode). Run both
+// for a window bounded by Timer2, then scale.
+//
+// This is the only SYSCLK figure in the firmware that is measured rather
+// than asserted. Both timers are saved and restored, so it is safe to call
+// during bring-up and again later from a background task.
+//
+#define BTS_CLKMEAS_INTOSC1_HZ   10000000UL
+#define BTS_CLKMEAS_WINDOW       0x4000UL     // INTOSC1 cycles per window
+
+static uint32_t BTS_HAL_measureSysclkKHz(void)
+{
+    uint16_t t1TCR, t1TPR, t1TPRH, t2TCR, t2TPR, t2TPRH, t2CLKCTL;
+    uint32_t t1PRD, t2PRD, elapsed;
+
+    //
+    // Back up both timers - the task scheduler owns them.
+    //
+    t1TCR = HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TCR);
+    t1PRD = HWREG(CPUTIMER1_BASE + CPUTIMER_O_PRD);
+    t1TPR = HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TPR);
+    t1TPRH = HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TPRH);
+    t2CLKCTL = HWREGH(CPUSYS_BASE + SYSCTL_O_TMR2CLKCTL);
+    t2TCR = HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR);
+    t2PRD = HWREG(CPUTIMER2_BASE + CPUTIMER_O_PRD);
+    t2TPR = HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TPR);
+    t2TPRH = HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TPRH);
+
+    EALLOW;
+
+    //
+    // Timer1 free-runs on SYSCLK from a known top.
+    //
+    HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TSS;
+    HWREG(CPUTIMER1_BASE + CPUTIMER_O_PRD) = 0xFFFFFFFFUL;
+    HWREG(CPUTIMER1_BASE + CPUTIMER_O_TPR) = 0U;
+    HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TRB;
+
+    //
+    // Timer2 on INTOSC1, no prescale, bounding the window.
+    //
+    HWREGH(CPUSYS_BASE + SYSCTL_O_TMR2CLKCTL) =
+        (HWREGH(CPUSYS_BASE + SYSCTL_O_TMR2CLKCTL) &
+         (uint16_t)~(SYSCTL_TMR2CLKCTL_TMR2CLKSRCSEL_M |
+                     SYSCTL_TMR2CLKCTL_TMR2CLKPRESCALE_M)) | 1U;
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TSS;
+    HWREG(CPUTIMER2_BASE + CPUTIMER_O_PRD) = BTS_CLKMEAS_WINDOW;
+    HWREG(CPUTIMER2_BASE + CPUTIMER_O_TPR) = 0U;
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TRB;
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TIF;
+
+    //
+    // Release both as close together as possible, then wait out the window.
+    //
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR) &= ~CPUTIMER_TCR_TSS;
+    HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TCR) &= ~CPUTIMER_TCR_TSS;
+
+    while ((HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR) & CPUTIMER_TCR_TIF) == 0U) {
+        ;
+    }
+
+    HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TSS;
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TSS;
+
+    elapsed = 0xFFFFFFFFUL - HWREG(CPUTIMER1_BASE + CPUTIMER_O_TIM);
+
+    //
+    // Restore.
+    //
+    HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TCR) = t1TCR;
+    HWREG(CPUTIMER1_BASE + CPUTIMER_O_PRD) = t1PRD;
+    HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TPR) = t1TPR;
+    HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TPRH) = t1TPRH;
+    HWREGH(CPUSYS_BASE + SYSCTL_O_TMR2CLKCTL) = t2CLKCTL;
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR) = t2TCR;
+    HWREG(CPUTIMER2_BASE + CPUTIMER_O_PRD) = t2PRD;
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TPR) = t2TPR;
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TPRH) = t2TPRH;
+    HWREGH(CPUTIMER1_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TRB;
+    HWREGH(CPUTIMER2_BASE + CPUTIMER_O_TCR) |= CPUTIMER_TCR_TRB;
+
+    EDIS;
+
+    BTS_sysclkTicks = elapsed;
+
+    //
+    // kHz = elapsed * (INTOSC1 / window) / 1000. Ordered to stay in 32 bits:
+    // INTOSC1/window is exact for the chosen constants.
+    //
+    return ((elapsed * (BTS_CLKMEAS_INTOSC1_HZ / BTS_CLKMEAS_WINDOW)) / 1000UL);
+}
+
+//
+// Public accessor so CPU1 tasks can re-measure without duplicating the code.
+//
+uint32_t BTS_HAL_getMeasuredSysclkKHz(void)
+{
+    return (BTS_HAL_measureSysclkKHz());
+}
+
+//
+// Periodic clock-health check, called from a slow background task.
+//
+// MCD is not only a boot-time concern: a marginal oscillator can drop out
+// while the unit is running, at which point the hardware silently switches
+// SYSCLK to INTOSC1 and every PLL register keeps reading correct. This is
+// the only thing that would catch that, and it is why the counter is kept
+// rather than just the current state - a trip that self-clears still leaves
+// evidence.
+//
+// Deliberately does NOT halt: a converter mid-cycle is stopped through the
+// normal shutdown path, not from a background poll. It records, and the
+// supervisor acts on BTS_mcdTrips.
+//
+void BTS_HAL_pollClockHealth(void)
+{
+    BTS_mcdLive = HWREGH(CLKCFG_BASE + SYSCTL_O_MCDCR);
+
+    if (BTS_HAL_mcdTripped()) {
+        if (BTS_mcdTrips < 0xFFFFU) {
+            BTS_mcdTrips++;
+        }
+    }
+}
+
+//
+// Halts the unit with every converter output driven low.
+//
+// Reached only when the clock cannot be trusted, so nothing here may depend
+// on a calibrated timebase: the trip zones are forced by register write, not
+// by the control loop, and the function never returns.
+//
+static void BTS_HAL_clockFailureHalt(void)
+{
+    uint16_t ch;
+
+    EALLOW;
+    //
+    // Force every ePWM into its one-shot trip state, which drives both
+    // outputs low in hardware and latches them there.
+    //
+    for (ch = 0U; ch < 8U; ch++) {
+        uint32_t base = EPWM1_BASE + (uint32_t)ch * (EPWM2_BASE - EPWM1_BASE);
+        EPWM_forceTripZoneEvent(base, EPWM_TZ_FORCE_EVENT_OST);
+    }
+    EDIS;
+
+    //
+    // Interrupts off, then spin. A watchdog reset from here is acceptable -
+    // it retries the PLL, which is the only recovery available.
+    //
+    DINT;
+    for (;;) {
+        ;
+    }
+}
+
 void BTS_HAL_setupDevice(void)
 {
+    uint16_t attempt;
+
+    //
+    // Capture and CLEAR the missing-clock detector BEFORE Device_init().
+    //
+    // This ordering is the whole fix. SysCtl_setClock() short-circuits on a
+    // latched MCLKSTS and returns false without touching a single PLL
+    // register; device.c discards that return. MCLKSTS survives a warm reset,
+    // so one oscillator glitch pins the device on INTOSC1 indefinitely while
+    // SYSPLLMULT/SYSPLLSTS/SYSPLLCTL1 keep reporting the configured values.
+    // Clearing it here means Device_init() can actually program the PLL.
+    //
+    BTS_mcdBefore = HWREGH(CLKCFG_BASE + SYSCTL_O_MCDCR);
+    if (BTS_HAL_mcdTripped()) {
+        SysCtl_resetMCD();
+    }
+
     //
     // Initialize device clock and peripherals
     //
     Device_init();
+
+    //
+    // Device_init() has already run driverlib's own lock sequence. Verify it
+    // actually took, and retry with a much longer settle if it did not.
+    //
+    // The loop condition tests the MCD as well as the lock bit: a latched MCD
+    // means the core is on INTOSC1 no matter what the PLL status says.
+    //
+    for (attempt = 0U; (attempt < BTS_PLL_LOCK_ATTEMPTS) &&
+                       (!BTS_HAL_pllIsLocked() || BTS_HAL_mcdTripped());
+         attempt++) {
+        //
+        // Clear any MCD latched by the previous attempt, or setClock() below
+        // will short-circuit exactly as the original failure did.
+        //
+        SysCtl_resetMCD();
+
+        EALLOW;
+        //
+        // Drop back to the oscillator before touching the multiplier, so the
+        // core is never clocked from a PLL mid-relock.
+        //
+        HWREGH(CLKCFG_BASE + SYSCTL_O_SYSPLLCTL1) &=
+            ~(uint16_t)SYSCTL_SYSPLLCTL1_PLLCLKEN;
+        HWREGH(CLKCFG_BASE + SYSCTL_O_SYSPLLCTL1) &=
+            ~(uint16_t)SYSCTL_SYSPLLCTL1_PLLEN;
+        EDIS;
+
+        BTS_HAL_pllSettle();
+
+        //
+        // Re-run the full driverlib sequence, which rewrites the multiplier
+        // and the dividers together. Its return value is checked here - the
+        // stock device.c throws it away, which is how the original failure
+        // stayed invisible.
+        //
+        BTS_setClockOk = (uint16_t)SysCtl_setClock(DEVICE_SETCLOCK_CFG);
+        BTS_HAL_pllSettle();
+    }
+
+    //
+    // Fatal if it never locked - see the note above on why this cannot be a
+    // warning. Recorded for the debugger before the outputs are killed.
+    //
+    //
+    // Latch the PLL state from CPU1 itself - see the note on these globals.
+    //
+    BTS_pllMultAfter = HWREGH(CLKCFG_BASE + SYSCTL_O_SYSPLLMULT);
+    BTS_pllStsAfter  = HWREGH(CLKCFG_BASE + SYSCTL_O_SYSPLLSTS);
+    BTS_pllCtl1After = HWREGH(CLKCFG_BASE + SYSCTL_O_SYSPLLCTL1);
+    BTS_clkSrcAfter  = HWREGH(CLKCFG_BASE + SYSCTL_O_CLKSRCCTL1);
+    BTS_sysDivAfter  = HWREGH(CLKCFG_BASE + SYSCTL_O_SYSCLKDIVSEL);
+    //
+    // The peripheral clock path, read from CPU1 for the same reason.
+    // LOSPCP sets LSPCLK (SCI/SPI/I2C); PERCLKDIVSEL holds EPWMCLKDIV.
+    //
+    BTS_lospcpAfter  = HWREGH(CLKCFG_BASE + SYSCTL_O_LOSPCP);
+    BTS_perDivAfter  = HWREGH(CLKCFG_BASE + SYSCTL_O_PERCLKDIVSEL);
+    BTS_tmr2ClkAfter = HWREGH(CLKCFG_BASE + SYSCTL_O_TMR2CLKCTL);
+
+    BTS_mcdAfter = HWREGH(CLKCFG_BASE + SYSCTL_O_MCDCR);
+
+    //
+    // Measure SYSCLK and hold the unit if it is not what the firmware has
+    // been compiled to assume.
+    //
+    // The lock bit alone is NOT sufficient evidence: under an MCD failover it
+    // reads locked while the core runs from INTOSC1. Every derived timing -
+    // PWM period, dead time, trip response, control-loop rate - comes from
+    // DEVICE_SYSCLK_FREQ, so a mismatch here is a hazard, not a degradation.
+    // +/-5% covers INTOSC2's +/-2% tolerance and the measurement window's
+    // quantisation, while still catching the ~20x error seen on this board.
+    //
+    BTS_sysclkKHz = BTS_HAL_measureSysclkKHz();
+
+    {
+        uint32_t expectedKHz = (uint32_t)(DEVICE_SYSCLK_FREQ / 1000U);
+        uint32_t lowKHz  = expectedKHz - (expectedKHz / 20U);
+        uint32_t highKHz = expectedKHz + (expectedKHz / 20U);
+
+        if (!BTS_HAL_pllIsLocked() || BTS_HAL_mcdTripped() ||
+            (BTS_sysclkKHz < lowKHz) || (BTS_sysclkKHz > highKHz)) {
+            BTS_pllLockFailed = 1U;
+            BTS_HAL_clockFailureHalt();
+        }
+    }
+    BTS_pllLockFailed = 0U;
     //SysCtl_setLowSpeedClock(SYSCTL_LSPCLK_PRESCALE_1);
     //
     // Disable pin locks and enable internal pull-ups.
@@ -1341,20 +1717,40 @@ void BTS_HAL_setupADC(void)
     DEVICE_DELAY_US(1000);
 }
 
-// Add ePWM trigger setup for 10kHz
+//
+// ePWM1 SOCA - the cell V/I acquisition trigger for adcCellVoltageISR.
+//
+// EPWM1 is shared: it is both channel 1's switching leg and the ADC trigger
+// source. Its period therefore belongs to the converter, NOT to the sample
+// rate - BTS_HAL_setupSyncBuckPwm(BTS_EPWM_BASE_CH1) runs AFTER this
+// function and sets TBPRD to BTS_DRV_EPWM_TBPRD (1002), so anything written
+// to TBPRD here is overwritten and has no effect.
+//
+// That is what used to happen: this function wrote TBPRD for a nominal
+// 10 kHz, the PWM setup replaced it, and the ADC ended up triggering once
+// per switching period. With EPWMCLK = SYSCLK/2 = 100 MHz and TBPRD 1002
+// that is 100e6/1003 = 99.7 kHz - ten times the documented intent, so
+// adcCellVoltageISR ran every ~10 us and read all eight slots each time.
+//
+// The sample rate is set with the SOC event prescaler instead, which divides
+// the trigger without touching the switching period:
+//
+//   99.7 kHz / BTS_ADC_SOC_PRESCALE(10) = 9.97 kSPS
+//
+// Note TBCLK is EPWMCLK (SYSCLK/2), not SYSCLK - the old
+// "DEVICE_SYSCLK_FREQ / 10000" form was doubly wrong for that reason too.
+//
 void BTS_HAL_setupAdcTrigger(uint32_t EPWM_BASE)
 {
-    // Configure ePWM1 for 10kHz trigger
-    EPWM_setClockPrescaler(EPWM_BASE, EPWM_CLOCK_DIVIDER_1, EPWM_HSCLOCK_DIVIDER_1);
-    EPWM_setTimeBasePeriod(EPWM_BASE, DEVICE_SYSCLK_FREQ / 10000 - 1); // 10kHz
-    EPWM_setTimeBaseCounterMode(EPWM_BASE, EPWM_COUNTER_MODE_UP);
-    EPWM_setPeriodLoadMode(EPWM_BASE, EPWM_PERIOD_SHADOW_LOAD);
-    EPWM_disablePhaseShiftLoad(EPWM_BASE);
-
-    // Trigger SOCA at counter zero
+    //
+    // Only the SOC configuration belongs here. Clock prescaler, period and
+    // counter mode are the converter's and are set by
+    // BTS_HAL_setupSyncBuckPwm().
+    //
     EPWM_enableADCTrigger(EPWM_BASE, EPWM_SOC_A);
     EPWM_setADCTriggerSource(EPWM_BASE, EPWM_SOC_A, EPWM_SOC_TBCTR_ZERO);
-    EPWM_setADCTriggerEventPrescale(EPWM_BASE, EPWM_SOC_A, 1);
+    EPWM_setADCTriggerEventPrescale(EPWM_BASE, EPWM_SOC_A,
+                                    BTS_ADC_SOC_PRESCALE);
 }
 
 void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE)
