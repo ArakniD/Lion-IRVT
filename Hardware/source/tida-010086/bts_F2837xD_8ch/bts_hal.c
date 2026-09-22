@@ -1608,6 +1608,24 @@ void BTS_HAL_setupTripSystem(void) {
     // Re-enabling the channel-6 hardware trip means moving one of them - the
     // free inputs are INPUT1, 2, 3, 7 and 8.
     //
+
+    //
+    // CPU2's two ADS1119 DRDY lines. These MUST be routed here, by CPU1: the
+    // Input X-BAR is device-global and its select registers are writable only
+    // from CPU1, so CPU2's GPIO_setInterruptPin(42/43, XINT1/2) configures the
+    // XINT edge logic but never connects a pin to it.
+    //
+    // Without these two writes INPUT4SELECT and INPUT5SELECT stay at their
+    // reset value of 0 (GPIO0), no DRDY edge ever reaches the PIE, CPU2's
+    // acquisition state machine sits in eAdsIdle forever and every channel
+    // reports 0.00 degrees C - while both converters still answer on I2C and
+    // report "ok" at boot, which makes it look like a sensor fault.
+    //
+    // The allocation above has listed INPUT4/INPUT5 all along; only the
+    // programming was missing.
+    //
+    BTS_HAL_setupInputXBAR(4, 0, 42U);   // XINT1 <- GPIO42, ADS1119 #1 DRDY
+    BTS_HAL_setupInputXBAR(5, 0, 43U);   // XINT2 <- GPIO43, ADS1119 #2 DRDY
 #if (BTS_TRIP_GPIO_CH1_ENABLED == true) && (BTS_TRIP_HW_CH1_ENABLED == true)
     BTS_HAL_setupInputXBAR(9,  0, BTS_TRP_PIN_GPIO_CH1);
 #endif

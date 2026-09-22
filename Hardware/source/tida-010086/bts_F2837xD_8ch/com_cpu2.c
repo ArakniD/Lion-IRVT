@@ -83,6 +83,20 @@
 
 #define ADS1119_CHANNELS_PER_DEV 4U
 
+//
+// AIN input -> BTS slot mapping.
+//
+// The thermistor inputs are wired in reverse on BOTH converters: the
+// highest AIN carries the lowest slot. U7 (0x40) AIN3..AIN0 are slots
+// 1..4, and U9 (0x41) AIN3..AIN0 are slots 5..8. Confirmed against the
+// schematic 2026-09-22.
+//
+// Publishing the raw AIN index put every temperature on the wrong slot -
+// a hot cell on slot 1 was reported as slot 4. The zero-based register
+// index for AIN <ch> on <unit> is therefore (3 - ch) + unit*4.
+//
+#define ADS1119_SLOT_FOR_AIN(ch)  ((ADS1119_CHANNELS_PER_DEV - 1U) - (ch))
+
 #define ADS1119_DRDY_GPIO_1 42     // DRDY for ADS1119 #1 (net DRDY3)
 #define ADS1119_DRDY_GPIO_2 43     // DRDY for ADS1119 #2 (net DRDY4)
 
@@ -106,12 +120,19 @@
 #define EEPROM_GLOBAL_V_ADDR  0x0400   // 16 bytes = 4 floats (was 0x0100)
 
 //
-// Slot runtime state, 8 slots x 32 B, ends 0x05FF. Clear of both the
-// calibration blocks and the globals, and a fixed stride for the same reason
-// as the calibration block - adding a field must not move every slot.
+// Slot runtime state, 8 slots x 64 B: 0x0500 .. 0x06FF.
+//
+// The stride was 32 B while the record was 40 B, so every slot overwrote the
+// first 8 bytes of the next one - the saveCounter and crc32 of slots 0..6
+// were destroyed by their successor and could never validate. Only slot 7,
+// having no successor, ever restored. Widened to 64 B, which both fixes the
+// overrun and leaves 8 spare words per slot for later runtime fields.
+//
+// The FM24V10 is 128 KiB, so this region ends at 0x06FF and the whole map
+// occupies well under 1% of the part. Space is not a constraint here.
 //
 #define STATE_FRAM_BASE       0x0500U
-#define STATE_FRAM_STRIDE     32U
+#define STATE_FRAM_STRIDE     64U
 
 //
 // Polling bound for the blocking I2C helpers. At 160 MHz this is a few
@@ -145,6 +166,24 @@
 
 // Default cell temperature window
 #define DEFAULT_MAX_CELL_TEMP        85.0f
+
+//
+// Per-slot limit defaults, installed when a slot has no valid F-RAM record.
+//
+// These are SLOT SETTINGS, persisted with the runtime record - deliberately
+// not part of BTS_channelCalibration, so an operator changing a charge
+// current never rewrites the calibration image.
+//
+// Deliberately conservative: a single lithium-ion cell's usual 3.0 - 4.2 V
+// window, and 1 A against a hardware over-current trip at +/-8 A. A slot
+// that has never been configured should do something safe and unremarkable,
+// not run at the hardware's limit. Zero is NOT an acceptable fallback - it
+// presents as a dead slot and hides the missing record.
+//
+#define DEFAULT_SLOT_VOLTAGE_MIN     3.0f
+#define DEFAULT_SLOT_VOLTAGE_MAX     4.2f
+#define DEFAULT_SLOT_CURRENT_MIN     0.0f
+#define DEFAULT_SLOT_CURRENT_MAX     1.0f
 
 //
 // Default on-chip ADC scaling for cell voltage and current.
@@ -344,6 +383,9 @@ void initI2C_Slave(void)
     I2C_enableModule(I2CA_BASE);
 }
 
+volatile uint16_t BTS_dbgI2cbMdr = 0xFFFFU;
+volatile uint16_t BTS_dbgI2cbStr = 0xFFFFU;
+
 void initI2C_Master(void)
 {
     //
@@ -352,17 +394,191 @@ void initI2C_Master(void)
     // Pins muxed by CPU1 in BTS_HAL_setupCpu2Pins().
     //
     I2C_disableModule(I2CB_BASE);
+
+    //
+    // Drive I2CMDR to a known-zero state before anything else.
+    //
+    // I2C_setConfig() is a read-modify-write that preserves STT and STP, and
+    // I2C_enableModule() only ORs IRS in - so neither can clear a stop that
+    // was armed but never completed. A frame abandoned mid-transfer therefore
+    // leaves STP set, and every later re-init faithfully restores it: the
+    // module comes back up already believing it owes the bus a stop, holds
+    // SCL low waiting to send it, and BB latches busy forever. That is why
+    // i2cRecoverBus() ran 47836 times without ever freeing the bus - it
+    // finished by calling this function, which put the stuck bit straight
+    // back.
+    //
+    // Measured on hardware 2026-09-22: I2CMDR read 0x4E20
+    // (FREE|STP|MST|TRX|IRS) with I2CSTR 0x1010 (BUS_BUSY|TX_DATA_RDY) and
+    // SCL - not SDA - clamped low in GPBDAT. Clearing IRS alone released SCL
+    // instantly and dropped I2CSTR to 0x0410, which is what proves the
+    // CONTROLLER was holding the wire, not a target on it.
+    //
+    HWREGH(I2CB_BASE + I2C_O_MDR) = 0U;
+
+    //
+    // A peripheral reset clears the latched state the mode register cannot
+    // reach. I2CA's recovery path has always done this; I2CB never did.
+    //
+    SysCtl_resetPeripheral(SYSCTL_PERIPH_RES_I2CB);
+    SysCtl_delay(100U);
+    HWREGH(I2CB_BASE + I2C_O_MDR) = 0U;
+
     I2C_initController(I2CB_BASE, DEVICE_SYSCLK_FREQ, 400000, I2C_DUTYCYCLE_50);
     I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
     I2C_setBitCount(I2CB_BASE, I2C_BITCOUNT_8);
+
+    //
+    // Digital loopback OFF. I2CMDR.DLB is NOT cleared by a module reset and
+    // was observed SET on hardware (I2CMDR = 0x4E20), which ties the
+    // transmitter straight back to the receiver: the controller ACKs its own
+    // address and never drives the pins, so the FM24V10 (0x50) and both
+    // ADS1119s (0x40/0x41) are unreachable and every read returns nothing.
+    // That is why calibration, slot state and the temperatures all failed to
+    // load while the bus looked electrically healthy.
+    //
+    // I2CA has always called this; I2CB never did.
+    //
+    I2C_disableLoopback(I2CB_BASE);
+
+    //
+    // Explicit 7-bit addressing for the same reason - all three devices on
+    // this bus are 7-bit, and the mode bit is not reset either.
+    //
+    I2C_setAddressMode(I2CB_BASE, I2C_ADDR_MODE_7BITS);
+
     I2C_setEmulationMode(I2CB_BASE, I2C_EMULATION_FREE_RUN);
     I2C_enableModule(I2CB_BASE);
+
+    //
+    // Latched by CPU2 itself. Peripheral registers have proven unreliable to
+    // read over JTAG on this part, so the only trustworthy observation is one
+    // the core makes of its own bus.
+    //
+    BTS_dbgI2cbMdr = HWREGH(I2CB_BASE + I2C_O_MDR);
+    BTS_dbgI2cbStr = HWREGH(I2CB_BASE + I2C_O_STR);
 }
 
 //
 // Blocking byte-level EEPROM/I2C helpers. These run only at boot and on an
 // explicit calibration save, so a polled implementation is appropriate.
 //
+//
+// I2CB bus recovery.
+//
+// A module reset clears a latched BB inside the controller, but it cannot
+// free the WIRE. If the controller was reset - or the CPU halted - while a
+// target was mid-byte, that target is still driving SDA low waiting for the
+// clocks to finish its transfer. Every subsequent START then fails
+// arbitration and the whole bus looks dead, which is exactly the state a
+// debugger halt during an F-RAM transfer leaves behind.
+//
+// The documented escape is to bit-bang up to nine SCL pulses with SDA
+// released: nine is enough for any target to clock out the rest of its byte
+// plus the ACK, after which it releases SDA and we can issue a clean STOP.
+//
+// The pins are temporarily taken back from the I2C peripheral to plain GPIO
+// to do this, then handed back. GPIO40/41 belong to CPU2 (assigned by CPU1
+// in BTS_HAL_setupCpu2Pins), so these writes are permitted here.
+//
+#define BTS_I2CB_SDA_PIN   40U
+#define BTS_I2CB_SCL_PIN   41U
+#define BTS_I2CB_RECOVERY_PULSES  9U
+
+//
+// Half-bit delay for the recovery clocking, ~5 us => ~100 kHz. SysCtl_delay
+// is 5 cycles per count, so this is SYSCLK/(5*200000).
+//
+#define BTS_I2C_RECOVERY_HALFBIT  ((DEVICE_SYSCLK_FREQ / 1000000U) * 1U)
+
+//
+// Counts how often the wire had to be freed. Non-zero means a transfer was
+// interrupted mid-byte - worth knowing, since it is invisible otherwise.
+//
+volatile uint16_t BTS_dbgBusRecoveries = 0U;
+volatile uint16_t BTS_dbgBusRecoverOk  = 0xFFU;
+
+static bool i2cRecoverBus(void)
+{
+    uint16_t i;
+    bool     freed;
+
+    BTS_dbgBusRecoveries++;
+
+    //
+    // Park the module so it is not driving the pins while we do.
+    //
+    // Clearing IRS is not enough on its own: STP survives it, so the module
+    // resumes clamping SCL the moment it is re-enabled. Zero the whole mode
+    // register so the controller genuinely lets go of both wires first -
+    // otherwise the bit-banging below fights the peripheral for the pins and
+    // the nine pulses accomplish nothing.
+    //
+    I2C_disableModule(I2CB_BASE);
+    HWREGH(I2CB_BASE + I2C_O_MDR) = 0U;
+
+    //
+    // Both pins to open-drain GPIO. SDA stays an input so a target can keep
+    // driving it; only SCL is driven, and only low - the bus pull-ups provide the
+    // high level, as an open-drain bus requires.
+    //
+    GPIO_setPinConfig(GPIO_40_GPIO40);
+    GPIO_setPinConfig(GPIO_41_GPIO41);
+    GPIO_setPadConfig(BTS_I2CB_SDA_PIN, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
+    GPIO_setPadConfig(BTS_I2CB_SCL_PIN, GPIO_PIN_TYPE_OD | GPIO_PIN_TYPE_PULLUP);
+    GPIO_setDirectionMode(BTS_I2CB_SDA_PIN, GPIO_DIR_MODE_IN);
+    GPIO_setDirectionMode(BTS_I2CB_SCL_PIN, GPIO_DIR_MODE_OUT);
+    GPIO_writePin(BTS_I2CB_SCL_PIN, 1);
+
+    //
+    // Nine pulses, ~100 kHz so the slowest target on the bus can follow.
+    // Stop early the moment SDA floats high - the target has let go.
+    //
+    for (i = 0U; i < BTS_I2CB_RECOVERY_PULSES; i++) {
+        if (GPIO_readPin(BTS_I2CB_SDA_PIN) != 0U) {
+            break;
+        }
+        GPIO_writePin(BTS_I2CB_SCL_PIN, 0);
+        SysCtl_delay(BTS_I2C_RECOVERY_HALFBIT);
+        GPIO_writePin(BTS_I2CB_SCL_PIN, 1);
+        SysCtl_delay(BTS_I2C_RECOVERY_HALFBIT);
+    }
+
+    //
+    // Both wires have to be released, not just SDA. The failure actually seen
+    // here clamped SCL while SDA floated high, so an SDA-only test reported
+    // 'still stuck' on a bus whose data line had never been the problem, and
+    // reported nothing at all about the line that was.
+    //
+    freed = (GPIO_readPin(BTS_I2CB_SDA_PIN) != 0U) &&
+            (GPIO_readPin(BTS_I2CB_SCL_PIN) != 0U);
+
+    //
+    // Manual STOP: SDA low->high while SCL is high. Leaves every target in
+    // its idle state rather than half-addressed.
+    //
+    GPIO_setDirectionMode(BTS_I2CB_SDA_PIN, GPIO_DIR_MODE_OUT);
+    GPIO_writePin(BTS_I2CB_SDA_PIN, 0);
+    SysCtl_delay(BTS_I2C_RECOVERY_HALFBIT);
+    GPIO_writePin(BTS_I2CB_SCL_PIN, 1);
+    SysCtl_delay(BTS_I2C_RECOVERY_HALFBIT);
+    GPIO_writePin(BTS_I2CB_SDA_PIN, 1);
+    SysCtl_delay(BTS_I2C_RECOVERY_HALFBIT);
+    GPIO_setDirectionMode(BTS_I2CB_SDA_PIN, GPIO_DIR_MODE_IN);
+
+    //
+    // Hand the pins back and re-establish the controller from scratch: the
+    // prescaler and bit count are part of initI2C_Master(), so reusing it
+    // keeps one definition of the module's configuration.
+    //
+    GPIO_setPinConfig(GPIO_40_SDAB);
+    GPIO_setPinConfig(GPIO_41_SCLB);
+    initI2C_Master();
+
+    BTS_dbgBusRecoverOk = freed ? 1U : 0U;
+    return freed;
+}
+
 static bool i2cMasterWaitBusFree(void)
 {
     //
@@ -392,6 +608,16 @@ static bool i2cMasterWaitBusFree(void)
             I2C_clearStatus(I2CB_BASE,
                             I2C_STS_NO_ACK | I2C_STS_ARB_LOST |
                             I2C_STS_REG_ACCESS_RDY | I2C_STS_STOP_CONDITION);
+
+            if (!I2C_isBusBusy(I2CB_BASE)) {
+                return true;
+            }
+
+            //
+            // Still busy after a module reset: the controller is not the
+            // problem, a target is holding the wire. Clock it free.
+            //
+            (void)i2cRecoverBus();
             return !I2C_isBusBusy(I2CB_BASE);
         }
     }
@@ -1156,6 +1382,40 @@ static void saveAllCalibration(void)
 #define STATE_EEPROM_BYTES (2U * (uint16_t)sizeof(BTS_slotRuntimeState))
 
 //
+// Save/restore instrumentation. The F-RAM write result was previously
+// discarded, so a failing transfer looked identical to a successful one.
+//
+volatile uint16_t BTS_dbgSaveOk    = 0xFFU;
+volatile uint16_t BTS_dbgSaveCh    = 0xFFU;
+volatile uint16_t BTS_dbgSaveFails = 0U;
+volatile uint16_t BTS_dbgReadOk    = 0xFFU;
+volatile uint16_t BTS_dbgValidOk   = 0xFFU;
+volatile uint32_t BTS_dbgHdrSeen   = 0xFFFFFFFFUL;
+volatile uint32_t BTS_dbgCrcSeen   = 0UL;
+volatile uint32_t BTS_dbgCrcCalc   = 0UL;
+
+
+//
+// The record must fit inside its stride. A 40-byte record in a 32-byte stride
+// silently corrupted seven of the eight slots for weeks; this makes the same
+// mistake a build error instead of a field failure.
+//
+// A negative array bound is a hard error in any C compiler, so a violated
+// condition fails the build rather than the field. Typedef'd, so it costs
+// nothing at runtime and may appear at file scope.
+//
+typedef char bts_stateRecordFitsStride[
+    (STATE_EEPROM_BYTES <= STATE_FRAM_STRIDE) ? 1 : -1];
+
+//
+// The record should fill its stride exactly: 32 C28x words = 64 wire bytes.
+// If this fires, a field was added without taking the words back out of
+// `reserved`, and every slot after slot 0 is about to be corrupted.
+//
+typedef char bts_stateRecordFillsStride[
+    (STATE_EEPROM_BYTES == STATE_FRAM_STRIDE) ? 1 : -1];
+
+//
 // Same generator and seed as calibrationCrc32(), over a different struct.
 //
 static uint32_t slotStateCrc32(const BTS_slotRuntimeState *st)
@@ -1259,7 +1519,22 @@ static bool saveSlotState(uint16_t channel)
     st.dischargeMah     = registers[rtBase + BTS_RT_DISCHARGE_MAH];
     st.dischargeMwh     = registers[rtBase + BTS_RT_DISCHARGE_MWH];
     st.dischargeSeconds = registers[rtBase + BTS_RT_DISCHARGE_SECONDS];
+
+    //
+    // Slot settings travel with the runtime record, not the calibration
+    // image, so changing a charge current never rewrites calibration.
+    //
+    {
+        uint16_t setBase = BTS_SET_BASE(channel);
+        st.voltageMin = registers[setBase + BTS_SET_V_MIN];
+        st.voltageMax = registers[setBase + BTS_SET_V_MAX];
+        st.currentMin = registers[setBase + BTS_SET_I_MIN];
+        st.currentMax = registers[setBase + BTS_SET_I_MAX];
+    }
+
     st.saveCounter      = ++slotStateSaveCounter[channel];
+    st.reserved[0]      = 0UL;
+    st.reserved[1]      = 0UL;
     st.crc32            = slotStateCrc32(&st);
 
     return writeSlotState(channel, &st);
@@ -1280,15 +1555,34 @@ static void loadSlotStates(void)
 
     for (ch = 0; ch < NUM_CHANNELS; ch++) {
         BTS_slotRuntimeState st;
-        uint16_t rtBase = BTS_RT_BASE(ch);
+        uint16_t rtBase  = BTS_RT_BASE(ch);
+        uint16_t setBase = BTS_SET_BASE(ch);
 
-        if (readSlotState(ch, &st) && validateSlotState(&st, ch)) {
+        bool rdOk = readSlotState(ch, &st);
+        bool vdOk = rdOk && validateSlotState(&st, ch);
+        if (ch == 0U) {
+            BTS_dbgReadOk  = rdOk ? 1U : 0U;
+            BTS_dbgValidOk = vdOk ? 1U : 0U;
+            BTS_dbgHdrSeen = st.header;
+            BTS_dbgCrcSeen = st.crc32;
+            BTS_dbgCrcCalc = slotStateCrc32(&st);
+        }
+
+        if (vdOk) {
             registers[rtBase + BTS_RT_CHARGE_MAH]        = st.chargeMah;
             registers[rtBase + BTS_RT_CHARGE_MWH]        = st.chargeMwh;
             registers[rtBase + BTS_RT_CHARGE_SECONDS]    = st.chargeSeconds;
             registers[rtBase + BTS_RT_DISCHARGE_MAH]     = st.dischargeMah;
             registers[rtBase + BTS_RT_DISCHARGE_MWH]     = st.dischargeMwh;
             registers[rtBase + BTS_RT_DISCHARGE_SECONDS] = st.dischargeSeconds;
+
+            //
+            // Slot settings come back with the runtime record.
+            //
+            registers[setBase + BTS_SET_V_MIN] = st.voltageMin;
+            registers[setBase + BTS_SET_V_MAX] = st.voltageMax;
+            registers[setBase + BTS_SET_I_MIN] = st.currentMin;
+            registers[setBase + BTS_SET_I_MAX] = st.currentMax;
 
             slotStateSaveCounter[ch] = st.saveCounter;
             restoreFlags |= (st.stateFlags & BTS_STATE_FLAGS_MASK)
@@ -1300,6 +1594,16 @@ static void loadSlotStates(void)
             registers[rtBase + BTS_RT_DISCHARGE_MAH]     = 0.0f;
             registers[rtBase + BTS_RT_DISCHARGE_MWH]     = 0.0f;
             registers[rtBase + BTS_RT_DISCHARGE_SECONDS] = 0.0f;
+
+            //
+            // No valid record - install the compiled limits rather than
+            // leaving zeros, which would present as a 0 A / 0 V slot.
+            //
+            registers[setBase + BTS_SET_V_MIN] = DEFAULT_SLOT_VOLTAGE_MIN;
+            registers[setBase + BTS_SET_V_MAX] = DEFAULT_SLOT_VOLTAGE_MAX;
+            registers[setBase + BTS_SET_I_MIN] = DEFAULT_SLOT_CURRENT_MIN;
+            registers[setBase + BTS_SET_I_MAX] = DEFAULT_SLOT_CURRENT_MAX;
+
             slotStateSaveCounter[ch] = 0UL;
         }
     }
@@ -1698,6 +2002,23 @@ static volatile uint16_t     adsPending[2] = {0U, 0U};
 static uint16_t              adsRxBytes[2][2];
 static uint16_t              adsRxCount[2] = {0U, 0U};
 static uint32_t              adsGuard[2]   = {0U, 0U};
+
+//
+// Consecutive service passes that found I2CB busy while a conversion was
+// waiting to be read. The main loop runs this far faster than the 20 SPS
+// conversion rate, so a genuine transfer by the other converter or the F-RAM
+// clears in a handful of passes; this threshold is well beyond that and only
+// a truly wedged controller can reach it.
+//
+#define ADS1119_BUS_STALL_PASSES  2000U
+static uint16_t              adsBusBusyPasses[2] = {0U, 0U};
+
+//
+// Times the temperature path had to invoke bus recovery. Distinct from
+// BTS_dbgBusRecoveries, which counts the bit-banging itself: this says the
+// stall was detected HERE, on the path that had no recovery at all before.
+//
+volatile uint16_t BTS_dbgAdsBusStalls = 0U;
 static uint32_t              adsDwellStart[2] = {0U, 0U};
 static uint16_t              adsSampleCh[2] = {0U, 0U};
 
@@ -1818,9 +2139,34 @@ static void ads1119Service(uint16_t unit)
         // Only start once DRDY has fired and the bus is genuinely free - the
         // other converter, the F-RAM, or a calibration save may be using it.
         //
-        if ((adsPending[unit] == 0U) || I2C_isBusBusy(I2CB_BASE)) {
+        if (adsPending[unit] == 0U) {
             return;
         }
+
+        if (I2C_isBusBusy(I2CB_BASE)) {
+            //
+            // Busy is normal for a few passes while another transfer on this
+            // bus finishes. Permanently busy is not, and it used to be
+            // invisible here: this branch simply returned, so a wedged
+            // controller parked the state machine in eAdsIdle forever and
+            // every channel reported 0.00 degrees C while both converters
+            // still answered 'ok' at boot.
+            //
+            // i2cMasterWaitBusFree() is the only function that can recover
+            // the bus, but it spins, and this runs in the main loop next to
+            // the host interfaces. So count the busy passes instead and call
+            // it once the bus has been stuck far longer than any legitimate
+            // transfer could take - the recovery itself is bounded.
+            //
+            if (++adsBusBusyPasses[unit] > ADS1119_BUS_STALL_PASSES) {
+                adsBusBusyPasses[unit] = 0U;
+                BTS_dbgAdsBusStalls++;
+                (void)i2cMasterWaitBusFree();
+            }
+            return;
+        }
+
+        adsBusBusyPasses[unit] = 0U;
 
         adsPending[unit] = 0U;
         adsRxCount[unit] = 0U;
@@ -1912,7 +2258,8 @@ static void ads1119Service(uint16_t unit)
             // drops any conversion left over from the previous input, so
             // whatever arrives now genuinely belongs to this channel.
             //
-            publishCellTemp(channel + (unit * ADS1119_CHANNELS_PER_DEV),
+            publishCellTemp(ADS1119_SLOT_FOR_AIN(channel) +
+                                (unit * ADS1119_CHANNELS_PER_DEV),
                             mVToTemperature(mV), true);
         }
 
@@ -2393,13 +2740,6 @@ static volatile uint16_t hostWdRemaining_s = 0U;
 static volatile uint16_t hostWdExpired = 0U;
 
 //
-// Set when a host disables the watchdog. The warning is printed from the
-// idle loop, not from the interrupt the write arrives in - uartSendResponse()
-// blocks per character and would hold off the host mid-transaction.
-//
-static volatile uint16_t hostWdDisableWarn = 0U;
-
-//
 // Reloads the host watchdog. Called from exactly one place per interface:
 // applyHostRegisterWrite() covers the I2C, UART and CAN write paths, and
 // i2cSlaveFifoISR()'s transmit path covers an I2C read.
@@ -2627,20 +2967,26 @@ static void applyHostRegisterWrite(uint16_t regIdx, float32_t value)
     //
     hostWatchdogFeed();
 
-    if (regIdx == BTS_REG_IDX(eHostWatchdog_s)) {
-        //
-        // Disabling supervision on a machine that charges lithium cells
-        // unattended is worth saying out loud - it is a legitimate bench
-        // setting and a dangerous production one. Printed from the idle
-        // loop; this runs inside an interrupt.
-        //
-        if (value == 0.0f) {
-            hostWdDisableWarn = 1U;
-        }
-    }
-
     if (regIdx == BTS_REG_IDX(eCalibrationMode) && value == 2.0f) {
         calibrationSavePending = 1U;
+    }
+
+    //
+    // A slot limit changed: mark that slot for an immediate save rather than
+    // waiting out the 6 s periodic sweep, so a power cut seconds after an
+    // operator sets a charge current cannot lose it. The write itself still
+    // happens from the idle loop - F-RAM is never written from an ISR, and
+    // this runs inside one.
+    //
+    if ((regIdx >= BTS_SET_BASE(0)) &&
+        (regIdx < (BTS_SET_BASE(0) + (NUM_CHANNELS * BTS_SET_REGS_PER_CH)))) {
+        uint16_t setOffset = (uint16_t)(regIdx - BTS_SET_BASE(0));
+        uint16_t field     = setOffset % BTS_SET_REGS_PER_CH;
+
+        if ((field == BTS_SET_V_MIN) || (field == BTS_SET_V_MAX) ||
+            (field == BTS_SET_I_MIN) || (field == BTS_SET_I_MAX)) {
+            stateSavePending[setOffset / BTS_SET_REGS_PER_CH] = 1U;
+        }
     }
 
     //
@@ -2770,21 +3116,12 @@ void BTS_serviceDeferredWork(void)
         for (ch = 0; ch < NUM_CHANNELS; ch++) {
             if (stateSavePending[ch] != 0U) {
                 stateSavePending[ch] = 0U;
-                (void)saveSlotState(ch);
+                BTS_dbgSaveOk = saveSlotState(ch) ? 1U : 0U;
+                BTS_dbgSaveCh = ch;
+                if (BTS_dbgSaveOk == 0U) { BTS_dbgSaveFails++; }
                 break;
             }
         }
-    }
-
-    //
-    // Deferred from applyHostRegisterWrite(): uartSendResponse() blocks per
-    // character, far too long to run inside the interrupt the write arrived
-    // in.
-    //
-    if (hostWdDisableWarn != 0U) {
-        hostWdDisableWarn = 0U;
-        uartSendResponse("WARNING: host watchdog DISABLED - slots will not "
-                         "pause if the host stops responding");
     }
 
     //

@@ -515,6 +515,25 @@ typedef struct _BTS_channelCalibration
 // mid-run when the unit reset comes back knowing what it was doing and how
 // far it had got. Restored as PAUSED, never resumed - see loadSlotStates().
 //
+//
+// Layout is fixed at 32 words = 64 wire bytes, matching STATE_FRAM_STRIDE
+// exactly. The previous revision was 20 words = 40 bytes against a 32-byte
+// stride, so every slot's record ran 8 bytes into the next slot's header and
+// clobbered its saveCounter and crc32 - only slot 7 could ever validate.
+// Keep sizeof(BTS_slotRuntimeState) * 2 <= STATE_FRAM_STRIDE; there is a
+// compile-time check on this in com_cpu2.c.
+//
+// The per-slot voltage and current limits live HERE, with the runtime data -
+// deliberately NOT in BTS_channelCalibration. Calibration is measured once
+// against a reference and should not be rewritten every time an operator
+// changes a charge current, which is what kept putting the calibration image
+// at risk of corruption.
+//
+// crc32 is the LAST member so it occupies the final 4 bytes of the record.
+// New fields consume `reserved` and every existing offset - including the
+// CRC's - stays put, so an older record still validates against the same
+// generator. Shrink `reserved` when adding a field; never append past crc32.
+//
 typedef struct _BTS_slotRuntimeState
 {
     uint32_t  header;           // BTS_STATE_HEADER | channel
@@ -525,11 +544,24 @@ typedef struct _BTS_slotRuntimeState
     float32_t dischargeMah;
     float32_t dischargeMwh;
     float32_t dischargeSeconds;
+    //
+    // Slot settings. Runtime information, not calibration.
+    //
+    float32_t voltageMin;
+    float32_t voltageMax;
+    float32_t currentMin;
+    float32_t currentMax;
     uint32_t  saveCounter;      // increments every save; staleness/wear info
-    uint32_t  crc32;            // over all preceding fields
+    uint32_t  reserved[2];      // expansion; zero-filled, covered by the CRC
+    uint32_t  crc32;            // over all preceding fields - keep LAST
 } BTS_slotRuntimeState;
 
-#define BTS_STATE_HEADER       0x5A5E0000UL
+//
+// Bumped 0x5A5E -> 0x5A5F with the 64-byte record. Old records were written
+// with an overrunning stride and cannot be trusted, so they must fail the
+// header test rather than be reinterpreted against the new layout.
+//
+#define BTS_STATE_HEADER       0x5A5F0000UL
 #define BTS_STATE_HEADER_MASK  0xFFFF0000UL
 #define BTS_STATE_CHANNEL_MASK 0x0000FFFFUL
 #define BTS_STATE_MAKE_HEADER(ch)  (BTS_STATE_HEADER | ((uint32_t)(ch) & BTS_STATE_CHANNEL_MASK))
