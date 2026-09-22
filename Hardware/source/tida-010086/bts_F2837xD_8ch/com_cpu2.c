@@ -2122,6 +2122,13 @@ static void ads1119Abort(uint16_t unit)
         }
     }
 }
+//
+// Set while a blocking F-RAM transfer owns I2CB. Defined with the bus
+// arbitration helpers below; declared here because the state machine must
+// stand off while it is set.
+//
+extern volatile uint16_t i2cbFramBusy;
+
 
 //
 // Advances one converter by a single step. Returns immediately whenever the
@@ -2131,6 +2138,18 @@ static void ads1119Service(uint16_t unit)
 {
     uint16_t devAddr = (unit == 0U) ? ADS1119_ADDR_1 : ADS1119_ADDR_2;
     uint16_t status  = I2C_getStatus(I2CB_BASE);
+
+    //
+    // The F-RAM owns the bus. Do not start or advance a frame while a
+    // blocking transfer is running - interleaving the two is exactly the
+    // corruption this guard exists to prevent. The converters are parked
+    // in eAdsIdle or eAdsSettle whenever the F-RAM can acquire, so nothing
+    // is in flight to lose; any DRDY edge that arrives meanwhile stays
+    // latched in adsPending[] and is serviced on the next pass.
+    //
+    if (i2cbFramBusy != 0U) {
+        return;
+    }
 
     switch (adsState[unit]) {
 
@@ -2467,6 +2486,113 @@ static void ads1119Service(uint16_t unit)
         return;
     }
 }
+//
+//=============================================================================
+// I2CB bus arbitration
+//=============================================================================
+//
+// I2CB carries three devices: the FM24V10 F-RAM at 0x50 and the two ADS1119
+// converters at 0x40/0x41. They are driven by two incompatible styles of
+// access from the same idle loop:
+//
+//   - the ADS1119s use the non-blocking state machine above, which leaves a
+//     transfer IN FLIGHT across service calls (a frame is started in one
+//     call and completed several calls later);
+//   - the F-RAM uses the blocking helpers, which drive a whole frame to
+//     completion inside one call.
+//
+// Nothing used to keep them apart. BTS_serviceDeferredWork() would start a
+// blocking F-RAM frame while the state machine was part way through its own,
+// so the two frames were interleaved on the wire: the F-RAM write was issued
+// on top of an ADS1119 read, both were corrupted, the controller was left
+// holding SCL, and the recovery that followed could not free it either.
+// Measured on hardware 2026-09-22: every F-RAM access failed
+// (BTS_dbgSaveOk/BTS_dbgReadOk 0) with BTS_dbgSaveFails and
+// BTS_dbgBusRecoveries climbing together once per attempt, while both
+// converters carried on reading correctly.
+//
+// The rule is now explicit: either the F-RAM is on the bus or the ADS1119s
+// are, never both.
+//
+// Only the two states that hold no transaction are safe to interrupt.
+// eAdsIdle is parked waiting for a DRDY edge, and eAdsSettle is waiting out
+// the 60 ms post-mux dwell - by far the longest state, so the F-RAM gets a
+// generous window on every channel step. Every other state has a frame open
+// on the wire.
+//
+// No lock is taken against the DRDY ISRs. They only set adsPending[], never
+// touch the bus, so an edge arriving during an F-RAM transfer is simply
+// serviced once the bus is handed back.
+//
+volatile uint16_t i2cbFramBusy = 0U;
+
+//
+// True when neither converter has a frame open, so the F-RAM may take the
+// bus. The F-RAM claims it first and re-checks, because a single service
+// pass can move a unit out of a parked state.
+//
+static bool adsBothParked(void)
+{
+    bool unit0Parked = (adsState[0] == eAdsIdle) || (adsState[0] == eAdsSettle);
+    bool unit1Parked = (adsState[1] == eAdsIdle) || (adsState[1] == eAdsSettle);
+
+    return unit0Parked && unit1Parked;
+}
+
+//
+// Claims I2CB for a blocking F-RAM transfer.
+//
+// Returns false if either converter has a frame open; the caller must then
+// leave its request pending and retry on a later pass rather than force the
+// transfer through. The bus must also be physically idle - a stop from the
+// previous frame may still be on the wire.
+//
+static bool i2cbFramAcquire(void)
+{
+    if (i2cbFramBusy != 0U) {
+        return false;
+    }
+
+    if (!adsBothParked()) {
+        return false;
+    }
+
+    //
+    // Claim before the final bus check. ads1119Service() honours this flag
+    // and will not start a new frame while it is set, so once it is taken
+    // the parked state cannot change underneath the transfer.
+    //
+    i2cbFramBusy = 1U;
+
+    //
+    // The converters are parked, so any residual BUS_BUSY is not a frame in
+    // progress - it is the latched BB bit left by a transfer that ended
+    // without a stop reaching the wire. Left alone it never clears, every
+    // setTargetAddress() is ignored, and the F-RAM is unreachable for good
+    // (measured: BTS_dbgSaveOk/BTS_dbgReadOk stuck at 0 with I2CSTR BUSBSY
+    // set and I2CSAR still holding 0x50).
+    //
+    // i2cMasterWaitBusFree() is the bounded recovery: it waits, then resets
+    // the module through nIRS, and finally bit-bangs the target free if a
+    // device is holding the wire. Calling it here is what makes the bus
+    // recover by itself rather than needing a power cycle. It is safe to
+    // spin here because this is the idle loop and nothing is in flight.
+    //
+    if (I2C_isBusBusy(I2CB_BASE)) {
+        if (!i2cMasterWaitBusFree()) {
+            i2cbFramBusy = 0U;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void i2cbFramRelease(void)
+{
+    i2cbFramBusy = 0U;
+}
+
 
 //
 // Drives both converters. Called from the idle loop; performs at most one
@@ -3115,10 +3241,22 @@ void BTS_serviceDeferredWork(void)
         uint16_t ch;
         for (ch = 0; ch < NUM_CHANNELS; ch++) {
             if (stateSavePending[ch] != 0U) {
+                //
+                // Take the bus first. If a converter has a frame open the
+                // request stays pending and is retried next pass - the save
+                // is deferred, never dropped and never forced through on
+                // top of an ADS1119 transfer.
+                //
+                if (!i2cbFramAcquire()) {
+                    break;
+                }
+
                 stateSavePending[ch] = 0U;
                 BTS_dbgSaveOk = saveSlotState(ch) ? 1U : 0U;
                 BTS_dbgSaveCh = ch;
                 if (BTS_dbgSaveOk == 0U) { BTS_dbgSaveFails++; }
+
+                i2cbFramRelease();
                 break;
             }
         }
@@ -3132,6 +3270,14 @@ void BTS_serviceDeferredWork(void)
         uint16_t slot  = calRuntimeSaveSlot;
         uint32_t flags = calRuntimeSaveFlags;
         uint32_t st;
+
+        //
+        // Same rule as the slot save: only on an idle bus. Leave the
+        // request pending if a converter is mid-frame.
+        //
+        if (!i2cbFramAcquire()) {
+            return;
+        }
 
         calRuntimeSavePending = 0U;
 
@@ -3149,9 +3295,21 @@ void BTS_serviceDeferredWork(void)
             st = (uint32_t)registers[BTS_REG_IDX(eCalStatus)] | (1UL << BTS_CAL_ST_FAILED);
             registers[BTS_REG_IDX(eCalStatus)] = (float32_t)st;
         }
+
+        i2cbFramRelease();
     }
 
     if (calibrationSavePending == 0U) {
+        return;
+    }
+
+    //
+    // Eight blocking block-writes back to back. This is the longest hold
+    // on I2CB in the system, so it waits for both converters to be parked
+    // and keeps the bus for the whole batch rather than letting a frame
+    // start between channels.
+    //
+    if (!i2cbFramAcquire()) {
         return;
     }
 
@@ -3161,6 +3319,8 @@ void BTS_serviceDeferredWork(void)
     //
     calibrationSavePending = 0U;
     saveAllCalibration();
+
+    i2cbFramRelease();
 }
 
 //
