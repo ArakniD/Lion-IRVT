@@ -10,4 +10,4 @@ On completion, record the ToDo completion at the end of this Agent.mds
 
 | ToDo | Completed | Commit | Notes |
 |---|---|---|---|
-| `01.Canbus telemetry.md` | 2026-09-24 | `TBD` | Fixed-point 8-byte frame carrying state, V, I, mAh and mWh. Breaking wire change; in-tree host decoder updated with it. Compile-verified only - no hardware this session. |
+| `01.Canbus telemetry.md` | 2026-09-24 | `8cb945d` | Fixed-point 8-byte frame carrying state, V, I, mAh and mWh. Breaking wire change; in-tree host decoder updated with it. Compile-verified only - no hardware this session. |
