@@ -3,9 +3,24 @@
 Authoritative design for the externally-referenced, per-slot calibration process
 across the C2000 BTS firmware, the ESP32 proxy, and the bench automation script.
 
-This document is the contract. Implementations must not deviate from the register
-addresses, command opcodes, status bits, or mathematics defined here without
-updating this file first.
+This document is the contract for the **mathematics, the opcodes, the state
+machine and the F-RAM layout**. Implementations must not deviate from those
+without updating this file first.
+
+> ### The register addresses in this document are from the v1 map and are stale
+>
+> It was written before the v2 reorder (2026-09-19) and the settings
+> compression (2026-09-22), and its addresses — `eCalSlot` at 1036, the
+> telemetry window at 1056–1088, the per-slot calibration block at settings
+> offset 11 — are all superseded. The calibration control block now lives at
+> **1008–1024** and its telemetry at **1032–1064**, with the calibration group
+> at `BTS_SET_BASE(ch) + 6`.
+>
+> **For any address, read
+> [`api-specification.md`](api-specification.md) §2.8**, which is verified
+> against `registers.h`. Everything else here — the two-point fit, the capture
+> windows, the opcode and status-bit numbering, the validation limits and the
+> F-RAM block layout — is current and is still the contract.
 
 ---
 

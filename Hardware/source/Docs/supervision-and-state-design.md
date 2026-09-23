@@ -52,18 +52,22 @@ not shift everything again.
 | Region | Base | Stride | Regs/slot | Range |
 |---|---|---|---|---|
 | **Runtime** (RO) | 0 | 48 B (12 regs) | 12 | 0 – 383 |
-| **Settings** (RW) | 384 | 96 B (24 regs) | 24 | 384 – 1151 |
-| **Unit** | 1152 | — | — | 1152 – 1256 |
+| **Settings** (RW) | 384 | 72 B (18 regs) | 18 | 384 – 959 |
+| **Unit** | 960 | — | 27 total | 960 – 1064 |
 
 Verified arithmetic: runtime ch7 ends at 383, immediately before the settings
-base; settings ch7 ends at 1151, immediately before the unit base.
+base; settings ch7 ends at 959, immediately before the unit base.
 
-**Total 315 registers**, top address 1256. That is 10 more than v1's 305: the
-16 new run-time-seconds registers, less the 16 deleted min/max-voltage
-registers, plus 8 spare settings slots, the watchdog timeout register and the
-watchdog countdown register. Costs **19 words** of `CPU2TOCPU1RAM`. Confirm
-against the map file after building — overflow here is a link-time failure
-(`#10099-D`).
+**Total 267 registers**, top address 1064.
+
+> **Revised 2026-09-22.** This document originally specified a 24-register
+> settings stride, a unit base of 1152 and 315 registers in total. The
+> settings region was then compressed to 18 registers per slot — the
+> charge/discharge limit split collapsed into one direction-agnostic pair of
+> each, and `eChX_MinCellTemp` and the per-slot spare were removed. The tables
+> below are the current layout. Costs **534 words** of `CPU2TOCPU1RAM` for the
+> register file. Confirm against the map file after building — overflow here
+> is a link-time failure (`#10099-D`).
 
 ### 1.3 Runtime block — `BTS_RT_BASE(ch)`, stride 48
 
@@ -86,68 +90,72 @@ Everything a host polls at 1 Hz, in one burst of 12 registers.
 
 All `REG_ACCESS_RO`. Channel 0 at 0–47, channel 7 at 336–383.
 
-### 1.4 Settings block — `BTS_SET_BASE(ch)`, stride 96
+### 1.4 Settings block — `BTS_SET_BASE(ch)`, stride 72
 
 Everything a host writes, grouped per slot so configuring a slot is also one
-burst. 24 registers of which 21 are used; 3 spare for future settings.
+burst. All 18 registers are used; there is no spare left.
 
 | Offset | Enum | Access |
 |---|---|---|
 | +0 | `eChX_Mode` | RW |
-| +4 | `eChX_ChargeVoltageMin` | RW |
-| +8 | `eChX_ChargeVoltageMax` | RW |
-| +12 | `eChX_DischargeVoltageMin` | RW |
-| +16 | `eChX_DischargeVoltageMax` | RW |
-| +20 | `eChX_ChargeCurrentMin` | RW |
-| +24 | `eChX_ChargeCurrentMax` | RW |
-| +28 | `eChX_DischargeCurrentMin` | RW |
-| +32 | `eChX_DischargeCurrentMax` | RW |
-| +36 | `eChX_MinCellTemp` | RW |
-| +40 | `eChX_MaxCellTemp` | RW |
-| +44 | `eChX_F28V_Gain` | RW |
-| +48 | `eChX_F28V_Offset` | RW |
-| +52 | `eChX_F28I_Gain` | RW |
-| +56 | `eChX_F28I_Offset` | RW |
-| +60 | `eChX_IoutGain_pu` | RW |
-| +64 | `eChX_IoutOffset_pu` | RW |
-| +68 | `eChX_IoutGain_A` | RW |
-| +72 | `eChX_IoutOffset_A` | RW |
-| +76 | `eChX_VoutGain_pu` | RW |
-| +80 | `eChX_VoutOffset_pu` | RW |
-| +84 | `eChX_VoutGain_V` | RW |
-| +88 | `eChX_VoutOffset_V` | RW |
-| +92 | *(spare)* | — |
+| +4 | `eChX_VoltageMin` | RW |
+| +8 | `eChX_VoltageMax` | RW |
+| +12 | `eChX_CurrentMin` | RW |
+| +16 | `eChX_CurrentMax` | RW |
+| +20 | `eChX_MaxCellTemp` | RW |
+| +24 | `eChX_F28V_Gain` | RW |
+| +28 | `eChX_F28V_Offset` | RW |
+| +32 | `eChX_F28I_Gain` | RW |
+| +36 | `eChX_F28I_Offset` | RW |
+| +40 | `eChX_IoutGain_pu` | RW |
+| +44 | `eChX_IoutOffset_pu` | RW |
+| +48 | `eChX_IoutGain_A` | RW |
+| +52 | `eChX_IoutOffset_A` | RW |
+| +56 | `eChX_VoutGain_pu` | RW |
+| +60 | `eChX_VoutOffset_pu` | RW |
+| +64 | `eChX_VoutGain_V` | RW |
+| +68 | `eChX_VoutOffset_V` | RW |
+
+**The limits are direction-agnostic.** A slot's direction comes from the mode
+register, so one `VoltageMin`/`VoltageMax` and one `CurrentMin`/`CurrentMax`
+pair serves both charge and discharge. The eight-register split that preceded
+this — `eChX_ChargeVoltageMin` and its siblings — is gone from both headers,
+along with `eChX_MinCellTemp`: only a maximum cell temperature is enforced.
+
+The four limits are **not** stored in the calibration image. They live in the
+slot's F-RAM runtime-state record (§5), so changing a charge current does not
+rewrite — and cannot corrupt — a calibration measured against a reference.
 
 The 12-register calibration block keeps its internal order, so
 `BTS_CAL_F28V_GAIN`..`BTS_CAL_VOUT_OFFSET_V` remain offsets 0..11 **relative to
-`eChX_F28V_Gain`**. `saveCalibration()`/`loadCalibration()` index through a new
-`BTS_CAL_BASE(ch) = BTS_SET_BASE(ch) + 11` and need no other change.
+`eChX_F28V_Gain`**. `saveCalibration()`/`loadCalibration()` index through
+`BTS_CAL_BASE(ch) = BTS_SET_BASE(ch) + 6` and need no other change.
 
-### 1.5 Unit block — base 1152
+### 1.5 Unit block — base 960
 
 | Addr | Enum | Access |
 |---|---|---|
-| 1152 | `eChargeDisableV` | RW |
-| 1156 | `eChargeRestrictV` | RW |
-| 1160 | `eDischargeRestrictV` | RW |
-| 1164 | `eDischargeDisableV` | RW |
-| 1168 | `eCalibrationMode` | RW |
-| 1172 | `eUnitState` | RO |
-| 1176 | `eInputVoltage` | RO |
-| 1180 | `eTripStatus` | RO |
-| 1184 | `eSlotMode` | RO |
-| 1188 | `eSlotEnable` | RO |
-| 1192 | `eGroupSize` | RO |
-| 1196 | `eHostWatchdog_s` | RW | §4 |
-| 1200 | `eCalSlot` | RW |
-| 1204 | `eCalCommand` | RW |
-| 1208 | `eCalArgument` | RW |
-| 1212 | `eCalStatus` | RO |
-| 1216 | `eCalResult` | RO |
-| 1220 | `eWatchdogRemaining_s` | RO | §4 |
+| 960 | `eChargeDisableV` | RW |
+| 964 | `eChargeRestrictV` | RW |
+| 968 | `eDischargeRestrictV` | RW |
+| 972 | `eDischargeDisableV` | RW |
+| 976 | `eCalibrationMode` | RW |
+| 980 | `eUnitState` | RO |
+| 984 | `eInputVoltage` | RO |
+| 988 | `eTripStatus` | RO |
+| 992 | `eSlotMode` | RO |
+| 996 | `eSlotEnable` | RO |
+| 1000 | `eGroupSize` | RO |
+| 1004 | `eHostWatchdog_s` | RW | §4 |
+| 1008 | `eCalSlot` | RW |
+| 1012 | `eCalCommand` | RW |
+| 1016 | `eCalArgument` | RW |
+| 1020 | `eCalStatus` | RO |
+| 1024 | `eCalResult` | RO |
+| 1028 | `eWatchdogRemaining_s` | RO | §4 |
 
-Calibration telemetry (the 9 live values) follows at **1224–1256**, keeping its
-existing internal order. 1256 is the top of the map.
+Calibration telemetry (the 9 live values) follows at **1032–1064**, keeping its
+existing internal order. 1064 is the top of the map.
 
 `eWatchdogRemaining_s` is the live countdown, in seconds, so a host can show
 how long is left rather than only that supervision is armed. It reads **0**
@@ -158,13 +166,30 @@ the register file and the timebase.
 
 ### 1.6 Registers removed
 
-`eChX_MinVoltage` and `eChX_MaxVoltage` (v1 324/328) are **deleted**. They were
-declared RO and never written on either core — 16 registers of permanent 0.0.
-Removing them offsets most of the cost of the 16 new run-time-seconds
+**In the v2 reorder.** `eChX_MinVoltage` and `eChX_MaxVoltage` (v1 324/328)
+were declared RO and never written on either core — 16 registers of permanent
+0.0. Removing them offset most of the cost of the 16 new run-time-seconds
 registers.
 
-If per-run voltage extremes are wanted later, add them to the settings block's
-spare space — and actually write them.
+**In the 2026-09-22 settings compression.** Six more per slot, 48 in total:
+
+| Removed | Replaced by |
+|---|---|
+| `eChX_ChargeVoltageMin`, `eChX_DischargeVoltageMin` | `eChX_VoltageMin` |
+| `eChX_ChargeVoltageMax`, `eChX_DischargeVoltageMax` | `eChX_VoltageMax` |
+| `eChX_ChargeCurrentMin`, `eChX_DischargeCurrentMin` | `eChX_CurrentMin` |
+| `eChX_ChargeCurrentMax`, `eChX_DischargeCurrentMax` | `eChX_CurrentMax` |
+| `eChX_MinCellTemp` | — only a maximum is enforced |
+| `eChX_SettingsSpare` | — no spare remains |
+
+A slot only ever runs in one direction at a time and the mode register says
+which, so the split pairs were never both in force. The saving moved the unit
+block down 192 bytes and the top of the map from 1256 to 1064.
+
+**There is no spare register left in any region.** A new per-slot field now
+means another stride change, which moves every address below it and breaks
+every host — the thing the generous strides were chosen to avoid. Budget for
+that before adding one.
 
 ---
 
