@@ -694,15 +694,59 @@ class SimulatedUnit:
         )
 
     def can_telemetry(self, channel: int) -> tuple[int, bytes]:
-        """Build a periodic telemetry frame, truncated current and all.
+        """Build a periodic telemetry frame.
 
-        The current's high word is genuinely absent here, because it is
-        genuinely absent on the wire - a test that decodes this frame must
-        cope with an unusable current rather than a merely imprecise one.
+        Mirrors ``sendCANData()`` byte for byte, saturation included: the
+        firmware clamps each field rather than wrapping, and a simulator that
+        wrapped instead would let a decoder bug through.
         """
         slot = self.slots[channel]
-        v = struct.pack("<f", slot.voltage_v)
-        c = struct.pack("<f", slot.current_a)
+
+        state = 0
+        if slot.running:
+            state |= (
+                canproto.CAN_STATE_CHARGING
+                if slot.charging
+                else canproto.CAN_STATE_DISCHARGING
+            )
+        if slot.paused:
+            state |= canproto.CAN_STATE_PAUSED
+        # The firmware's FAULT is wider than an over-current trip: a reverse
+        # polarity, a group disconnect or a strap-disabled slot all mean the
+        # same thing to a listener.
+        if slot.fault is not SlotFault.NONE or slot.voltage_v < 0 or not slot.enabled:
+            state |= canproto.CAN_STATE_FAULT
+
+        def clamp_milli(value: float) -> int:
+            return max(-32768, min(32767, int(value * 1000.0)))
+
+        def pack_acc(value: float, scale: int) -> int:
+            if not value > 0:
+                return 0
+            return min(canproto.CAN_ACC_FIELD_MAX, int(value / scale))
+
+        mv = clamp_milli(slot.voltage_v) & 0xFFFF
+        ma = clamp_milli(slot.current_a) & 0xFFFF
+
+        # CAN carries the total for the direction the slot is set to.
+        mah = pack_acc(
+            slot.charge_mah if slot.charging else slot.discharge_mah,
+            canproto.CAN_MAH_SCALE,
+        )
+        mwh = pack_acc(
+            slot.charge_mwh if slot.charging else slot.discharge_mwh,
+            canproto.CAN_MWH_SCALE,
+        )
+
         return canproto.telemetry_id(channel), bytes(
-            [channel, 0, v[0], v[1], v[2], v[3], c[0], c[1]]
+            [
+                (channel & 0x0F) | state,
+                mv & 0xFF,
+                (mv >> 8) & 0xFF,
+                ma & 0xFF,
+                (ma >> 8) & 0xFF,
+                mah & 0xFF,
+                ((mah >> 8) & 0x0F) | ((mwh & 0x0F) << 4),
+                (mwh >> 4) & 0xFF,
+            ]
         )

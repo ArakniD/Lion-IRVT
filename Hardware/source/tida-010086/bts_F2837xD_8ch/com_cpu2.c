@@ -1635,25 +1635,120 @@ void initCAN(void)
     CAN_startModule(CANA_BASE);
 }
 
+//
+// Scales a float accumulator into one of the frame's 12-bit fields.
+//
+// Saturates rather than wraps. A counter that rolls over reads as a fresh
+// test rather than a finished one, which is the more dangerous of the two
+// wrong answers - a listener watching for a cell to reach capacity would see
+// it reset and keep waiting.
+//
+// Negatives clamp to zero: both accumulators hold the magnitude of their own
+// direction, so a negative here would be a defect upstream rather than a
+// value to sign-extend into a field that has no sign bit.
+//
+static uint16_t canPackAccumulator(float32_t value, uint16_t scale)
+{
+    float32_t scaled;
+
+    //
+    // Written as !(> 0) rather than (<= 0) so a NaN - which compares false
+    // against everything - lands here instead of reaching the cast below,
+    // where its conversion would be undefined.
+    //
+    if (!(value > (float32_t)0.0)) {
+        return 0U;
+    }
+
+    scaled = value / (float32_t)scale;
+
+    if (scaled >= (float32_t)BTS_CAN_ACC_FIELD_MAX) {
+        return BTS_CAN_ACC_FIELD_MAX;
+    }
+
+    return (uint16_t)scaled;
+}
+
+//
+// Clamps a float to a signed 16-bit count in milli-units.
+//
+// +/-32.767 V and +/-32.767 A against a 3 V / 10 A board, so saturation here
+// is a fault indication rather than a working range limit - but it must still
+// saturate, because a wrapped value would read as the opposite polarity.
+//
+static int16_t canPackMilli(float32_t value)
+{
+    float32_t milli = value * (float32_t)1000.0;
+
+    //
+    // NaN compares false against both bounds, so it would fall through to the
+    // cast where the result is undefined. Catch it first: zero is the safe
+    // reading for a measurement that does not exist.
+    //
+    if (!(milli == milli)) {
+        return (int16_t)0;
+    }
+
+    if (milli > (float32_t)32767.0) {
+        return (int16_t)32767;
+    }
+    if (milli < (float32_t)-32768.0) {
+        return (int16_t)-32768;
+    }
+
+    return (int16_t)milli;
+}
+
+//
+// Packs one slot into its 8-byte telemetry frame. Layout and scaling are
+// documented at BTS_CAN_MAH_SCALE in registers.h.
+//
+// Everything on the wire is a fixed-point integer. The previous layout put
+// raw floats in the frame and ran out of room, transmitting only the low word
+// of the current - which is not where the sign and exponent are, so the value
+// could not be reconstructed at all, and mAh/mWh did not fit. Scaled integers
+// make the whole slot fit with both accumulators alongside it.
+//
 void sendCANData(uint16_t channel)
 {
     uint16_t data[8];
-    const uint16_t *v;
-    const uint16_t *c;
+    int16_t  mv;
+    int16_t  ma;
+    uint16_t mah;
+    uint16_t mwh;
 
     if (channel >= NUM_CHANNELS) return;
 
-    v = (const uint16_t *)&canData[channel].voltage;
-    c = (const uint16_t *)&canData[channel].current;
+    mv  = canPackMilli(canData[channel].voltage);
+    ma  = canPackMilli(canData[channel].current);
+    mah = canPackAccumulator(canData[channel].mAh, BTS_CAN_MAH_SCALE);
+    mwh = canPackAccumulator(canData[channel].mWh, BTS_CAN_MWH_SCALE);
 
-    data[0] = canData[channel].channel & 0xFFU;
-    data[1] = 0;
-    data[2] = v[0] & 0xFFU;
-    data[3] = (v[0] >> 8) & 0xFFU;
-    data[4] = v[1] & 0xFFU;
-    data[5] = (v[1] >> 8) & 0xFFU;
-    data[6] = c[0] & 0xFFU;
-    data[7] = (c[0] >> 8) & 0xFFU;
+    //
+    // Byte 0: slot index in the low nibble, run state in the high nibble. The
+    // state bits were composed on CPU1 from ChannelStatus and arrive already
+    // positioned, so this side never re-derives them.
+    //
+    data[0] = (canData[channel].channel & BTS_CAN_SLOT_MASK) |
+              (canData[channel].state & 0xF0U);
+
+    //
+    // Bytes 1-4: voltage then current, signed millivolts and milliamps,
+    // little-endian. Each is masked to 8 bits because a C28x byte is 16 bits
+    // wide and CAN_sendMessage() takes the low half of every word.
+    //
+    data[1] = (uint16_t)mv & 0xFFU;
+    data[2] = ((uint16_t)mv >> 8) & 0xFFU;
+    data[3] = (uint16_t)ma & 0xFFU;
+    data[4] = ((uint16_t)ma >> 8) & 0xFFU;
+
+    //
+    // Bytes 5-7: two 12-bit fields sharing byte 6 - mAh takes its low nibble,
+    // mWh its high one.
+    //
+    data[5] = mah & 0xFFU;
+    data[6] = ((mah >> 8) & 0x0FU) | ((mwh & 0x0FU) << 4);
+    data[7] = (mwh >> 4) & 0xFFU;
 
     CAN_sendMessage(CANA_BASE, channel + 1, 8, data);
 }

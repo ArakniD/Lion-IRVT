@@ -50,6 +50,60 @@
 #define CAN_MSG_ID_BASE 0x1C000000 // Base for 29-bit ID
 #define CAN_DEVICE_ID 0x0001 // Example device ID
 
+//
+//=============================================================================
+// CAN per-slot telemetry frame
+//=============================================================================
+//
+// Eight bytes carrying a whole slot: state, voltage, current, and both
+// accumulators. The previous layout spent four bytes on a raw voltage float
+// and then had only two left for current, so it transmitted the LOW word of
+// that float and nothing else - sign and exponent both live in the missing
+// half, which made the current unreconstructable rather than merely coarse.
+// mAh and mWh did not fit at all.
+//
+// Fixed-point in engineering units fixes that. Every field below is an exact
+// integer, so there is no float to truncate and no endianness to agree on
+// beyond the byte order stated here.
+//
+//   Byte 0      slot index (bits 0-3) and run state (bits 4-7)
+//   Byte 1-2    voltage, signed 16-bit millivolts, little-endian
+//   Byte 3-4    current, signed 16-bit milliamps, little-endian
+//   Byte 5-7    mAh and mWh, two unsigned 12-bit fields
+//
+// The two 12-bit fields share byte 6, low nibble to mAh and high nibble to
+// mWh:
+//
+//   mAh = (byte5 | (byte6 & 0x0F) << 8) * 4      0 .. 16380 mAh
+//   mWh = ((byte6 >> 4) | byte7 << 4)   * 16     0 .. 65520 mWh
+//
+// Both are magnitudes of the direction the slot is set to, matching what
+// canData carries. The scale factors trade resolution for reach: 4 mAh and
+// 16 mWh are far below any cell-level measurement interest, while the
+// ceilings cover a 16 Ah cell and a 65 Wh pack.
+//
+// Saturating rather than wrapping matters here - a counter that rolls over
+// reads as a fresh test rather than a finished one.
+//
+#define BTS_CAN_MAH_SCALE        4U      /* mAh per LSB of the 12-bit field */
+#define BTS_CAN_MWH_SCALE        16U     /* mWh per LSB of the 12-bit field */
+#define BTS_CAN_ACC_FIELD_MAX    0x0FFFU /* both fields are 12 bits         */
+
+//
+// Run state, byte 0 bits 4-7. Charging and discharging are mutually
+// exclusive; PAUSED sits ALONGSIDE whichever one the slot holds, exactly as
+// it does in the status word, so a listener sees both that the slot is held
+// and what a resume would do. FAULT is likewise independent - a slot can be
+// faulted while its direction bit still shows what it was doing.
+//
+// A slot that is stopped, idle and healthy has all four bits clear.
+//
+#define BTS_CAN_STATE_CHARGING     0x10U
+#define BTS_CAN_STATE_DISCHARGING  0x20U
+#define BTS_CAN_STATE_PAUSED       0x40U
+#define BTS_CAN_STATE_FAULT        0x80U
+#define BTS_CAN_SLOT_MASK          0x0FU
+
 typedef enum {
     REG_ACCESS_RO,  // Read-only
     REG_ACCESS_RW   // Read/write
@@ -705,6 +759,13 @@ typedef struct {
     float current;    // Amps
     float mAh;        // Milliamp-hours
     float mWh;        // Milliwatt-hours
+    //
+    // Run state for the telemetry frame's byte 0, already reduced to the
+    // BTS_CAN_STATE_* bits. Composed on CPU1 rather than on CPU2 because the
+    // source is ChannelStatus, which is CPU1's - CPU2 would otherwise have to
+    // re-derive it from the packed status word and the two would drift.
+    //
+    uint16_t state;
 } CAN_data;
 
 //

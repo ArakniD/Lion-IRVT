@@ -14,15 +14,32 @@ differs from the I2C register format (fully big-endian). ``canISR()`` in
 ``com_cpu2.c`` assembles the float from ``data[4..7]`` as two 16-bit
 little-endian words, because the C2000 is a 16-bit-word machine.
 
-TELEMETRY CURRENT IS UNUSABLE
------------------------------
-``sendCANData()`` packs all four bytes of the voltage float but **only the low
-16-bit word** of the current float - the frame has no room for the second
-word after the channel byte and its pad. The sign, exponent and high mantissa
-bits are never transmitted, so the current in a telemetry frame is not merely
-imprecise, it is unreconstructable. :class:`CanTelemetry` therefore reports
-``current_a`` as ``None`` and exposes the raw word for diagnostics. Read
-current through the register mailbox instead.
+TELEMETRY IS FIXED-POINT, AND CARRIES THE WHOLE SLOT
+----------------------------------------------------
+The frame packs state, voltage, current and both accumulators into its eight
+bytes as scaled integers. There is no float on the wire, so there is nothing
+to truncate:
+
+===== ==========================================================
+Byte  Contents
+===== ==========================================================
+0     slot index (bits 0-3), run state (bits 4-7)
+1-2   voltage, signed 16-bit millivolts, little-endian
+3-4   current, signed 16-bit milliamps, little-endian
+5-7   mAh and mWh as two unsigned 12-bit fields sharing byte 6
+===== ==========================================================
+
+The accumulators are scaled - 4 mAh and 16 mWh per LSB - which buys a 16 Ah
+and 65 Wh reach out of 12 bits each. Both saturate at their ceiling rather
+than wrapping, so :attr:`CanTelemetry.mah_saturated` distinguishes "at least
+this much" from an exact reading.
+
+An earlier layout put raw floats in the frame and ran out of room, sending
+only the low 16-bit word of the current float. The sign and exponent live in
+the missing half, so that value was unreconstructable rather than merely
+coarse, and the accumulators did not fit at all. Hosts written against that
+layout must be updated together with the firmware - the two are not
+distinguishable on the wire.
 """
 
 from __future__ import annotations
@@ -51,6 +68,21 @@ MAILBOX_ID: Final = CAN_ID_BASE | CAN_KIND_MAILBOX
 #: channels, so any one channel refreshes at 1 Hz.
 TELEMETRY_CHANNEL_HZ: Final = 1.0
 
+#: Run-state bits in the high nibble of byte 0. ``BTS_CAN_STATE_*`` in
+#: registers.h. CHARGING and DISCHARGING are mutually exclusive; PAUSED and
+#: FAULT are independent of both, so a paused slot still reports the direction
+#: it would resume into.
+CAN_STATE_CHARGING: Final = 0x10
+CAN_STATE_DISCHARGING: Final = 0x20
+CAN_STATE_PAUSED: Final = 0x40
+CAN_STATE_FAULT: Final = 0x80
+
+#: Engineering units per LSB of the two 12-bit accumulator fields.
+CAN_MAH_SCALE: Final = 4
+CAN_MWH_SCALE: Final = 16
+#: Both fields are 12 bits, and the firmware saturates rather than wrapping.
+CAN_ACC_FIELD_MAX: Final = 0x0FFF
+
 
 def telemetry_id(channel: int) -> int:
     """Extended CAN ID of ``channel``'s periodic telemetry object."""
@@ -73,13 +105,31 @@ class CanTelemetry:
 
     channel: int
     voltage_v: float
-    #: Always None - see the module docstring. Kept in the dataclass so a
-    #: consumer that expects the field does not crash, and so the reason is
-    #: discoverable at the point of use.
-    current_a: None
-    #: The low 16-bit word of the current float, as received. Useful only for
-    #: confirming that frames are arriving at all.
-    current_low_word: int
+    current_a: float
+    mah: float
+    mwh: float
+
+    #: Run state, decoded from byte 0's high nibble.
+    charging: bool
+    discharging: bool
+    paused: bool
+    fault: bool
+
+    #: True when an accumulator reached its 12-bit ceiling. The firmware
+    #: saturates rather than wrapping, so the value is a floor ("at least
+    #: this much") rather than a measurement.
+    mah_saturated: bool
+    mwh_saturated: bool
+
+    @property
+    def running(self) -> bool:
+        """Whether the slot holds a direction, paused or not.
+
+        A paused slot keeps its direction bit, matching the status word where
+        RUNNING survives a pause - so this is "has a test in progress",
+        not "is delivering power right now".
+        """
+        return self.charging or self.discharging
 
     @classmethod
     def decode(cls, can_id: int, data: bytes) -> "CanTelemetry":
@@ -88,15 +138,29 @@ class CanTelemetry:
             raise ValueError(f"CAN id 0x{can_id:08X} is not a telemetry frame")
         if len(data) < 8:
             raise ValueError(f"telemetry frame is {len(data)} bytes, need 8")
-        # data[0] channel, data[1] pad, data[2..5] voltage (two LE words),
-        # data[6..7] the LOW word of current only.
-        voltage = struct.unpack("<f", bytes(data[2:6]))[0]
-        current_low = data[6] | (data[7] << 8)
+
+        state = data[0] & 0xF0
+
+        # Signed 16-bit milli-units, little-endian.
+        mv, ma = struct.unpack("<hh", bytes(data[1:5]))
+
+        # Two 12-bit fields sharing byte 6: mAh takes its low nibble, mWh its
+        # high one.
+        mah_raw = data[5] | ((data[6] & 0x0F) << 8)
+        mwh_raw = ((data[6] >> 4) & 0x0F) | (data[7] << 4)
+
         return cls(
-            channel=data[0] & 0xFF,
-            voltage_v=voltage,
-            current_a=None,
-            current_low_word=current_low,
+            channel=data[0] & 0x0F,
+            voltage_v=mv / 1000.0,
+            current_a=ma / 1000.0,
+            mah=float(mah_raw * CAN_MAH_SCALE),
+            mwh=float(mwh_raw * CAN_MWH_SCALE),
+            charging=bool(state & CAN_STATE_CHARGING),
+            discharging=bool(state & CAN_STATE_DISCHARGING),
+            paused=bool(state & CAN_STATE_PAUSED),
+            fault=bool(state & CAN_STATE_FAULT),
+            mah_saturated=mah_raw == CAN_ACC_FIELD_MAX,
+            mwh_saturated=mwh_raw == CAN_ACC_FIELD_MAX,
         )
 
 

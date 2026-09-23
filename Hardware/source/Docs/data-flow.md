@@ -551,25 +551,62 @@ protection is the bench supply's own current limit.
 
 ---
 
-## 7. CAN telemetry — read the caveat
+## 7. CAN telemetry
 
 Message objects 1–8 carry per-channel telemetry; object 9 is a host register
 read/write.
 
-The per-channel frame is 8 bytes and packs only two quantities:
+The per-channel frame is 8 bytes and carries the whole slot — state, both
+measurements and both accumulators — as fixed-point integers:
 
 | Byte | Contents |
 |---|---|
-| 0 | channel index |
-| 1 | zero |
-| 2–5 | `voltage`, all four bytes |
-| 6–7 | `current`, **low word only** |
+| 0 | slot index (bits 0–3), run state (bits 4–7) |
+| 1–2 | voltage, signed 16-bit **millivolts**, little-endian |
+| 3–4 | current, signed 16-bit **milliamps**, little-endian |
+| 5–7 | mAh and mWh, two unsigned 12-bit fields sharing byte 6 |
 
-**The current field is truncated.** `sendCANData()` packs `c[0]` and stops —
-the float's upper word never goes on the wire, so the value cannot be
-reconstructed. `canData` also carries `mAh` and `mWh` and **neither is
-transmitted at all**; the frame has no room left.
+The two accumulator fields are scaled to reach past 12 bits:
 
-A host that needs current or the accumulators reads them through the register
-mailbox on message object 9 instead. The telemetry frames are trustworthy for
-voltage only.
+```
+mAh = (byte5 | (byte6 & 0x0F) << 8) * 4       0 .. 16380 mAh
+mWh = ((byte6 >> 4) | byte7 << 4)   * 16      0 .. 65520 mWh
+```
+
+4 mAh and 16 mWh per LSB are far below any cell-level measurement interest,
+while the ceilings cover a 16 Ah cell and a 65 Wh pack. Both fields
+**saturate rather than wrap** — a counter that rolled over would read as a
+fresh test rather than a finished one, which is the more dangerous of the two
+wrong answers.
+
+The run-state nibble is `BTS_CAN_STATE_*` in `registers.h`:
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 4 | `CHARGING` | slot is running in charge |
+| 5 | `DISCHARGING` | slot is running in discharge |
+| 6 | `PAUSED` | held; the direction bit says what a resume would do |
+| 7 | `FAULT` | trip, reverse polarity, group disconnect or strap-disabled |
+
+`PAUSED` sits **alongside** a direction bit rather than replacing it, exactly
+as it does in the status word — a listener that saw only `PAUSED` could not
+tell which way the slot would resume. `FAULT` is deliberately wider than an
+over-current trip: all four of its sources mean the same thing to a listener,
+and a host that needs to tell them apart reads the status word.
+
+The state bits are composed on **CPU1** (`bts_cpu1.c`, in the `canData` fill)
+from `ChannelStatus`, not re-derived on CPU2 from the packed status word —
+one encoding, so the two cannot drift.
+
+### What this replaced
+
+The previous frame put raw floats on the wire and ran out of room. It packed
+all four bytes of the voltage but only the **low 16-bit word** of the current,
+and the sign and exponent live in the missing half — so the current was not
+merely imprecise, it was unreconstructable. `mAh` and `mWh` did not fit at
+all. Fixed-point removed the failure mode rather than narrowing it.
+
+**This is a breaking wire change.** The two layouts are not distinguishable
+on the wire, so a host must be updated together with the firmware. The
+in-tree decoder (`lion-lvrt-integration/.../protocol/can.py`) and its
+simulator were updated with it.

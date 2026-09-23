@@ -448,14 +448,22 @@ Command reference and what changes between the two builds:
 ### CAN (CANA)
 
 500 kbit/s, extended 29-bit IDs, base `0x1C000000`. TX objects 1-8 carry
-per-channel telemetry (channel byte + voltage + current, little-endian words);
-object 9 is a host register read/write mailbox (`addr` big-endian, R/W flag,
-then float in little-endian word order — note it differs from the I2C wire
-order). Periodic TX is round-robin from the 8 Hz CPU Timer 1 ISR.
+per-channel telemetry; object 9 is a host register read/write mailbox (`addr`
+big-endian, R/W flag, then float in little-endian word order — note it differs
+from the I2C wire order). Periodic TX is round-robin from the 8 Hz CPU Timer 1
+ISR.
 
-`canData[].mAh` / `.mWh` are now populated by `publishStatusToCpu2()` from
-the accumulator matching each slot's direction, but `sendCANData()` still
-does not transmit them.
+**The telemetry frame is fixed-point, and carries the whole slot**: byte 0 is
+the slot index plus a run-state nibble (`BTS_CAN_STATE_*`), bytes 1-4 are
+signed millivolts and milliamps, and bytes 5-7 pack mAh and mWh as two 12-bit
+fields scaled by 4 and 16. Both accumulator fields saturate rather than
+wrapping. There is no float on the wire.
+
+An earlier layout put raw floats in the frame, which left room for only the
+**low word** of the current float — the half without the sign or exponent, so
+the value could not be reconstructed — and no room at all for the
+accumulators. The two layouts are indistinguishable on the wire, so firmware
+and host must be updated together. Layout and scaling: `Docs/data-flow.md` §7.
 
 ---
 
@@ -588,7 +596,6 @@ brought to life.
 | `eChX_SettingsSpare` | Reserved by design. RO, reads 0.0, one per slot at settings offset 23 — the place to put a future per-slot setting without moving anything |
 | `iref_cuttout_A` | Still loaded from `eChX_ChargeCurrentMin` and read by nothing. CC-to-cutoff taper is the ESP32's job |
 | `eTripStatus` (1180) | Still always 0. See below |
-| `canData[].mAh` / `.mWh` | Populated, but `sendCANData()` still does not transmit them |
 
 `eTripStatus` is mirrored from `cpu1Status.tripStatus`, which is only ever
 written by `epwmTripISR`. That ISR is registered and enabled unconditionally,

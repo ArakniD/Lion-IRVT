@@ -1292,6 +1292,50 @@ static void publishStatusToCpu2(void)
         //
         canData[ch].mAh = status[ch].charging ? accChargeMah[ch] : accDischargeMah[ch];
         canData[ch].mWh = status[ch].charging ? accChargeMwh[ch] : accDischargeMwh[ch];
+
+        //
+        // Run state for the frame's byte 0. Reduced here rather than on CPU2
+        // because ChannelStatus is this core's; re-deriving it from the
+        // packed status word on the other side would be a second encoding of
+        // the same thing, free to drift.
+        //
+        // Direction is reported whenever the slot holds one, INCLUDING while
+        // paused - a resume goes back to that direction, so a listener that
+        // saw only PAUSED would not know which way. This mirrors the status
+        // word, where RUNNING and the direction bit both survive a pause.
+        //
+        {
+            uint16_t canState = 0U;
+
+            if (status[ch].running) {
+                canState |= status[ch].charging ? BTS_CAN_STATE_CHARGING
+                                                : BTS_CAN_STATE_DISCHARGING;
+            }
+            if (status[ch].paused) {
+                canState |= BTS_CAN_STATE_PAUSED;
+            }
+
+            //
+            // FAULT is anything that blocks the slot from acting, which is a
+            // wider set than an over-current trip:
+            //
+            //   overCurrentTrip   the software trip in BTS_tripEpwm()
+            //   reversePolarity   cell wired backwards; the slot is stopped
+            //   groupDisconnect   a group member stopped tracking, so every
+            //                     slot in that group was stopped with it
+            //   slotDisabled      masked off by the ENABLE strap at power-on
+            //
+            // All four mean the same thing to a listener: this slot will not
+            // run, and asking it to will not change that. They are separable
+            // through the status word for a host that needs to know which.
+            //
+            if (status[ch].overCurrentTrip || status[ch].reversePolarity ||
+                status[ch].groupDisconnect || status[ch].slotDisabled) {
+                canState |= BTS_CAN_STATE_FAULT;
+            }
+
+            canData[ch].state = canState;
+        }
     }
 
     cpu1Status.unitState = (uint32_t)unitState;

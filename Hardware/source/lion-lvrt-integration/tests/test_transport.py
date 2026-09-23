@@ -291,22 +291,85 @@ def test_can_refuses_a_write_to_a_read_only_register() -> None:
         canproto.encode_register_write(regs.rt_addr(0, regs.RT_STATUS), 1.0)
 
 
-def test_can_telemetry_current_is_unrecoverable() -> None:
-    """Only the low word of the current float is transmitted.
+def test_can_telemetry_carries_the_whole_slot() -> None:
+    """State, voltage, current and both accumulators, in one frame.
 
-    The exponent and sign are in the missing half, so the value cannot be
-    reconstructed - the decoder must report absence rather than a number.
+    Current used to be unrecoverable: the frame carried only the low word of
+    a float, and the sign and exponent were in the missing half. Fixed-point
+    fields removed that failure mode rather than narrowing it.
     """
     unit = SimulatedUnit()
-    unit.slots[2].voltage_v = 3.85
-    unit.slots[2].current_a = -1.75
+    slot = unit.slots[2]
+    slot.voltage_v = 3.85
+    slot.current_a = -1.75
+    slot.running = True
+    slot.charging = False
+    slot.discharge_mah = 1200.0
+    slot.discharge_mwh = 4400.0
 
     can_id, data = unit.can_telemetry(2)
     frame = canproto.CanTelemetry.decode(can_id, data)
 
     assert frame.channel == 2
-    assert frame.voltage_v == pytest.approx(3.85, abs=1e-5)
-    assert frame.current_a is None
+    assert frame.voltage_v == pytest.approx(3.85, abs=5e-4)
+    assert frame.current_a == pytest.approx(-1.75, abs=5e-4)
+
+    # Quantised to the field scale, not rounded to the nearest step.
+    assert frame.mah == pytest.approx(1200.0, abs=canproto.CAN_MAH_SCALE)
+    assert frame.mwh == pytest.approx(4400.0, abs=canproto.CAN_MWH_SCALE)
+
+    assert frame.discharging is True
+    assert frame.charging is False
+    assert frame.paused is False
+    assert frame.fault is False
+    assert frame.running is True
+    assert frame.mah_saturated is False
+
+
+def test_can_telemetry_reports_direction_through_a_pause() -> None:
+    """A paused slot keeps the direction it would resume into.
+
+    PAUSED sits alongside the direction bit rather than replacing it, exactly
+    as it does in the status word - a listener that saw only PAUSED could not
+    tell what a resume would do.
+    """
+    unit = SimulatedUnit()
+    slot = unit.slots[0]
+    slot.running = True
+    slot.charging = True
+    slot.paused = True
+
+    frame = canproto.CanTelemetry.decode(*unit.can_telemetry(0))
+
+    assert frame.paused is True
+    assert frame.charging is True
+    assert frame.running is True
+
+
+def test_can_telemetry_accumulators_saturate() -> None:
+    """A counter that wrapped would read as a fresh test, not a finished one."""
+    unit = SimulatedUnit()
+    slot = unit.slots[1]
+    slot.running = True
+    slot.charging = True
+    slot.charge_mah = 99_000.0
+    slot.charge_mwh = 400_000.0
+
+    frame = canproto.CanTelemetry.decode(*unit.can_telemetry(1))
+
+    assert frame.mah_saturated is True
+    assert frame.mwh_saturated is True
+    assert frame.mah == canproto.CAN_ACC_FIELD_MAX * canproto.CAN_MAH_SCALE
+    assert frame.mwh == canproto.CAN_ACC_FIELD_MAX * canproto.CAN_MWH_SCALE
+
+
+def test_can_telemetry_flags_a_faulted_slot() -> None:
+    unit = SimulatedUnit()
+    unit.slots[3].enabled = False
+
+    frame = canproto.CanTelemetry.decode(*unit.can_telemetry(3))
+
+    assert frame.fault is True
 
 
 def test_can_telemetry_ids() -> None:
