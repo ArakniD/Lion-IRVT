@@ -57,10 +57,22 @@ PAGE 1 : /* Data Memory */
 // RAMM1_RSVD      : origin = 0x0007F8, length = 0x000008     /* Reserve and do not use for code as per the errata advisory "Memory: Prefetching Beyond Valid Memory" */
 //   RAMD1           : origin = 0x00B800, length = 0x000800
    RAMD01          	: origin = 0x00B800, length = 0x000800
-   /* The F2837xD has LS0..LS5 only, spanning 0x008000..0x00AFFF.
-      CPU1 takes LS0..LS3 (0x008000..0x009FFF), CPU2 takes LS4..LS5
-      (0x00A000..0x00AFFF). A 0x2000 length here would run into RAMD01. */
-   RAMLS4_5         : origin = 0x00A000, length = 0x001000
+   /*
+    * No RAMLS block is declared for CPU2, deliberately.
+    *
+    * The LSx RAMs are per-subsystem, not shared silicon - each CPU has its
+    * own LS0..LS5 at the same addresses, the way each has its own flash bank.
+    * (MemCfg bears this out: GSxRAM has a CPU1/CPU2 controller select,
+    * LSxRAM has only CPU-only/CPU+CLA1 - there is no arbitration to do.)
+    * CPU2's .bss used to live in its own LS4/LS5 and has been moved to
+    * RAMGS12/RAMGS13, which were entirely empty.
+    *
+    * The point is not a collision - there was none - but ownership: LS4 and
+    * LS5 are now CLA1 program and data on CPU1, and CPU2's CLA is reserved
+    * for the ADS131M08 current loop in a later phase. Leaving no RAMLS block
+    * here means a future CPU2 CLA starts from a blank slate rather than
+    * having to evict .bss first.
+    */
    RAMGS11          : origin = 0x017000, length = 0x001000     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
    RAMGS12          : origin = 0x018000, length = 0x001000     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
    RAMGS13          : origin = 0x019000, length = 0x001000     /* Only Available on F28379D, F28377D, F28375D devices. Remove line on other devices. */
@@ -111,7 +123,7 @@ SECTIONS
 
    /* Allocate uninitalized data sections: */
    .stack             : > RAMD01             PAGE = 1
-   .bss               : >> RAMLS4_5 | RAMGS12 | RAMGS13   PAGE = 1
+   .bss               : >> RAMGS12 | RAMGS13   PAGE = 1
    .sysmem            : > RAMGS11            PAGE = 1
    .data           	  : >> RAMD01 | RAMGS12  PAGE = 1   //added from COFF to EABI
 
@@ -133,6 +145,17 @@ SECTIONS
                        RUN_START(Cla1ConstRunStart),
                        LOAD_START(Cla1ConstLoadStart),
                        LOAD_SIZE(Cla1ConstLoadSize)
+
+   /* Same story for the CLA program image, which device.c now also copies
+      unconditionally. CPU1 runs a CLA task and CPU2 does not, so on this core
+      Cla1Prog is empty and Cla1funcsLoadSize resolves to zero - the memcpy
+      copies nothing. The symbols exist only so the link succeeds. */
+   Cla1Prog         :  LOAD = FLASHM, PAGE = 0,
+                       RUN = RAMGS13, PAGE = 1,
+                       LOAD_START(Cla1funcsLoadStart),
+                       LOAD_END(Cla1funcsLoadEnd),
+                       RUN_START(Cla1funcsRunStart),
+                       LOAD_SIZE(Cla1funcsLoadSize)
 
    /* The following section definitions are required when using the IPC API
       Drivers. On CPU2 the Put side is CPU2->CPU1 and the Get side is

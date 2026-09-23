@@ -1728,6 +1728,58 @@ void BTS_HAL_setupADC(void)
     ADC_setInterruptSource(ADCB_BASE, ADC_INT_NUMBER1, ADC_SOC_NUMBER2);
     Interrupt_disable(INT_ADCB1);
 
+    //
+    // ADCA INT2 - the CLA1 Task 1 trigger, and nothing else.
+    //
+    // Source is SOC6, the A0 reference channel and the last conversion in the
+    // EPWM1 SOCA sweep, so by the time this flag sets every cell voltage and
+    // current result register for this sample period has been written. The
+    // CLA reads all seventeen results directly; sourcing the trigger any
+    // earlier would have it read the previous sweep's tail.
+    //
+    // Deliberately independent of ADCA INT1, which drives adcCellVoltageISR
+    // off SOC0 at the head of the same sweep. The two share no flag and no
+    // acknowledge: the CLA path cannot delay the control path, and the
+    // control path cannot starve the CLA.
+    //
+    // Interrupt_disable(INT_ADCA2) for the same reason the ADCB block above
+    // masks PIE 1.2 - ADC_enableInterrupt() arms both the status flag and its
+    // PIE route, and there is no C28x handler for ADCA2. The CLA takes its
+    // trigger from the peripheral's interrupt signal via CLA1TASKSRCSEL, not
+    // from the PIE, so masking the PIE channel costs nothing.
+    //
+    // Continuous mode so the flag pulses on every EOC whether or not it has
+    // been cleared. Nothing on the C28x side ever clears ADCINT2, and the CLA
+    // has no way to; without this the CLA would run exactly once.
+    //
+    ADC_enableInterrupt(ADCA_BASE, ADC_INT_NUMBER2);
+    ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER2);
+    ADC_setInterruptSource(ADCA_BASE, ADC_INT_NUMBER2, ADC_SOC_NUMBER6);
+    ADC_enableContinuousMode(ADCA_BASE, ADC_INT_NUMBER2);
+    Interrupt_disable(INT_ADCA2);
+
+    //
+    // Pulse ADCA's interrupt flags at end-of-CONVERSION, not the reset
+    // default of end-of-acquisition-window.
+    //
+    // Required for the CLA: TI's cla_adc_fir32 example does the same, because
+    // a task triggered at end-of-acquisition starts while the SAR is still
+    // converting and reads the PREVIOUS sweep's result registers. With
+    // continuous mode on INT2 that error would be invisible - every sample
+    // would simply be one period stale, and the filter would hide it.
+    //
+    // This also moves ADCINT1, and therefore adcCellVoltageISR, one ADC
+    // conversion later. That direction is strictly safer: the ISR currently
+    // reads SOC0's result at end-of-acquisition, i.e. before the conversion
+    // that produces it has latched. The shift is ~106 ns at 12-bit against a
+    // 100 us sample period.
+    //
+    // ADCB/C/D keep the default. Their results are read by the CLA (which
+    // reads them well after SOC6 on ADCA completes) or polled (ADCB INT1 for
+    // the input voltage), so neither is timing-sensitive in this way.
+    //
+    ADC_setInterruptPulseMode(ADCA_BASE, ADC_PULSE_END_OF_CONV);
+
     ADC_enableConverter(ADCA_BASE);
     ADC_enableConverter(ADCB_BASE);
     ADC_enableConverter(ADCC_BASE);
@@ -1741,19 +1793,24 @@ void BTS_HAL_setupADC(void)
 // EPWM1 is shared: it is both channel 1's switching leg and the ADC trigger
 // source. Its period therefore belongs to the converter, NOT to the sample
 // rate - BTS_HAL_setupSyncBuckPwm(BTS_EPWM_BASE_CH1) runs AFTER this
-// function and sets TBPRD to BTS_DRV_EPWM_TBPRD (1002), so anything written
-// to TBPRD here is overwritten and has no effect.
+// function and sets TBPRD to BTS_DRV_EPWM_TBPRD (902 on this device), so
+// anything written to TBPRD here is overwritten and has no effect.
 //
 // That is what used to happen: this function wrote TBPRD for a nominal
 // 10 kHz, the PWM setup replaced it, and the ADC ended up triggering once
-// per switching period. With EPWMCLK = SYSCLK/2 = 100 MHz and TBPRD 1002
-// that is 100e6/1003 = 99.7 kHz - ten times the documented intent, so
+// per switching period. With EPWMCLK = SYSCLK/2 = 90 MHz and TBPRD 902 that
+// is 90e6/903 = 99.67 kHz - ten times the documented intent, so
 // adcCellVoltageISR ran every ~10 us and read all eight slots each time.
 //
 // The sample rate is set with the SOC event prescaler instead, which divides
 // the trigger without touching the switching period:
 //
-//   99.7 kHz / BTS_ADC_SOC_PRESCALE(10) = 9.97 kSPS
+//   99.67 kHz / BTS_ADC_SOC_PRESCALE(15) = 6.645 kSPS
+//
+// Verified on the live device, not derived from the headers: TBCTL 0x8010,
+// TBPRD 902, ETPS 0x0820 (SOCPSSEL set), ETSOCPS 0x005F (SOCAPRD2 = 15),
+// PERCLKDIVSEL 0x51. BTS_ADC_SOC_PRESCALE is 15 while its own comment block
+// says 10, and SYSCLK is 180 MHz rather than 200 - see bts_cla_shared.h.
 //
 // Note TBCLK is EPWMCLK (SYSCLK/2), not SYSCLK - the old
 // "DEVICE_SYSCLK_FREQ / 10000" form was doubly wrong for that reason too.

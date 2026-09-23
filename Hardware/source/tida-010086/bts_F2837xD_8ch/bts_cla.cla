@@ -1,0 +1,181 @@
+/*
+ * bts_cla.cla
+ *
+ * CLA1 Task 1: single-pole IIR filter over the F2837xD internal ADC's cell
+ * voltage and cell current channels.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * The internal ADC runs at ~6.645 kSPS (EPWM1 TBPRD 902 at EPWMCLK 90 MHz,
+ * SOC event prescaler /15 - all four values read back off the live device;
+ * see the derivation in bts_cla_shared.h). adcCellVoltageISR stores each
+ * sample into an 8-deep ring - 1.2 ms of history - and BTS_monitor_Iout_Vout
+ * averages that ring at 10 Hz in C1(). Telemetry therefore reports a 1.2 ms
+ * snapshot taken once every 100 ms: 98.8% of the samples are discarded, and
+ * whatever ripple happens to sit inside that window aliases straight
+ * through.
+ *
+ * This task runs on EVERY conversion and folds every sample into a running
+ * average, so the number C1() picks up is a true 20 Hz-bandwidth estimate of
+ * the whole interval. It costs the C28x nothing - the CLA is a separate
+ * processor with its own bus to the ADC result registers.
+ *
+ * TELEMETRY ONLY
+ * --------------
+ * Nothing here feeds the control loop or any protection path. The reverse
+ * polarity check, group supervision and BTS_cellVoltageAsCtrl16b() all keep
+ * reading the unfiltered CellVoltage_V / CellCurrent_I. A 20 Hz filter adds
+ * ~12 ms of lag, which is fine for a display and not fine for a trip.
+ *
+ * TRIGGER
+ * -------
+ * ADCA INT2, sourced from ADCA SOC6 (the A0 reference channel, last in the
+ * EPWM1 SOCA sweep) and routed by CLA1TASKSRCSEL1. Taking the trigger at the
+ * tail of the sweep guarantees all seventeen result registers hold this
+ * period's conversions. ADCA INT2 is in continuous mode and its PIE channel
+ * is masked - see the long note in BTS_HAL_setupADC().
+ *
+ * DATA
+ * ----
+ * Every object shared with the C28x is defined in bts_cla_data.c and only
+ * declared in bts_cla_shared.h. That is a toolchain constraint, not a style
+ * choice: the CLA compiler cannot export a symbol the C28x linker resolves.
+ *
+ * Guarded on CPU1. The project builds every root-level source under both
+ * configurations, and CPU2's CLA is reserved for the ADS131M08 current
+ * control loop in a later phase of work.
+ *
+ * Copyright (C) 2026 - see repository licence.
+ */
+
+#ifdef CPU1
+
+//
+// A targeted include set, NOT driverlib.h.
+//
+// adc.h is CLA-safe: its includes stop at stdbool/stdint, inc/hw_adc.h,
+// inc/hw_sysctl.h, inc/hw_memmap.h, inc/hw_types.h, cpu.h and debug.h. It
+// never reaches sysctl.h or interrupt.h, neither of which compiles for the
+// CLA. hw_types.h has an explicit __TMS320C28XX_CLA__ branch giving HWREGH a
+// 16-bit-pointer definition, which is what ADC_readResult expands to; and
+// ADC_readResult's ASSERT is a no-op unless DEBUG is defined, so the whole
+// call inlines to a single HWREGH load.
+//
+// stdint.h first: hw_types.h typedefs uint8_t from uint16_t without ever
+// defining uint16_t itself.
+//
+#include <stdint.h>
+#include "inc/hw_types.h"
+#include "inc/hw_memmap.h"
+#include "adc.h"
+
+#include "bts_cla_shared.h"
+
+//
+// Task 1 - filter one ADC sweep.
+//
+// The SOC-to-channel map below MIRRORS adcCellVoltageISR in bts_cpu1.c
+// exactly, including the current reference subtraction. If a channel is ever
+// re-pinned, both have to move together or the filtered telemetry silently
+// reports a different slot than the control path does.
+//
+// Note the result BASE addresses: ADCxRESULT_BASE (0x0B00..0x0B60), not
+// ADCx_BASE (0x7400..). Passing the peripheral base instead returns ADCCTL1 /
+// ADCCTL2, which is where the constant 8320 (0x2080) in the ISR's history
+// comment came from. All four result bases are inside the CLA's 16-bit
+// address space; the peripheral bases are not.
+//
+__interrupt void Cla1Task1(void)
+{
+    float32_t vRaw[BTS_CLA_NUM_CH];
+    float32_t iRaw[BTS_CLA_NUM_CH];
+    float32_t refRaw;
+    int16_t i;
+
+    //
+    // Cell voltages.
+    //
+    vRaw[0] = (float32_t)ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER0); // Ch1: A3
+    vRaw[1] = (float32_t)ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER0); // Ch2: B3
+    vRaw[2] = (float32_t)ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER1); // Ch3: A5
+    vRaw[3] = (float32_t)ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER2); // Ch4: IN15
+    vRaw[4] = (float32_t)ADC_readResult(ADCDRESULT_BASE, ADC_SOC_NUMBER0); // Ch5: D1
+    vRaw[5] = (float32_t)ADC_readResult(ADCCRESULT_BASE, ADC_SOC_NUMBER0); // Ch6: C3
+    vRaw[6] = (float32_t)ADC_readResult(ADCDRESULT_BASE, ADC_SOC_NUMBER1); // Ch7: D3
+    vRaw[7] = (float32_t)ADC_readResult(ADCCRESULT_BASE, ADC_SOC_NUMBER1); // Ch8: C5
+
+    //
+    // Cell currents.
+    //
+    iRaw[0] = (float32_t)ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER3); // Ch1: A2
+    iRaw[1] = (float32_t)ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER3); // Ch2: B2
+    iRaw[2] = (float32_t)ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER4); // Ch3: A4
+    iRaw[3] = (float32_t)ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER5); // Ch4: IN14
+    iRaw[4] = (float32_t)ADC_readResult(ADCDRESULT_BASE, ADC_SOC_NUMBER2); // Ch5: D0
+    iRaw[5] = (float32_t)ADC_readResult(ADCCRESULT_BASE, ADC_SOC_NUMBER2); // Ch6: C2
+    iRaw[6] = (float32_t)ADC_readResult(ADCDRESULT_BASE, ADC_SOC_NUMBER3); // Ch7: D2
+    iRaw[7] = (float32_t)ADC_readResult(ADCCRESULT_BASE, ADC_SOC_NUMBER3); // Ch8: C4
+
+    //
+    // The A0 reference. Cell current is differential about it, exactly as
+    // adcCellVoltageISR computes iRaw[ch] - refRaw.
+    //
+    refRaw = (float32_t)ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER6);
+
+    if (BTS_claPrimed == 0U)
+    {
+        //
+        // First run: load the state rather than filter towards it from zero,
+        // so telemetry does not ramp up over the first 12 ms of every boot.
+        //
+        for (i = 0; i < BTS_CLA_NUM_CH; i++)
+        {
+            BTS_claCellVoltageFilt[i] = vRaw[i];
+            BTS_claCellCurrentFilt[i] = iRaw[i] - refRaw;
+        }
+        BTS_claPrimed = 1U;
+    }
+    else
+    {
+        //
+        //   y += alpha * (x - y)
+        //
+        // One multiply-accumulate per channel in float32. The CLA's MFLOAT32
+        // pipeline does this in a handful of cycles against a 150 us sample
+        // period, so there is no risk of overrunning the next trigger - and
+        // MSTF's overflow flag would show it if there ever were.
+        //
+        for (i = 0; i < BTS_CLA_NUM_CH; i++)
+        {
+            BTS_claCellVoltageFilt[i] +=
+                BTS_CLA_ALPHA * (vRaw[i] - BTS_claCellVoltageFilt[i]);
+
+            BTS_claCellCurrentFilt[i] +=
+                BTS_CLA_ALPHA * ((iRaw[i] - refRaw) -
+                                 BTS_claCellCurrentFilt[i]);
+        }
+    }
+
+    //
+    // Liveness. C1() compares this against the value it saw 100 ms ago; if it
+    // has not moved, the filtered telemetry falls back to the unfiltered
+    // value rather than reporting a frozen reading as if it were live.
+    //
+    BTS_claRunCount++;
+}
+
+//
+// Tasks 2-8 are unused. They are defined anyway because BTS_initCla() maps all
+// eight MVECT registers - an unmapped vector left at its reset value would
+// send the CLA off to fetch from wherever that happens to point if the task
+// were ever triggered. Only task 1 is enabled in MIER, so these never run.
+//
+interrupt void Cla1Task2(void) { }
+interrupt void Cla1Task3(void) { }
+interrupt void Cla1Task4(void) { }
+interrupt void Cla1Task5(void) { }
+interrupt void Cla1Task6(void) { }
+interrupt void Cla1Task7(void) { }
+interrupt void Cla1Task8(void) { }
+
+#endif /* CPU1 */

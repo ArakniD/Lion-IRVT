@@ -899,11 +899,18 @@
 //
 // EPWM1 is shared between channel 1's switching leg and the ADC SOCA
 // trigger, so the sample rate CANNOT be set by its period - that belongs to
-// the converter (BTS_DRV_EPWM_TBPRD = 1002, giving ~99.7 kHz switching at
-// EPWMCLK = SYSCLK/2 = 100 MHz). The SOC event prescaler divides the trigger
-// instead, leaving the PWM untouched:
+// the converter (BTS_DRV_EPWM_TBPRD = 902 on this device, giving 99.67 kHz
+// switching at EPWMCLK = SYSCLK/2 = 90 MHz - SYSCLK is 180 MHz here, NOT the
+// 200 MHz of the LaunchPad branch). The SOC event prescaler divides the
+// trigger instead, leaving the PWM untouched:
 //
-//   99.7 kHz / 10 = 9.97 kSPS
+//   99.67 kHz / 15 = 6.645 kSPS
+//
+// The paragraph below describing a prescale of 10 and a 9.97 kSPS result is
+// WRONG and is kept only because it is what the value was originally chosen
+// against. The constant is 15. Confirmed against the live device:
+// ETSOCPS = 0x005F (SOCAPRD2 = 15), TBPRD = 902, PERCLKDIVSEL = 0x51.
+// BTS_CLA_ALPHA in bts_cla_shared.h is derived from 6.645 kSPS.
 //
 // 10 was chosen for ~10 kSPS: the control loop does not need faster, and at
 // the previous effective rate the ISR read all eight slots every ~10 us,
@@ -914,7 +921,9 @@
 //
 //
 // 15 is the SLOWEST the SOC event prescaler can go - driverlib ASSERTs
-// preScaleCount < 16. At EPWM1's 124.5 kHz switching rate that is 8.3 kSPS.
+// preScaleCount < 16. At EPWM1's measured 99.67 kHz switching rate that is
+// 6.645 kSPS. (The "124.5 kHz / 8.3 kSPS" in the original note assumed a
+// clock this device does not run at.)
 // A sub-100 Hz acquisition is NOT reachable this way: EPWM1's period belongs
 // to channel 1's converter and cannot be stretched, so the only route to a
 // much slower rate would be a separate timer-triggered SOC source.

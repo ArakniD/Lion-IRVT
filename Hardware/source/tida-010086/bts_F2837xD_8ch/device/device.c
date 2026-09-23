@@ -92,6 +92,13 @@ void Device_init(void)
     memcpy(&RamfuncsRunStart, &RamfuncsLoadStart, (size_t)&RamfuncsLoadSize);
     memcpy(&isrcodefuncsRunStart,&isrcodefuncsLoadStart,  (size_t)&isrcodefuncsLoadSize );
     memcpy(&Cla1ConstRunStart,&Cla1ConstLoadStart, (size_t)&Cla1ConstLoadSize );
+
+    //
+    // The CLA program image. This must land in RAMLS4 before the CLA is
+    // handed that block in BTS_initCla() - the CLA cannot fetch from flash,
+    // its address bus being only 16 bits wide.
+    //
+    memcpy(&Cla1funcsRunStart, &Cla1funcsLoadStart, (size_t)&Cla1funcsLoadSize);
 #endif
 
     //

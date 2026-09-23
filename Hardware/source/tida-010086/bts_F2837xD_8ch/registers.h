@@ -678,6 +678,25 @@ typedef struct
     float32_t F28V_Offset;
     float32_t F28I_Gain;
     float32_t F28I_Offset;
+    //
+    // CLA1-filtered cell voltage and current, in the same engineering units
+    // as CellVoltage_V / CellCurrent_I above.
+    //
+    // The pair above is a 10 Hz average of an 8-deep ring - 1.2 ms of the
+    // preceding 100 ms, with 98.8% of the samples discarded. These two are
+    // refreshed by CLA1 Task 1 on EVERY conversion at 6.645 kSPS through a
+    // 20 Hz single-pole IIR, so they represent the whole interval.
+    //
+    // TELEMETRY ONLY. The ~12 ms of filter lag is fine for a host display and
+    // is not fine for a trip, so the reverse-polarity check, group
+    // supervision, the control loop and the calibration captures all keep
+    // reading the unfiltered pair. See bts_cla.cla.
+    //
+    // If CLA1 is not running, BTS_updateFilteredTelemetry() copies the
+    // unfiltered values in here instead - these fields are never stale.
+    //
+    float32_t CellVoltageFilt_V;
+    float32_t CellCurrentFilt_I;
 } BTS_measValue;
 
 typedef struct {

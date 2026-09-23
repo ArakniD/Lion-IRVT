@@ -1,3 +1,16 @@
+/*
+ * CLA1 support.
+ *
+ * CLA_SCRATCHPAD_SIZE and the two --undef_sym directives are what the
+ * compiler's CLA C support expects: --cla_support=cla1 emits references to
+ * __cla_scratchpad_start/__cla_scratchpad_end for the CLA's compiler-managed
+ * local frame, and the CLAscratch section below reserves the space between
+ * them. Without the --undef_sym lines the linker drops the symbols before the
+ * CLAscratch directive can place them.
+ */
+CLA_SCRATCHPAD_SIZE = 0x100;
+--undef_sym=__cla_scratchpad_end
+--undef_sym=__cla_scratchpad_start
 
 MEMORY
 {
@@ -5,6 +18,21 @@ PAGE 0 :  /* Program Memory */
           /* Memory (RAM/FLASH) blocks can be moved to PAGE1 for data allocation */
           /* BEGIN is used for the "boot to Flash" bootloader mode   */
    RAMLS0           : origin = 0x008000, length = 0x000800
+
+   /*
+    * LS4 and LS5 are CLA1's. They are CPU1-subsystem RAM, not shared silicon:
+    * CPU2's linker used to place its .bss here and no longer does - see
+    * 2837xD_RAM_lnk_cpu2.cmd, which now sends .bss to RAMGS12/RAMGS13.
+    *
+    * Split into two blocks rather than TI's single RAMLS4_5 because the
+    * program/data selection (LSxCLAPGM) is per-LS-block: LS4 is handed to the
+    * CLA as program memory and LS5 as data memory, so each needs its own
+    * MEMORY range. Keeping the CLA's data here instead of sharing LS1..LS3
+    * leaves .bss purely CPU-owned, so the control ISR never arbitrates with
+    * the CLA for a RAM port.
+    */
+   RAMLS4           : origin = 0x00A000, length = 0x000800
+   RAMLS5           : origin = 0x00A800, length = 0x000800
 
    BEGIN           	: origin = 0x080000, length = 0x000002
    RAMM0           	: origin = 0x000122, length = 0x0002DE
@@ -65,6 +93,17 @@ PAGE 1 : /* Data Memory */
    RAMGS6     		: origin = 0x012000, length = 0x001000
    RAMGS7      		: origin = 0x013000, length = 0x001000
    RAMGS8      		: origin = 0x014000, length = 0x001000
+
+   /*
+    * CLA1 message RAMs. Fixed addresses in the device memory map: the low
+    * block is CLA-write / CPU-read and the high block CPU-write / CLA-read.
+    * Declared for completeness so any object emitting the standard
+    * Cla1ToCpuMsgRAM / CpuToCla1MsgRAM sections links; this design keeps its
+    * shared data in LS5 instead, which is large enough for the whole filter
+    * state where these 0x80-word windows are not.
+    */
+   CLA1_MSGRAMLOW   : origin = 0x001480, length = 0x000080
+   CLA1_MSGRAMHIGH  : origin = 0x001500, length = 0x000080
 
    CPU2TOCPU1RAM   : origin = 0x03F800, length = 0x000400
    CPU1TOCPU2RAM   : origin = 0x03FC00, length = 0x000400
@@ -149,16 +188,56 @@ SECTIONS
    ramgs0           : > RAMGS4,     PAGE = 1
    ramgs1           : > RAMGS5,     PAGE = 1
 
-   .scratchpad      : > RAMGS6, PAGE = 1
-   .bss_cla         : > RAMGS6,  PAGE = 1
    controlVariables : > RAMGS6,  PAGE = 1
 
+   /*
+    * ==================== CLA1 ====================
+    *
+    * Everything the CLA touches must live in an LSx block. The CLA's address
+    * bus is only 16 bits wide (TRM 6.7.2), so RAMGS/RAMM/flash are all out of
+    * reach - .scratchpad, .bss_cla and .const_cla used to sit in RAMGS6/RAMGS2
+    * where no CLA could ever have read them. They were inert because no CLA
+    * code existed; they are real now.
+    *
+    * LS4 is program, LS5 is data. bts_cpu1.c hands both blocks to the CLA and
+    * sets LSxCLAPGM accordingly in BTS_initCla().
+    */
+   Cla1Prog         :  LOAD = FLASHK,
+                       RUN = RAMLS4,
+                       LOAD_START(Cla1funcsLoadStart),
+                       LOAD_END(Cla1funcsLoadEnd),
+                       RUN_START(Cla1funcsRunStart),
+                       LOAD_SIZE(Cla1funcsLoadSize),
+                       PAGE = 0, ALIGN(8)
+
+   /*
+    * CLA local data. CLADataLS5 carries this design's filter state, which is
+    * defined in C (bts_cla_data.c) - the CLA compiler cannot export a symbol
+    * the C28x linker will resolve, so anything both sides touch is a C object
+    * placed here by #pragma DATA_SECTION.
+    */
+   CLADataLS5       : > RAMLS5,  PAGE = 0
+   .scratchpad      : > RAMLS5,  PAGE = 0
+   .bss_cla         : > RAMLS5,  PAGE = 0
+
+   CLAscratch       : { *.obj(CLAscratch)
+                        . += CLA_SCRATCHPAD_SIZE;
+                        *.obj(CLAscratch_end) }
+                    > RAMLS5,  PAGE = 0
+
+   /*
+    * device.c copies this unconditionally when _FLASH is defined, so the
+    * LOAD/RUN symbols have to exist whether or not the CLA has any constants.
+    */
    .const_cla       :  LOAD = FLASHL,
-                       RUN = RAMGS2,
+                       RUN = RAMLS5,
                        RUN_START(Cla1ConstRunStart),
                        LOAD_START(Cla1ConstLoadStart),
                        LOAD_SIZE(Cla1ConstLoadSize),
-                       PAGE = 0
+                       PAGE = 0, ALIGN(4)
+
+   Cla1ToCpuMsgRAM  : > CLA1_MSGRAMLOW,   PAGE = 1
+   CpuToCla1MsgRAM  : > CLA1_MSGRAMHIGH,  PAGE = 1
 
    /* The following section definitions are required when using the IPC API Drivers */
     GROUP : > CPU1TOCPU2RAM, PAGE = 1

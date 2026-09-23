@@ -16,6 +16,7 @@
 #ifdef CPU1
 #include <bts.h>
 #include "registers.h"
+#include "bts_cla_shared.h"
 #include <math.h>
 
 //
@@ -42,6 +43,12 @@ __interrupt void adcCellVoltageISR(void);
 static void updateInputVoltage(void);
 static void checkGroupIntegrity(void);
 static void publishStatusToCpu2(void);
+
+//
+// CLA1 - the internal-ADC telemetry filter. See bts_cla.cla.
+//
+static void BTS_initCla(void);
+static void BTS_updateFilteredTelemetry(void);
 void updateStatusRegisters(void);
 void modeCallback(float value, uint16_t channel);
 void BTS_HandleRegisterWrite(void);
@@ -817,9 +824,73 @@ static void calPublishTelemetry(void)
         cpu1Status.calTelemetry[3] = m->Isense_A;
         cpu1Status.calTelemetry[4] = calF28VoltagePu(m);
         cpu1Status.calTelemetry[5] = calF28CurrentPu(m);
-        cpu1Status.calTelemetry[6] = m->CellVoltage_V;
-        cpu1Status.calTelemetry[7] = m->CellCurrent_I;
+        cpu1Status.calTelemetry[6] = m->CellVoltageFilt_V;
+        cpu1Status.calTelemetry[7] = m->CellCurrentFilt_I;
     }
+}
+
+//
+// Bring CLA1 up on the internal-ADC telemetry filter. See bts_cla.cla.
+//
+// Must run after BTS_HAL_setupDevice() - that is what copies the Cla1Prog
+// image out of flash into RAMLS4 - and after BTS_HAL_setupADC(), which arms
+// ADCA INT2 on SOC6 with Interrupt_disable(INT_ADCA2) so the flag reaches
+// CLA1 and nothing else.
+//
+// CLA1's peripheral clock is already on: Device_enableAllPeripherals()
+// enables SYSCTL_PERIPH_CLK_CLA1 (device/device.c:175).
+//
+static void BTS_initCla(void)
+{
+    //
+    // LS4 = CLA program, LS5 = CLA data.
+    //
+    // Order matters. TI's own cla_asin_cpu01.c sets the controller select
+    // (LSxMSEL) FIRST and the program/data select (LSxCLAPGM) second; doing
+    // it the other way round can leave the block handed to the CLA while it
+    // is still typed as data, and the fetch aborts.
+    //
+    MemCfg_setLSRAMControllerSel(MEMCFG_SECT_LS4,
+                                 MEMCFG_LSRAMCONTROLLER_CPU_CLA1);
+    MemCfg_setCLAMemType(MEMCFG_SECT_LS4, MEMCFG_CLA_MEM_PROGRAM);
+
+    MemCfg_setLSRAMControllerSel(MEMCFG_SECT_LS5,
+                                 MEMCFG_LSRAMCONTROLLER_CPU_CLA1);
+    MemCfg_setCLAMemType(MEMCFG_SECT_LS5, MEMCFG_CLA_MEM_DATA);
+
+    //
+    // All eight vectors are mapped even though only task 1 is enabled. An
+    // unmapped MVECT holds whatever the reset value was; if a stray trigger
+    // ever reached a task with a garbage vector the CLA would fetch from a
+    // random address. bts_cla.cla defines empty bodies for tasks 2-8 for
+    // exactly this reason.
+    //
+    // The (uint16_t) casts are what --diag_suppress=770 is for: MVECTn holds
+    // a 16-bit CLA program address, and the CLA program space is entirely
+    // below 0x10000, so the narrowing is correct here.
+    //
+    CLA_mapTaskVector(CLA1_BASE, CLA_MVECT_1, (uint16_t)&Cla1Task1);
+    CLA_mapTaskVector(CLA1_BASE, CLA_MVECT_2, (uint16_t)&Cla1Task2);
+    CLA_mapTaskVector(CLA1_BASE, CLA_MVECT_3, (uint16_t)&Cla1Task3);
+    CLA_mapTaskVector(CLA1_BASE, CLA_MVECT_4, (uint16_t)&Cla1Task4);
+    CLA_mapTaskVector(CLA1_BASE, CLA_MVECT_5, (uint16_t)&Cla1Task5);
+    CLA_mapTaskVector(CLA1_BASE, CLA_MVECT_6, (uint16_t)&Cla1Task6);
+    CLA_mapTaskVector(CLA1_BASE, CLA_MVECT_7, (uint16_t)&Cla1Task7);
+    CLA_mapTaskVector(CLA1_BASE, CLA_MVECT_8, (uint16_t)&Cla1Task8);
+
+    //
+    // IACKE lets software force a task with CLA_forceTasks(); harmless here
+    // and useful for bringing the filter up on the bench without the ADC.
+    //
+    CLA_enableIACK(CLA1_BASE);
+    CLA_enableTasks(CLA1_BASE, CLA_TASKFLAG_1);
+
+    //
+    // ADCA INT2 fires at the end of SOC6, the last conversion in the sweep,
+    // so task 1 sees all seventeen results already latched. INT_ADCA2 is
+    // disabled at the PIE, so this flag has exactly one consumer.
+    //
+    CLA_setTriggerSource(CLA_TASK_1, CLA_TRIGGER_ADCA2);
 }
 
 //
@@ -850,6 +921,12 @@ void main(void)
 
     // Setup ADC trigger for 10kHz sampling
     BTS_HAL_setupAdcTrigger(EPWM1_BASE);
+
+    //
+    // Start CLA1 filtering the internal ADC. Telemetry only - the control
+    // loop and the protection paths keep reading the unfiltered samples.
+    //
+    BTS_initCla();
 
     //
     // Tasks State-machine initialization
@@ -1189,8 +1266,8 @@ static void publishStatusToCpu2(void)
         bitset |= (status[ch].restored & 0x1) << BTS_STATUS_RESTORED;
         cpu1Status.statusBits[ch] = bitset;
 
-        cpu1Status.cellVoltage[ch] = BTS_measValues[ch].CellVoltage_V;
-        cpu1Status.cellCurrent[ch] = BTS_measValues[ch].CellCurrent_I;
+        cpu1Status.cellVoltage[ch] = BTS_measValues[ch].CellVoltageFilt_V;
+        cpu1Status.cellCurrent[ch] = BTS_measValues[ch].CellCurrentFilt_I;
 
         //
         // The ADS131M08 engineering values. Computed at 10 Hz since the
@@ -1207,8 +1284,8 @@ static void publishStatusToCpu2(void)
         cpu1Status.dischargeSeconds[ch] = accDischargeSeconds[ch];
 
         canData[ch].channel = ch;
-        canData[ch].voltage = BTS_measValues[ch].CellVoltage_V;
-        canData[ch].current = BTS_measValues[ch].CellCurrent_I;
+        canData[ch].voltage = BTS_measValues[ch].CellVoltageFilt_V;
+        canData[ch].current = BTS_measValues[ch].CellCurrentFilt_I;
         //
         // CAN carries the total for the direction the slot is set to, so a
         // listener sees the figure for the test in progress.
@@ -1530,6 +1607,64 @@ void BTS_monitor_Iout_Vout(BTS_measValue* measValues)
     avgValue = (float32_t)measValues->Sum_CellI / ((float32_t)BTS_f28AverageFactor * 4096.0);
     measValues->CellCurrent_I = (avgValue * 2.5f) * measValues->F28I_Gain + measValues->F28I_Offset;
 }
+
+//
+// Copy CLA1's filtered cell V/I into the telemetry fields, applying the same
+// counts -> engineering conversion BTS_monitor_Iout_Vout uses above.
+//
+// The CLA stores raw ADC counts, so the scaling has to be identical or the
+// filtered and unfiltered numbers would disagree by a constant factor and
+// look like a calibration fault. It is written out rather than factored into
+// a shared helper because BTS_monitor_Iout_Vout runs from ramfuncs and is on
+// the hot path; this one runs at 10 Hz.
+//
+// Falls back to the unfiltered values whenever CLA1 is not demonstrably
+// running - if the program image failed to copy into RAMLS4, if LSxCLAPGM was
+// never set, or if the ADCA INT2 trigger is not reaching CLA1TASKSRCSEL1,
+// BTS_claRunCount stops advancing and these fields would otherwise report a
+// frozen number, or 0 V, with nothing to distinguish it from a real reading.
+//
+// Called once per C1() pass, i.e. at 10 Hz, right after the eight
+// BTS_monitor_Iout_Vout calls that refresh the unfiltered pair.
+//
+static void BTS_updateFilteredTelemetry(void)
+{
+    static uint16_t lastRunCount = 0U;
+    static uint16_t claSeenRunning = 0U;
+    uint16_t nowRunCount = BTS_claRunCount;
+    uint16_t ch;
+
+    //
+    // At 6.645 kSPS the counter advances ~665 times between calls and wraps
+    // every 9.86 s, so equality across a 100 ms gap means it genuinely is not
+    // running. The first pass cannot tell - lastRunCount starts at 0 and the
+    // CLA may legitimately be at 0 - so claSeenRunning latches only once a
+    // difference has actually been observed.
+    //
+    if (nowRunCount != lastRunCount) {
+        claSeenRunning = 1U;
+    } else {
+        claSeenRunning = 0U;
+    }
+    lastRunCount = nowRunCount;
+
+    for (ch = 0U; ch < NUM_CHANNELS; ch++) {
+        BTS_measValue *m = &BTS_measValues[ch];
+
+        if ((claSeenRunning != 0U) && (BTS_claPrimed != 0U)) {
+            float32_t vCounts = BTS_claCellVoltageFilt[ch];
+            float32_t iCounts = BTS_claCellCurrentFilt[ch];
+
+            m->CellVoltageFilt_V = ((vCounts / 4096.0f) * 2.5f) *
+                                   m->F28V_Gain + m->F28V_Offset;
+            m->CellCurrentFilt_I = ((iCounts / 4096.0f) * 2.5f) *
+                                   m->F28I_Gain + m->F28I_Offset;
+        } else {
+            m->CellVoltageFilt_V = m->CellVoltage_V;
+            m->CellCurrentFilt_I = m->CellCurrent_I;
+        }
+    }
+}
 //
 //=============================================================================
 // STATE-MACHINE SEQUENCING AND SYNCRONIZATION FOR SLOW BACKGROUND TASKS
@@ -1710,6 +1845,12 @@ void C1(void)
     BTS_monitor_Iout_Vout(&BTS_measValues_ch6);
     BTS_monitor_Iout_Vout(&BTS_measValues_ch7);
     BTS_monitor_Iout_Vout(&BTS_measValues_ch8);
+
+    //
+    // Refresh the CLA-filtered copy from the same pass, so the filtered and
+    // unfiltered pairs a host reads always describe the same instant.
+    //
+    BTS_updateFilteredTelemetry();
 
     //
     // Integrate charge, energy and run time from the measurements just

@@ -252,6 +252,16 @@ extern uint16_t Cla1ConstRunStart;
 extern uint16_t Cla1ConstLoadStart;
 extern uint16_t Cla1ConstLoadSize;
 
+//
+// CLA1 program image. Defined by both linker command files: on CPU1 it is the
+// real filter task, copied from flash into RAMLS4; on CPU2 it is an empty
+// section so this unconditional copy links and moves nothing.
+//
+extern uint16_t Cla1funcsRunStart;
+extern uint16_t Cla1funcsLoadStart;
+extern uint16_t Cla1funcsLoadEnd;
+extern uint16_t Cla1funcsLoadSize;
+
 #define DEVICE_FLASH_WAITSTATES 3
 
 #endif
