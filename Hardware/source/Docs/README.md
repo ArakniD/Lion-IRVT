@@ -3,10 +3,20 @@
 How to calibrate one or more slots on the eight-channel battery test system
 (BTS), with the hardware in front of you.
 
-This is the operator's document. The engineering contract — register
-addresses, opcodes, the two-point mathematics — is in
-[`calibration-design.md`](calibration-design.md). You do not need to read it to
-run a calibration.
+This is the operator's document. You do not need to read anything else to run
+a calibration.
+
+### The other documents in this directory
+
+| File | What it is |
+|---|---|
+| [`api-specification.md`](api-specification.md) | Part 1 the HTTP API; Part 2 the **complete I2C register map** — 267 registers in three regions, verified against `registers.h`. The authority for any address |
+| [`ble-specification.md`](ble-specification.md) | The GATT service: 12 characteristics, packed record layouts, notify behaviour, protocol versioning |
+| [`data-flow.md`](data-flow.md) | How measurements, commands, settings and calibration move between CPU1, CPU2, the ESP32 and a host. Diagrams, the measured rates, the CLA telemetry filter, and the dead paths |
+| [`supervision-and-state-design.md`](supervision-and-state-design.md) | The design contract for the PAUSED state, the host watchdog and F-RAM state persistence |
+| [`calibration-design.md`](calibration-design.md) | The calibration mathematics, opcodes and state machine. **Its register addresses are stale** — use `api-specification.md` for those |
+| [`calibration-flow.md`](calibration-flow.md) | The calibration procedure and state machine as diagrams |
+| [`hardware-resources.md`](hardware-resources.md) | PIE, ACK groups, XINT, X-BAR, ADC base and CLA1 allocation across both cores |
 
 ---
 
@@ -341,7 +351,8 @@ to the log; the procedure is driven over BLE or HTTP.
 | Another slot paused itself partway through the session | The host watchdog. Nothing talked to the unit for 30 s, so every *running* slot paused. The slot under calibration is unaffected. | Expected. Check the ESP32 is powered and its I2C link is up (`GET /api/i2c_diag`), then resume or stop the slot. |
 | A slot shows `restored` after you power-cycled the unit | The F-RAM state block. It was mid-run when the unit went down, and came back paused with its counters rather than resuming into a cell that may have been changed. | Working as designed. Stop it before calibrating; resume it only if you know the same cell is still in the slot. |
 | The AT console prints `WARNING: host watchdog DISABLED` repeatedly | **Known bug.** The message is spurious — supervision is armed. | Ignore it. Confirm with `AT+WD?`, which should answer `+WD=30.00`. |
-| The AT console answers only garbage at 115200 | **Known bug.** The console's real baud rate is not what the build configures. | Connect at **~7267 baud**. See the console note below. |
+| The AT console answers only garbage | **Build skew**, not a hardware fault. The console is served by **CPU2**, and `SCI_setConfig()` derives its divisor from `DEVICE_LSPCLK_FREQ`. Editing the clock config and rebuilding only CPU1 leaves CPU2's divisor built for the old clock. | Rebuild and reload **both** cores, then connect at **115200 8N1**. |
+| The AT console says nothing at all to `AT` | **By design.** `uartRxISR()` matches only `"AT+"`; a bare `AT` is dropped with no `OK` and no `ERROR`. | Probe with a real command, e.g. `AT+InputVoltage?`. |
 | Current reads the right size with the wrong sign afterwards | A signed value was entered where a magnitude was wanted. | Recalibrate that slot's current. Enter the absolute value. |
 | `unsupported DMM` on connect | `*IDN?` returned a model the script does not know. | Check it is the right instrument. `--allow-unknown-dmm` overrides, if you are sure it speaks the same SCPI. |
 | Both ticks stay grey after a successful save | The save reported bit 7 but the status bits did not follow. | Re-read `/api/calibration`. If it persists, the F-RAM image may have failed validation on reload — power-cycle and check. |
@@ -394,26 +405,31 @@ Verify the result independently before you trust the unit:
 
 ## Known issues
 
-Two defects in the debug console, both found during hardware verification and
-neither yet fixed. Neither affects calibration accuracy or the safety paths,
-but both will waste your time if you meet them cold.
+One cosmetic defect in the debug console. It does not affect calibration
+accuracy or the safety paths, but it will waste your time if you meet it cold.
 
-### The AT console's baud rate is not 115200
-
-**Connect at approximately 7267 baud.** At 115200 every received byte is
-framing garbage — the console answers, but with bytes like 254, 248, 254, 245
-where `A`, `T`, `+` were sent.
-
-`BTS_CONSOLE_BAUDRATE` is `115200` and `SCI_setConfig()` computes BRR = 42
-from `DEVICE_LSPCLK_FREQ`, which should give roughly 145 kbaud — already not
-115200. The rate that actually works implies the real LSPCLK is far lower than
-`DEVICE_LSPCLK_FREQ` claims. **The root cause is not established.** Reading
-`ClkCfgRegs` over JTAG returned all zeros, which is a known artefact on this
-part when the registers are read while the core is running, so the PLL
-configuration has not yet been confirmed either way.
-
-Do not "fix" this by changing the baud constant until the clock tree has been
-read properly with the core halted. Set your terminal to 7267 and carry on.
+> ### The AT console baud rate is no longer an issue — it works at 115200
+>
+> Earlier revisions of this document told you to connect at ~7267 baud. That
+> was wrong, and the advice is withdrawn.
+>
+> The console runs correctly at the configured **115200 8N1** on the
+> controlCARD FTDI backchannel. What looked like a wrong baud rate was **build
+> skew**: the console is served by CPU2, `SCI_setConfig()` derives BRR from
+> `DEVICE_LSPCLK_FREQ`, and the clock configuration was being edited with only
+> CPU1 rebuilt and reloaded. CPU2 kept running a divisor built for the previous
+> clock, so the apparent baud shifted every time — which was misread as
+> confirmation of a hardware fault.
+>
+> The clock itself was never wrong. SYSCLK measures **179.7 MHz** against a
+> configured 180 MHz (20 MHz XTAL ×18 /2), 0.17 % error. LSPCLK is 45 MHz and
+> the driver programs BRR = 47, giving 117188 baud — 1.7 % off 115200 and
+> comfortably inside UART tolerance.
+>
+> **Two practical rules from this.** Rebuild and reload *both* cores after any
+> clock change. And probe the console with a real command such as
+> `AT+InputVoltage?` — a bare `AT` is silently ignored by design, which reads
+> exactly like a dead console.
 
 ### A spurious watchdog-disabled warning
 

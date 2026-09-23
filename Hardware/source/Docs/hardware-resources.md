@@ -23,10 +23,16 @@ it. Each defect below carries a "what it looked like when it broke" note,
 because the symptom is what a future reader recognises first.
 
 Four further problems, none previously known, were found while compiling these
-tables and are recorded in [§7](#7-known-conflicts-and-latent-bugs). Two are
+tables and are recorded in [§8](#8-known-conflicts-and-latent-bugs). Two are
 resource conflicts of exactly the kind this file exists to prevent — a
 trip-vector registration that silently collapses to one slot, and a CPU2 timer
-claimed twice — and both are masked today only by a build flag.
+claimed twice. The trip-vector one has since been fixed; the timer is still
+masked by a build flag.
+
+[§7](#7-cla1-allocation) covers CLA1, which is a third processor on this die
+and does not appear in any of the PIE, X-BAR or timer tables — its trigger
+never reaches a PIE channel and its code and data live in RAM blocks the C28x
+gives away at boot.
 
 ---
 
@@ -41,13 +47,14 @@ absolutely is.
 
 | Interrupt | PIE grp.ch | Handler | Registered at | Body at | Services |
 |---|---|---|---|---|---|
-| `INT_ADCA1` | **1.1** | `adcCellVoltageISR` | `bts_cpu1.c:919` | `bts_cpu1.c:1965` | On-chip 12-bit ADC: 8 cell voltages, 8 cell currents, 1 reference |
-| `INT_EPWM1_TZ` … `INT_EPWM8_TZ` | **2.1–2.8** | `epwmTripISR` | `bts_hal.c:1482` | `bts_cpu1.c:2020` | ePWM trip zones, all 8 slots. **See §7.1 — the registration is wrong** |
-| `INT_EPWM1` | **3.1** | `epwm1ISR` | `bts_hal.c:1475` | `bts_cpu1.c:1100` | SFRA sweep. Compiled out: `BTS_SFRA_ENABLED (false)`, `bts_user_settings.h:270` |
-| `INT_SPIA_RX` | **6.1** | `ISR2` → `BTS_ExAdcRead_ch1_4()` | `bts_hal.c:1461` | `bts_cpu1.c:1085`, `bts_hal.h:212` | SPIA RX FIFO — ADS131M08 #1 frame for slots 1–4 |
-| `INT_SPIC_RX` | **6.9** | `ISR4` → `BTS_ExAdcRead_ch5_8()` | `bts_hal.c:1468` | `bts_cpu1.c:1092`, `bts_hal.h:227` | SPIC RX FIFO — ADS131M08 #2 frame for slots 5–8 |
-| `INT_XINT3` | **12.1** | `ISR1` → `BTS_runISR_ch1_4()` | `bts_hal.c:1460` | `bts_cpu1.c:1059`, `bts.h:759` | SPI ADC1 DRDY on GPIO25. Runs the slot 1–4 control loops |
-| `INT_XINT5` | **12.3** | `ISR3` → `BTS_runISR_ch5_8()` | `bts_hal.c:1467` | `bts_cpu1.c:1072`, `bts.h:816` | SPI ADC2 DRDY on GPIO49. Runs the slot 5–8 control loops |
+| `INT_ADCA1` | **1.1** | `adcCellVoltageISR` | `bts_cpu1.c:1022` | `bts_cpu1.c:2217` | On-chip 12-bit ADC: 8 cell voltages, 8 cell currents, 1 reference |
+| `INT_ADCA2` | **1.2** | — **masked, routed to CLA1** | — | `bts_cla.cla` | ADCA INT2 ← SOC6. `Interrupt_disable(INT_ADCA2)`; the flag drives CLA1 task 1 instead. See [§7](#7-cla1-allocation) |
+| `INT_EPWM1_TZ` … `INT_EPWM8_TZ` | **2.1–2.8** | `epwmTripISR` | `bts_hal.c:1978` | `bts_cpu1.c:2272` | ePWM trip zones, all 8 slots. **Was §8.1 — now fixed, registered from an explicit table** |
+| `INT_EPWM1` | **3.1** | `epwm1ISR` | `bts_hal.c:1955` | `bts_cpu1.c:1203` | SFRA sweep. Compiled out: `BTS_SFRA_ENABLED (false)`, `bts_user_settings.h:270` |
+| `INT_SPIA_RX` | **6.1** | `ISR2` → `BTS_ExAdcRead_ch1_4()` | `bts_hal.c:1941` | `bts_cpu1.c:1188`, `bts_hal.h:240` | SPIA RX FIFO — ADS131M08 #1 frame for slots 1–4 |
+| `INT_SPIC_RX` | **6.9** | `ISR4` → `BTS_ExAdcRead_ch5_8()` | `bts_hal.c:1948` | `bts_cpu1.c:1195`, `bts_hal.h:255` | SPIC RX FIFO — ADS131M08 #2 frame for slots 5–8 |
+| `INT_XINT3` | **12.1** | `ISR1` → `BTS_runISR_ch1_4()` | `bts_hal.c:1940` | `bts_cpu1.c:1162`, `bts.h:759` | SPI ADC1 DRDY on GPIO25. Runs the slot 1–4 control loops |
+| `INT_XINT5` | **12.3** | `ISR3` → `BTS_runISR_ch5_8()` | `bts_hal.c:1947` | `bts_cpu1.c:1175`, `bts.h:816` | SPI ADC2 DRDY on GPIO49. Runs the slot 5–8 control loops |
 
 The `BTS_SPI_DRDY_XINT_ADC1/2` and `BTS_DRDY_ADC1/2` indirections that select
 XINT3/XINT5 and `ISR1`/`ISR3` are at `bts_user_settings.h:521-525` and
@@ -65,7 +72,16 @@ XINT3/XINT5 and `ISR1`/`ISR3` are at `bts_user_settings.h:521-525` and
 > arms ADCB's own INT1 flag so `updateInputVoltage()` can spin on it
 > (`bts_cpu1.c:1877`), but `Interrupt_enable(INT_ADCB1)` is never called, so
 > the PIE never propagates it. This is intentional: the bus-voltage read is a
-> bounded poll, not an ISR. See §7.3 for a flaw in that poll.
+> bounded poll, not an ISR. See §8.3 for a flaw in that poll.
+
+> **`INT_ADCA2` (1.2) is armed in the ADC and masked in the PIE.** This is not
+> an oversight either. `ADC_enableInterrupt(ADCA_BASE, ADC_INT_NUMBER2)`
+> (`bts_hal.c:1755`) arms both the `ADCINT2` status flag and its PIE line;
+> `Interrupt_disable(INT_ADCA2)` (`:1759`) takes the PIE line straight back
+> out. The flag itself is what `CLA1TASKSRCSEL1` samples, so CLA1 task 1 still
+> triggers on every sweep while CPU1 never sees a vector. Continuous mode
+> (`ADC_enableContinuousMode`, `:1758`) means the flag re-arms without anyone
+> clearing it — nothing on the C28x side ever would.
 
 ### 1.2 CPU2 — communications and configuration
 
@@ -73,7 +89,7 @@ XINT3/XINT5 and `ISR1`/`ISR3` are at `bts_user_settings.h:521-525` and
 |---|---|---|---|---|---|
 | `INT_XINT1` | **1.4** | `ads1119Drdy1ISR` | `com_cpu2.c:1506` | `com_cpu2.c:1734` | ADS1119 #1 DRDY on GPIO42 (slots 1–4 cell temperature) |
 | `INT_XINT2` | **1.5** | `ads1119Drdy2ISR` | `com_cpu2.c:1507` | `com_cpu2.c:1746` | ADS1119 #2 DRDY on GPIO43 (slots 5–8 cell temperature) |
-| `INT_TIMER0` | **1.7** | `ledTimerISR` | `led_driver.c:43` | `led_driver.c:131` | WS2812B refresh at 80 Hz. **Production build only**; see §7.2 |
+| `INT_TIMER0` | **1.7** | `ledTimerISR` | `led_driver.c:43` | `led_driver.c:131` | WS2812B refresh at 80 Hz. **Production build only**; see §8.2 |
 | `INT_I2CA` | **8.1** | `i2cSlaveISR` | `com_cpu2.c:339` | `com_cpu2.c:2883` | I2C target framing (start/stop/AAS/NACK) |
 | `INT_I2CA_FIFO` | **8.2** | `i2cSlaveFifoISR` | `com_cpu2.c:340` | `com_cpu2.c:2976` | I2C target data bytes, and the watchdog reload on a host read |
 | `INT_SCIA_RX` | **9.1** | `uartRxISR` | `com_cpu2.c:1383` | `com_cpu2.c:3247` | AT console RX. Console build only (`BTS_CONSOLE_ENABLED`) |
@@ -144,7 +160,7 @@ does need `INTERRUPT_ACK_GROUP1`.
 ### What it looked like when it broke
 
 > **Defect 2 — the ACK group did not follow the XINT move.** When CPU1 moved
-> its SPI DRDY lines from XINT1/XINT2 to XINT3/XINT5 (see §4), the PIE group
+> its SPI DRDY lines from XINT1/XINT2 to XINT3/XINT5 (see [§4](#4-input-x-bar)), the PIE group
 > went from 1 to **12**, but `BTS_runISR_ch1_4()` and `BTS_runISR_ch5_8()`
 > still acked `INTERRUPT_ACK_GROUP1`.
 >
@@ -306,10 +322,10 @@ gated on `BTS_TRIP_HW_CHn_ENABLED`.
 
 | Module | Purpose | Configured at |
 |---|---|---|
-| `EPWM1`–`EPWM8` | Slot 1–8 synchronous buck/boost, HRPWM on both edges | `bts_hal.c:599` via `bts_cpu1.c:846-853` |
-| `EPWM1` *(also)* | **SOCA trigger for the on-chip ADC** | `bts_hal.c:1336` via `bts_cpu1.c:826` — see §7.4 |
-| `EPWM11` | ADS131M08 #1 master clock, GPIO20 | `bts_hal.c:763` via `bts_cpu1.c:855` |
-| `EPWM12` | ADS131M08 #2 master clock, GPIO22 | `bts_hal.c:763` via `bts_cpu1.c:856` |
+| `EPWM1`–`EPWM8` | Slot 1–8 synchronous buck/boost, HRPWM on both edges | `bts_hal.c:975` via `bts_cpu1.c:949-956` |
+| `EPWM1` *(also)* | **SOCA trigger for the on-chip ADC**, prescaled /15 | `bts_hal.c:1818-1828` via `bts_cpu1.c:923` — see [§8.4](#84-the-adc-trigger-rate-is-664-ksps-not-10-khz) |
+| `EPWM11` | ADS131M08 #1 master clock, GPIO20 | `bts_hal.c:763` via `bts_cpu1.c:958` |
+| `EPWM12` | ADS131M08 #2 master clock, GPIO22 | `bts_hal.c:763` via `bts_cpu1.c:959` |
 | `EPWM9`, `EPWM10` | — | **Free** |
 
 `EPWM1` is also the sync-chain master for group interleaving; every other
@@ -339,7 +355,7 @@ Rule of thumb: **every API except `ADC_readResult()` takes `ADCx_BASE`.**
 
 ### SOC allocation
 
-All `ADC_TRIGGER_EPWM1_SOCA` unless noted. Configured `bts_hal.c:1286-1310`.
+All `ADC_TRIGGER_EPWM1_SOCA` unless noted. Configured `bts_hal.c:1680-1704`.
 
 | | SOC0 | SOC1 | SOC2 | SOC3 | SOC4 | SOC5 | SOC6 |
 |---|---|---|---|---|---|---|---|
@@ -348,8 +364,28 @@ All `ADC_TRIGGER_EPWM1_SOCA` unless noted. Configured `bts_hal.c:1286-1310`.
 | **ADCC** | IN3 — ch6 V | IN5 — ch8 V | IN2 — ch6 I | IN4 — ch8 I | | | |
 | **ADCD** | IN1 — ch5 V | IN3 — ch7 V | IN0 — ch5 I | IN2 — ch7 I | | | |
 
-ADC interrupt sources: **ADCA INT1 ← SOC0** (`bts_hal.c:1315`, drives PIE 1.1);
-**ADCB INT1 ← SOC2** (`bts_hal.c:1326`, polled only — see §1.1 and §7.3).
+Seventeen SOCs in total, all on the one `EPWM1` SOCA event, converting in
+parallel across the four converters. **SOC6 is last in ADCA's round robin**,
+which is what makes it the right interrupt source for anything that wants the
+whole sweep — including the A0 reference every current reading is differential
+about.
+
+ADC interrupt sources:
+
+| Flag | Source SOC | PIE | Used by |
+|---|---|---|---|
+| **ADCA INT1** | SOC0 | 1.1, enabled | `adcCellVoltageISR` (`bts_hal.c:1709`) |
+| **ADCA INT2** | **SOC6** | 1.2, **masked** | **CLA1 task 1** via `CLA1TASKSRCSEL1` (`bts_hal.c:1755-1759`) — see [§7](#7-cla1-allocation) |
+| **ADCB INT1** | SOC2 | not enabled | polled by `updateInputVoltage()` (`bts_hal.c:1728`) — see §1.1 and §8.3 |
+
+`ADC_setInterruptPulseMode(ADCA_BASE, ADC_PULSE_END_OF_CONV)` (`bts_hal.c:1781`)
+applies to **ADCA only** and is a requirement of the CLA path, not a
+preference: in the default `ADC_PULSE_END_OF_ACQ_WIN` mode the flag asserts
+when the acquisition window closes, which is *before* the result register is
+written — the CLA would latch the previous sweep. TI's own `cla_adc_fir32`
+example makes the same change for the same reason. The side effect on ADCA
+INT1 is that it now fires ~106 ns later, at end-of-conversion rather than
+end-of-acquisition, which is strictly safer for `adcCellVoltageISR` too.
 
 ### What it looked like when it broke
 
@@ -361,19 +397,163 @@ ADC interrupt sources: **ADCA INT1 ← SOC0** (`bts_hal.c:1315`, drives PIE 1.1)
 >
 > A constant that is the same on every channel and never moves is the
 > signature: real ADC noise is never that quiet. **Fixed** in
-> `adcCellVoltageISR` (`bts_cpu1.c:1975-1994`, with the rationale at
-> `:1968-1972`) and in the bus-voltage read (`bts_cpu1.c:1893`).
+> `adcCellVoltageISR` (`bts_cpu1.c:2217`, rationale immediately above it) and
+> in the bus-voltage read. `bts_cla.cla` carries the same warning at its SOC
+> map, because the CLA reads the identical set of registers and would fail the
+> identical way.
 
 ---
 
-## 7. Known conflicts and latent bugs
+## 7. CLA1 allocation
 
-### 7.1 All eight trip-zone ISRs are registered into the ePWM1 vector
+CLA1 is a third processor on this die, independent of both C28x cores. It does
+not appear in the PIE tables, the X-BAR tables or the timer tables, and that is
+precisely why it needs its own section: its trigger never reaches a PIE
+channel, and the RAM it executes from is taken away from CPU1 at boot and never
+given back.
 
-**Status: live defect, currently masked. Found 2026-09-21 while compiling
-these tables; not previously known.**
+**CPU1 owns CLA1. CPU2's CLA is deliberately untouched** — it is reserved for
+the ADS131M08 current control loop in a later phase. `bts_cla.cla` is wrapped
+in `#ifdef CPU1` for exactly this reason: the project compiles every root-level
+source under both configurations.
 
-`bts_hal.c:1482-1483`:
+### 7.1 What CLA1 does here
+
+One task. `Cla1Task1` reads all seventeen ADC results, subtracts the A0
+reference from each current, and folds both sets through a 20 Hz single-pole
+IIR in float32. The output is telemetry only. The rate chain, the filter
+mathematics and the C28x-side consumers are in
+[`data-flow.md` §2](data-flow.md#2-measurement-path--silicon-to-phone); this
+section is the resource side.
+
+Tasks 2–8 are defined as empty bodies and are **not** enabled in `MIER`. They
+exist because `BTS_initCla()` maps all eight `MVECT` registers — an unmapped
+vector left at its reset value sends the CLA off to fetch from wherever that
+happens to point, if it is ever triggered.
+
+### 7.2 The trigger does not go through the PIE
+
+```
+EPWM1 SOCA ──► ADCA SOC6 conversion ──► ADCINT2 flag ──► CLA1TASKSRCSEL1 ──► task 1
+                                              │
+                                              └──► PIE 1.2  ✗ masked
+```
+
+`CLA_setTriggerSource(CLA_TASK_1, CLA_TRIGGER_ADCA2)` (`bts_cpu1.c:893`) writes
+the task-1 field of `CLA1TASKSRCSEL1`. That register samples the peripheral's
+interrupt flag directly; the PIE is not in the path. So `Interrupt_disable(INT_ADCA2)`
+costs nothing and buys the guarantee that CPU1 can never be dragged into a
+vector for an interrupt it has no handler for.
+
+**SOC6 is the trigger, not SOC0.** SOC6 is last in ADCA's round robin, so when
+its flag sets, every result register in the sweep holds this period's
+conversion. Triggering off SOC0 — which is what ADCA INT1 uses — would hand the
+CLA sixteen values from the *previous* period and one from this one.
+
+### 7.3 Memory: LS4 and LS5 belong to the CLA
+
+The CLA's address bus is **16 bits wide** (TRM 6.7.2). It can only reach the
+LSx RAM blocks and the ADC result window at `0x0B00-0x0B6F`. RAMGS, RAMM and
+flash are all out of range — which is why every shared object has to be placed
+by hand, and why `ADC_readResult()`'s RESULT base (§6) is not merely the
+correct API but the only reachable one.
+
+| Block | Origin | Length | Owner | Contents |
+|---|---|---|---|---|
+| `RAMLS4` | `0x00A000` | `0x800` | **CLA program** | `Cla1Prog`, `0x1A0` words used. Loads from `FLASHK`, runs from RAM |
+| `RAMLS5` | `0x00A800` | `0x800` | **CLA data** | `CLADataLS5` `0x22` words at `0x00A940`, `.scratchpad` `0x28` words at `0x00A900`, `.const_cla` |
+
+Both blocks are handed over in `BTS_initCla()` (`bts_cpu1.c:843`):
+
+```c
+MemCfg_setLSRAMControllerSel(MEMCFG_SECT_LS4, MEMCFG_LSRAMCONTROLLER_CPU_CLA1);
+MemCfg_setCLAMemType(MEMCFG_SECT_LS4, MEMCFG_CLA_MEM_PROGRAM);   // LS5: ..._MEM_DATA
+```
+
+**Controller select before memory type, always** — `LSxMSEL` before
+`LSxCLAPGM`. That is the order TI's own `cla_asin_cpu01.c` uses. Declaring a
+block CLA *program* while the C28x still
+masters it can abort the CLA's first instruction fetch, and the failure looks
+like a CLA that simply never starts — no fault, no flag, `BTS_claRunCount`
+stuck at zero.
+
+**CPU2 was moved out of LS4/LS5 to make room.** CPU2's `.bss` used to sit in
+`RAMLS4_5`; it is now on `RAMGS12`/`RAMGS13` (`2837xD_RAM_lnk_cpu2.cmd`). The
+LSx blocks are per-core, so this was not strictly a collision — but leaving
+CPU2's allocation there would have made the next person to read the two linker
+files believe it was.
+
+### 7.4 Every shared object is defined in C, not in the `.cla`
+
+`bts_cla_data.c` defines the four shared objects and `bts_cla_shared.h` only
+declares them:
+
+```c
+#pragma DATA_SECTION(BTS_claCellVoltageFilt, "CLADataLS5")
+volatile float32_t BTS_claCellVoltageFilt[BTS_CLA_NUM_CH];
+```
+
+This is a toolchain constraint, quoted verbatim from TI in the header: the CLA
+compiler cannot export a symbol the C28x linker resolves. Defining the array in
+`bts_cla.cla` links — and gives the two processors two different arrays.
+
+`bts_cla_data.c` also carries a compile-time guard:
+
+```c
+#if (BTS_CLA_NUM_CH != NUM_CHANNELS)
+#error "BTS_CLA_NUM_CH in bts_cla_shared.h must match NUM_CHANNELS"
+#endif
+```
+
+### 7.5 Initialisation order
+
+`BTS_initCla()` is called from `main()` at `bts_cpu1.c:929`, and its position is
+load-bearing at both ends:
+
+| Step | Where | Why it must be there |
+|---|---|---|
+| `BTS_HAL_setupADC()` | `bts_cpu1.c:920` | arms ADCA INT2; the CLA's trigger source must exist before it is selected |
+| `BTS_HAL_setupAdcTrigger(EPWM1_BASE)` | `:923` | starts EPWM1 SOCA |
+| **`BTS_initCla()`** | **`:929`** | after the ADC is configured, and after `BTS_HAL_setupDevice()` has copied `Cla1Prog`/`.const_cla` out of flash (`device.c:94`, `:101`) |
+| `BTS_HAL_setupSyncBuckPwm(...)` | `:949` | rewrites `TBPRD`; does **not** touch the SOC registers, so the trigger survives |
+
+`BTS_initCla()` itself does five things, in this order: hand LS4 to the CLA and
+type it program, hand LS5 to the CLA and type it data, map all eight `MVECT`
+registers, `CLA_enableIACK()` (so the filter can be forced from the bench
+without the ADC running), and `CLA_enableTasks(CLA1_BASE, CLA_TASKFLAG_1)`.
+The trigger select is last.
+
+The copy out of flash is **not** here — `Device_init()` does it
+(`device/device.c:94`, `:101`) long before `main()` reaches this point. That is
+what the note at `bts_cpu1.c:835` is guarding: `BTS_initCla()` must run after
+`BTS_HAL_setupDevice()`, or it maps `MVECT` entries pointing at an `RAMLS4`
+that has not been populated yet.
+
+### 7.6 Source index
+
+| Item | File |
+|---|---|
+| Task body, SOC→channel map, filter | `bts_cla.cla` |
+| Shared declarations, alpha, rate derivation | `bts_cla_shared.h` |
+| Shared definitions, `CLADataLS5` pragmas, channel-count guard | `bts_cla_data.c` |
+| LS4/LS5 handover, `MVECT`, `MIER`, trigger select | `bts_cpu1.c:843-910` |
+| `Cla1Prog` / `CLADataLS5` / `.scratchpad` placement | `2837xD_RAM_lnk_cpu1.cmd` |
+| ADCA INT2 arm + PIE mask, `ADC_PULSE_END_OF_CONV` | `bts_hal.c:1746-1781` |
+| C28x-side scaling and liveness fallback | `bts_cpu1.c:1630` |
+| CPU2 `.bss` moved off `RAMLS4_5` | `2837xD_RAM_lnk_cpu2.cmd` |
+
+---
+
+## 8. Known conflicts and latent bugs
+
+### 8.1 All eight trip-zone ISRs used to register into the ePWM1 vector
+
+**Status: FIXED. Was a live defect, masked by a build flag. Found 2026-09-21
+while compiling these tables; the fix is now in `bts_hal.c:1974-1980`. Kept
+here because the mechanism generalises to every `INT_*` constant on this
+device.**
+
+The code used to read:
 
 ```c
 for (uint16_t i = 1; i <= 8; i++) {
@@ -418,20 +598,28 @@ group 2 instead of group 1: the background tasks stop, the register file
 freezes with stale values, and the unit looks alive while all supervision is
 dead — *with the converter in a tripped state it can no longer report*.
 
-**Fix** (not applied here — this document records, it does not change
-behaviour): either stride by `0x00010001U`, or, clearer and immune to the same
-mistake, index an explicit table:
+**Fix, now applied** (`bts_hal.c:1974-1980`) — an explicit table, which is
+immune to the same mistake rather than merely correct:
 
 ```c
 static const uint32_t tzInts[8] = {
     INT_EPWM1_TZ, INT_EPWM2_TZ, INT_EPWM3_TZ, INT_EPWM4_TZ,
     INT_EPWM5_TZ, INT_EPWM6_TZ, INT_EPWM7_TZ, INT_EPWM8_TZ,
 };
+for (uint16_t i = 0; i < 8U; i++) {
+    Interrupt_register(tzInts[i], &epwmTripISR);
+    Interrupt_enable(tzInts[i]);
+}
 ```
 
-**This must be fixed before any `BTS_TRIP_HW_CHn_ENABLED` is set true.**
+The general rule survives the fix: **never do arithmetic on an `INT_*`
+constant.** The vector ID and the group/channel live in different halves of the
+same word and `Interrupt_register()` and `Interrupt_enable()` read different
+halves, so an off-by-stride error corrupts one and not the other — which is why
+this presented as eight enabled trips pointing at one handler rather than as
+anything failing outright.
 
-### 7.2 CPU Timer 0 on CPU2 is double-booked
+### 8.2 CPU Timer 0 on CPU2 is double-booked
 
 **Status: latent in the current build, live in a production build. Not
 previously known.**
@@ -467,7 +655,7 @@ follows is not guarded by that condition.
 `#if (BTS_LED_DRIVER_ENABLED == false)`, or move the dwell timebase to CPU
 Timer 2, which is unused on CPU2.
 
-### 7.3 The ADCB end-of-conversion flag is never cleared on the success path
+### 8.3 The ADCB end-of-conversion flag is never cleared on the success path
 
 **Status: minor, in the supervision path. Not previously known.**
 
@@ -492,49 +680,84 @@ never trigger.
 
 **Fix**: clear the flag after a successful read as well as after a timeout.
 
-### 7.4 EPWM1's period is written twice; the ADC trigger rate is not 10 kHz
+### 8.4 The ADC trigger rate is 6.64 kSPS, not 10 kHz
 
-**Status: works, but the comment and the intent disagree with the hardware.**
+**Status: the trigger defect is FIXED. The rate is still not what the comments
+in `bts_user_settings.h` said, and anything derived from those comments is
+wrong by a factor of 1.5.**
 
-`BTS_HAL_setupAdcTrigger(EPWM1_BASE)` (`bts_cpu1.c:826`) sets `EPWM1` TBPRD to
-`DEVICE_SYSCLK_FREQ / 10000 - 1` = 15999 and enables SOCA on `TBCTR == 0`,
-commented "10kHz" (`bts_hal.c:1340`).
+`BTS_HAL_setupAdcTrigger(EPWM1_BASE)` (`bts_cpu1.c:923`) used to set `EPWM1`
+TBPRD to `DEVICE_SYSCLK_FREQ / 10000 - 1` and enable SOCA on `TBCTR == 0`,
+commented "10kHz". Twenty-six lines later `BTS_HAL_setupSyncBuckPwm(BTS_EPWM_BASE_CH1)`
+(`bts_cpu1.c:949`) — where `BTS_EPWM_BASE_CH1` **is** `EPWM1_BASE` — overwrote
+TBPRD with the switching-frequency value. The SOC registers were untouched, so
+the trigger survived at the much shorter period and fired at the full switching
+rate.
 
-Twenty lines later, `BTS_HAL_setupSyncBuckPwm(BTS_EPWM_BASE_CH1)`
-(`bts_cpu1.c:846`) — where `BTS_EPWM_BASE_CH1` **is** `EPWM1_BASE`
-(`bts_user_settings.h:406`) — overwrites TBPRD with `BTS_DRV_EPWM_TBPRD` = 802.
-It does not touch the SOC registers, so the SOCA trigger survives at the new,
-much shorter period.
+Two compounding errors, both now moot: TBCLK is `EPWMCLK` = `SYSCLK/2`, not
+`SYSCLK`, so even unmolested the divisor was wrong by 2; and TBPRD was replaced
+anyway.
 
-Two compounding errors:
+**Fixed** the way this section originally recommended —
+`EPWM_setADCTriggerEventPrescale()`, which divides the SOC *event* and leaves
+the switching period alone. `BTS_HAL_setupAdcTrigger()` (`bts_hal.c:1818`) is
+now three calls and no TBPRD write at all:
 
-1. TBCLK is `EPWMCLK` = `SYSCLK/2` = 80 MHz, not `SYSCLK`. Even unmolested,
-   TBPRD 15999 would have given 5 kHz, not 10 kHz.
-2. TBPRD is then replaced by the switching-frequency value anyway.
+```c
+EPWM_enableADCTrigger(EPWM_BASE, EPWM_SOC_A);
+EPWM_setADCTriggerSource(EPWM_BASE, EPWM_SOC_A, EPWM_SOC_TBCTR_ZERO);
+EPWM_setADCTriggerEventPrescale(EPWM_BASE, EPWM_SOC_A, BTS_ADC_SOC_PRESCALE);
+```
 
-**Actual ADCA trigger rate: 80 MHz / 803 ≈ 99.6 kHz** — the converter
-switching frequency, roughly 10x the documented intent. `adcCellVoltageISR`
-(17 result reads plus 8 `BTS_storeValuesF28()` calls) therefore runs every
-~10 µs on CPU1.
+#### The actual rate, read off the device
 
-This is survivable — the conversions fit in the window and the system is
-running — but it is a substantial and unintended CPU1 interrupt load, and the
-"10kHz" comment will mislead anyone budgeting ISR time. If a 10 kHz
-cell-voltage sample rate is what is wanted, use
-`EPWM_setADCTriggerEventPrescale()` (which divides the SOC event, leaving the
-switching period alone) rather than a second TBPRD write, or move the SOC
-trigger to `EPWM9`/`EPWM10`, which are free.
+`bts_user_settings.h` disagreed with itself — the comment block around
+`BTS_ADC_SOC_PRESCALE` claimed prescale 10 and 9.97 kSPS while the `#define`
+two lines below said 15, and it assumed SYSCLK 200 MHz when this build runs at
+180. `_LAUNCHXL_F28379D` is **not** in the project's symbol list, so `device.h`
+takes the IMULT-18 branch: `(20 MHz × 18 × 1) / 2` = 180 MHz.
 
-Note also that ADCA INT1 is sourced from **SOC0** (`bts_hal.c:1315`) while the
-ISR reads SOC0–SOC6. The interrupt asserts when SOC0 finishes, so SOC1–SOC6 —
-including the SOC6 reference subtracted from every current reading — are read
-one conversion cycle stale. At ~100 kHz that is ~10 µs and immaterial, but if
-the trigger rate is ever reduced, source the interrupt from the **last** SOC in
-the round robin instead.
+Five registers settle it with nothing left to infer:
 
+| Register | Value | Meaning |
+|---|---|---|
+| `PERCLKDIVSEL` | `0x0051` | `EPWMCLKDIV` = 1 → **EPWMCLK = SYSCLK/2 = 90 MHz** |
+| `EPwm1Regs.TBCTL` | `0x8010` | up-count; `HSPCLKDIV` and `CLKDIV` both ÷1 → TBCLK = EPWMCLK |
+| `EPwm1Regs.TBPRD` | `902` | 90e6 / 903 = **99.67 kHz** switching |
+| `EPwm1Regs.ETPS` | `0x0820` | `SOCPSSEL` **set** → the extended divider in `ETSOCPS` is live, not `ETPS.SOCAPRD` |
+| `EPwm1Regs.ETSOCPS` | `0x005F` | `SOCAPRD2` = **15** |
+
+**99.67 kHz / 15 = 6.645 kSPS.**
+
+The `ETPS`/`ETSOCPS` distinction is the easy one to get wrong: with `SOCPSSEL`
+set, reading `ETPS.SOCAPRD` gives you a stale two-bit field that no longer
+controls anything. The live divider is the 5-bit `SOCAPRD2` in `ETSOCPS` at
+offset `0x33`.
+
+This matters beyond documentation. The CLA's filter coefficient is
+`2*pi*fc/fs`, so a wrong `fs` is a wrong cutoff: `BTS_CLA_ALPHA` was initially
+derived as 0.012605 against the assumed 9.97 kSPS and delivered 13.3 Hz instead
+of the specified 20. Corrected to **0.018912**. The derivation is recorded in
+`bts_cla_shared.h` register by register so the next person does not have to
+re-measure it.
+
+#### ADCA INT1 is still sourced from SOC0
+
+ADCA INT1 fires on **SOC0** (`bts_hal.c:1709`) while `adcCellVoltageISR` reads
+SOC0–SOC6, so SOC1–SOC6 — including the SOC6 reference subtracted from every
+current reading — are one conversion cycle stale. At 6.645 kSPS that is 150 µs
+rather than the ~10 µs it was, which is less comfortable than it looks on
+paper, though still far inside any real signal's bandwidth.
+
+`ADC_setInterruptPulseMode(ADCA_BASE, ADC_PULSE_END_OF_CONV)` (`bts_hal.c:1781`)
+narrows it slightly — the flag now asserts at end-of-conversion rather than
+end-of-acquisition — but does not close it. **CLA1 does not have this problem**:
+it triggers off SOC6, the last conversion in the sweep, so every register it
+reads is from the current period. If the ISR's staleness ever matters, the fix
+is the same one: move ADCA INT1 to SOC6 as well.
 ---
 
-## 8. Rules
+## 9. Rules
 
 These are the invariants. Each one has already cost a hardware debugging
 session.
@@ -570,10 +793,26 @@ session.
    while CPU1 looks perfectly healthy. Load CPU2's `.out` explicitly, then
    restart.
 
-7. **All pin muxing for both cores happens on CPU1.** `GPxMUX`/`GPyGMUX`, pad
+7. **Never do arithmetic on an `INT_*` constant.** The vector ID is in bits
+   31:16 and the group/channel in 15:0. `Interrupt_register()` reads only the
+   first and `Interrupt_enable()` only the second, so a wrong stride corrupts
+   one and silently leaves the other correct. List the constants. See §8.1.
+
+8. **`LSxMSEL` before `LSxCLAPGM`.** Hand mastership of an LS block to the CLA
+   before declaring it CLA program memory. The reverse order can abort the
+   CLA's first instruction fetch, and the symptom is a CLA that never starts —
+   no fault, no flag, just a run counter stuck at zero. See
+   [§7.3](#73-memory-ls4-and-ls5-belong-to-the-cla).
+
+9. **Anything the CLA and the C28x share is defined in C.** The CLA compiler
+   cannot export a symbol the C28x linker resolves. Declaring it in the `.cla`
+   file links successfully and produces two separate objects.
+
+10. **All pin muxing for both cores happens on CPU1.**
+ `GPxMUX`/`GPyGMUX`, pad
    config and qualification are writable only from CPU1 — a
    `GPIO_setPinConfig()` executed on CPU2 is silently discarded.
-   `BTS_HAL_setupCpu2Pins()` (`bts_hal.c:960`) establishes CPU2's pins before
+   `BTS_HAL_setupCpu2Pins()` (`bts_hal.c:1336`) establishes CPU2's pins before
    CPU2 is released. `GPIO_setInterruptPin()` is **not** a mux operation and
    *is* callable from CPU2 — which is exactly what makes rule 1 a trap.
 
@@ -584,8 +823,8 @@ session.
 > `adcCellVoltageISR` was not registered until afterwards, in `main()`.
 >
 > By then the ADC was already converting and raising ADCINT1:
-> `BTS_HAL_setupADC()` (`bts_cpu1.c:823`) arms the interrupt and
-> `BTS_HAL_setupAdcTrigger()` (`:826`) starts ePWM1 driving SOCA. ADCINT1
+> `BTS_HAL_setupADC()` (`bts_cpu1.c:920`) arms the interrupt and
+> `BTS_HAL_setupAdcTrigger()` (`:923`) starts ePWM1 driving SOCA. ADCINT1
 > fired into the still-default PIE vector —
 > `Interrupt_defaultHandler`/`Interrupt_illegalOperationHandler`, an infinite
 > loop — with PIE group 1 never acknowledged. CPU1 vanished into it and every
@@ -597,9 +836,10 @@ session.
 > keeps mirroring happily, and every host interface keeps answering.
 >
 > **Fixed:** `EINT`/`ERTM` moved out into `BTS_HAL_enableGlobalInterrupts()`
-> (`bts_hal.c:1502`, rationale at `:1489-1501`), called from `bts_cpu1.c:925`
-> after every registration. The header carries the ordering requirement at
-> `bts_hal.h:102-107`. CPU2 already had this right — its `EINT`/`ERTM` are at
+> (`bts_hal.c:1998`, rationale immediately above it), called from
+> `bts_cpu1.c:1028` after every registration. The header carries the ordering
+> requirement at `bts_hal.h:122-127`. CPU2 already had this right — its
+> `EINT`/`ERTM` are at
 > `com_cpu2.c:3386-3387`, after all of
 > `initI2C_Slave`/`initUART`/`initCAN`/`initTimer`/`LEDDriver_init`.
 >
@@ -611,21 +851,26 @@ session.
 
 ---
 
-## 9. Source index
+## 10. Source index
 
 | Resource | Declared in | Applied in |
 |---|---|---|
 | XINT selection, DRDY pins, trip pins | `bts_user_settings.h:355-379`, `:501-546` | `bts_hal.c:413-473` |
 | Input X-BAR writes | — | `bts_hal.c:925-946`, `:1236-1257`; `com_cpu2.c:1501-1504` |
 | Input X-BAR allocation comment | — | `bts_hal.c:1196-1233` (keep in step with §4) |
-| CPU1 interrupt registration | — | `bts_hal.c:1457-1486`; `bts_cpu1.c:919-920` |
-| CPU1 global enable | `bts_hal.h:102-107` | `bts_hal.c:1502`; called `bts_cpu1.c:925` |
-| CPU1 ISR bodies | `bts_hal.h:128-131` | `bts_cpu1.c:1059-1106`, `:1965`, `:2020` |
-| CPU1 ACK groups | — | `bts.h:811`, `:862`; `bts_hal.h:220`, `:235`; `bts_cpu1.c:1104`, `:2002`, `:2119` |
+| CPU1 interrupt registration | — | `bts_hal.c:1936-1981`; `bts_cpu1.c:1022` |
+| CPU1 global enable | `bts_hal.h:122-127` | `bts_hal.c:1998`; called `bts_cpu1.c:1028` |
+| CPU1 ISR bodies | `bts_hal.h:148-151` | `bts_cpu1.c:1162-1209`, `:2217`, `:2272` |
+| CPU1 ACK groups | — | `bts.h:811`, `:862`; `bts_hal.h:240`, `:255`; `bts_cpu1.c:1207`, `:2254`, `:2371` |
 | CPU2 interrupt registration | — | `com_cpu2.c:339-342`, `:1315`, `:1383`, `:1399`, `:1506-1507`; `led_driver.c:43` |
 | CPU2 global enable | — | `com_cpu2.c:3386-3387` |
-| ADC SOC / interrupt setup | — | `bts_hal.c:1286-1326` |
-| Trip zone signals and interrupt masking | `bts_user_settings.h:113-120` | `bts_hal.c:1061-1109` |
+| ADC SOC / interrupt setup | — | `bts_hal.c:1680-1781` |
+| ADC SOC trigger and event prescale | `bts_hal.h:136` | `bts_hal.c:1818-1828`; `BTS_ADC_SOC_PRESCALE` at `bts_user_settings.h:931` |
+| CLA1 task body and SOC map | `bts_cla_shared.h` | `bts_cla.cla` |
+| CLA1 shared data definitions | `bts_cla_shared.h` | `bts_cla_data.c` |
+| CLA1 init: LS4/LS5, `MVECT`, `MIER`, trigger | — | `bts_cpu1.c:843-910`; called `:929` |
+| CLA1 memory placement | — | `2837xD_RAM_lnk_cpu1.cmd` (`Cla1Prog`, `CLADataLS5`, `.scratchpad`) |
+| Trip zone signals and interrupt masking | `bts_user_settings.h:113-120` | `bts_hal.c:1437-1490` |
 | PIE group numbers | `driverlib/f2837xd/driverlib/inc/hw_ints.h` | — |
 | XINT → X-BAR input mapping | `driverlib/f2837xd/driverlib/gpio.c:127-147` | — |
 | X-BAR input → peripheral mapping | `driverlib/f2837xd/driverlib/xbar.h:199-215` | — |
