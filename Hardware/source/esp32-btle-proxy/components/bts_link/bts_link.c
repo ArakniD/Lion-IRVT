@@ -519,8 +519,15 @@ static void bts_poll_task(void *arg)
                 local.unit.unit_state         = (bts_unit_state_t)(uint32_t)unit[1];
                 local.unit.input_voltage_v    = unit[2];
                 local.unit.trip_status        = (uint32_t)unit[3];
-                /* unit[4..6] are the strap-latched slot mode/enable/group
-                 * size, which CPU1 fixes at boot and nothing here consumes. */
+                /*
+                 * Strap-latched grouping. CPU1 fixes these at power-on and
+                 * never re-reads the straps, so they are constant for the
+                 * boot - but they are read every cycle anyway because they
+                 * arrive free inside a burst that is already being made.
+                 */
+                local.unit.slot_mode          = (uint8_t)(uint32_t)unit[4];
+                local.unit.slot_enable        = (uint8_t)(uint32_t)unit[5];
+                local.unit.group_size         = (uint8_t)(uint32_t)unit[6];
                 local.unit.watchdog_timeout_s = unit[7];
             } else {
                 cycle_ok = false;

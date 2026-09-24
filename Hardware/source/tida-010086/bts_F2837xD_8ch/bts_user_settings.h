@@ -75,49 +75,52 @@
 // Hardware trip lines (per slot)
 //=============================================================================
 //
-// Each slot has two independent hardware trip paths into its ePWM trip zone:
+// Each slot's CMPSS over-current comparator reaches its ePWM trip zone and
+// latches the PWM low within a switching cycle. Enabled here; the routing is
+// built by BTS_HAL_setupTripRouting() and armed by BTS_HAL_armTripZones().
 //
-//   OST1 - the CMPSS over-current comparator, tripping outside
-//          +/-BTS_USER_DEFAULT_TRIP_A via the ePWM X-BAR.
-//   OST2 - the external GPIO trip input, via the Input X-BAR.
+// The GPIO trip inputs (OSHT2) remain masked - those links are not wired on
+// this board, and the Input X-BAR path they need has the defaulting problem
+// described below.
 //
-// Both are DISABLED here because the trip links are not physically wired on
-// this board yet.
+// HOW THE COMPARATOR REACHES THE TRIP ZONE, because the obvious route does
+// not work. The one-shot inputs OSHT1/OSHT2 read TZ1/TZ2, which are hardwired
+// to Input X-BAR INPUT1/INPUT2 (see XBAR_InputNum in xbar.h) - not to the
+// ePWM X-BAR where the comparators actually arrive. Nothing in this project
+// writes INPUT1SELECT/INPUT2SELECT, so both sat at their reset default of
+// GPIO0, which this board muxes as EPWM1A (BTS_EPWM_H_PIN_CONFIG_EPWM_CH1):
+// channel 1's trip zones were watching channel 1's own high-side gate drive
+// and latched OST1+OST2 the instant the converter switched. That is the
+// observed EPwm1Regs.TZOSTFLG = 0x0003 which re-asserted immediately after
+// every TZCLR write.
 //
-// There is a second, sharper reason to mask them. TZ1 and TZ2 are hardwired
-// to Input X-BAR INPUT1 and INPUT2 (see XBAR_InputNum in xbar.h), and nothing
-// in this project ever writes INPUT1SELECT/INPUT2SELECT - so both sit at
-// their reset default of GPIO0, which this board muxes as EPWM1A
-// (BTS_EPWM_H_PIN_CONFIG_EPWM_CH1). Channel 1's trip zones were therefore
-// watching channel 1's own high-side gate drive, and latched OST1+OST2 the
-// instant the converter switched. That is the observed EPwm1Regs_TZOSTFLG =
-// 0x0003 which re-asserted immediately after every TZCLR write.
+// The comparators now reach the trip zones through the DIGITAL COMPARE
+// submodule instead, which is the path the ePWM X-BAR outputs TRIP4..TRIP12
+// actually feed. DCAEVT1 is a one-shot, so the latching behaviour is the
+// same; only the route differs. INPUT1/INPUT2 are left alone.
 //
-// WHAT PROTECTION REMAINS WHILE THESE ARE false:
-//   - The software over-current limit in BTS_tripEpwm(), which compares each
-//     control pass against +/-BTS_USER_DEFAULT_TRIP_A and pulls the PWM down
-//     via the trip zone. This requires BTS_OCP_TRIGGER to be true - it is
-//     enabled below precisely because it is the ONLY over-current protection
-//     left once the hardware trips are masked. It acts within a control
-//     period rather than within a switching cycle.
-//   - BTS_ctrlDirection() clamps at the same thresholds, but note it only
-//     reshapes which FET conducts - it does not stop the converter.
-//   - The unit-level input-voltage guard and the group-integrity check in
-//     C1() are unaffected.
+// TRIP LEVEL is BTS_CMPSS_TRIP_A (9.5 A), deliberately ABOVE the software
+// limit of 8 A - see the layering note at that definition. The software trip
+// in BTS_tripEpwm() remains the first line and still requires BTS_OCP_TRIGGER.
 //
-// What is lost is the cycle-by-cycle hardware backstop, which is the only
-// thing fast enough to catch a genuine short. Do NOT run an unattended
-// high-current test in this configuration, and set these back to true - and
-// fix the INPUT1/INPUT2 routing above - once the trip links are wired.
+// ARMING IS DEFERRED, and this matters. An unpowered current-sense chain
+// outputs ~0 V, which on a 1.25 V-centred chain reads as -10 A and trips the
+// low comparator. Arming at boot would therefore latch an over-current on
+// every slot before the board did anything. serviceTripArming() in bts_cpu1.c
+// arms the zones once a slot is actually commanded to run and disarms when
+// the last one stops.
 //
-#define BTS_TRIP_HW_CH1_ENABLED (false)
-#define BTS_TRIP_HW_CH2_ENABLED (false)
-#define BTS_TRIP_HW_CH3_ENABLED (false)
-#define BTS_TRIP_HW_CH4_ENABLED (false)
-#define BTS_TRIP_HW_CH5_ENABLED (false)
-#define BTS_TRIP_HW_CH6_ENABLED (false)
-#define BTS_TRIP_HW_CH7_ENABLED (false)
-#define BTS_TRIP_HW_CH8_ENABLED (false)
+// A slot the ENABLE strap masks off is left out of its group's trip OR
+// entirely, for the same reason - its sense chain is never powered.
+//
+#define BTS_TRIP_HW_CH1_ENABLED (true)
+#define BTS_TRIP_HW_CH2_ENABLED (true)
+#define BTS_TRIP_HW_CH3_ENABLED (true)
+#define BTS_TRIP_HW_CH4_ENABLED (true)
+#define BTS_TRIP_HW_CH5_ENABLED (true)
+#define BTS_TRIP_HW_CH6_ENABLED (true)
+#define BTS_TRIP_HW_CH7_ENABLED (true)
+#define BTS_TRIP_HW_CH8_ENABLED (true)
 
 //
 // True when at least one slot still wants a hardware trip. Used to decide
@@ -221,11 +224,19 @@
 // Software over-current trip, evaluated in BTS_tripEpwm() every control pass
 // against ioutTrip_16b / ioutTrip_n_16b (+/-BTS_USER_DEFAULT_TRIP_A).
 //
-// This MUST stay true while any BTS_TRIP_HW_CHn_ENABLED is false: with the
-// hardware trip signals masked, this is the only over-current protection
-// left on that slot. It acts within a control period rather than within a
-// switching cycle, so it is a weaker backstop than the CMPSS - but it is the
-// difference between a soft limit and none at all.
+// This is the FIRST line of over-current defence, not a fallback. It fires at
+// BTS_USER_DEFAULT_TRIP_A (8 A) while the CMPSS comparator sits above it at
+// BTS_CMPSS_TRIP_A (9.5 A), so in normal operation this catches the fault and
+// the hardware trip never fires. The comparator is there for what a control
+// period is too slow for - a genuine short.
+//
+// It must therefore stay true. Leaving it false would push every over-current
+// onto the hardware trip, which is a harsher stop: the comparator latches the
+// PWM low in hardware rather than bringing the reference down.
+//
+// It matters even more while a slot's trips are unarmed. serviceTripArming()
+// only arms the comparators once a slot is running, and an ENABLE-strapped-off
+// slot is never armed at all, so this is the only protection those slots have.
 //
 #define BTS_OCP_TRIGGER (true)
 #define BTS_USER_DEFAULT_TRIP_A           ((float32_t)8)
@@ -239,40 +250,94 @@
 // an ADC input pin. The comparator compares that pin against the module's
 // internal 12-bit DAC, so the trip level is expressed as a DAC count.
 //
-// Signal scaling: the sense chain is bipolar and spans approximately +/-10 A
-// across the full input range, centred at mid-scale (0 A sits at VDDA/2).
-// With a 12-bit DAC referenced to VDDA:
+// SIGNAL SCALING - and the correction this block used to get wrong.
 //
-//   count(I) = 2048 + I * (2048 / 10 A)
+// The IoutS1-8 sense signals come from instrumentation amplifiers whose
+// common-mode voltage is 1.25 V, so ZERO CURRENT SITS AT 1.25 V, not at the
+// DAC's mid-scale. The chain spans +/-10 A across 0 V to 2.50 V:
 //
-// so +8 A -> 2048 + 1638 = 3686 and -8 A -> 2048 - 1638 = 410.
+//   0.00 V -> -10 A      1.25 V -> 0 A      2.50 V -> +10 A
 //
-// The high comparator trips above the positive threshold and the low
-// comparator below the negative one, giving symmetric protection in both
-// charge and discharge directions.
+// which is 0.125 V per amp. This is the same scaling the on-chip ADC path
+// uses and states at BTS_F28I_GAIN_DEFAULT above, measured on hardware
+// 2026-09-21 - the two must agree, because they are the same physical signal.
+//
+// The DAC reference is VDDA, which on this controlCARD is the REF5030's
+// 3.0 V rail - measured 3.019 V from A0 reading 1696 counts. The ADC and the
+// CMPSS DAC therefore share a reference, which is why a count computed here
+// is directly comparable with an ADC result.
+//
+//   count(I) = (1.25 V + I * 0.125 V/A) / VREF * 4095
+//
+// WHAT THIS REPLACED, because the error was not a small one: the previous
+// form assumed 0 A at DAC mid-scale (2048) and derived counts-per-amp from
+// mid-scale / 10 A. That put +8 A at 3686 counts, which against a 3.019 V
+// reference is 2.718 V at the pin - a level the sense chain reaches only at
+// +11.7 A, past its own full scale. THE HIGH-SIDE TRIP WAS UNREACHABLE. The
+// low side fared better but was still wrong: 410 counts is 0.302 V, which is
+// -7.6 A rather than -8 A.
+//
+// The error was invisible because every BTS_TRIP_HW_CHn_ENABLED was false,
+// so the thresholds were computed, written to the DAC, and never consulted.
 //
 #define BTS_CMPSS_DAC_MAX                 ((float32_t)4095)
-#define BTS_CMPSS_DAC_MIDSCALE            ((float32_t)2048)
-// Full-scale current at either extreme of the sense range.
+
+//
+// Sense-chain transfer function. BTS_CMPSS_ZERO_A_V is the instrumentation
+// amplifier's common mode; volts-per-amp follows from it and full scale.
+//
+#define BTS_CMPSS_ZERO_A_V                ((float32_t)1.25)
 #define BTS_CMPSS_FULLSCALE_A             ((float32_t)10)
-// DAC counts per amp.
-#define BTS_CMPSS_COUNTS_PER_A            (BTS_CMPSS_DAC_MIDSCALE / BTS_CMPSS_FULLSCALE_A)
+#define BTS_CMPSS_VOLTS_PER_A             (BTS_CMPSS_ZERO_A_V / BTS_CMPSS_FULLSCALE_A)
+
+//
+// DAC reference. Measured, not nominal - see BTS_VIN_REF_VOLTS below for the
+// same 3.019 V figure derived independently from the A0 reference reading.
+//
+#define BTS_CMPSS_VREF_V                  ((float32_t)3.019)
+#define BTS_CMPSS_COUNTS_PER_V            (BTS_CMPSS_DAC_MAX / BTS_CMPSS_VREF_V)
 
 // Clamp so an over-large trip setting cannot wrap the 12-bit field.
 #define BTS_CMPSS_CLAMP(x)                                                    \
     ((x) < (float32_t)0 ? (float32_t)0 :                                      \
     ((x) > BTS_CMPSS_DAC_MAX ? BTS_CMPSS_DAC_MAX : (x)))
 
-#define BTS_CMPSS_DAC_HIGH_COUNT(amps)                                        \
-    ((uint16_t)BTS_CMPSS_CLAMP(BTS_CMPSS_DAC_MIDSCALE +                       \
-                               (amps) * BTS_CMPSS_COUNTS_PER_A))
-#define BTS_CMPSS_DAC_LOW_COUNT(amps)                                         \
-    ((uint16_t)BTS_CMPSS_CLAMP(BTS_CMPSS_DAC_MIDSCALE -                       \
-                               (amps) * BTS_CMPSS_COUNTS_PER_A))
+//
+// Signed current to DAC count. The high comparator takes the positive trip
+// and the low comparator the negative one, so the sign is applied by these
+// two wrappers rather than passed in by the caller.
+//
+#define BTS_CMPSS_DAC_COUNT(amps)                                             \
+    ((uint16_t)BTS_CMPSS_CLAMP((BTS_CMPSS_ZERO_A_V +                          \
+                                (amps) * BTS_CMPSS_VOLTS_PER_A) *             \
+                               BTS_CMPSS_COUNTS_PER_V))
 
-// Default trip levels: +/-8 A  ->  3686 / 410 counts.
-#define BTS_CMPSS_TRIP_HIGH               BTS_CMPSS_DAC_HIGH_COUNT(BTS_USER_DEFAULT_TRIP_A)
-#define BTS_CMPSS_TRIP_LOW                BTS_CMPSS_DAC_LOW_COUNT(BTS_USER_DEFAULT_TRIP_A)
+#define BTS_CMPSS_DAC_HIGH_COUNT(amps)    BTS_CMPSS_DAC_COUNT(amps)
+#define BTS_CMPSS_DAC_LOW_COUNT(amps)     BTS_CMPSS_DAC_COUNT(-(amps))
+
+//
+// HARDWARE TRIP LEVEL - deliberately ABOVE the software trip.
+//
+// The two protections are layered rather than duplicated:
+//
+//   BTS_USER_DEFAULT_TRIP_A  8.0 A   software, acts within a control period
+//   BTS_CMPSS_TRIP_A         9.5 A   hardware, acts within a switching cycle
+//   BTS_CMPSS_FULLSCALE_A   10.0 A   sense chain full scale
+//
+// In normal operation BTS_tripEpwm() catches an over-current first and the
+// comparator never fires. The comparator exists for what software is too slow
+// for - a genuine short, where the current is past 9.5 A long before the next
+// control pass. Setting the two equal would let the hardware win every race
+// and leave the software path, and its diagnostics, untested.
+//
+// 0.5 A of headroom remains below full scale, so the threshold is reachable
+// with margin for sense-chain and DAC tolerance.
+//
+#define BTS_CMPSS_TRIP_A                  ((float32_t)9.5)
+
+// +9.5 A -> 2.4375 V -> 3306 counts;  -9.5 A -> 0.0625 V -> 84 counts.
+#define BTS_CMPSS_TRIP_HIGH               BTS_CMPSS_DAC_HIGH_COUNT(BTS_CMPSS_TRIP_A)
+#define BTS_CMPSS_TRIP_LOW                BTS_CMPSS_DAC_LOW_COUNT(BTS_CMPSS_TRIP_A)
 
 // Add new averaging factor for F28 ADC
 #define BTS_f28AverageFactor 8  // Smaller factor for faster response

@@ -295,28 +295,168 @@ last select register; the next register is `INPUTSELECTLOCK`. There is no
 
 ## 5. ePWM X-BAR, CMPSS and ePWM module allocation
 
+**Status: the hardware over-current trips are live.** All eight are enabled
+and routed; see §5.1 for how a comparator actually reaches a trip zone, which
+is not the obvious path.
+
 The CMPSS comparators do **not** go through the Input X-BAR. They reach the
 ePWM trip zones through the separate **ePWM X-BAR** at `EPWMXBAR_BASE`
-`0x7A00`. Each `TRIPn` output selects among muxes; `CMPSSn` occupies mux
-`(n-1)*2` (`bts_hal.c:919-923`).
+`0x7A00`. Each `TRIPn` output selects among 16 muxes and **can enable several
+at once, OR-ing them onto that one output** — which is what makes a grouped
+trip possible with no software in the path. `CMPSSn` occupies mux `(n-1)*2`.
 
-| Slot | CMPSS | ePWM X-BAR trip | Mux | Set at | State |
-|---|---|---|---|---|---|
-| 1 | `CMPSS1` | `XBAR_TRIP4` | `MUX00` | `bts_hal.c:1140` | Compiled out |
-| 2 | `CMPSS2` | `XBAR_TRIP5` | `MUX02` | `bts_hal.c:1143` | Compiled out |
-| 3 | `CMPSS3` | `XBAR_TRIP7` | `MUX04` | `bts_hal.c:1146` | Compiled out |
-| 4 | `CMPSS4` | `XBAR_TRIP8` | `MUX06` | `bts_hal.c:1149` | Compiled out |
-| 5 | `CMPSS5` | `XBAR_TRIP9` | `MUX08` | `bts_hal.c:1152` | Compiled out |
-| 6 | `CMPSS6` | `XBAR_TRIP10` | `MUX10` | `bts_hal.c:1155` | Compiled out |
-| 7 | `CMPSS7` | `XBAR_TRIP11` | `MUX12` | `bts_hal.c:1158` | Compiled out |
-| 8 | `CMPSS8` | `XBAR_TRIP12` | `MUX14` | `bts_hal.c:1161` | Compiled out |
+| Slot | CMPSS | ePWM X-BAR trip | Mux |
+|---|---|---|---|
+| 1 | `CMPSS1` | `XBAR_TRIP4` | `MUX00` |
+| 2 | `CMPSS2` | `XBAR_TRIP5` | `MUX02` |
+| 3 | `CMPSS3` | `XBAR_TRIP7` | `MUX04` |
+| 4 | `CMPSS4` | `XBAR_TRIP8` | `MUX06` |
+| 5 | `CMPSS5` | `XBAR_TRIP9` | `MUX08` |
+| 6 | `CMPSS6` | `XBAR_TRIP10` | `MUX10` |
+| 7 | `CMPSS7` | `XBAR_TRIP11` | `MUX12` |
+| 8 | `CMPSS8` | `XBAR_TRIP12` | `MUX14` |
 
-All eight CMPSS modules are still *configured* unconditionally
-(`bts_hal.c:1118-1125`) — only the X-BAR routing and the trip-zone signals are
-gated on `BTS_TRIP_HW_CHn_ENABLED`.
+The tables live at the top of `BTS_HAL_setupTripRouting()`'s block in
+`bts_hal.c`; the routing itself is built there, and the trip zones are
+configured in `BTS_HAL_setupEPWMTripZone()`.
 
 > `XBAR_TRIP6` is skipped: `INPUT6` feeds ePWM TRIP6 directly, and `INPUT6` is
 > XINT3's input (CPU1's SPI ADC1 DRDY). Do not route a CMPSS to TRIP6.
+
+### 5.1 A comparator reaches the trip zone through Digital Compare, not TZ1/TZ2
+
+This is the part that is easy to get wrong, and getting it wrong is what
+produced the `TZOSTFLG = 0x0003` that re-asserted after every `TZCLR` write.
+
+The one-shot inputs `OSHT1`/`OSHT2` read **TZ1/TZ2**, which are hardwired to
+Input X-BAR `INPUT1`/`INPUT2` — *not* to the ePWM X-BAR where the comparators
+arrive. Nothing in this project writes `INPUT1SELECT`/`INPUT2SELECT`, so both
+sat at their reset default of **GPIO0**, which this board muxes as EPWM1A.
+Channel 1's trip zones were watching channel 1's own high-side gate drive and
+latched the instant the converter switched.
+
+The ePWM X-BAR outputs `TRIP4..TRIP12` reach a trip zone only through the
+**Digital Compare submodule**:
+
+```c
+EPWM_selectDigitalCompareTripInput(base, EPWM_DC_TRIP_TRIPINn, EPWM_DC_TYPE_DCAH);
+EPWM_setTripZoneDigitalCompareEventCondition(base, EPWM_TZ_DC_OUTPUT_A1,
+                                             EPWM_TZ_EVENT_DCXH_HIGH);
+EPWM_enableTripZoneSignals(base, EPWM_TZ_SIGNAL_DCAEVT1);
+```
+
+`DCAEVT1` is a **one-shot**, so the latching behaviour is identical to what
+`OSHT1` would have given; only the route differs. `INPUT1`/`INPUT2` are left
+alone.
+
+Two consequences worth knowing:
+
+- **`DCAEVT1` has its own action register.** It does not follow `TZA`/`TZB`, so
+  `EPWM_setTripZoneAction(base, EPWM_TZ_ACTION_EVENT_DCAEVT1, ...)` is required
+  or the flag latches and the pins do not move.
+- **The ISR must read `EPWM_TZ_FLAG_DCAEVT1`.** A handler testing only
+  `EPWM_TZ_FLAG_OST` sees nothing, forever.
+
+### 5.2 Trip levels, and the zero that was wrong
+
+The sense chain is an instrumentation amplifier with a **1.25 V common mode**:
+0 V is −10 A, 1.25 V is 0 A, 2.50 V is +10 A. The CMPSS DAC shares the ADC's
+3.019 V reference (the REF5030 rail, measured from A0 = 1696 counts).
+
+The previous threshold maths assumed 0 A at DAC **mid-scale** and derived
+counts-per-amp from `2048 / 10 A`. That put +8 A at 3686 counts = 2.718 V,
+which the sense chain only reaches at **+11.7 A** — past its own full scale.
+**The high-side trip was unreachable**, and the low side asked for −7.6 A
+rather than −8 A. The error was invisible because every trip was disabled, so
+the thresholds were computed, written to the DAC, and never consulted.
+
+Corrected to `count(I) = (1.25 + I × 0.125) / 3.019 × 4095`:
+
+| | Level | Acts within | Counts |
+|---|---|---|---|
+| Software, `BTS_tripEpwm()` | **±8.0 A** | a control period (~150 µs) | — |
+| Hardware, CMPSS | **±9.5 A** | a switching cycle (<1 µs) | 3306 / 84 |
+| Sense chain full scale | ±10.0 A | — | 3391 / 0 |
+
+The two are **layered, not duplicated**. In normal operation the software trip
+catches an over-current first and the comparator never fires; the comparator
+exists for what a control period is too slow for — a genuine short. Setting
+them equal would let the hardware win every race and leave the software path,
+and its diagnostics, untested.
+
+### 5.3 Grouped trips: one X-BAR output per group
+
+Slots in a group share one load and one control loop, so an over-current on
+any member makes every member unsafe. `BTS_HAL_setupTripRouting()` gives each
+group **one** trip output carrying the OR of that group's comparators, and
+points every ePWM in the group at it — so all of them trip in the same
+switching cycle, in hardware:
+
+```
+ungrouped   TRIP4 = CMPSS1            -> ePWM1
+pairs       TRIP4 = CMPSS1 | CMPSS2   -> ePWM1, ePWM2
+quads       TRIP4 = CMPSS1..CMPSS4    -> ePWM1..ePWM4
+octet       TRIP4 = CMPSS1..CMPSS8    -> ePWM1..ePWM8
+```
+
+The group leader's `TRIPn` is the one used, matching `BTS_GROUP_LEADER()`.
+
+**A partial group is not a group.** If the ENABLE strap masks off any member,
+the *whole* group is left unrouted and unarmed. A disabled slot's sense chain
+is unpowered and floats near 0 V — which reads as −10 A and would trip the
+group the instant it armed — and a group missing a member cannot safely run
+anyway, so arming the survivors would suggest it was usable. Masking slot 8
+therefore disables the pair 7–8, the quad 5–8 and the octet 1–8, while leaving
+the lower groups fully protected.
+
+> **Ordering contract.** `BTS_HAL_setupTripRouting()` must run **after**
+> `BTS_HAL_setupGPIO()` has latched the straps. It cannot live in
+> `BTS_HAL_setupTripSystem()` with the rest of the trip plumbing, because that
+> runs from `BTS_HAL_setupDevice()` before the strap pins are even inputs.
+> It is called from `main()` alongside `BTS_initSlotGrouping()`.
+
+### 5.4 The trips are armed on first run, not at boot
+
+`BTS_HAL_setupTripRouting()` configures every trip zone and leaves them all
+**disarmed**. `serviceTripArming()` (`bts_cpu1.c`, called at 10 Hz from `C1()`)
+arms them once any slot's `enable_logic` is set and disarms when the last one
+clears.
+
+The reason is the sense chain again: before its supply has settled it outputs
+near 0 V, which on a 1.25 V-centred chain means −10 A. Arming during boot
+latches an over-current on every slot before the board has done anything — and
+because `DCAEVT1` is a one-shot it *stays* latched, with a naive clear simply
+re-latching while the source is still asserted. The unit would come up unable
+to start any slot.
+
+Nothing is given up by waiting. An unarmed trip only matters while current is
+flowing, and no current flows until a slot runs.
+
+### 5.5 Group semantics: what the leader owns
+
+Only a group **leader** has a control loop; followers mirror its duty.
+`modeCallback()` rejects a mode write to a follower or to a strap-disabled
+slot outright, so a host must address the leader.
+
+What the leader's registers mean for the group:
+
+| Quantity | Scope | Why |
+|---|---|---|
+| Mode, direction, run/stop, pause/resume | **Shared** — the leader's write carries to every member | The group shares one load; members cannot disagree about which way it is driving |
+| `V_MIN` / `V_MAX` | **Shared, undivided** | Members are in **parallel** — they all sit at the same voltage |
+| `I_MIN` / `I_MAX` | **Shared, DIVIDED** across members | The leader's register is the group **total**; each slot carries its share |
+| mAh / mWh / seconds | **Per slot, undivided** | Each slot measures the current it actually carried |
+
+So a group of four set to 6 A runs **1.5 A per slot**, and a host reading the
+group's delivered charge **sums its members' accumulators**. The division is
+by the count of *enabled* members (`btsGroupMembers[]`), not the nominal group
+size, so a part-populated group still delivers the total that was asked for.
+
+The leader's own reference is divided once, in `modeCallback()`; followers copy
+that already-divided value rather than dividing again.
+
+> Before this, the current was copied to followers **undivided** — a group of
+> eight set to 5 A would have drawn 40 A from the bus.
 
 ### ePWM module allocation
 

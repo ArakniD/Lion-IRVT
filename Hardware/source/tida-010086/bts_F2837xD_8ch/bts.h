@@ -101,11 +101,20 @@ extern ChannelStatus status[];
 //   btsSlotIsLeader   1 if this slot is its own leader
 //   btsSlotEnabled    1 if the ENABLE strap selected this slot
 //   btsSlotUsesIntAdc 1 if the voltage loop reads the C2000's internal ADC
+//   btsGroupMembers   how many ENABLED slots share this slot's group
+//
+// btsGroupMembers is what the leader's current setting is divided by. The
+// members of a group are wired in PARALLEL, so they share the total current
+// but all see the same voltage - a 6 A setting on a group of three is 2 A per
+// slot, while the voltage limits pass through untouched. It counts only
+// ENABLED slots, so a part-populated group still divides by what is really
+// there rather than by the nominal group size.
 //
 extern uint16_t btsSlotLeader[];
 extern uint16_t btsSlotIsLeader[];
 extern uint16_t btsSlotEnabled[];
 extern uint16_t btsSlotUsesIntAdc[];
+extern uint16_t btsGroupMembers[];
 
 void BTS_initSlotGrouping(uint16_t mode, uint16_t enable);
 
@@ -375,6 +384,18 @@ static inline void BTS_tripEpwm(uint32_t EPWM_BASE, BTS_DCL_CTRL_TYPE* ctrl_cc, 
     }
 
     else{
+        //
+        // Clears the OST flag this function's own EPWM_forceTripZoneEvent()
+        // raises, so a software trip releases once tripFlag drops.
+        //
+        // DELIBERATELY NOT EPWM_TZ_FLAG_DCAEVT1. That flag belongs to the
+        // CMPSS over-current comparator, and this runs every control pass:
+        // clearing it here would release a genuine hardware over-current
+        // within a control period of it latching, which is exactly the
+        // cycle-by-cycle protection the comparator exists to provide. A
+        // DCAEVT1 trip is cleared only by epwmTripISR(), after it has stopped
+        // the slot and recorded the cause.
+        //
         EPWM_clearTripZoneFlag(EPWM_BASE, EPWM_TZ_FLAG_OST);
     }
 

@@ -42,6 +42,7 @@ ChannelStatus status[PWM_CH_MAX];
 uint16_t btsSlotLeader[PWM_CH_MAX]     = {0, 1, 2, 3, 4, 5, 6, 7};
 uint16_t btsSlotIsLeader[PWM_CH_MAX]   = {1, 1, 1, 1, 1, 1, 1, 1};
 uint16_t btsSlotEnabled[PWM_CH_MAX]    = {1, 1, 1, 1, 1, 1, 1, 1};
+uint16_t btsGroupMembers[PWM_CH_MAX]   = {1, 1, 1, 1, 1, 1, 1, 1};
 uint16_t btsSlotUsesIntAdc[PWM_CH_MAX] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 BTS_DCL_CTRL_TYPE   BTS_ctrl_cc[PWM_CH_MAX]
@@ -158,6 +159,34 @@ void BTS_initSlotGrouping(uint16_t mode, uint16_t enable)
             status[ch].stopped = 1;
             BTS_userInputs[ch].enable_logic = 0;
         }
+    }
+
+    //
+    // Count the ENABLED members of each group. This is the divisor for the
+    // leader's current setting: group members are wired in parallel, so the
+    // total current belongs to the leader and each slot carries its share.
+    //
+    // Counting enabled slots rather than using the nominal group size matters
+    // when the ENABLE strap part-populates a group. Dividing a 6 A setting by
+    // a nominal 4 when only 3 slots are present would deliver 4.5 A, not 6;
+    // dividing by the 3 that are actually there delivers what was asked for.
+    //
+    for (ch = 0; ch < PWM_CH_MAX; ch++) {
+        uint16_t m;
+        uint16_t members = 0U;
+
+        for (m = 0; m < PWM_CH_MAX; m++) {
+            if ((btsSlotLeader[m] == btsSlotLeader[ch]) &&
+                (btsSlotEnabled[m] != 0U)) {
+                members++;
+            }
+        }
+
+        //
+        // Never zero: this value is a divisor, and a disabled slot still has
+        // to hold a sane one even though it will never run.
+        //
+        btsGroupMembers[ch] = (members > 0U) ? members : 1U;
     }
 }
 

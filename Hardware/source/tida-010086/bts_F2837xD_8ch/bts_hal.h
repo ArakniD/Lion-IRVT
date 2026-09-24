@@ -145,6 +145,26 @@ void BTS_HAL_setupCMPSS(uint32_t cmpssBase);
 void BTS_HAL_setupCpu2Pins(void);
 void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase, uint16_t channel);
 
+//
+// Routes the over-current comparators to the ePWM trip zones, grouped to
+// match the MODE strap, and configures every trip zone to match.
+//
+// ORDERING CONTRACT: must be called AFTER BTS_HAL_setupGPIO() has latched the
+// straps. It cannot live in BTS_HAL_setupTripSystem() for that reason - that
+// runs from BTS_HAL_setupDevice(), before the strap pins are even inputs.
+//
+// Leaves every trip DISARMED. Call BTS_HAL_armTripZones(true) once the
+// current-sense chains are powered; arming at boot latches a spurious
+// over-current, because an unpowered sense chain reads as -10 A.
+//
+void BTS_HAL_setupTripRouting(uint16_t groupSize, uint16_t slotEnable);
+
+//
+// Arms or disarms the hardware over-current trips on every configured slot.
+// Idempotent, and safe to call from the control path.
+//
+void BTS_HAL_armTripZones(bool arm);
+
 __interrupt void ISR1(void);
 __interrupt void ISR2(void);
 __interrupt void ISR3(void);

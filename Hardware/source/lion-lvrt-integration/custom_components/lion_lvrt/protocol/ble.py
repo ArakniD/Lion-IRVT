@@ -87,7 +87,11 @@ NOTIFY_UUIDS: Final = (UNIT_STATUS_UUID, SLOT_STATUS_UUID, CAL_STATUS_UUID)
 #   I trip_status  f input_voltage_v  I uptime_s
 #   B stats_live  B wifi_connected  H reserved  f watchdog_timeout_s
 UNIT_STATUS_FMT: Final = "<BBBBIfIBBHf"
+#: Proto 5 appends the MODE/ENABLE strap configuration: slot_mode,
+#: slot_enable, group_size and one pad byte.
+UNIT_STATUS_V5_FMT: Final = "<BBBBIfIBBHfBBBB"
 UNIT_STATUS_LEN: Final = struct.calcsize(UNIT_STATUS_FMT)
+UNIT_STATUS_V5_LEN: Final = struct.calcsize(UNIT_STATUS_V5_FMT)
 
 # ble_slot_status_t, 68 B (proto 3; was 40 B before the bts_* block).
 #   B slot  B state  B fault  B configured
@@ -190,12 +194,44 @@ class UnitStatus:
     wifi_connected: bool
     watchdog_timeout_s: float
 
+    #: MODE/ENABLE strap configuration, appended in proto 5. None on older
+    #: firmware, which is not the same as "ungrouped" - the unit may well be
+    #: grouped and simply not say so, so a caller must not substitute 1.
+    slot_mode: int | None = None
+    #: Index of the HIGHEST enabled slot: 7 means all eight, 0 means slot 1
+    #: only. NOT a bitmask - the straps cannot express an arbitrary set.
+    slot_enable: int | None = None
+    #: Slots per group: 1, 2, 4 or 8.
+    group_size: int | None = None
+
+    @property
+    def slots_enabled(self) -> int | None:
+        """How many slots the ENABLE strap leaves active, or None if unknown."""
+        return None if self.slot_enable is None else self.slot_enable + 1
+
+    def group_leader(self, slot: int) -> int | None:
+        """The slot that speaks for ``slot``'s group, or None if unknown.
+
+        Only a leader accepts commands; a start addressed to a follower is
+        rejected by the unit. Group sizes are powers of two, so masking the
+        low bits of the index gives the leader - the same arithmetic as
+        ``BTS_GROUP_LEADER()`` on the C2000.
+        """
+        if self.group_size is None:
+            return None
+        return slot & ~(self.group_size - 1)
+
     @classmethod
     def decode(cls, data: bytes) -> "UnitStatus":
         # Proto 2 emitted 20 bytes without watchdog_timeout_s. Accept it and
         # report the watchdog as disabled rather than refusing the device.
         _require(data, 20, "unit status")
-        if len(data) >= UNIT_STATUS_LEN:
+        mode = enable = group = None
+        if len(data) >= UNIT_STATUS_V5_LEN:
+            fields = struct.unpack(UNIT_STATUS_V5_FMT, data[:UNIT_STATUS_V5_LEN])
+            watchdog = fields[10]
+            mode, enable, group = fields[11], fields[12], fields[13]
+        elif len(data) >= UNIT_STATUS_LEN:
             fields = struct.unpack(UNIT_STATUS_FMT, data[:UNIT_STATUS_LEN])
             watchdog = fields[10]
         else:
@@ -213,6 +249,9 @@ class UnitStatus:
             trip_status=fields[4],
             input_voltage_v=fields[5],
             uptime_s=fields[6],
+            slot_mode=mode,
+            slot_enable=enable,
+            group_size=group,
             stats_live=bool(fields[7]),
             wifi_connected=bool(fields[8]),
             watchdog_timeout_s=watchdog,

@@ -18,6 +18,7 @@
 //#############################################################################
 
 #include <bts_hal.h>
+#include "registers.h"   // BTS_SLOT_ENABLED, strap grouping macros
 
 //
 //=============================================================================
@@ -1425,14 +1426,131 @@ void BTS_HAL_setupTripGPIO(uint32_t pinConfig, uint32_t pin) {
     GPIO_setQualificationMode(pin, GPIO_QUAL_SYNC);
 }
 
-// Function to configure ePWM Trip Zone
+//
+// Per-slot CMPSS -> ePWM X-BAR facts. Index is the slot, 0-based.
+//
+// Each ePWM X-BAR TRIPn output selects among 16 muxes and can enable SEVERAL
+// at once, in which case the selected sources are OR-ed onto that one output.
+// That OR is what makes a grouped trip possible without any software in the
+// path: point every ePWM in a group at one TRIPn, and enable that group's
+// comparator muxes on it.
+//
+// CMPSSn occupies mux (n-1)*2. TRIP6 is deliberately absent from this table -
+// INPUT6 feeds ePWM TRIP6 directly and INPUT6 is XINT3's input (CPU1's SPI
+// ADC1 DRDY), so routing a comparator there would fight the SPI ADC.
+//
+static const XBAR_TripNum        btsTripNum[8] = {
+    XBAR_TRIP4,  XBAR_TRIP5,  XBAR_TRIP7,  XBAR_TRIP8,
+    XBAR_TRIP9,  XBAR_TRIP10, XBAR_TRIP11, XBAR_TRIP12,
+};
+
+static const XBAR_EPWMMuxConfig  btsTripMuxCfg[8] = {
+    XBAR_EPWM_MUX00_CMPSS1_CTRIPH_OR_L, XBAR_EPWM_MUX02_CMPSS2_CTRIPH_OR_L,
+    XBAR_EPWM_MUX04_CMPSS3_CTRIPH_OR_L, XBAR_EPWM_MUX06_CMPSS4_CTRIPH_OR_L,
+    XBAR_EPWM_MUX08_CMPSS5_CTRIPH_OR_L, XBAR_EPWM_MUX10_CMPSS6_CTRIPH_OR_L,
+    XBAR_EPWM_MUX12_CMPSS7_CTRIPH_OR_L, XBAR_EPWM_MUX14_CMPSS8_CTRIPH_OR_L,
+};
+
+static const uint32_t            btsTripMuxMask[8] = {
+    XBAR_MUX00, XBAR_MUX02, XBAR_MUX04, XBAR_MUX06,
+    XBAR_MUX08, XBAR_MUX10, XBAR_MUX12, XBAR_MUX14,
+};
+
+//
+// The ePWM Digital Compare input number that corresponds to each TRIPn above.
+// EPWM_DC_TRIP_TRIPINn is an enum whose value is n-1, so these are just the
+// trip numbers - but written out, because the two namespaces look alike and
+// mixing them compiles.
+//
+static const EPWM_DigitalCompareTripInput btsTripDcInput[8] = {
+    EPWM_DC_TRIP_TRIPIN4,  EPWM_DC_TRIP_TRIPIN5,
+    EPWM_DC_TRIP_TRIPIN7,  EPWM_DC_TRIP_TRIPIN8,
+    EPWM_DC_TRIP_TRIPIN9,  EPWM_DC_TRIP_TRIPIN10,
+    EPWM_DC_TRIP_TRIPIN11, EPWM_DC_TRIP_TRIPIN12,
+};
+
+//
+// Which TRIPn each slot's ePWM actually listens to, resolved at boot from the
+// MODE strap. Read by BTS_HAL_setupEPWMTripZone(); a slot whose group has no
+// enabled member is left at BTS_TRIP_ROUTE_NONE and stays masked.
+//
+#define BTS_TRIP_ROUTE_NONE  (0xFFU)
+static uint16_t btsTripRoute[8] = {
+    BTS_TRIP_ROUTE_NONE, BTS_TRIP_ROUTE_NONE, BTS_TRIP_ROUTE_NONE,
+    BTS_TRIP_ROUTE_NONE, BTS_TRIP_ROUTE_NONE, BTS_TRIP_ROUTE_NONE,
+    BTS_TRIP_ROUTE_NONE, BTS_TRIP_ROUTE_NONE,
+};
+
+//
+// Routes the over-current comparators to the ePWM trip zones, grouped to
+// match the MODE strap.
+//
+// MUST be called after BTS_HAL_setupGPIO() has latched the straps, and this
+// is why the routing is not done inside BTS_HAL_setupTripSystem() with the
+// rest of the trip plumbing - that runs from BTS_HAL_setupDevice(), long
+// before the strap pins have even been configured as inputs.
+//
+// WHAT GROUPING MEANS FOR A TRIP. Slots in a group share one load and one
+// control loop, so an over-current on any member makes every member unsafe.
+// The grouped routing gives each group ONE X-BAR trip output carrying the OR
+// of that group's comparators, and points every ePWM in the group at it - so
+// all of them trip in the same switching cycle, in hardware, with no software
+// in the path:
+//
+//   ungrouped   TRIP4 = CMPSS1            -> ePWM1
+//   pairs       TRIP4 = CMPSS1 | CMPSS2   -> ePWM1, ePWM2
+//   quads       TRIP4 = CMPSS1..CMPSS4    -> ePWM1..ePWM4
+//   octet       TRIP4 = CMPSS1..CMPSS8    -> ePWM1..ePWM8
+//
+// The group leader's TRIPn is the one used, matching BTS_GROUP_LEADER().
+//
+// A PARTIAL GROUP IS NOT A GROUP. If the ENABLE strap masks off any member of
+// a group, the WHOLE group is left unrouted and unarmed - not just the masked
+// slot.
+//
+// Two reasons, and the second is the one that matters:
+//
+//   A disabled slot's sense chain is unpowered. It floats near 0 V, which on
+//   a 1.25 V-centred chain reads as -10 A, past the low comparator. Including
+//   it in the group's OR would trip the group the instant the trips armed.
+//
+//   Including the others but not it would be worse. The members of a group
+//   share one load and one control loop; a group missing a member cannot
+//   safely run at all, so arming protection on the survivors would suggest
+//   the group is usable when it is not.
+//
+// This matches the ENABLE strap's own semantics: it masks off the HIGHEST
+// slots, so disabling slot 8 disables the pair 7-8, the quad 5-8 and the
+// octet 1-8 - the groupings that contained it - while leaving the lower
+// groups fully intact and protected.
+//
+//
+// Configures one slot's trip zone, and its Digital Compare path.
 //
 // channel is 0-based and selects that slot's BTS_TRIP_HW_CHn_ENABLED setting.
-// When a slot's hardware trip is disabled the trip SIGNALS are left masked,
-// so neither the CMPSS comparator nor the GPIO input can reach this ePWM's
-// one-shot latch. The trip ACTIONS are still programmed, because the software
-// over-current path (BTS_tripEpwm) forces a trip through the same trip zone
-// and must still bring the outputs low.
+// When a slot's hardware trip is disabled, or its group has no contributing
+// comparator, the trip SIGNALS are left masked - but the trip ACTIONS are
+// still programmed, because the software over-current path (BTS_tripEpwm)
+// forces a trip through this same trip zone and must still bring the outputs
+// low.
+//
+// WHY DIGITAL COMPARE AND NOT TZ1/TZ2. The one-shot inputs OSHT1/OSHT2 read
+// TZ1/TZ2, which are hardwired to Input X-BAR INPUT1/INPUT2 - NOT to the ePWM
+// X-BAR where the comparators arrive. Nothing in this project ever writes
+// INPUT1SELECT/INPUT2SELECT, so both sat at their reset default of GPIO0,
+// which this board muxes as EPWM1A: channel 1's trip zones were watching
+// channel 1's own gate drive and latched the instant it switched. That is the
+// EPwm1Regs.TZOSTFLG = 0x0003 that re-asserted after every TZCLR write.
+//
+// The ePWM X-BAR outputs TRIP4..TRIP12 reach a trip zone only through the
+// Digital Compare submodule: select the TRIPIN as the DCAH source, declare
+// "DCAH high" the event, and take DCAEVT1 - which is a ONE-SHOT, the same
+// latching behaviour OSHT1 would have given. So the comparator still latches
+// the PWM low in hardware within a switching cycle; it simply arrives by the
+// route that is actually connected.
+//
+// TZ2/OSHT2 stays masked throughout. The external GPIO trip inputs are not
+// wired on this board, and INPUT2 has the same GPIO0 default problem.
 //
 void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase, uint16_t channel) {
     static const bool tripHwEnabled[8] = {
@@ -1441,25 +1559,81 @@ void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase, uint16_t channel) {
         BTS_TRIP_HW_CH5_ENABLED, BTS_TRIP_HW_CH6_ENABLED,
         BTS_TRIP_HW_CH7_ENABLED, BTS_TRIP_HW_CH8_ENABLED,
     };
-    bool hwTrip = (channel < 8U) ? tripHwEnabled[channel] : false;
+    bool     hwTrip = (channel < 8U) ? tripHwEnabled[channel] : false;
+    uint16_t route  = (channel < 8U) ? btsTripRoute[channel] : BTS_TRIP_ROUTE_NONE;
+
+    //
+    // A slot with no route has no comparator reaching it - either its own
+    // trip is compiled out, or every member of its group is strap-disabled.
+    // Treat that exactly like a disabled trip.
+    //
+    if (route == BTS_TRIP_ROUTE_NONE) {
+        hwTrip = false;
+    }
 
     EALLOW;
+
+    //
+    // The one-shot inputs are always masked: see the note above. Anything
+    // arriving from a comparator comes in through Digital Compare A.
+    //
+    EPWM_disableTripZoneSignals(epwmBase,
+                                EPWM_TZ_SIGNAL_OSHT1 | EPWM_TZ_SIGNAL_OSHT2);
+
     if (hwTrip) {
-        // Enable TZ1 (CMPSS) and TZ2 (GPIO AND group trip)
-        EPWM_enableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_OSHT1 | EPWM_TZ_SIGNAL_OSHT2);
+        //
+        // Point DCAH at this slot's GROUP trip output, not necessarily its
+        // own - btsTripRoute[] holds the group leader, whose TRIPn carries
+        // the OR of the group's comparators.
+        //
+        EPWM_selectDigitalCompareTripInput(epwmBase,
+                                           btsTripDcInput[route],
+                                           EPWM_DC_TYPE_DCAH);
+
+        //
+        // The comparators are configured CTRIPH_OR_L, so the X-BAR output is
+        // already "either limit exceeded" and is active high.
+        //
+        EPWM_setTripZoneDigitalCompareEventCondition(epwmBase,
+                                                     EPWM_TZ_DC_OUTPUT_A1,
+                                                     EPWM_TZ_EVENT_DCXH_HIGH);
+
+        //
+        // Unfiltered. The CMPSS already applies its own digital filter
+        // (CMPSS_configFilterHigh/Low, 8 samples at /5), so filtering again
+        // here would only add latency to the one path that exists to be fast.
+        //
+        EPWM_setDigitalCompareEventSource(epwmBase,
+                                          EPWM_DC_MODULE_A,
+                                          EPWM_DC_EVENT_1,
+                                          EPWM_DC_EVENT_SOURCE_ORIG_SIGNAL);
+        EPWM_setDigitalCompareEventSyncMode(epwmBase,
+                                            EPWM_DC_MODULE_A,
+                                            EPWM_DC_EVENT_1,
+                                            EPWM_DC_EVENT_INPUT_NOT_SYNCED);
+
+        //
+        // NOT enabled here. BTS_HAL_armTripZones() does that once the sense
+        // chains are live - see the arm-delay note there.
+        //
     } else {
-        //
-        // Trip links are not wired on this slot. Mask both one-shot sources
-        // so an unpowered, floating sense chain cannot latch a spurious
-        // over-current at boot. See BTS_TRIP_HW_CHn_ENABLED in
-        // bts_user_settings.h for what protection this gives up.
-        //
-        EPWM_disableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_OSHT1 | EPWM_TZ_SIGNAL_OSHT2);
+        EPWM_disableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_DCAEVT1);
+        EPWM_setTripZoneDigitalCompareEventCondition(epwmBase,
+                                                     EPWM_TZ_DC_OUTPUT_A1,
+                                                     EPWM_TZ_EVENT_DC_DISABLED);
     }
 
     // Configure trip actions: force EPWMA and EPWMB low
     EPWM_setTripZoneAction(epwmBase, EPWM_TZ_ACTION_EVENT_TZA, EPWM_TZ_ACTION_LOW);
     EPWM_setTripZoneAction(epwmBase, EPWM_TZ_ACTION_EVENT_TZB, EPWM_TZ_ACTION_LOW);
+
+    //
+    // DCAEVT1 has its own action register and does NOT follow TZA/TZB - a
+    // trip zone left at its default here would latch the flag and change
+    // nothing on the pins.
+    //
+    EPWM_setTripZoneAction(epwmBase, EPWM_TZ_ACTION_EVENT_DCAEVT1,
+                           EPWM_TZ_ACTION_LOW);
 
     //
     // Clear anything latched while the trip sources were still being
@@ -1468,18 +1642,73 @@ void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase, uint16_t channel) {
     //
     EPWM_clearOneShotTripZoneFlag(epwmBase,
                                   EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2);
-    EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_OST | EPWM_TZ_INTERRUPT);
+    EPWM_clearTripZoneFlag(epwmBase,
+                           EPWM_TZ_FLAG_OST | EPWM_TZ_FLAG_DCAEVT1 |
+                           EPWM_TZ_INTERRUPT);
 
     //
-    // The trip-zone interrupt is only useful when a hardware source can
-    // raise it. The software trip path sets the flags itself and does not
-    // rely on this ISR.
+    // The trip-zone interrupt is likewise left disabled until the arm. The
+    // software trip path sets the flags itself and does not rely on this ISR.
     //
-    if (hwTrip) {
-        // Enable trip zone interrupt
-        EPWM_enableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
-    } else {
-        EPWM_disableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
+    EPWM_disableTripZoneInterrupt(epwmBase,
+                                  EPWM_TZ_INTERRUPT_OST |
+                                  EPWM_TZ_INTERRUPT_DCAEVT1);
+    EDIS;
+}
+
+//
+// Arms - or disarms - the hardware over-current trips on every slot.
+//
+// WHY THIS IS SEPARATE FROM CONFIGURATION, i.e. the boot-time arm delay.
+//
+// The current-sense chain is an instrumentation amplifier referenced to
+// 1.25 V. Until its supply is up and settled its output sits near 0 V, and
+// 0 V on that chain means -10 A: past the low comparator's threshold. Arming
+// the trips as part of boot therefore latches a spurious over-current on
+// every slot before the board has done anything, and because DCAEVT1 is a
+// one-shot it STAYS latched - the slot cannot start until something clears
+// it, and a naive clear just re-latches while the source is still asserted.
+// A disabled or empty slot never powers its sense chain at all, which is why
+// BTS_HAL_setupTripRouting() also leaves those comparators out of the group.
+//
+// So configuration happens at boot and arming happens when a slot first
+// starts, by which time the chain is powered and reading a real current.
+//
+// Idempotent, and safe to call from the control path: re-arming an
+// already-armed zone writes the same bits.
+//
+void BTS_HAL_armTripZones(bool arm)
+{
+    static const bool tripHwEnabled[8] = {
+        BTS_TRIP_HW_CH1_ENABLED, BTS_TRIP_HW_CH2_ENABLED,
+        BTS_TRIP_HW_CH3_ENABLED, BTS_TRIP_HW_CH4_ENABLED,
+        BTS_TRIP_HW_CH5_ENABLED, BTS_TRIP_HW_CH6_ENABLED,
+        BTS_TRIP_HW_CH7_ENABLED, BTS_TRIP_HW_CH8_ENABLED,
+    };
+    uint16_t ch;
+
+    EALLOW;
+    for (ch = 0U; ch < BTS_HAL_NUM_PWM_CHANNELS; ch++) {
+        uint32_t epwmBase = EPWM1_BASE + (uint32_t)ch * (EPWM2_BASE - EPWM1_BASE);
+
+        if (!tripHwEnabled[ch] || (btsTripRoute[ch] == BTS_TRIP_ROUTE_NONE)) {
+            continue;
+        }
+
+        if (arm) {
+            //
+            // Clear first, then enable. A flag latched while the chain was
+            // settling would otherwise fire the ISR the moment the signal is
+            // unmasked, reporting an over-current that never happened.
+            //
+            EPWM_clearTripZoneFlag(epwmBase,
+                                   EPWM_TZ_FLAG_DCAEVT1 | EPWM_TZ_INTERRUPT);
+            EPWM_enableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_DCAEVT1);
+            EPWM_enableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_DCAEVT1);
+        } else {
+            EPWM_disableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_DCAEVT1);
+            EPWM_disableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_DCAEVT1);
+        }
     }
     EDIS;
 }
@@ -1501,41 +1730,11 @@ void BTS_HAL_setupTripSystem(void) {
     BTS_HAL_setupCMPSS(CMPSS8_BASE); // Channel 8
 
     //
-    // Route each channel's CMPSS trip to an ePWM X-BAR trip signal.
+    // The CMPSS -> ePWM X-BAR routing is NOT done here. It depends on the
+    // MODE strap, which BTS_HAL_setupGPIO() has not read yet at this point in
+    // boot, so it lives in BTS_HAL_setupTripRouting() and is called from
+    // main() once the straps are latched. See that function.
     //
-    // The previous code pushed XBAR_OUT_MUX* constants into the *Input*
-    // X-BAR, which interprets its argument as a GPIO pin number - so those
-    // calls silently selected GPIO1, GPIO5, GPIO9, ... instead of wiring up
-    // any comparator.
-    //
-    // Each route is gated on its slot's BTS_TRIP_HW_CHn_ENABLED. A slot whose
-    // trip links are not wired leaves its X-BAR mux unconfigured, so nothing
-    // drives the ePWM trip input even if the comparator itself latches.
-    //
-#if (BTS_TRIP_HW_CH1_ENABLED == true)
-    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP4,  XBAR_EPWM_MUX00_CMPSS1_CTRIPH_OR_L, XBAR_MUX00);
-#endif
-#if (BTS_TRIP_HW_CH2_ENABLED == true)
-    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP5,  XBAR_EPWM_MUX02_CMPSS2_CTRIPH_OR_L, XBAR_MUX02);
-#endif
-#if (BTS_TRIP_HW_CH3_ENABLED == true)
-    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP7,  XBAR_EPWM_MUX04_CMPSS3_CTRIPH_OR_L, XBAR_MUX04);
-#endif
-#if (BTS_TRIP_HW_CH4_ENABLED == true)
-    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP8,  XBAR_EPWM_MUX06_CMPSS4_CTRIPH_OR_L, XBAR_MUX06);
-#endif
-#if (BTS_TRIP_HW_CH5_ENABLED == true)
-    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP9,  XBAR_EPWM_MUX08_CMPSS5_CTRIPH_OR_L, XBAR_MUX08);
-#endif
-#if (BTS_TRIP_HW_CH6_ENABLED == true)
-    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP10, XBAR_EPWM_MUX10_CMPSS6_CTRIPH_OR_L, XBAR_MUX10);
-#endif
-#if (BTS_TRIP_HW_CH7_ENABLED == true)
-    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP11, XBAR_EPWM_MUX12_CMPSS7_CTRIPH_OR_L, XBAR_MUX12);
-#endif
-#if (BTS_TRIP_HW_CH8_ENABLED == true)
-    BTS_HAL_setupCmpssEpwmXBAR(XBAR_TRIP12, XBAR_EPWM_MUX14_CMPSS8_CTRIPH_OR_L, XBAR_MUX14);
-#endif
 
     // Configure GPIOs for individual trips, group trip, and AND gate outputs
 #if (BTS_TRIP_GPIO_CH1_ENABLED == true) && (BTS_TRIP_HW_CH1_ENABLED == true)
@@ -1651,11 +1850,12 @@ void BTS_HAL_setupTripSystem(void) {
     BTS_HAL_setupInputXBAR(16, 0, BTS_TRP_PIN_GPIO_CH8);
 #endif
 
-    // Configure Trip Zones for all ePWM modules
-    for (uint16_t i = 1; i <= 8; i++) {
-        uint32_t epwmBase = EPWM1_BASE + (i - 1) * 0x1000;
-        BTS_HAL_setupEPWMTripZone(epwmBase, i - 1U);
-    }
+    //
+    // The trip zones themselves are NOT configured here. Each one needs to
+    // know which group trip output it listens to, which is resolved from the
+    // MODE strap in BTS_HAL_setupTripRouting() - and the straps have not been
+    // read yet at this point in boot.
+    //
 }
 
 // Update BTS_HAL_setupADC
@@ -1856,19 +2056,132 @@ void BTS_HAL_setupSfraClock(uint32_t EPWM_BASE)
 // groupSize is passed in rather than derived from the mode so this stays a
 // HAL function, with no knowledge of the register map.
 //
+void BTS_HAL_setupTripRouting(uint16_t groupSize, uint16_t slotEnable)
+{
+    static const bool tripHwEnabled[8] = {
+        BTS_TRIP_HW_CH1_ENABLED, BTS_TRIP_HW_CH2_ENABLED,
+        BTS_TRIP_HW_CH3_ENABLED, BTS_TRIP_HW_CH4_ENABLED,
+        BTS_TRIP_HW_CH5_ENABLED, BTS_TRIP_HW_CH6_ENABLED,
+        BTS_TRIP_HW_CH7_ENABLED, BTS_TRIP_HW_CH8_ENABLED,
+    };
+    uint16_t leader;
+    uint16_t member;
+
+    if ((groupSize == 0U) || (groupSize > BTS_HAL_NUM_PWM_CHANNELS)) {
+        groupSize = 1U;
+    }
+
+    for (leader = 0U; leader < BTS_HAL_NUM_PWM_CHANNELS; leader += groupSize) {
+        XBAR_TripNum trip        = btsTripNum[leader];
+        uint32_t     muxMask     = 0UL;
+        uint16_t     contributors = 0U;
+        bool         groupUsable  = true;
+
+        //
+        // Build this group's OR. XBAR_setEPWMMuxConfig() selects the source
+        // within each mux and must be called per mux; XBAR_enableEPWMMux()
+        // then enables them together, which is where the OR happens.
+        //
+        //
+        // A group is all-or-nothing: one masked or compiled-out member and
+        // the whole group goes unrouted. See the note above.
+        //
+        for (member = leader; member < (leader + groupSize); member++) {
+            if (!tripHwEnabled[member] || !BTS_SLOT_ENABLED(member, slotEnable)) {
+                groupUsable = false;
+                break;
+            }
+        }
+
+        if (groupUsable) {
+            for (member = leader; member < (leader + groupSize); member++) {
+                XBAR_setEPWMMuxConfig(trip, btsTripMuxCfg[member]);
+                muxMask |= btsTripMuxMask[member];
+                contributors++;
+            }
+        }
+
+        //
+        // Record where each member of this group listens. A group with no
+        // contributing comparator is left unrouted rather than pointed at an
+        // unconfigured trip output, so its trip zone stays masked.
+        //
+        for (member = leader; member < (leader + groupSize); member++) {
+            btsTripRoute[member] = (contributors > 0U) ? leader
+                                                       : BTS_TRIP_ROUTE_NONE;
+        }
+
+        if (contributors > 0U) {
+            XBAR_enableEPWMMux(trip, muxMask);
+        }
+    }
+
+    //
+    // Now that every slot knows where it listens, configure the trip zones.
+    // They are configured but NOT armed - see BTS_HAL_armTripZones().
+    //
+    for (member = 0U; member < BTS_HAL_NUM_PWM_CHANNELS; member++) {
+        uint32_t epwmBase = EPWM1_BASE +
+                            (uint32_t)member * (EPWM2_BASE - EPWM1_BASE);
+        BTS_HAL_setupEPWMTripZone(epwmBase, member);
+    }
+}
+
+//
+// Per-slot switching phase, in eighths of a period. Index is the slot, 0-based.
+//
+//   slot  1  2  3  4  5  6  7  8
+//   deg   0 180 90 270 45 225 135 315
+//
+// ONE TABLE SATISFIES ALL THREE GROUPINGS, which is why the phases are not in
+// the obvious ascending order. The values are the slot index with its three
+// bits REVERSED, times 45 degrees - and bit reversal has the property that any
+// aligned power-of-two block of the sequence is itself evenly spread:
+//
+//   pairs   {1,2} {3,4} {5,6} {7,8}          180 deg apart within each pair
+//   quads   {1,2,3,4} {5,6,7,8}               90 deg apart within each quad
+//   octet   {1..8}                            45 deg apart across all eight
+//   none    {1} .. {8}                        all eight mutually spread
+//
+// So the strap can regroup the unit at boot and the interleaving stays correct
+// without recomputing anything per group. A naive (ch % groupSize) phase - what
+// this replaced - is only correct for the grouping it was computed for, and
+// leaves ungrouped slots all switching in phase, which is the noisiest case
+// and the one the board spends most of its time in.
+//
+// Interleaving matters because the slots share an input bus: simultaneous
+// switching edges sum into the input capacitors, and spreading them in time
+// spreads the current draw.
+//
+static const uint16_t btsSlotPhaseEighths[8] = {
+    0U,  // slot 1    0 deg
+    4U,  // slot 2  180 deg
+    2U,  // slot 3   90 deg
+    6U,  // slot 4  270 deg
+    1U,  // slot 5   45 deg
+    5U,  // slot 6  225 deg
+    3U,  // slot 7  135 deg
+    7U,  // slot 8  315 deg
+};
+
+//
+// Phases the eight switching legs.
+//
+// groupSize is accepted for call-site clarity but no longer changes the
+// result: btsSlotPhaseEighths[] is correct for every grouping at once, which
+// is the whole point of the bit-reversed order. It is kept in the signature
+// so the call reads as part of the grouping setup, where it belongs.
+//
 void BTS_HAL_setupGroupPhase(uint16_t groupSize)
 {
     uint16_t ch;
 
-    if (groupSize == 0U) {
-        groupSize = 1U;
-    }
+    (void)groupSize;
 
     for (ch = 0; ch < BTS_HAL_NUM_PWM_CHANNELS; ch++) {
         uint32_t epwmBase = EPWM1_BASE + (uint32_t)ch * (EPWM2_BASE - EPWM1_BASE);
-        uint16_t idx      = (uint16_t)(ch % groupSize);
         uint16_t phase    = (uint16_t)(((uint32_t)BTS_DRV_EPWM_PERIOD_TICKS *
-                                        (uint32_t)idx) / (uint32_t)groupSize);
+                                        (uint32_t)btsSlotPhaseEighths[ch]) / 8UL);
 
         if (ch == 0U) {
             //
@@ -1887,16 +2200,14 @@ void BTS_HAL_setupGroupPhase(uint16_t groupSize)
         //
         EPWM_setSyncOutPulseMode(epwmBase, EPWM_SYNC_OUT_PULSE_ON_EPWMxSYNCIN);
 
-        if (groupSize == 1U) {
-            //
-            // Independent slots keep the original free-running behaviour;
-            // mode 0 must remain identical to how the unit ran before
-            // grouping existed.
-            //
-            EPWM_disablePhaseShiftLoad(epwmBase);
-            continue;
-        }
-
+        //
+        // Ungrouped slots are phased too, which is a DELIBERATE CHANGE from
+        // the previous behaviour. Mode 0 used to leave every slot free-running
+        // and therefore nominally in phase - the case where eight legs can
+        // switch on the same edge and sum their input current. The table
+        // spreads all eight by 45 degrees, so independent operation is
+        // interleaved by design rather than by luck.
+        //
         EPWM_setPhaseShift(epwmBase, phase);
         EPWM_setTimeBaseCounter(epwmBase, phase);
         EPWM_setCountModeAfterSync(epwmBase, EPWM_COUNT_MODE_UP_AFTER_SYNC);

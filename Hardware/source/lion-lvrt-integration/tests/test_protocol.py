@@ -97,7 +97,11 @@ def _format_offsets(fmt: str) -> list[int]:
 @pytest.mark.parametrize(
     ("c_name", "fmt"),
     [
-        ("ble_unit_status_t", proto.UNIT_STATUS_FMT),
+        # The v5 format is the one that describes the current header. The
+        # shorter UNIT_STATUS_FMT is retained in ble.py to decode proto-4
+        # firmware, which this test cannot check against a header it no
+        # longer matches.
+        ("ble_unit_status_t", proto.UNIT_STATUS_V5_FMT),
         ("ble_slot_status_t", proto.SLOT_STATUS_FMT),
         ("ble_slot_config_t", proto.SLOT_CONFIG_FMT),
         ("ble_slot_result_t", proto.SLOT_RESULT_FMT),

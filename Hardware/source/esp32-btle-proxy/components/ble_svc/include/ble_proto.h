@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define BLE_PROTO_VERSION       4
+#define BLE_PROTO_VERSION       5
 
 /* Attribute value sizes are bounded by the negotiated MTU (247 - 3). */
 #define BLE_PROTO_MAX_PAYLOAD   244
@@ -66,6 +66,25 @@ typedef struct __attribute__((packed)) {
      * can show whether supervision is armed but not a countdown.
      */
     float    watchdog_timeout_s;
+
+    /*
+     * Appended for BLE_PROTO_VERSION 5: the MODE/ENABLE straps, latched by
+     * the C2000 at power-on and constant for the boot.
+     *
+     * slot_enable is the index of the HIGHEST enabled slot - 7 means all
+     * eight, 0 means slot 1 only. It is NOT a bitmask; the straps cannot
+     * express an arbitrary set.
+     *
+     * A client needs these to interpret the slot list correctly. Only a
+     * group leader accepts commands, so in a grouped mode a start addressed
+     * to a follower is rejected by the unit; and a group's charge is the sum
+     * of its members' accumulators, since every slot measures its own
+     * current even when it shares a control loop.
+     */
+    uint8_t  slot_mode;     /* bts_slot_mode_t                       */
+    uint8_t  slot_enable;   /* highest enabled slot index, not a mask */
+    uint8_t  group_size;    /* 1, 2, 4 or 8                          */
+    uint8_t  reserved2;     /* pad to a multiple of 4                */
 } ble_unit_status_t;
 
 typedef struct __attribute__((packed)) {

@@ -975,6 +975,19 @@ void main(void)
     BTS_HAL_setupGroupPhase(BTS_MODE_GROUP_SIZE((uint16_t)startup_mode));
 
     //
+    // Route the over-current comparators to the trip zones, grouped to match
+    // the same strap. This cannot happen in BTS_HAL_setupTripSystem() with
+    // the rest of the trip plumbing: that runs inside BTS_HAL_setupDevice(),
+    // before BTS_HAL_setupGPIO() has even configured the strap pins as
+    // inputs, so the grouping is not known yet.
+    //
+    // The trips are configured here but left DISARMED - see
+    // BTS_HAL_armTripZones() and serviceTripArming() for why arming waits.
+    //
+    BTS_HAL_setupTripRouting(BTS_MODE_GROUP_SIZE((uint16_t)startup_mode),
+                             (uint16_t)startup_enable);
+
+    //
     // Start ePWM clocks
     //
     BTS_HAL_enableEpwmCounting();
@@ -1462,6 +1475,30 @@ void modeCallback(float value, uint16_t channel)
             //
             uint16_t regBase = BTS_SET_BASE(channel);
 
+            //
+            // THE CURRENT SETTINGS BELONG TO THE GROUP, NOT TO THE SLOT.
+            //
+            // Group members are wired in PARALLEL, so the leader's register
+            // holds the total current for the whole group and each slot
+            // carries its share of it: a group of two set to 6 A runs 3 A per
+            // slot, a group of four runs 1.5 A, a group of eight 0.75 A.
+            //
+            // Voltage is NOT divided, for the same reason - parallel slots
+            // all sit at the same voltage, so each one's limits are the
+            // group's limits unchanged.
+            //
+            // The accumulators are likewise per slot and undivided: each slot
+            // measures the current it actually carried, so a host wanting the
+            // group's charge sums its members. That is also what makes the
+            // division safe to get wrong in only one direction - an
+            // over-divided reference under-delivers current, it does not
+            // over-deliver it.
+            //
+            // btsGroupMembers is never zero, so this cannot divide by zero.
+            //
+            float32_t groupShare = (float32_t)1.0 /
+                                   (float32_t)btsGroupMembers[channel];
+
             status[channel].running   = 1;
             status[channel].stopped   = 0;
             status[channel].paused    = 0;
@@ -1470,8 +1507,8 @@ void modeCallback(float value, uint16_t channel)
 
             BTS_userInputs[channel].vref_charge_V    = registers[regBase + BTS_SET_V_MAX];
             BTS_userInputs[channel].vref_discharge_V = registers[regBase + BTS_SET_V_MIN];
-            BTS_userInputs[channel].iref_A           = registers[regBase + BTS_SET_I_MAX];
-            BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + BTS_SET_I_MIN];
+            BTS_userInputs[channel].iref_A           = registers[regBase + BTS_SET_I_MAX] * groupShare;
+            BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + BTS_SET_I_MIN] * groupShare;
             BTS_userInputs[channel].direction_logic  = status[channel].charging;
             BTS_userInputs[channel].enable_logic     = 1;
 
@@ -1510,6 +1547,11 @@ void modeCallback(float value, uint16_t channel)
                 status[m].wdTripped   = status[channel].wdTripped;
                 status[m].restored    = status[channel].restored;
 
+                //
+                // The leader's iref_A is ALREADY its per-slot share, so this
+                // copies rather than divides again. Voltage passes through
+                // untouched: parallel slots share a voltage, not a current.
+                //
                 BTS_userInputs[m].vref_charge_V    = BTS_userInputs[channel].vref_charge_V;
                 BTS_userInputs[m].vref_discharge_V = BTS_userInputs[channel].vref_discharge_V;
                 BTS_userInputs[m].iref_A           = BTS_userInputs[channel].iref_A;
@@ -1879,6 +1921,57 @@ void B3(void)
 //
 // C - TASKS (executed at 10Hz)
 //
+//
+// Boot-time arm delay for the hardware over-current trips.
+//
+// THE PROBLEM. Each slot's current-sense chain is an instrumentation amplifier
+// referenced to 1.25 V, and 1.25 V is what it reads at zero current. Before
+// its supply has come up and settled, its output sits near 0 V - and on that
+// chain 0 V means -10 A, well past the low comparator's -9.5 A threshold.
+// Arming the trips during boot therefore latches an over-current on every
+// slot before the board has done anything at all. Because the trip is a
+// one-shot it then STAYS latched, and clearing it while the source is still
+// asserted just re-latches: the unit would come up unable to start any slot,
+// exactly the TZOSTFLG = 0x0003 pattern seen when TZ1/TZ2 were misrouted.
+//
+// THE RULE. Arm once a slot has actually been commanded to run - by then its
+// sense chain is powered and reading a real current - and disarm again when
+// the last slot stops, so an idle unit is never holding an armed comparator
+// against a chain that may be powering down.
+//
+// The extra delay costs nothing in protection terms. An unarmed trip only
+// matters while current is flowing, and no current flows until a slot runs.
+//
+// Called at 10 Hz from C1(). BTS_HAL_armTripZones() is idempotent, so this
+// tracks the edge rather than the level only to avoid pointless register
+// writes.
+//
+static void serviceTripArming(void)
+{
+    static uint16_t tripsArmed = 0U;
+    uint16_t        wantArmed  = 0U;
+    uint16_t        ch;
+
+    for (ch = 0U; ch < NUM_CHANNELS; ch++) {
+        //
+        // enable_logic rather than slotIsRunning(): a paused slot keeps its
+        // sense chain powered, and re-arming it on every pause/resume would
+        // be churn for no benefit. This asks "is the converter live".
+        //
+        if (BTS_userInputs[ch].enable_logic != 0U) {
+            wantArmed = 1U;
+            break;
+        }
+    }
+
+    if (wantArmed == tripsArmed) {
+        return;
+    }
+
+    BTS_HAL_armTripZones(wantArmed != 0U);
+    tripsArmed = wantArmed;
+}
+
 void C1(void)
 {
     BTS_monitor_Iout_Vout(&BTS_measValues_ch1);
@@ -1952,6 +2045,13 @@ void C1(void)
     }
 
     checkGroupIntegrity();
+
+    //
+    // Arm the hardware trips once a slot is actually running, and drop them
+    // again when none is. See serviceTripArming() for why this is not done
+    // at boot.
+    //
+    serviceTripArming();
 
     calServiceDeadMan();
 
@@ -2305,11 +2405,22 @@ __interrupt void adcCellVoltageISR(void)
 // "get current vector" API - the supported mechanism is to read each
 // module's trip-zone flags (TZFLG) and service whichever have latched.
 //
-// EPWM_getTripZoneFlagStatus() reports *which kind* of trip fired
-// (EPWM_TZ_FLAG_OST for the one-shot inputs); EPWM_getOneShotTripZoneFlagStatus()
-// reports *which one-shot input* fired. BTS_HAL_setupEPWMTripZone() enables
-// OSHT1 (CMPSS via Input X-BAR) and OSHT2 (GPIO group trip), so those map to
-// EPWM_TZ_OST_FLAG_OST1 and EPWM_TZ_OST_FLAG_OST2 respectively.
+// EPWM_getTripZoneFlagStatus() reports *which kind* of trip fired. Two kinds
+// can reach this handler:
+//
+//   EPWM_TZ_FLAG_DCAEVT1  the CMPSS over-current comparator, arriving through
+//                         the Digital Compare submodule. This is the live
+//                         hardware trip - see BTS_HAL_setupEPWMTripZone() for
+//                         why it does not come in on OSHT1.
+//   EPWM_TZ_FLAG_OST      the one-shot inputs TZ1/TZ2. Both are masked in this
+//                         build, so this only appears if something re-enables
+//                         them; it is still handled rather than ignored.
+//
+// A GROUPED TRIP RAISES THIS ON EVERY MEMBER AT ONCE. The group's comparators
+// are OR-ed onto one X-BAR trip output that every ePWM in the group watches,
+// so the hardware has already stopped all of them before this runs - the loop
+// below simply finds several channels flagged rather than one. That is the
+// point of the grouped routing: no software in the stopping path.
 //
 #pragma CODE_SECTION(epwmTripISR, "isrcodefuncs")
 #pragma INTERRUPT(epwmTripISR, HPI)
@@ -2328,18 +2439,27 @@ __interrupt void epwmTripISR(void) {
         uint32_t epwmBase = EPWM1_BASE + (uint32_t)channel * (EPWM2_BASE - EPWM1_BASE);
         uint16_t tzStatus = EPWM_getTripZoneFlagStatus(epwmBase);
 
-        if ((tzStatus & EPWM_TZ_FLAG_OST) == 0U) {
+        if ((tzStatus & (EPWM_TZ_FLAG_DCAEVT1 | EPWM_TZ_FLAG_OST)) == 0U) {
             continue;
         }
 
-        uint16_t ostStatus = EPWM_getOneShotTripZoneFlagStatus(epwmBase);
-
         // TripStatusBitfield packs two bits per channel: cmpss then gpio.
-        if (ostStatus & EPWM_TZ_OST_FLAG_OST1) {   // CMPSS over-current trip
+        if (tzStatus & EPWM_TZ_FLAG_DCAEVT1) {
+            //
+            // The over-current comparator. Reported in the cmpss bit, which
+            // is what it is regardless of the route it took to get here.
+            //
             tripBits |= 1UL << (channel * 2U);
         }
-        if (ostStatus & EPWM_TZ_OST_FLAG_OST2) {   // GPIO group trip
-            tripBits |= 1UL << (channel * 2U + 1U);
+        if (tzStatus & EPWM_TZ_FLAG_OST) {
+            uint16_t ostStatus = EPWM_getOneShotTripZoneFlagStatus(epwmBase);
+
+            if (ostStatus & EPWM_TZ_OST_FLAG_OST1) {
+                tripBits |= 1UL << (channel * 2U);
+            }
+            if (ostStatus & EPWM_TZ_OST_FLAG_OST2) {   // GPIO group trip
+                tripBits |= 1UL << (channel * 2U + 1U);
+            }
         }
 
         status[channel].overCurrentTrip = 1;
@@ -2390,16 +2510,27 @@ __interrupt void epwmTripISR(void) {
         //
         EPWM_clearOneShotTripZoneFlag(epwmBase,
                                       EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2);
-        EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_OST | EPWM_TZ_INTERRUPT);
+        EPWM_clearTripZoneFlag(epwmBase,
+                               EPWM_TZ_FLAG_OST | EPWM_TZ_FLAG_DCAEVT1 |
+                               EPWM_TZ_INTERRUPT);
 
         //
         // If the source re-asserts immediately the flag will still be set on
         // the next pass. Mask this channel's trip interrupt after a burst so
         // a stuck input cannot starve the background loop.
         //
-        if (EPWM_getTripZoneFlagStatus(epwmBase) & EPWM_TZ_FLAG_OST) {
+        if (EPWM_getTripZoneFlagStatus(epwmBase) &
+            (EPWM_TZ_FLAG_DCAEVT1 | EPWM_TZ_FLAG_OST)) {
             if (++reentryCount[channel] >= 16U) {
-                EPWM_disableTripZoneInterrupt(epwmBase, EPWM_TZ_INTERRUPT_OST);
+                //
+                // Masks the INTERRUPT only. The trip ACTION - both outputs
+                // forced low - stays latched in hardware, so the channel is
+                // still safe; this only stops a permanently-asserted source
+                // from starving the background loop.
+                //
+                EPWM_disableTripZoneInterrupt(epwmBase,
+                                              EPWM_TZ_INTERRUPT_OST |
+                                              EPWM_TZ_INTERRUPT_DCAEVT1);
             }
         } else {
             reentryCount[channel] = 0;

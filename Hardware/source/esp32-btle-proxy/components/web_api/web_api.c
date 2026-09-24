@@ -341,6 +341,16 @@ static void emit_unit(json_out_t *j)
      */
     json_kv_f(j, "watchdog_timeout_s", snap.unit.watchdog_timeout_s, 0);
     json_kv_bool(j, "watchdog_enabled", snap.unit.watchdog_timeout_s > 0.0f);
+    /*
+     * Strap configuration, fixed at the unit's power-on. slot_enable is the
+     * index of the highest enabled slot (7 = all eight), not a bitmask.
+     * slots_enabled is that index made into a count, because every consumer
+     * so far wanted the count and got the off-by-one wrong.
+     */
+    json_kv_u(j, "slot_mode", snap.unit.slot_mode);
+    json_kv_u(j, "slot_enable", snap.unit.slot_enable);
+    json_kv_u(j, "slots_enabled", (uint32_t)snap.unit.slot_enable + 1u);
+    json_kv_u(j, "group_size", snap.unit.group_size);
     json_kv_u(j, "slots", SLOT_COUNT);
     json_kv_f(j, "max_current_a", BTS_UNIT_MAX_CURRENT_A, 1);
     json_kv_f(j, "max_voltage_v", BTS_UNIT_MAX_VOLTAGE_V, 1);

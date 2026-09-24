@@ -70,16 +70,20 @@ Nine facts that invalidate the obvious guess. Each is confirmed in source.
    and the CC-CV crossover are compiled out. `voutRef_pu` is computed every
    millisecond and ignored.
 
-5. **Every hardware over-current trip is disabled.**
-   `BTS_TRIP_HW_CH1..8_ENABLED (false)` (`bts_user_settings.h:113-120`). The
-   only over-current protection left is the software check in
-   `BTS_tripEpwm()`, which acts within a control period rather than a
-   switching cycle. **The host watchdog is not a substitute** — it is a
-   supervision timeout measured in seconds. Do not run unattended
-   high-current tests. See `bts_user_settings.h:74-111` for why the trips are
-   masked (TZ1/TZ2 are hardwired to Input X-BAR INPUT1/INPUT2, which sit at
-   their GPIO0 reset default — channel 1's trip zone was watching its own
-   gate drive).
+5. **The hardware over-current trips are live, and they arm on first run.**
+   All eight are enabled at ±9.5 A, above the software trip's ±8 A — layered,
+   not duplicated, so the software path still catches an ordinary
+   over-current and the comparator is there for a genuine short.
+
+   Two things about them are not obvious. They reach the trip zones through
+   the **Digital Compare** submodule, not `OSHT1`/TZ1 — TZ1/TZ2 are hardwired
+   to Input X-BAR INPUT1/INPUT2, which sit at their GPIO0 reset default, so
+   channel 1's trip zone used to watch its own gate drive. And they are
+   **armed by `serviceTripArming()` on first run rather than at boot**,
+   because an unpowered sense chain reads as −10 A and would latch every slot
+   before the board did anything. In a grouped mode one X-BAR output carries
+   the OR of the group's comparators, so a trip stops every member in the
+   same switching cycle. Details: `Docs/hardware-resources.md` §5.
 
 6. **The Input X-BAR is device-global, not per-core.** Each core has its own
    PIE vector, but `GPIO_setInterruptPin()` writes the **single shared Input
@@ -205,6 +209,12 @@ temperature window and trip protection.
   internal ADC instead of the ADS131M08). Only a **group leader** has a
   control loop; followers mirror it. `modeCallback()` and `CAL_CMD_ENTER` both
   reject writes to a follower or a strap-disabled slot.
+  - **The leader's registers describe the whole group.** Mode, direction and
+    run state carry to every member. Voltage limits pass through undivided —
+    members are in parallel and share a voltage. **Current limits are the
+    group TOTAL and are divided** by the number of enabled members, so a group
+    of four set to 6 A runs 1.5 A per slot. The accumulators stay per slot and
+    undivided, so a host wanting the group's charge sums its members.
 - Unit-level input bus voltage enforces charge/discharge restrict and disable
   thresholds — **at mode-write time and again at 10 Hz in `C1()`**. A slot in
   calibration is exempt from both; missing either one stops the slot a

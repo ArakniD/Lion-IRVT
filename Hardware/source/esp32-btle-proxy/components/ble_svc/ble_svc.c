@@ -85,6 +85,9 @@ static void build_unit_status(ble_unit_status_t *out)
     out->stats_live         = bts_link_stats_are_live() ? 1 : 0;
     out->wifi_connected     = s_wifi_connected ? 1 : 0;
     out->watchdog_timeout_s = snap.unit.watchdog_timeout_s;
+    out->slot_mode          = snap.unit.slot_mode;
+    out->slot_enable        = snap.unit.slot_enable;
+    out->group_size         = snap.unit.group_size;
 }
 
 static void build_slot_status(uint8_t slot, const slot_status_t *st,

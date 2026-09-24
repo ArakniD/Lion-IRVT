@@ -76,6 +76,27 @@ typedef struct {
      * the README.
      */
     float            watchdog_timeout_s;
+
+    /*
+     * Strap configuration, latched by the C2000 at power-on and fixed for
+     * the life of the boot - the MODE and ENABLE straps are read once and
+     * never re-sampled, so these do not change while the unit is up.
+     *
+     * slot_mode    bts_slot_mode_t: grouping plus the internal-ADC variants
+     * slot_enable  index of the HIGHEST enabled slot, so 7 means all eight
+     *              and 0 means slot 1 only. Not a bitmask.
+     * group_size   slots per group: 1, 2, 4 or 8
+     *
+     * These matter to a host beyond display. In a grouped mode only the
+     * group leader accepts commands, and a host that issues a start to a
+     * follower will have it silently rejected; and accumulated charge for a
+     * group is the SUM of its members' individual accumulators, because each
+     * slot still measures its own current.
+     */
+    uint8_t          slot_mode;
+    uint8_t          slot_enable;
+    uint8_t          group_size;
+
     bool             online;           /* last poll cycle completed */
     uint32_t         consecutive_errors;
     int64_t          last_poll_us;
