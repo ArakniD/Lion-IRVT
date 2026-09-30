@@ -98,7 +98,7 @@ All 12 characteristics of service `e5f10001-…`, in GATT declaration order
 | 6 | `0007` | Slot serial | WRITE | UTF-8 text, no NUL | 1–31 B |
 | 7 | `0008` | Catalogue index | READ, WRITE | `uint8_t` | 1 B |
 | 8 | `0009` | Catalogue entry | READ | `ble_catalog_entry_t` | 96 B |
-| 9 | `000a` | Slot status | READ, NOTIFY | `ble_slot_status_t` | **68 B** |
+| 9 | `000a` | Slot status | READ, NOTIFY | `ble_slot_status_t` | **70 B** |
 | 10 | `000b` | Calibration control | WRITE | `ble_cal_cmd_t` | 8 B |
 | 11 | `000c` | Calibration status | READ, NOTIFY | `ble_cal_status_t` | 48 B |
 | 12 | `000d` | Register access | READ, WRITE | `ble_register_cmd_t` | 8 B |
@@ -141,7 +141,7 @@ snapshot.
 
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
-| 0 | 1 | `uint8` | `version` | `BLE_PROTO_VERSION`, currently **3**. See §7. |
+| 0 | 1 | `uint8` | `version` | `BLE_PROTO_VERSION`, currently **6**. See §7. |
 | 1 | 1 | `uint8` | `slot_count` | `SLOT_COUNT` = 8 |
 | 2 | 1 | `uint8` | `online` | 1 = the last I2C poll cycle to the BTS completed |
 | 3 | 1 | `uint8` | `unit_state` | `bts_unit_state_t`, see §3.1.1 |
@@ -394,7 +394,7 @@ first.
 
 ---
 
-### 3.9 `000a` — Slot status (READ, NOTIFY), 68 B
+### 3.9 `000a` — Slot status (READ, NOTIFY), 70 B
 
 `ble_slot_status_t`. A **read** returns the slot named by slot-select; a
 **notification** may be for any slot, so always decode the `slot` field
@@ -425,12 +425,20 @@ rather than assuming the selected one.
 | 56 | 4 | `float32` | `bts_discharge_mah` | **New in 3.** Discharge-direction total |
 | 60 | 4 | `float32` | `bts_discharge_mwh` | **New in 3.** |
 | 64 | 4 | `float32` | `bts_discharge_seconds` | **New in 3.** Seconds spent discharging this run |
-| | **68** | | | |
+| 68 | 1 | `uint8` | `bts_const_voltage` | **New in 6.** Status bit 6 — the CV half of the CCCV loop is regulating and the current is tapering |
+| 69 | 1 | `uint8` | `bts_const_current` | **New in 6.** Status bit 7 — the CC half is regulating |
+| | **70** | | | |
 
-Python: `struct.unpack("<BBBBffffffIIIBBBBffffff", data)`
+Python: `struct.unpack("<BBBBffffffIIIBBBBffffffBB", data)`
 
-Offsets sum to 68: 4×1 + 6×4 + 3×4 + 4×1 + 6×4 = 4 + 24 + 12 + 4 + 24.
-`tools/ble_verify.py` asserts `struct.calcsize(SLOT_FMT) == 68`.
+Offsets sum to 70: 4×1 + 6×4 + 3×4 + 4×1 + 6×4 + 2×1.
+`tools/ble_verify.py` asserts `struct.calcsize(SLOT_FMT) == 70`.
+
+> **Proto 6 appended two bytes at the END of this record.** Every offset
+> above is unchanged, so a client written for proto 3-5 reads the first 68
+> bytes exactly as before. The two flags were published as status bits 6 and
+> 7 long before this, but read a constant 0: the CC-only control law pinned
+> `ctrlMode_logic` to 0 and the CV branch was compiled out entirely.
 
 > **This record grew by 28 bytes in proto 3**, from 40. Every pre-existing
 > field kept its offset, so a version-2 client decoding the first 40 bytes
@@ -843,10 +851,11 @@ notifications as a live feed, not as a log.
 ### 6.3 Notifications are not segmented
 
 A notification is capped at `MTU - 3` bytes and is never split across
-packets. With the default 23-byte ATT MTU a **68-byte** slot-status
+packets. With the default 23-byte ATT MTU a **70-byte** slot-status
 notification would be truncated to 20 bytes — and since proto 3 grew that
-record from 40 to 68, an MTU that was merely marginal before is now
-comfortably too small. Negotiate the MTU before subscribing (§8).
+record from 40 to 68, and proto 6 to 70, an MTU that was merely marginal
+before is now comfortably too small. Negotiate the MTU before subscribing
+(§8).
 
 ---
 
@@ -860,6 +869,9 @@ read it in one operation before it commits to decoding anything else.
 | 1 | 9 (`0002`–`000a`) | Original interface: unit status, command, slot select/config/result/serial, catalogue index/entry, slot status |
 | 2 | **11** (`0002`–`000c`) | Added `000b` calibration control and `000c` calibration status. **No existing struct changed and no discriminator moved.** Status-word bits 12–14 defined. Notify tick halved to 500 ms so calibration can notify at 2 Hz; the slot and unit cadence stayed at 1 Hz |
 | **3** | 11 (unchanged) | **Two existing records grew.** `ble_unit_status_t` 20 → **24 B** (`watchdog_timeout_s` appended); `ble_slot_status_t` 40 → **68 B** (four BTS-state flags and six counters appended). Added command opcodes 5 `PAUSE` and 6 `RESUME`. Status-word bits 2, 15, 17, 18 defined and driven. No discriminator moved and **no existing field changed offset** |
+| 4 | **12** (`0002`–`000d`) | Added `000d` register access |
+| 5 | 12 (unchanged) | `ble_unit_status_t` gained the latched MODE/ENABLE straps |
+| **6** | 12 (unchanged) | `ble_slot_status_t` 68 → **70 B**: `bts_const_voltage` and `bts_const_current` appended at the end. These are status bits 6 and 7, which existed from version 1 but read a constant 0 until the firmware moved to CCCV — the CC-only control law compiled the CV branch out and pinned `ctrlMode_logic` to 0. **No existing field changed offset** |
 
 ### 7.1 Handling a mismatch
 
@@ -1018,7 +1030,7 @@ CAL_STATUS  = uuid(0x000C)
 
 CAL_CMD_FMT    = "<BBHf"                       # ble_cal_cmd_t,    8 B
 CAL_STATUS_FMT = "<BBBBII" + "f" * 9           # ble_cal_status_t, 48 B
-SLOT_FMT       = "<BBBBffffffIIIBBBBffffff"    # ble_slot_status_t, 68 B
+SLOT_FMT       = "<BBBBffffffIIIBBBBffffffBB"  # ble_slot_status_t, 70 B
 
 CAL_CMD_ENTER, CAL_CMD_CAPTURE_VOLTAGE, CAL_CMD_EXIT = 1, 3, 2
 SLOT = 2                                       # 0-based: front-panel slot 3
@@ -1131,8 +1143,8 @@ rather than from the header. Where the two disagree, the header wins.
 UNIT_FMT = "<BBBBIfIBBHf"
 assert struct.calcsize(UNIT_FMT) == 24
 
-SLOT_FMT = "<BBBBffffffIIIBBBBffffff"
-assert struct.calcsize(SLOT_FMT) == 68
+SLOT_FMT = "<BBBBffffffIIIBBBBffffffBB"
+assert struct.calcsize(SLOT_FMT) == 70
 ```
 
 That turns a proto bump that changes a struct — as version 3 did to both of

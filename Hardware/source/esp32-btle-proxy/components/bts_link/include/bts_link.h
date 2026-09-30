@@ -61,6 +61,19 @@ typedef struct {
     bool     wd_tripped;
     bool     restored;
     bool     ended;
+    /*
+     * Which half of the CCCV law is regulating right now. In a charge the
+     * slot starts in CC and crosses to CV once the cell reaches its voltage
+     * limit; the charge then terminates when the current has fallen to
+     * I_MIN, so seeing CV is what says the taper has begun. A discharge runs
+     * in CC throughout.
+     *
+     * Exactly one of the two is set while a slot runs. Both read false for a
+     * stopped slot, because the BTS publishes the loop's state rather than
+     * the slot's intent.
+     */
+    bool     const_voltage;
+    bool     const_current;
     bool     valid;            /* false until the first good read */
 } bts_channel_state_t;
 

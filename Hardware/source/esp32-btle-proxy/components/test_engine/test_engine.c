@@ -438,9 +438,15 @@ static void tick_charge(uint8_t slot, const bts_channel_state_t *ch)
      * toward iref_cuttout_A (which cell_profile_to_bts_limits() sets from
      * charge_term_c). Full is "in CV and the current has fallen to the
      * taper threshold". The voltage-plus-taper arm is a fallback for a BTS
-     * build that does not publish the CV status bit.
+     * build that does not publish the CV status bit - which every build did
+     * until the firmware moved to CCCV; before that the CC-only control law
+     * pinned ctrlMode_logic to 0 and this bit never set.
+     *
+     * The BTS now terminates a charge itself on the same condition, so
+     * bts_says_done() below will usually fire first. This arm remains as the
+     * host-side check.
      */
-    const bool in_cv      = (ch->status_bits & BTS_STATUS_CONST_VOLTAGE) != 0;
+    const bool in_cv      = ch->const_voltage;
     const bool tapered    = fabsf(ch->cell_current_a) <= c->profile.charge_term_current_a;
     const bool at_voltage = ch->cell_voltage_v >= c->profile.charge_v_max - 0.005f;
 
@@ -728,6 +734,8 @@ static void fill_status_locked(uint8_t slot, const bts_snapshot_t *snap,
     out->bts_wd_tripped        = ch->wd_tripped;
     out->bts_restored          = ch->restored;
     out->bts_ended             = ch->ended;
+    out->bts_const_voltage     = ch->const_voltage;
+    out->bts_const_current     = ch->const_current;
     out->bts_charge_mah        = ch->charge_mah;
     out->bts_charge_mwh        = ch->charge_mwh;
     out->bts_charge_seconds    = ch->charge_seconds;

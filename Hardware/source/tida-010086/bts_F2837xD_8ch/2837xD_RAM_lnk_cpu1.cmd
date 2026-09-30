@@ -40,13 +40,29 @@ PAGE 0 :  /* Program Memory */
    RAMGS0      		: origin = 0x00C000, length = 0x001000
    RAMGS1      		: origin = 0x00D000, length = 0x001000
    RAMGS2      		: origin = 0x00E000, length = 0x001000
-   /* RAMGS9+RAMGS10 are contiguous and are combined into one 0x2000
-      region for the ISR code group. With all eight control loops
-      compiled in, isrcodefuncs+dclfuncs no longer fits in a single
-      0x1000 block. The Filter4/Difference_RegsFile sections that
-      nominally sat here are unreferenced leftovers from the
-      reference design. */
-   RAMGS9_10   		: origin = 0x015000, length = 0x002000
+   /* RAMGS8+RAMGS9+RAMGS10 are contiguous and are combined into one
+      0x3000 region for the ISR code group.
+
+      It was RAMGS9_10 (0x2000) while the build was CC-only, where
+      isrcodefuncs measured 0x1c7c. Switching BTS_LAB_TYPE to
+      BTS_LAB_CLOSED_LOOP_CCCV compiles the CV half of BTS_ctrlISR() in,
+      and because that function is FUNC_ALWAYS_INLINE it expands into all
+      eight per-channel ISRs - so the section grew to 0x22b1 and the link
+      failed outright. RAMGS8 is immediately below and was completely
+      empty, so the region extends DOWN rather than moving.
+
+      The Filter1/2/3_RegsFile and Difference_RegsFile sections that
+      nominally sat in RAMGS6..RAMGS8 are unreferenced leftovers from the
+      reference design: they appear in no object file and allocate nothing
+      in the map. Filter3_RegsFile's assignment to RAMGS8 is removed below
+      with this change; the other two keep their now-unused blocks.
+
+      These are GSx blocks, which are shared silicon - but this group is
+      CODE, loaded from flash and copied at boot, and CPU2's linker places
+      nothing above RAMGS11. The hazard recorded for RAMGS0 (a CCS flash
+      algorithm staged there clobbering CPU1's ramfuncs) does not reach
+      here: the programmer stages at 0x00C000, well below 0x014000. */
+   RAMGS8_9_10  		: origin = 0x014000, length = 0x003000
    RESET           	: origin = 0x3FFFC0, length = 0x000002
 
    /* Flash sectors */
@@ -92,7 +108,7 @@ PAGE 1 : /* Data Memory */
    RAMGS5     		: origin = 0x011000, length = 0x001000
    RAMGS6     		: origin = 0x012000, length = 0x001000
    RAMGS7      		: origin = 0x013000, length = 0x001000
-   RAMGS8      		: origin = 0x014000, length = 0x001000
+   /* RAMGS8 is now the low third of RAMGS8_9_10 on PAGE 0 - see above. */
 
    /*
     * CLA1 message RAMs. Fixed addresses in the device memory map: the low
@@ -159,8 +175,16 @@ SECTIONS
     {
         isrcodefuncs
         dclfuncs
-    }    LOAD = FLASHC,
-         RUN =  RAMGS9_10,
+    }    /*
+          * LOAD moved FLASHC -> FLASHE with the CCCV switch. FLASHC is one
+          * 0x2000 sector and the group is now 0x22b1, so the LOAD image no
+          * longer fit even after the RUN region was widened - the linker
+          * reports run and load placement separately, and this one failed on
+          * its own. FLASHE is 0x8000 and holds only .init_array, which is
+          * empty in this build.
+          */
+         LOAD = FLASHE,
+         RUN =  RAMGS8_9_10,
          LOAD_START(isrcodefuncsLoadStart),
          LOAD_SIZE(isrcodefuncsLoadSize),
          LOAD_END(isrcodefuncsLoadEnd),
@@ -277,7 +301,7 @@ SECTIONS
    /* The following section definition are for SDFM examples */
    Filter1_RegsFile : > RAMGS6,	PAGE = 1, fill=0x1111
    Filter2_RegsFile : > RAMGS7,	PAGE = 1, fill=0x2222
-   Filter3_RegsFile : > RAMGS8,	PAGE = 1, fill=0x3333
+   /* Filter3_RegsFile dropped: unreferenced, and RAMGS8 is now ISR code. */
 
 
     SFRA_F32_Data : > RAMGS4, ALIGN = 64, PAGE = 1

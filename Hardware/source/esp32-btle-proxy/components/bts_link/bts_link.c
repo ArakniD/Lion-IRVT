@@ -419,6 +419,8 @@ static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_
     st->wd_tripped = (status & BTS_STATUS_WD_TRIPPED) != 0;
     st->restored   = (status & BTS_STATUS_RESTORED) != 0;
     st->ended      = (status & BTS_STATUS_ENDED_MASK) != 0;
+    st->const_voltage = (status & BTS_STATUS_CONST_VOLTAGE) != 0;
+    st->const_current = (status & BTS_STATUS_CONST_CURRENT) != 0;
     st->cmpss_trip = (trip_bits & BTS_TRIP_CMPSS(ch)) != 0;
     st->gpio_trip  = (trip_bits & BTS_TRIP_GPIO(ch)) != 0;
     st->valid      = true;

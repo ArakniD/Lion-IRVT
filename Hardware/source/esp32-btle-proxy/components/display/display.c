@@ -471,6 +471,22 @@ static void draw_slot_row(uint8_t slot)
     band_text(26, y + 7, y, num, C_WHITE, 1);
 
     char v[12];
+    /*
+     * Which half of the CCCV law the BTS is regulating on, in the gap
+     * between the slot number and the voltage column. A charge runs CC up to
+     * the voltage limit and then crosses to CV while the current tapers
+     * toward termination, so this is the operator's view of how far along a
+     * charge actually is - the numbers alone do not show it.
+     *
+     * Only one of the two is ever set, and both are clear on a slot that is
+     * not running, so nothing is drawn then. The fault and paused branches
+     * below overdraw from x=40, which is why this sits at 34.
+     */
+    if (st.bts_const_voltage || st.bts_const_current) {
+        band_text(34, y + 7, y, st.bts_const_voltage ? "CV" : "CC",
+                  st.bts_const_voltage ? C_CYAN : C_GREY, 1);
+    }
+
     fmt_value(v, sizeof(v), st.voltage_v, 3);
     band_text_right(COL_V_R, y + 7, y, v, C_WHITE, 1);
 

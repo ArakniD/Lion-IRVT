@@ -27,8 +27,13 @@ DEVICE_NAME = "BTS-Tester"
 # (register access), which this script does not exercise.
 #
 # An OLDER firmware is the real hazard - proto 2's ble_slot_status_t is 40 B
-# where this decodes 68, so it would be rejected here rather than misread.
-MIN_PROTO_VERSION = 3
+# where this decodes 70, so it would be rejected here rather than misread.
+#
+# Raised to 6 with the CCCV work: the slot record grew by the two regulation
+# flags at its end, and decode_slot() now unpacks 70 bytes. A proto-5 unit
+# returns 68 and is short by exactly those two, so it must be rejected rather
+# than silently reported as CC.
+MIN_PROTO_VERSION = 6
 
 # e5f1xxxx-9a4c-4b7d-8f2e-1c3a5b7d9f01
 def uuid(disc):
@@ -84,9 +89,10 @@ assert UNIT_LEN == 24, UNIT_LEN
 #   B bts_paused  B bts_wd_tripped  B bts_restored  B bts_ended
 #   f bts_charge_mah  f bts_charge_mwh  f bts_charge_seconds
 #   f bts_discharge_mah  f bts_discharge_mwh  f bts_discharge_seconds
-SLOT_FMT = "<BBBBffffffIIIBBBBffffff"
+#   B bts_const_voltage  B bts_const_current            (proto 6)
+SLOT_FMT = "<BBBBffffffIIIBBBBffffffBB"
 SLOT_LEN = struct.calcsize(SLOT_FMT)
-assert SLOT_LEN == 68, SLOT_LEN
+assert SLOT_LEN == 70, SLOT_LEN
 
 
 def decode_unit(b):
@@ -110,7 +116,8 @@ def decode_slot(b):
     (slot, state, fault, configured, v, i, t, mah, mwh, prog,
      elapsed, state_elapsed, status,
      paused, wd_tripped, restored, ended,
-     c_mah, c_mwh, c_s, d_mah, d_mwh, d_s) = struct.unpack(SLOT_FMT, b[:SLOT_LEN])
+     c_mah, c_mwh, c_s, d_mah, d_mwh, d_s,
+     const_v, const_i) = struct.unpack(SLOT_FMT, b[:SLOT_LEN])
     return {
         "slot": slot, "state": state, "fault": fault,
         "configured": bool(configured),
@@ -122,6 +129,7 @@ def decode_slot(b):
         "bts_restored": bool(restored), "bts_ended": bool(ended),
         "bts_charge": [round(c_mah, 2), round(c_mwh, 2), round(c_s, 0)],
         "bts_discharge": [round(d_mah, 2), round(d_mwh, 2), round(d_s, 0)],
+        "bts_regulation": "CV" if const_v else ("CC" if const_i else "-"),
     }
 
 

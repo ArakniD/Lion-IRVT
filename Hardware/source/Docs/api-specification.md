@@ -203,6 +203,8 @@ per-direction counters surface as named JSON:
   "watchdog_tripped": false,
   "restored": true,
   "ended": false,
+  "const_voltage": true,
+  "const_current": false,
   "charge_mah": 1842.3,
   "charge_mwh": 6871.9,
   "charge_seconds": 4380,
@@ -217,7 +219,9 @@ per-direction counters surface as named JSON:
 | `paused` | bool | Status bit 15. The slot is held; its direction bit still says what a resume would do |
 | `watchdog_tripped` | bool | Status bit 17. Paused **because the host link went quiet** |
 | `restored` | bool | Status bit 18. Paused **because the unit reset mid-run** and came back holding the counters |
-| `ended` | bool | Status bit 2. Test finished normally. See the note in §2.7 — nothing on the C2000 currently asserts it |
+| `ended` | bool | Status bit 2. Test finished normally — set by the firmware's `serviceTermination()`: a charge that reached `I_MIN` while in CV, or a discharge that reached `V_MIN` |
+| `const_voltage` | bool | Status bit 6. The CV half of the CCCV loop is regulating — the cell is at its voltage limit and the current is tapering toward termination |
+| `const_current` | bool | Status bit 7. The CC half is regulating. Exactly one of the two is set while a slot runs; both are false when it is not |
 | `charge_mah` / `charge_mwh` | float, 1 dp | Charge-direction totals |
 | `charge_seconds` | float, 0 dp | Seconds spent charging this run |
 | `discharge_mah` / `discharge_mwh` | float, 1 dp | Discharge-direction totals |

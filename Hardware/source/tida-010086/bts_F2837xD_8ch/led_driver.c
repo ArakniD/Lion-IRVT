@@ -36,13 +36,25 @@ void LEDDriver_init(void) {
     SCI_performSoftwareReset(SCIA_BASE);
     SCI_disableInterrupt(SCIA_BASE, SCI_INT_RXRDY_BRKDT | SCI_INT_TXRDY);
 
-    // Initialize timer for LED updates (80 Hz for smooth flashing)
-    CPUTimer_setPeriod(CPUTIMER0_BASE, DEVICE_SYSCLK_FREQ / 80);
-    CPUTimer_setPreScaler(CPUTIMER0_BASE, 0);
-    CPUTimer_enableInterrupt(CPUTIMER0_BASE);
-    Interrupt_register(INT_TIMER0, &ledTimerISR);
-    Interrupt_enable(INT_TIMER0);
-    CPUTimer_startTimer(CPUTIMER0_BASE);
+    //
+    // Timer for LED updates, 80 Hz for smooth flashing.
+    //
+    // CPU TIMER 2, NOT TIMER 0. Timer 0 is the ADS1119 dwell timebase, and
+    // initADS1119() reprograms it to a free-running 0xFFFFFFFF period with
+    // the interrupt DISABLED. main() calls initADS1119() after this function,
+    // so on Timer 0 the LED tick was silently switched off moments after it
+    // was started - the string never updated in a production build.
+    //
+    // Timer 2 is free ON CPU2 ONLY. It is not free on CPU1: the task
+    // scheduler owns it as TASKC_CPUTIMER_BASE, and BTS_HAL_measureSysclkKHz()
+    // borrows it to count INTOSC1. CPU2 runs neither.
+    //
+    CPUTimer_setPeriod(CPUTIMER2_BASE, DEVICE_SYSCLK_FREQ / 80);
+    CPUTimer_setPreScaler(CPUTIMER2_BASE, 0);
+    CPUTimer_enableInterrupt(CPUTIMER2_BASE);
+    Interrupt_register(INT_TIMER2, &ledTimerISR);
+    Interrupt_enable(INT_TIMER2);
+    CPUTimer_startTimer(CPUTIMER2_BASE);
 
     // Clear LED buffer
     for (uint16_t i = 0; i < LED_BUFFER_SIZE; i++) {
@@ -128,10 +140,15 @@ void LEDDriver_update(void) {
 }
 
 // Timer ISR for periodic LED updates
+//
+// CPU Timer 2 is connected directly to CPU INT14, not through the PIE, so
+// there is no acknowledge group to clear - exactly as timerISR() documents
+// for Timer 1 on INT13. Calling Interrupt_clearACKGroup() here would be
+// acknowledging a group this interrupt never came through.
+//
 __interrupt void ledTimerISR(void) {
     LEDDriver_update();
-    CPUTimer_clearOverflowFlag(CPUTIMER0_BASE);
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
+    CPUTimer_clearOverflowFlag(CPUTIMER2_BASE);
 }
 
 #else  /* BTS_LED_DRIVER_ENABLED == false */
@@ -144,8 +161,11 @@ __interrupt void ledTimerISR(void) {
 void LEDDriver_init(void) { }
 void LEDDriver_update(void) { }
 __interrupt void ledTimerISR(void) {
-    CPUTimer_clearOverflowFlag(CPUTIMER0_BASE);
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
+    //
+    // Never registered in this build, but kept symmetrical with the live
+    // version above: Timer 2, and no PIE acknowledge - INT14 is direct.
+    //
+    CPUTimer_clearOverflowFlag(CPUTIMER2_BASE);
 }
 
 #endif /* BTS_LED_DRIVER_ENABLED */

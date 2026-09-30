@@ -43,6 +43,30 @@ __interrupt void adcCellVoltageISR(void);
 static void updateInputVoltage(void);
 static void checkGroupIntegrity(void);
 static void publishStatusToCpu2(void);
+static void serviceTermination(void);
+
+//
+// Consecutive C1 passes each slot has satisfied its termination condition.
+//
+// A charge ends on a CURRENT threshold, and current is the noisiest thing
+// measured here - a single sample dipping under I_MIN is not a finished
+// charge. The condition has to hold for BTS_TERM_DWELL_PASSES passes in a
+// row; anything failing resets the count to zero.
+//
+// Reset by slotStop(), slotFinish() and a fresh start, so a resumed slot
+// earns its termination again from scratch rather than inheriting progress
+// from before it was held.
+//
+static uint16_t termDwell[NUM_CHANNELS];
+
+//
+// How long a termination condition must hold. C1 is nominally 10 Hz but was
+// measured on hardware at 0.69 Hz, so this is deliberately expressed in
+// PASSES rather than seconds - at the nominal rate it is ~0.5 s and at the
+// measured rate ~7 s. Both are short against any real charge and long
+// against measurement noise.
+//
+#define BTS_TERM_DWELL_PASSES  ((uint16_t)5)
 
 //
 // CLA1 - the internal-ADC telemetry filter. See bts_cla.cla.
@@ -262,6 +286,39 @@ static void slotStop(uint16_t ch)
     status[ch].paused    = 0;
     status[ch].wdTripped = 0;
     status[ch].restored  = 0;
+
+    termDwell[ch] = 0U;
+}
+
+//
+// Ends one slot because its test COMPLETED, as distinct from slotStop()'s
+// "something halted it".
+//
+// The converter is shut down identically - same references zeroed, same
+// enable dropped - but the status is the other way round: finished is set
+// and stopped is left clear, so a host can tell a charge that reached its
+// termination current from one an operator stopped, a trip stopped, or the
+// watchdog paused. status[].finished is bit 2, BTS_STATUS_END.
+//
+// Nothing cleared it until now except a fresh start (see the register write
+// handler), and that is deliberate: END persists until the slot is started
+// again, which is what makes the next termination distinguishable from this
+// one.
+//
+static void slotFinish(uint16_t ch)
+{
+    BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
+    BTS_userInputs[ch].enable_logic = 0;
+
+    status[ch].running   = 0;
+    status[ch].stopped   = 0;
+    status[ch].finished  = 1;
+    status[ch].paused    = 0;
+    status[ch].wdTripped = 0;
+    status[ch].restored  = 0;
+
+    termDwell[ch] = 0U;
 }
 
 //
@@ -1539,6 +1596,7 @@ void modeCallback(float value, uint16_t channel)
             // termination distinguishable from this one.
             //
             status[channel].finished = 0;
+            termDwell[channel] = 0U;
             accResetDirection(channel, status[channel].charging);
         } else {
             slotStop(channel);
@@ -2128,6 +2186,14 @@ void C1(void)
         }
     }
 
+    //
+    // Terminate any test that has run to completion, BEFORE the group check:
+    // a slot that just ended is no longer running, so checkGroupIntegrity()
+    // correctly stops watching it rather than reporting the shutdown it just
+    // performed as a group member falling out of step.
+    //
+    serviceTermination();
+
     checkGroupIntegrity();
 
     //
@@ -2261,6 +2327,108 @@ void C3(void)
     // Execute task C1 the next time CpuTimer2 decrements to 0
     //
     C_Task_Ptr = &C1;
+}
+
+//
+// Ends a test that has run to completion.
+//
+// CHARGE terminates on CURRENT. In CCCV the loop holds V_MAX while the cell
+// takes progressively less current, so a charge is finished when that current
+// has fallen to I_MIN. Two guards, and both are load bearing:
+//
+//   The loop must be IN CV (ctrlMode_logic != 0). A charge starts in CC with
+//   current ramping up from zero, so |I| is below I_MIN at the very moment
+//   the slot starts - an unguarded test would end every charge immediately.
+//   Being in CV is what distinguishes "current has fallen away because the
+//   cell is full" from "current has not risen yet".
+//
+//   I_MIN must be non-zero. Zero means no termination current was configured,
+//   and |I| <= 0 would never be satisfied anyway, but testing it explicitly
+//   keeps the intent obvious next to the V_MIN rule below.
+//
+// DISCHARGE terminates on VOLTAGE, at V_MIN, with no CV requirement - a
+// discharge runs in CC the whole way down and simply stops when the cell
+// reaches its floor. V_MIN == 0 DISABLES the check entirely: a zero floor is
+// how an operator asks to run the cell down without a voltage cutoff, not a
+// request to terminate at 0 V.
+//
+// The sensor is the ADS131M08 (Isense_A / Vsense_V), NOT the internal ADC.
+// That is the converter the CC loop regulates against and the one the
+// accumulators integrate, so a slot ends on the same measurement that decided
+// its current - and, unlike the internal-ADC pair, it is live for every MODE
+// strap rather than only those with btsSlotUsesIntAdc set.
+//
+// GROUPED SLOTS: only the LEADER decides, and it ends its whole group.
+// Followers do not run a controller at all - they mirror the leader's duty -
+// so a follower's own reading is not a control input and must not be allowed
+// to end anything on its own. This mirrors how start and stop already
+// propagate from a leader to its members.
+//
+static void serviceTermination(void)
+{
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        uint16_t terminate = 0U;
+
+        //
+        // Only a running, non-calibrating leader can terminate. A calibrating
+        // slot is driving a bench reference, not running a test.
+        //
+        if ((slotIsRunning(ch) == 0U) || calSlotIsCalibrating(ch) ||
+            (btsSlotIsLeader[ch] == 0U)) {
+            termDwell[ch] = 0U;
+            continue;
+        }
+
+        if (status[ch].charging) {
+            float32_t iMin = BTS_userInputs[ch].iref_cuttout_A;
+
+            if ((iMin > (float32_t)0.0) &&
+                (BTS_ctrlLoopVariables[ch].ctrlMode_logic != 0U) &&
+                (fabsf(BTS_measValues[ch].Isense_A) <= iMin)) {
+                terminate = 1U;
+            }
+        } else {
+            float32_t vMin = BTS_userInputs[ch].vref_discharge_V;
+
+            //
+            // vMin == 0 disables the check - see the note above.
+            //
+            if ((vMin > (float32_t)0.0) &&
+                (BTS_measValues[ch].Vsense_V <= vMin)) {
+                terminate = 1U;
+            }
+        }
+
+        if (terminate == 0U) {
+            termDwell[ch] = 0U;
+            continue;
+        }
+
+        if (++termDwell[ch] < BTS_TERM_DWELL_PASSES) {
+            continue;
+        }
+
+        //
+        // Confirmed. End the leader and every member of its group together -
+        // a partially ended group would leave the leader driving followers
+        // that consider themselves finished.
+        //
+        {
+            uint16_t m;
+
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if ((m != ch) && (btsSlotLeader[m] == ch) &&
+                    (btsSlotEnabled[m] != 0U)) {
+                    slotFinish(m);
+                }
+            }
+            slotFinish(ch);
+        }
+
+        updateStatusRegisters();
+    }
 }
 
 //

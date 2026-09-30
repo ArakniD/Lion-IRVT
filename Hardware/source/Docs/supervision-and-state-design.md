@@ -232,6 +232,14 @@ The existing `BTS_STATUS_FINISHED` (bit 2), never written to date, becomes the
 `END` indicator and is now driven — keep both the old name and the new
 semantic, do not add a second bit for the same thing.
 
+> **Actually driven as of the CCCV work.** Bit 2 was published from
+> `status[].finished` from the moment this document was written, but nothing
+> ever *set* that field — it was only cleared on a start and restored from
+> F-RAM. `serviceTermination()` (§2.5) is the writer the design always
+> assumed. Bits **6 (CONST_VOLTAGE)** and **7 (CONST_CURRENT)** became real at
+> the same time and for the same reason: they were copied from
+> `ctrlMode_logic`, which the CC-only control law pinned to 0.
+
 > **Corrected 2026-09-19.** An earlier revision of this table defined
 > `BTS_STATUS_END` as bit **16** while the paragraph above required bit 2 to
 > carry the meaning — the two could not both be true. Resolved in favour of
@@ -258,6 +266,58 @@ semantic, do not add a second bit for the same thing.
 
 **Entering PAUSED always zeroes the converter reference first**, then clears
 `enable_logic`. Same ordering as a trip exit.
+
+### 2.5 Termination — how a slot reaches END
+
+The `──termination──> END` arrow above was specified from the start and had no
+implementation until the firmware moved to CCCV
+(`BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_CCCV`). Under the previous CC-only law
+there was no constant-voltage phase to taper out of, so there was nothing for
+a charge to terminate *on*.
+
+`serviceTermination()` runs in `C1()`, immediately before the group-integrity
+check so a slot that has just ended is no longer treated as a running group
+member.
+
+| Direction | Terminates when | Disabled by |
+|---|---|---|
+| **CHARGE** | the loop is **in CV** *and* `|I| <= I_MIN` | `I_MIN == 0` |
+| **DISCHARGE** | `V <= V_MIN` | **`V_MIN == 0`** |
+
+Three rules are load bearing:
+
+**A charge must be in CV before its current is tested.** Current ramps from
+zero at the start of a charge, so `|I|` is below `I_MIN` at the very moment
+the slot starts. Being in CV is what separates "current has fallen away
+because the cell is full" from "current has not risen yet". Without this guard
+every charge would end immediately.
+
+**`V_MIN == 0` disables discharge termination entirely.** A zero floor is how
+an operator asks to run a cell down with no voltage cutoff — it is not a
+request to terminate at 0 V.
+
+**The sensor is the ADS131M08**, `Isense_A` / `Vsense_V` — the converter the
+CC loop regulates against and the one the counters integrate, not the 12-bit
+internal ADC. A slot therefore ends on the same measurement that set its
+current, and the check works for every MODE strap rather than only those with
+`btsSlotUsesIntAdc` set.
+
+Both conditions must hold for `BTS_TERM_DWELL_PASSES` consecutive C1 passes.
+Current is the noisiest quantity measured here and a single sample dipping
+under `I_MIN` is not a finished charge. The dwell is expressed in **passes,
+not seconds**, because C1 is nominally 10 Hz but was measured on hardware at
+0.69 Hz — 5 passes is ~0.5 s nominal and ~7 s measured, both short against a
+real charge and long against noise.
+
+**In a group, only the leader decides, and it ends the whole group.**
+Followers mirror the leader's duty and run no controller, so a follower's own
+reading is not a control input and must not end anything by itself. This is
+the same propagation start and stop already use.
+
+`slotFinish()` is deliberately distinct from `slotStop()`: same converter
+shutdown, but it sets `finished` and leaves `stopped` clear, so a host can
+tell a charge that reached its termination current from one an operator
+halted. END persists until the slot is started again.
 
 ### 2.4 Mode register
 

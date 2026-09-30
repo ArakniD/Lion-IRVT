@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define BLE_PROTO_VERSION       5
+#define BLE_PROTO_VERSION       6
 
 /* Attribute value sizes are bounded by the negotiated MTU (247 - 3). */
 #define BLE_PROTO_MAX_PAYLOAD   244
@@ -121,6 +121,22 @@ typedef struct __attribute__((packed)) {
     float    bts_discharge_mah;
     float    bts_discharge_mwh;
     float    bts_discharge_seconds;
+
+    /*
+     * Appended in proto 6: which half of the BTS's CCCV law is regulating.
+     * A charge crosses CC -> CV at the voltage limit and then tapers, so CV
+     * is the signal that the taper has begun and termination is near.
+     *
+     * These read false on every build before the firmware moved to CCCV:
+     * the CC-only control law pinned ctrlMode_logic to 0, so status bits 6
+     * and 7 were published but never set.
+     *
+     * APPENDED AT THE END, deliberately. The record is packed and the
+     * interface is append-only, so every offset above keeps its place and an
+     * older client decoding 68 bytes still reads them correctly.
+     */
+    uint8_t  bts_const_voltage;
+    uint8_t  bts_const_current;
 } ble_slot_status_t;
 
 typedef struct __attribute__((packed)) {

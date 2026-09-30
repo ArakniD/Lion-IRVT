@@ -179,6 +179,13 @@ typedef struct {
     bool             bts_wd_tripped;
     bool             bts_restored;
     bool             bts_ended;
+    /*
+     * Which half of the BTS's CCCV law is regulating. A charge crosses from
+     * CC to CV at the voltage limit and then tapers, so CV is the signal
+     * that the taper has started.
+     */
+    bool             bts_const_voltage;
+    bool             bts_const_current;
     /* The BTS's per-direction counters, which survive a pause. */
     float            bts_charge_mah;
     float            bts_charge_mwh;

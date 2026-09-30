@@ -118,6 +118,8 @@ static void build_slot_status(uint8_t slot, const slot_status_t *st,
     out->bts_discharge_mah     = st->bts_discharge_mah;
     out->bts_discharge_mwh     = st->bts_discharge_mwh;
     out->bts_discharge_seconds = st->bts_discharge_seconds;
+    out->bts_const_voltage     = st->bts_const_voltage ? 1 : 0;
+    out->bts_const_current     = st->bts_const_current ? 1 : 0;
 }
 
 static void build_slot_config(uint8_t slot, ble_slot_config_t *out)

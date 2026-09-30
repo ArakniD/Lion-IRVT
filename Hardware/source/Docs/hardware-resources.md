@@ -89,7 +89,7 @@ XINT3/XINT5 and `ISR1`/`ISR3` are at `bts_user_settings.h:521-525` and
 |---|---|---|---|---|---|
 | `INT_XINT1` | **1.4** | `ads1119Drdy1ISR` | `com_cpu2.c:1506` | `com_cpu2.c:1734` | ADS1119 #1 DRDY on GPIO42 (slots 1–4 cell temperature) |
 | `INT_XINT2` | **1.5** | `ads1119Drdy2ISR` | `com_cpu2.c:1507` | `com_cpu2.c:1746` | ADS1119 #2 DRDY on GPIO43 (slots 5–8 cell temperature) |
-| `INT_TIMER0` | **1.7** | `ledTimerISR` | `led_driver.c:43` | `led_driver.c:131` | WS2812B refresh at 80 Hz. **Production build only**; see §8.2 |
+| `INT_TIMER2` | **direct to CPU INT14** | `ledTimerISR` | `led_driver.c:55` | `led_driver.c:148` | WS2812B refresh at 80 Hz. **Production build only.** Moved off Timer 0, which the ADS1119 dwell reprograms — see §8.2 |
 | `INT_I2CA` | **8.1** | `i2cSlaveISR` | `com_cpu2.c:339` | `com_cpu2.c:2883` | I2C target framing (start/stop/AAS/NACK) |
 | `INT_I2CA_FIFO` | **8.2** | `i2cSlaveFifoISR` | `com_cpu2.c:340` | `com_cpu2.c:2976` | I2C target data bytes, and the watchdog reload on a host read |
 | `INT_SCIA_RX` | **9.1** | `uartRxISR` | `com_cpu2.c:1383` | `com_cpu2.c:3247` | AT console RX. Console build only (`BTS_CONSOLE_ENABLED`) |
@@ -138,7 +138,7 @@ spuriously.
 | `BTS_runISR_ch5_8()` (from `ISR3`) | `INT_XINT5` | **12** | `INTERRUPT_ACK_GROUP12` | `bts.h:862` |
 | `ads1119Drdy1ISR` | `INT_XINT1` | 1 | `INTERRUPT_ACK_GROUP1` | `com_cpu2.c:1741` |
 | `ads1119Drdy2ISR` | `INT_XINT2` | 1 | `INTERRUPT_ACK_GROUP1` | `com_cpu2.c:1749` |
-| `ledTimerISR` | `INT_TIMER0` | 1 | `INTERRUPT_ACK_GROUP1` | `led_driver.c:134`, stub `:148` |
+| `ledTimerISR` | `INT_TIMER2` | **none — direct INT14** | **must NOT ack** | `led_driver.c:151`, stub `:168` |
 | `i2cSlaveISR` | `INT_I2CA` | 8 | `INTERRUPT_ACK_GROUP8` | `com_cpu2.c:2968` |
 | `i2cSlaveFifoISR` | `INT_I2CA_FIFO` | 8 | `INTERRUPT_ACK_GROUP8` | `com_cpu2.c:3135` |
 | `canISR` | `INT_CANA0` | 9 | `INTERRUPT_ACK_GROUP9` | `com_cpu2.c:3187` |
@@ -154,8 +154,16 @@ and sets `IER` directly instead of touching `PIEIER`
 calling `Interrupt_clearACKGroup()` from such a handler re-opens an unrelated
 group. `timerISR` correctly does not ack, and says why at `com_cpu2.c:2554`.
 
-**CPU Timer 0 is different** — it *is* a PIE interrupt at 1.7 and its handler
-does need `INTERRUPT_ACK_GROUP1`.
+**CPU Timer 0 is different** — it *is* a PIE interrupt at 1.7 and a handler
+registered on it does need `INTERRUPT_ACK_GROUP1`. Nothing registers one now:
+`ledTimerISR` moved to Timer 2 (§8.2) and the ADS1119 dwell runs Timer 0 with
+its interrupt disabled, reading only the counter.
+
+This rule is why the LED move was not a one-line base swap. `ledTimerISR` had
+`Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1)` in both its live body and its
+stub, correct for Timer 0 and wrong for Timer 2; carrying it across would have
+re-opened PIE group 1 — which carries the ADC interrupts — from a handler that
+never arrived through it. Both copies were deleted.
 
 ### What it looked like when it broke
 
@@ -765,41 +773,53 @@ halves, so an off-by-stride error corrupts one and not the other — which is wh
 this presented as eight enabled trips pointing at one handler rather than as
 anything failing outright.
 
-### 8.2 CPU Timer 0 on CPU2 is double-booked
+### 8.2 CPU Timer 0 on CPU2 was double-booked
 
-**Status: latent in the current build, live in a production build. Not
-previously known.**
+**Status: FIXED.** It was latent while the console build shipped and live —
+LEDs dead — in any production build. Not previously known.
 
-Two subsystems claim CPU2's Timer 0 with incompatible configurations:
+Two subsystems claimed CPU2's Timer 0 with incompatible configurations:
 
-| Claimant | Configuration | Where | Guard |
+| Claimant | Configuration | Guard |
+|---|---|---|
+| WS2812B LED driver | period `SYSCLK/80` (80 Hz), **interrupt enabled**, `INT_TIMER0` registered | `#if BTS_LED_DRIVER_ENABLED == true` |
+| ADS1119 settle dwell | period `0xFFFFFFFF` free-running, **interrupt disabled**, counter read only | **none — unconditional** |
+
+In `main()`, `LEDDriver_init()` runs before `initADS1119()`. **The ADS1119
+claim ran second and won**: it called
+`CPUTimer_disableInterrupt(CPUTIMER0_BASE)` and reprogrammed the period, so
+the registered, enabled `ledTimerISR` never fired again.
+
+With `BTS_DEBUG_CONSOLE` `true` this was invisible — `BTS_LED_DRIVER_ENABLED`
+is then `false` and `LEDDriver_init()` is a no-op stub. In a production build
+the WS2812B string went dark moments after boot, having briefly worked. **A
+frozen LED showing "running" for a slot that has since tripped is actively
+misleading**, which is what made this worth fixing rather than documenting.
+
+The comment in `initADS1119()` showed the author knew the timer was shared
+("CPU timer 0 is otherwise only started by the WS2812B driver, which is
+compiled out in a console build") — but the code below it was never guarded by
+that condition.
+
+**Fixed** by moving the LED dwell to **CPU Timer 2**, not by guarding the
+ADS1119 setup. The dwell genuinely needs a free-running counter in both build
+flavours, and Timer 2 is the only timer with no other claimant on this core.
+
+Timer 2 is free **on CPU2 only**, and the distinction matters:
+
+| Core | Timer 0 | Timer 1 | Timer 2 |
 |---|---|---|---|
-| WS2812B LED driver | period `SYSCLK/80` (80 Hz), **interrupt enabled**, `INT_TIMER0` registered | `led_driver.c:40-45` | `#if BTS_LED_DRIVER_ENABLED == true` |
-| ADS1119 settle dwell | period `0xFFFFFFFF` free-running, **interrupt disabled**, counter read only | `com_cpu2.c:1482-1485` | **none — unconditional** |
+| CPU1 | Task A (`TASKA_CPUTIMER_BASE`) | Task B, and borrowed by `BTS_HAL_measureSysclkKHz()` | Task C (`TASKC_CPUTIMER_BASE`), also borrowed by the clock measurement |
+| CPU2 | ADS1119 settle dwell | `timerISR` at 8 Hz | **WS2812B refresh at 80 Hz** ← was free |
 
-In `main()`, `LEDDriver_init()` runs at `com_cpu2.c:3384` and `initADS1119()`
-at `com_cpu2.c:3414`. **The ADS1119 claim runs second and wins.**
+CPU2 runs neither the A/B/C task chain nor `BTS_HAL_setupDevice()`, so it
+never calls the clock measurement. **Do not make the same move on CPU1** —
+Timer 2 is the Task C timebase there.
 
-In the current build this is harmless: `BTS_DEBUG_CONSOLE` is `true`
-(`bts_user_settings.h:42`), so `BTS_LED_DRIVER_ENABLED` is `false` and
-`LEDDriver_init()` is a no-op stub (`led_driver.c:144`).
-
-Set `BTS_DEBUG_CONSOLE` to `false` for a production build and the LED driver
-becomes real — then `initADS1119()` silently calls
-`CPUTimer_disableInterrupt(CPUTIMER0_BASE)` and reprograms the period. The
-registered, enabled `ledTimerISR` never fires again and the WS2812B string
-freezes on whatever it last displayed. **Status indication would appear to
-work at boot and then stop, with no error** — and a frozen LED showing
-"running" on a slot that has since tripped is actively misleading.
-
-The comment at `com_cpu2.c:1476-1480` shows the author knew the timer was
-shared ("CPU timer 0 is otherwise only started by the WS2812B driver, which is
-compiled out in a console build, so start it here") — but the code that
-follows is not guarded by that condition.
-
-**Fix**: wrap the ADS1119 timer setup in
-`#if (BTS_LED_DRIVER_ENABLED == false)`, or move the dwell timebase to CPU
-Timer 2, which is unused on CPU2.
+One consequence, covered in §1.2: Timer 2 reaches the CPU directly on INT14
+and does not pass through the PIE, so `ledTimerISR` must **not** call
+`Interrupt_clearACKGroup()`. Both the live handler and its no-op stub had that
+call for Timer 0 and both lost it.
 
 ### 8.3 The ADCB end-of-conversion flag was never cleared on the success path
 

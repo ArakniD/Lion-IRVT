@@ -1878,9 +1878,14 @@ void initADS1119(void)
     //
     // Free-running timebase for the settling delay between channels.
     //
-    // CPU timer 0 is otherwise only started by the WS2812B driver, which
-    // is compiled out in a console build, so start it here and let it run
-    // with no interrupt. Only the counter is read.
+    // CPU timer 0 is the ADS1119 dwell's alone. It did not used to be: the
+    // WS2812B driver started Timer 0 at 80 Hz with an interrupt, and this
+    // function runs AFTER LEDDriver_init() in main(), so these four lines
+    // silently stopped the LED tick in every production build - period
+    // 0xFFFFFFFF with the interrupt disabled. The LED driver moved to Timer 2
+    // (free on CPU2) to resolve it; see LEDDriver_init().
+    //
+    // Only the counter is read here, so no interrupt is wanted.
     //
     CPUTimer_setPeriod(CPUTIMER0_BASE, 0xFFFFFFFFUL);
     CPUTimer_setPreScaler(CPUTIMER0_BASE, 0U);

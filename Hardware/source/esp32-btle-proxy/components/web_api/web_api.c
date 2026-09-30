@@ -294,6 +294,8 @@ static void emit_slot(json_out_t *j, uint8_t slot, const slot_status_t *st,
     json_kv_bool(j, "watchdog_tripped", st->bts_wd_tripped);
     json_kv_bool(j, "restored", st->bts_restored);
     json_kv_bool(j, "ended", st->bts_ended);
+    json_kv_bool(j, "const_voltage", st->bts_const_voltage);
+    json_kv_bool(j, "const_current", st->bts_const_current);
     json_kv_f(j, "charge_mah", st->bts_charge_mah, 1);
     json_kv_f(j, "charge_mwh", st->bts_charge_mwh, 1);
     json_kv_f(j, "charge_seconds", st->bts_charge_seconds, 0);

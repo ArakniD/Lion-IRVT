@@ -388,7 +388,30 @@
 #define BTS_LAB_CLOSED_LOOP_ACMC_VOUT (4)
 #define BTS_LAB_CLOSED_LOOP_CCCV (5)
 
-#define BTS_LAB_TYPE    BTS_LAB_CLOSED_LOOP_ACMC_IOUT
+//
+// The control law the slots run.
+//
+// BTS_LAB_CLOSED_LOOP_CCCV: constant current until the cell reaches its
+// voltage limit, then constant voltage while the current falls away. This
+// is the behaviour a charge cycle actually needs, and it is what drives
+// termination - see serviceTermination() in bts_cpu1.c.
+//
+// It was BTS_LAB_CLOSED_LOOP_ACMC_IOUT (CC only) for a long time, which
+// compiled the entire CV half of BTS_ctrlISR() out. Three things that looked
+// like separate omissions were all that one setting:
+//
+//   - iref_cuttout_A was loaded from I_MIN and read by nothing.
+//   - status[].finished (bit 2, END) was never set by any path.
+//   - ctrlMode_logic was pinned to 0, so the CC/CV status bits published
+//     "always CC" rather than tracking the loop.
+//
+// Switching it changes the sensor path as well: BTS_cellVoltageAsCtrl16b()
+// becomes live for the internal-ADC MODE straps, because the CV loop needs
+// a cell voltage. That function reads CLA1's fast filter - the 8-deep ring
+// it used to read is no longer filled - which is why the ADC/CLA work had
+// to land before this switch.
+//
+#define BTS_LAB_TYPE    BTS_LAB_CLOSED_LOOP_CCCV
 
 
 #if BTS_LAB_TYPE == BTS_LAB_OPEN_LOOP_ACMC_IOUT
@@ -400,6 +423,21 @@
 #define BTS_ISR_CL_MODE BTS_ISR_CL_MODE_CC
 #define BTS_ISR_MODE BTS_ISR_MODE_CLOSED_LOOP
 #else
+//
+// CCCV and the two ACMC_VOUT labs.
+//
+// BTS_SFRA_CAPTURE_SETTINGS has to be defined here even though CCCV is not
+// primarily an SFRA mode. Without it the macro is undefined, every
+// "#if(BTS_SFRA_CAPTURE_SETTINGS == ...)" test below silently evaluates it
+// as 0, no branch matches, and BTS_SFRA_AMPLITUDE never gets defined - which
+// is invisible today only because that whole block sits inside
+// "#if(BTS_SFRA_ENABLED == true)" and SFRA is off. Turning SFRA on would
+// fail to compile at bts.c's BTS_SFRA_AMPLITUDE use, a long way from here.
+//
+// VSET_VOUT is the correct capture point for a voltage loop: the injection
+// goes into the voltage setpoint, which is what CV regulates.
+//
+#define BTS_SFRA_CAPTURE_SETTINGS BTS_SFRA_CAPTURE_VSET_VOUT
 #define BTS_ISR_CL_MODE BTS_ISR_CL_MODE_CCCV
 #define BTS_ISR_MODE BTS_ISR_MODE_CLOSED_LOOP
 #endif
