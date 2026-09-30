@@ -1344,11 +1344,29 @@ static void publishStatusToCpu2(void)
         uint32_t calFlags = calValidFlags[ch];
 
         //
-        // Regulation mode. The ISR has tracked ctrlMode_logic all along; it
-        // simply was never copied here, so bits 6 and 7 always read 0.
+        // Regulation mode, bits 6 and 7. The ISR has tracked ctrlMode_logic
+        // all along; it simply was never copied here until the CCCV work.
         //
-        status[ch].constVoltage = (BTS_ctrlLoopVariables[ch].ctrlMode_logic != 0U) ? 1U : 0U;
-        status[ch].constCurrent = (BTS_ctrlLoopVariables[ch].ctrlMode_logic == 0U) ? 1U : 0U;
+        // BOTH BITS ARE CLEAR UNLESS THE SLOT IS ACTUALLY REGULATING.
+        //
+        // ctrlMode_logic is 0 on an idle slot as well as on a slot running
+        // in constant current, so testing it alone made every stopped slot
+        // publish CONST_CURRENT. Observed on hardware: an empty slot 1 read
+        // status 0x80 with running == 0, which a host would show as "in CC"
+        // on a slot doing nothing.
+        //
+        // These bits report what the LOOP is doing, so they only mean
+        // anything while the loop is closed.
+        //
+        if (slotIsRunning(ch)) {
+            status[ch].constVoltage =
+                (BTS_ctrlLoopVariables[ch].ctrlMode_logic != 0U) ? 1U : 0U;
+            status[ch].constCurrent =
+                (BTS_ctrlLoopVariables[ch].ctrlMode_logic == 0U) ? 1U : 0U;
+        } else {
+            status[ch].constVoltage = 0U;
+            status[ch].constCurrent = 0U;
+        }
 
         //
         // Calibration validity comes from the PERSISTED flags CPU2 mirrors
