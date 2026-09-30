@@ -54,8 +54,8 @@ flowchart LR
 
     subgraph CPU1 ["F28379D CPU1 — control core"]
         ADS["ADS131M08<br/>SPI, 16-bit WORD mode"]
-        INT["On-chip ADC<br/>12-bit @ 2.5 V ref<br/>17 SOCs @ 6.645 kSPS"]
-        CLA["CLA1 task 1<br/>20 Hz IIR per channel<br/>runs on EVERY sweep"]
+        INT["On-chip ADC<br/>12-bit @ 2.5 V ref<br/>17 SOCs @ 99.67 kSPS"]
+        CLA["CLA1 task 1<br/>two IIRs per channel<br/>20 Hz + fast<br/>runs on EVERY sweep"]
         PROT["Reverse polarity check<br/>+ group supervision"]
         LOOP["DCL control loop<br/>HRPWM, per slot"]
         ACC["mAh / mWh / seconds<br/>integrated per direction"]
@@ -87,10 +87,9 @@ flowchart LR
     ADS -->|"ioutSense_pu<br/>raw per-unit"| LOOP
     ADS -->|"16-bit sums"| ACC
     ADS -.->|"computed at 10 Hz,<br/>NEVER READ"| DEAD
-    INT -->|"8-deep ring, meaned at 10 Hz<br/>CellVoltage_V / CellCurrent_I"| PROT
     INT -->|"ADCA INT2 at SOC6,<br/>every sweep"| CLA
-    CLA -->|"CellVoltageFilt_V<br/>CellCurrentFilt_I"| PUB
-    PROT -.->|"fallback only, if the<br/>CLA stops advancing"| PUB
+    CLA -->|"fast IIR<br/>CellVoltage_V / CellCurrent_I"| PROT
+    CLA -->|"20 Hz IIR<br/>CellVoltageFilt_V<br/>CellCurrentFilt_I"| PUB
     ACC --> PUB
     LOOP --> PUB
 
@@ -131,69 +130,110 @@ it at the publish call. A console `ChN` is a **slot**, not an AIN.
 value means an open input. `publishCellTemp()` is called unconditionally, so
 an all-zero transfer publishes the floor as if it were valid.
 
-### The internal ADC is filtered by the CLA, and only for telemetry
+### The internal ADC is filtered by the CLA, for telemetry *and* protection
 
-`CellVoltage_V` and `CellCurrent_I` are a **1.2 ms snapshot taken once
-every 100 ms**. `adcCellVoltageISR` pushes each sweep into an 8-deep ring
+`CellVoltage_V` and `CellCurrent_I` **used to be** a 1.2 ms snapshot taken
+once every 100 ms. `adcCellVoltageISR` pushed each sweep into an 8-deep ring
 (`BTS_f28AverageFactor`, `bts_user_settings.h:278`) and
-`BTS_monitor_Iout_Vout()` means that ring at 10 Hz. At 6.645 kSPS eight
-samples is 1.2 ms, so **98.8 % of the conversions are discarded**, and
-whatever ripple happens to sit inside that window aliases straight through
-to the host.
+`BTS_monitor_Iout_Vout()` meaned that ring at 10 Hz. At the old 6.645 kSPS
+eight samples was 1.2 ms, so **98.8 % of the conversions were discarded**,
+and whatever ripple sat inside that window aliased straight through to the
+host.
 
-CLA1 task 1 (`bts_cla.cla`) closes that gap. It runs on *every* sweep and
-folds each sample into a single-pole IIR:
+**That ISR no longer runs.** The sweep is now 1:1 with the switching period,
+and an interrupt every 10.03 us would land on a core already servicing eight
+ADS131M08 control loops. `INT_ADCA1` is still *registered* — so a bring-up
+build can re-enable it with one line — but it is masked in the PIE
+(`Interrupt_disable(INT_ADCA1)`), and ADCA INT1 is put into continuous mode
+so the converter does not stall waiting for an acknowledgement that will
+never come.
+
+CLA1 task 1 (`bts_cla.cla`) absorbs the whole rate instead. It runs on
+*every* sweep and folds each sample into **two** single-pole IIRs, because
+the two consumers want opposite things:
 
 ```
-y += alpha * (x - y)      alpha = 2*pi*fc/fs = 2*pi*20/6645 = 0.018912
+y += alpha * (x - y)
+
+  ...Filt   alpha = 2*pi*fc/fs = 2*pi*20/99670 = 0.0012608    20 Hz, telemetry
+  ...Fast   alpha = 2/(N+1)    = 2/9           = 0.22222      protection path
 ```
 
-One float32 multiply-accumulate per channel, sixteen channels plus the A0
-reference, on a processor that is not the C28x. The C28x cost is zero.
-`BTS_updateFilteredTelemetry()` (`bts_cpu1.c:1630`) scales the result out
-of counts into volts and amps using the same gains `BTS_monitor_Iout_Vout()`
-uses, and publishes it as `CellVoltageFilt_V` / `CellCurrentFilt_I`.
+The fast pair is what replaces the ring. `alpha = 2/(N+1)` is the
+single-pole equivalent of an N-sample box mean, so its settling matches the
+8-deep ring it stands in for — **~184 us at this rate, against the 1204 us
+the ring spanned at the old one**. The protection path got *faster*, and it
+is now refreshed every sweep rather than once per 100 ms telemetry pass.
+
+Four float32 multiply-accumulates per channel, eight channels, plus the A0
+reference subtraction, on a processor that is not the C28x. The C28x cost is
+zero. `BTS_updateFilteredTelemetry()` scales the 20 Hz pair out of counts
+into volts and amps using the same gains `BTS_monitor_Iout_Vout()` uses and
+publishes it as `CellVoltageFilt_V` / `CellCurrentFilt_I`;
+`BTS_refreshCellFromCla()`, called first in `C1()`, does the same for the
+fast pair into `CellVoltage_V` / `CellCurrent_I`.
 
 ```mermaid
 flowchart LR
-    SOC["EPWM1 SOCA<br/>TBPRD 902 @ 90 MHz<br/>event prescale /15"]
+    SOC["EPWM1 SOCA<br/>TBPRD 902 @ 90 MHz<br/>event prescale /1"]
     SWEEP["17 SOCs across ADCA-D<br/>SOC0..SOC5 V/I, SOC6 = A0 ref"]
-    I1["ADCA INT1 ← SOC0<br/>PIE 1.1, enabled"]
+    I1["ADCA INT1 ← SOC0<br/>PIE MASKED, continuous"]
     I2["ADCA INT2 ← SOC6<br/>PIE masked, continuous"]
-    ISR["adcCellVoltageISR<br/>8-deep ring per channel"]
-    CLA1["CLA1 task 1<br/>IIR, alpha 0.018912"]
-    MEAN["BTS_monitor_Iout_Vout()<br/>ring mean @ 10 Hz"]
+    ISR["adcCellVoltageISR<br/>registered, never fires"]
+    CLA1["CLA1 task 1<br/>Filt alpha 0.0012608<br/>Fast alpha 0.22222"]
+    FAST["BTS_refreshCellFromCla()<br/>fast pair → V/A @ 10 Hz"]
     UPD["BTS_updateFilteredTelemetry()<br/>counts → V/A @ 10 Hz"]
     SAFE["Reverse polarity,<br/>group supervision,<br/>BTS_cellVoltageAsCtrl16b()"]
     TEL["cpu1Status, canData,<br/>calibration telemetry"]
 
     SOC --> SWEEP
-    SWEEP --> I1 --> ISR --> MEAN
-    SWEEP --> I2 --> CLA1 --> UPD
-    MEAN -->|"CellVoltage_V<br/>CellCurrent_I"| SAFE
-    MEAN -.->|"fallback"| UPD
+    SWEEP -.-> I1
+    I1 -.->|"masked"| ISR
+    SWEEP --> I2 --> CLA1
+    CLA1 --> FAST
+    CLA1 --> UPD
+    FAST -->|"CellVoltage_V<br/>CellCurrent_I"| SAFE
     UPD -->|"CellVoltageFilt_V<br/>CellCurrentFilt_I"| TEL
+
+    style ISR stroke-dasharray: 5 5
+    style I1 stroke-dasharray: 5 5
 ```
 
-**The filtered values are telemetry only.** That was a deliberate scope
-decision, and the split is visible in the code: the reverse-polarity check
-(`bts_cpu1.c:1900`), group supervision (`bts_cpu1.c:2070`, `:2080`) and
-`BTS_cellVoltageAsCtrl16b()` (`bts.h:450`) all keep reading the unfiltered
-`CellVoltage_V` / `CellCurrent_I`. A 20 Hz single pole adds ~12 ms of lag,
-which is fine for a display and not fine for a trip. The three sinks the
-filtered pair does reach are `cpu1Status` (`bts_cpu1.c:1269-1270`), the CAN
-frame (`:1287-1288`) and the calibration telemetry window (`:827-828`).
+**Which pair a consumer reads is the whole design.** A 20 Hz single pole
+adds ~12 ms of lag: fine for a display, not fine for a trip. So the
+reverse-polarity check, group supervision and `BTS_cellVoltageAsCtrl16b()`
+read `CellVoltage_V` / `CellCurrent_I` — now sourced from the **fast** pair
+by `BTS_refreshCellFromCla()` rather than from the dead ring. The three
+sinks the 20 Hz pair reaches are `cpu1Status`, the CAN frame and the
+calibration telemetry window.
+
+**The over-current trips read neither of them.** They run off the ADS131M08
+in `BTS_tripEpwm()` and off the CMPSS comparators in hardware, and no part
+of that path passes through the CLA.
 
 **It fails back, not silent.** `BTS_claRunCount` is incremented once per
 task run. `BTS_updateFilteredTelemetry()` compares it against the value it
-saw 100 ms earlier; if it has not moved — the CLA never started, LS4/LS5
-were never handed over, the ADCA INT2 trigger is not reaching
-`CLA1TASKSRCSEL1` — telemetry reverts to the unfiltered pair rather than
-reporting a frozen number, or 0 V, with nothing to distinguish it from a
-real reading. `BTS_claPrimed` covers the other end: the first task run
-*loads* the filter state from the raw sample instead of converging towards
-it from zero, so telemetry does not ramp up from 0 V over the first 12 ms
-of every boot.
+saw on the previous pass; if it has not moved — the CLA never started,
+LS4/LS5 were never handed over, the ADCA INT2 trigger is not reaching
+`CLA1TASKSRCSEL1` — the 20 Hz telemetry reverts to the unfiltered pair, and
+`claFastStale` latches so that `BTS_refreshCellFromCla()` **leaves the cell
+readings alone** instead of zeroing them. A fabricated 0 V would read as
+reverse polarity; a stale reading is the safer failure.
+
+**That counter is 32-bit, and the width is load bearing.** It is tested for
+*inequality against the previous pass*, so it must not be able to wrap back
+onto that value inside one observation period. At 99.67 kSPS a 16-bit
+counter wraps in 657 ms — and while `C1()`'s nominal period is 100 ms, it
+was **measured on hardware at 0.69 Hz**, a ~1.45 s period, comfortably
+longer than that wrap. A 16-bit counter could therefore have read the same
+value twice running with the CLA perfectly healthy, latched `claFastStale`,
+and frozen the very readings it exists to protect. At 32 bits the wrap is
+~12 hours. Both sides access it in one instruction — `MOVL` on the C28x,
+`MMOV32` on the CLA — so there is nothing to tear.
+
+`BTS_claPrimed` covers the other end: the first task run *loads* the filter
+state from the raw sample instead of converging towards it from zero, so
+telemetry does not ramp up from 0 V over the opening milliseconds of a boot.
 
 Measured on the bench at the shipped coefficient: channel 4's raw current
 (SOC5 − SOC6) spread 44 counts ≈ 259 mA across five consecutive sweeps,
@@ -211,9 +251,9 @@ PIE channel is masked — is in
 |---|---|---|
 | Control loop ISR | per switching cycle | HRPWM |
 | Converter switching | **99.67 kHz** | `BTS_DRV_EPWM_TBPRD` = 902 at EPWMCLK 90 MHz |
-| On-chip ADC sweep, 17 SOCs | **6.645 kSPS** | EPWM1 SOCA, `BTS_ADC_SOC_PRESCALE` = 15 |
-| `adcCellVoltageISR` (ADCA INT1 ← SOC0) | 6.645 kHz | same trigger |
-| CLA1 task 1 (ADCA INT2 ← SOC6) | 6.645 kHz | same trigger |
+| On-chip ADC sweep, 17 SOCs | **99.67 kSPS** | EPWM1 SOCA, `BTS_ADC_SOC_PRESCALE` = 1 — 1:1 with the switching period |
+| `adcCellVoltageISR` (ADCA INT1 ← SOC0) | **never fires** | PIE-masked; ADCA INT1 left in continuous mode |
+| CLA1 task 1 (ADCA INT2 ← SOC6) | **99.67 kHz** | same trigger |
 | Task A / B / C | 1 kHz / 200 Hz / 20 Hz | `TASKA/B/C_FREQ_HZ` |
 | `BTS_monitor_Iout_Vout()` | 10 Hz | Task C |
 | Accumulator integration | 150 ms fixed step | Task C |
@@ -225,7 +265,7 @@ The 9-transaction poll cycle is the whole point of the v2 map: eight per-slot
 runtime bursts of 12 registers plus one unit burst. Under v1 the same data
 cost 33 transactions.
 
-**The 6.645 kSPS figure was read off the live device, not off the headers.**
+**The rate chain was read off the live device, not off the headers.**
 `bts_user_settings.h` contradicted itself for a long time — the comment block
 around `BTS_ADC_SOC_PRESCALE` said prescale 10 and 9.97 kSPS while the
 `#define` two lines below said 15, and it assumed SYSCLK 200 MHz when this
@@ -234,10 +274,20 @@ the IMULT-18 branch). Five registers settle it with nothing left to infer:
 `PERCLKDIVSEL` 0x51 (EPWMCLK = SYSCLK/2 = 90 MHz), `TBCTL` 0x8010 (up-count,
 both dividers ÷1), `TBPRD` 902 (90e6/903 = 99.67 kHz), `ETPS` 0x0820
 (`SOCPSSEL` set, so the extended divider is the live one) and `ETSOCPS`
-0x005F (`SOCAPRD2` = 15). 99.67 kHz / 15 = 6.645 kSPS. Anything derived from
-the old numbers — filter coefficients, ISR budgets, aliasing arguments — is
-wrong by a factor of 1.5; the CLA's alpha was, and had to be corrected from
-0.012605 (13.3 Hz) to 0.018912.
+(`SOCAPRD2`, which is `BTS_ADC_SOC_PRESCALE`).
+
+**The prescale is now 1**, so the sweep runs at the switching frequency
+itself: **99.67 kSPS**. It was 15 (6.645 kSPS) before that, and the comments
+claimed 10 (9.97 kSPS) before that. `BTS_CLA_ALPHA` is tied to `fs` and has
+had to follow the rate each time — 0.012605 → 0.018912 → **0.0012608** —
+holding the 20 Hz corner throughout. Anything else derived from an old
+figure (ISR budgets, aliasing arguments) is stale by the same ratio.
+
+**Why the higher rate is affordable:** the C28x is no longer in the fast
+path at all. ADCA is the busiest converter at 7 SOCs × 622 ns = 4.36 µs
+inside a 10.03 µs period, about 43 % utilisation, and the CLA — a separate
+processor with its own bus to the result registers — consumes every sweep
+while the C28x reads the outcome at 10 Hz.
 
 ---
 

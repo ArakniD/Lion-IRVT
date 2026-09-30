@@ -963,37 +963,46 @@
 // ADC acquisition rate for adcCellVoltageISR (cell V/I on the internal ADC).
 //
 // EPWM1 is shared between channel 1's switching leg and the ADC SOCA
-// trigger, so the sample rate CANNOT be set by its period - that belongs to
-// the converter (BTS_DRV_EPWM_TBPRD = 902 on this device, giving 99.67 kHz
-// switching at EPWMCLK = SYSCLK/2 = 90 MHz - SYSCLK is 180 MHz here, NOT the
-// 200 MHz of the LaunchPad branch). The SOC event prescaler divides the
-// trigger instead, leaving the PWM untouched:
+// trigger. Its period belongs to the converter (BTS_DRV_EPWM_TBPRD = 902 on
+// this device, giving 99.67 kHz switching at EPWMCLK = SYSCLK/2 = 90 MHz -
+// SYSCLK is 180 MHz here, NOT the 200 MHz of the LaunchPad branch).
 //
-//   99.67 kHz / 15 = 6.645 kSPS
+// PRESCALE 1: THE ADC NOW SAMPLES 1:1 WITH THE SWITCHING PERIOD.
 //
-// The paragraph below describing a prescale of 10 and a 9.97 kSPS result is
-// WRONG and is kept only because it is what the value was originally chosen
-// against. The constant is 15. Confirmed against the live device:
-// ETSOCPS = 0x005F (SOCAPRD2 = 15), TBPRD = 902, PERCLKDIVSEL = 0x51.
-// BTS_CLA_ALPHA in bts_cla_shared.h is derived from 6.645 kSPS.
+//   99.67 kHz / 1 = 99.67 kSPS
 //
-// 10 was chosen for ~10 kSPS: the control loop does not need faster, and at
-// the previous effective rate the ISR read all eight slots every ~10 us,
-// which is a large and unintended CPU1 load.
+// This is only affordable because the C28x is no longer in the fast path.
+// CLA1 task 1 consumes the sweep - see bts_cla.cla - and the C28x sees the
+// data at 10 Hz through BTS_updateFilteredTelemetry() in C1(). A CPU ISR at
+// 99.67 kHz would be an interrupt every 10.03 us on a core already running
+// the ADS131M08 control loops off their DRDY interrupts.
 //
-// Range is 1..15 (driverlib ASSERTs < 16). 1 restores one sample per
-// switching period.
+// ADCA is the busiest converter at 7 SOCs; at 622 ns per SOC that is a
+// 4.36 us sweep inside a 10.03 us period, so roughly 43% converter
+// utilisation with the sweep comfortably complete before the next trigger.
 //
+// The prescaler is KEPT rather than deleted even though it now divides by 1:
+// it is the one knob that can slow acquisition without touching the switching
+// frequency. Range is 1..15 - driverlib ASSERTs preScaleCount < 16 - so 15,
+// giving 6.645 kSPS, is the slowest reachable here. A sub-100 Hz acquisition
+// is NOT reachable this way at all: EPWM1's period belongs to channel 1's
+// converter and cannot be stretched, so a much slower rate would need a
+// separate timer-triggered SOC source.
 //
-// 15 is the SLOWEST the SOC event prescaler can go - driverlib ASSERTs
-// preScaleCount < 16. At EPWM1's measured 99.67 kHz switching rate that is
-// 6.645 kSPS. (The "124.5 kHz / 8.3 kSPS" in the original note assumed a
-// clock this device does not run at.)
-// A sub-100 Hz acquisition is NOT reachable this way: EPWM1's period belongs
-// to channel 1's converter and cannot be stretched, so the only route to a
-// much slower rate would be a separate timer-triggered SOC source.
+// BTS_CLA_ALPHA in bts_cla_shared.h is derived from whatever rate this
+// produces - CHANGE ONE AND THE FILTER'S CORNER FREQUENCY MOVES. It has been
+// re-derived at every rate this setting has had; the table is in
+// bts_cla_shared.h.
 //
-#define BTS_ADC_SOC_PRESCALE              ((uint16_t)15)
+// History for the next person, because three different figures appear in the
+// commit log and only the last is real: the surrounding comment once claimed
+// prescale 10 and 9.97 kSPS while the constant actually said 15 and the true
+// rate was 6.645 kSPS, and SYSCLK was assumed to be 200 MHz when it is 180.
+// The "124.5 kHz / 8.3 kSPS" in the original note assumed a clock this device
+// does not run at either. Confirmed on the live device: TBPRD = 902,
+// PERCLKDIVSEL = 0x51, ETPS = 0x0820 (SOCPSSEL set), SOCAPRD2 in ETSOCPS.
+//
+#define BTS_ADC_SOC_PRESCALE              ((uint16_t)1)
 
 // Sampling speed of 33,203.125 Hz
 

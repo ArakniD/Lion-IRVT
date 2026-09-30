@@ -1903,10 +1903,24 @@ void BTS_HAL_setupADC(void)
     ADC_setupSOC(ADCB_BASE, ADC_SOC_NUMBER1, ADC_TRIGGER_SW_ONLY, ADC_CH_ADCIN0, 15);
     ADC_setupSOC(ADCB_BASE, ADC_SOC_NUMBER2, ADC_TRIGGER_SW_ONLY, ADC_CH_ADCIN1, 15);
 
-    // ADC interrupt
+    //
+    // ADCA INT1. Armed in the ADC but MASKED IN THE PIE, exactly like INT2
+    // below - see Interrupt_disable(INT_ADCA1) in main().
+    //
+    // At the 1:1 trigger rate this fires every 10.03 us. Taking that as a
+    // C28x interrupt would mean ~100k context switches a second on a core
+    // that is already servicing two ADS131M08 DRDY interrupts and running
+    // eight control loops off them. THE CLA CONSUMES THE SWEEP INSTEAD, and
+    // the C28x reads the filtered result at 10 Hz in C1().
+    //
+    // The flag is still armed and still sourced from SOC0 so that anything
+    // polling it - or a future ISR - has a live end-of-sweep indication. It
+    // simply does not reach the PIE.
+    //
     ADC_enableInterrupt(ADCA_BASE, ADC_INT_NUMBER1);
     ADC_clearInterruptStatus(ADCA_BASE, ADC_INT_NUMBER1);
     ADC_setInterruptSource(ADCA_BASE, ADC_INT_NUMBER1, ADC_SOC_NUMBER0);
+    ADC_enableContinuousMode(ADCA_BASE, ADC_INT_NUMBER1);
 
     //
     // ADCB end-of-conversion flag for the software-triggered input-voltage
@@ -1988,7 +2002,11 @@ void BTS_HAL_setupADC(void)
 }
 
 //
-// ePWM1 SOCA - the cell V/I acquisition trigger for adcCellVoltageISR.
+// ePWM1 SOCA - the cell V/I acquisition trigger.
+//
+// The consumer is CLA1 task 1, NOT adcCellVoltageISR: that ISR is registered
+// but PIE-masked, because at this rate it would fire every 10.03 us. See the
+// prescale note below and the long comment in BTS_HAL_setupADC().
 //
 // EPWM1 is shared: it is both channel 1's switching leg and the ADC trigger
 // source. Its period therefore belongs to the converter, NOT to the sample
@@ -2003,14 +2021,21 @@ void BTS_HAL_setupADC(void)
 // adcCellVoltageISR ran every ~10 us and read all eight slots each time.
 //
 // The sample rate is set with the SOC event prescaler instead, which divides
-// the trigger without touching the switching period:
+// the trigger without touching the switching period. It is now 1, so the
+// "once per switching period" behaviour above is no longer accidental - it is
+// the intent:
 //
-//   99.67 kHz / BTS_ADC_SOC_PRESCALE(15) = 6.645 kSPS
+//   99.67 kHz / BTS_ADC_SOC_PRESCALE(1) = 99.67 kSPS
+//
+// What changed is who consumes it. The CLA takes every sweep and the C28x
+// reads the result at 10 Hz, so the rate costs CPU1 nothing. The prescaler is
+// kept rather than deleted because it is the only way to slow acquisition
+// without moving the switching frequency.
 //
 // Verified on the live device, not derived from the headers: TBCTL 0x8010,
-// TBPRD 902, ETPS 0x0820 (SOCPSSEL set), ETSOCPS 0x005F (SOCAPRD2 = 15),
-// PERCLKDIVSEL 0x51. BTS_ADC_SOC_PRESCALE is 15 while its own comment block
-// says 10, and SYSCLK is 180 MHz rather than 200 - see bts_cla_shared.h.
+// TBPRD 902, ETPS 0x0820 (SOCPSSEL set), PERCLKDIVSEL 0x51, and SOCAPRD2 in
+// ETSOCPS carrying BTS_ADC_SOC_PRESCALE. SYSCLK is 180 MHz, not the 200 MHz
+// the old comments assumed - see bts_cla_shared.h.
 //
 // Note TBCLK is EPWMCLK (SYSCLK/2), not SYSCLK - the old
 // "DEVICE_SYSCLK_FREQ / 10000" form was doubly wrong for that reason too.

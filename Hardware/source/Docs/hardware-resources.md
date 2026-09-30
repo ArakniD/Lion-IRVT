@@ -47,7 +47,7 @@ absolutely is.
 
 | Interrupt | PIE grp.ch | Handler | Registered at | Body at | Services |
 |---|---|---|---|---|---|
-| `INT_ADCA1` | **1.1** | `adcCellVoltageISR` | `bts_cpu1.c:1022` | `bts_cpu1.c:2217` | On-chip 12-bit ADC: 8 cell voltages, 8 cell currents, 1 reference |
+| `INT_ADCA1` | **1.1** | `adcCellVoltageISR` — **registered but masked** | `bts_cpu1.c:1022` | `bts_cpu1.c:2217` | On-chip 12-bit ADC: 8 cell voltages, 8 cell currents, 1 reference. `Interrupt_disable(INT_ADCA1)` in `main()`; the sweep is consumed by CLA1 instead. See [§8.4](#84-the-adc-trigger-rate-is-9967-ksps-one-sweep-per-switching-period) |
 | `INT_ADCA2` | **1.2** | — **masked, routed to CLA1** | — | `bts_cla.cla` | ADCA INT2 ← SOC6. `Interrupt_disable(INT_ADCA2)`; the flag drives CLA1 task 1 instead. See [§7](#7-cla1-allocation) |
 | `INT_EPWM1_TZ` … `INT_EPWM8_TZ` | **2.1–2.8** | `epwmTripISR` | `bts_hal.c:1978` | `bts_cpu1.c:2272` | ePWM trip zones, all 8 slots. **Was §8.1 — now fixed, registered from an explicit table** |
 | `INT_EPWM1` | **3.1** | `epwm1ISR` | `bts_hal.c:1955` | `bts_cpu1.c:1203` | SFRA sweep. Compiled out: `BTS_SFRA_ENABLED (false)`, `bts_user_settings.h:270` |
@@ -129,7 +129,7 @@ spuriously.
 
 | Handler | Invoked by | PIE group | Acks | Where |
 |---|---|---|---|---|
-| `adcCellVoltageISR` | `INT_ADCA1` | 1 | `INTERRUPT_ACK_GROUP1` | `bts_cpu1.c:2002` |
+| `adcCellVoltageISR` *(masked — never entered)* | `INT_ADCA1` | 1 | `INTERRUPT_ACK_GROUP1` | `bts_cpu1.c:2002` |
 | `epwmTripISR` | `INT_EPWMx_TZ` | 2 | `INTERRUPT_ACK_GROUP2` | `bts_cpu1.c:2119` |
 | `epwm1ISR` | `INT_EPWM1` | 3 | `INTERRUPT_ACK_GROUP3` | `bts_cpu1.c:1104` |
 | `BTS_ExAdcRead_ch1_4()` (from `ISR2`) | `INT_SPIA_RX` | 6 | `INTERRUPT_ACK_GROUP6` | `bts_hal.h:220` |
@@ -463,7 +463,7 @@ that already-divided value rather than dividing again.
 | Module | Purpose | Configured at |
 |---|---|---|
 | `EPWM1`–`EPWM8` | Slot 1–8 synchronous buck/boost, HRPWM on both edges | `bts_hal.c:975` via `bts_cpu1.c:949-956` |
-| `EPWM1` *(also)* | **SOCA trigger for the on-chip ADC**, prescaled /15 | `bts_hal.c:1818-1828` via `bts_cpu1.c:923` — see [§8.4](#84-the-adc-trigger-rate-is-664-ksps-not-10-khz) |
+| `EPWM1` *(also)* | **SOCA trigger for the on-chip ADC**, prescale /1 — one sweep per switching period | `bts_hal.c:1818-1828` via `bts_cpu1.c:923` — see [§8.4](#84-the-adc-trigger-rate-is-9967-ksps-one-sweep-per-switching-period) |
 | `EPWM11` | ADS131M08 #1 master clock, GPIO20 | `bts_hal.c:763` via `bts_cpu1.c:958` |
 | `EPWM12` | ADS131M08 #2 master clock, GPIO22 | `bts_hal.c:763` via `bts_cpu1.c:959` |
 | `EPWM9`, `EPWM10` | — | **Free** |
@@ -514,7 +514,7 @@ ADC interrupt sources:
 
 | Flag | Source SOC | PIE | Used by |
 |---|---|---|---|
-| **ADCA INT1** | SOC0 | 1.1, enabled | `adcCellVoltageISR` (`bts_hal.c:1709`) |
+| **ADCA INT1** | SOC0 | 1.1, **masked** | `adcCellVoltageISR` (`bts_hal.c:1709`) — registered, never entered. Continuous mode, so the converter never stalls on an unacknowledged flag |
 | **ADCA INT2** | **SOC6** | 1.2, **masked** | **CLA1 task 1** via `CLA1TASKSRCSEL1` (`bts_hal.c:1755-1759`) — see [§7](#7-cla1-allocation) |
 | **ADCB INT1** | SOC2 | not enabled | polled by `updateInputVoltage()` (`bts_hal.c:1728`) — see §1.1 and §8.3 |
 
@@ -524,8 +524,9 @@ preference: in the default `ADC_PULSE_END_OF_ACQ_WIN` mode the flag asserts
 when the acquisition window closes, which is *before* the result register is
 written — the CLA would latch the previous sweep. TI's own `cla_adc_fir32`
 example makes the same change for the same reason. The side effect on ADCA
-INT1 is that it now fires ~106 ns later, at end-of-conversion rather than
-end-of-acquisition, which is strictly safer for `adcCellVoltageISR` too.
+INT1 is that it now sets ~106 ns later, at end-of-conversion rather than
+end-of-acquisition — which would be strictly safer for `adcCellVoltageISR`
+if that ISR still ran.
 
 ### What it looked like when it broke
 
@@ -560,8 +561,13 @@ source under both configurations.
 ### 7.1 What CLA1 does here
 
 One task. `Cla1Task1` reads all seventeen ADC results, subtracts the A0
-reference from each current, and folds both sets through a 20 Hz single-pole
-IIR in float32. The output is telemetry only. The rate chain, the filter
+reference from each current, and folds both sets through **two** single-pole
+IIRs in float32: a 20 Hz pair for telemetry and a fast pair
+(`alpha = 2/(N+1)`, N = 8) that carries the protection path — the reverse
+polarity check, group supervision and `BTS_cellVoltageAsCtrl16b()`. It
+replaced `adcCellVoltageISR`'s 8-deep ring, which no longer runs. The
+over-current trips read neither pair; they run off the ADS131M08 and the
+CMPSS comparators. The rate chain, the filter
 mathematics and the C28x-side consumers are in
 [`data-flow.md` §2](data-flow.md#2-measurement-path--silicon-to-phone); this
 section is the resource side.
@@ -795,9 +801,9 @@ follows is not guarded by that condition.
 `#if (BTS_LED_DRIVER_ENABLED == false)`, or move the dwell timebase to CPU
 Timer 2, which is unused on CPU2.
 
-### 8.3 The ADCB end-of-conversion flag is never cleared on the success path
+### 8.3 The ADCB end-of-conversion flag was never cleared on the success path
 
-**Status: minor, in the supervision path. Not previously known.**
+**Status: FIXED.** Minor, in the supervision path. Not previously known.
 
 `updateInputVoltage()` (`bts_cpu1.c:1864-1922`) forces ADCB SOC1/SOC2, then
 spins on ADCB INT1 with a bounded wait. It clears the flag **only on the
@@ -818,13 +824,19 @@ would be indistinguishable from a healthy one, and the "treat a timeout as
 0 V, which is the safe reading" protection at `bts_cpu1.c:1882-1890` would
 never trigger.
 
-**Fix**: clear the flag after a successful read as well as after a timeout.
+**Fixed** as described: `updateInputVoltage()` now calls
+`ADC_clearInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1)` on the success path as
+well as on the timeout branch, and gates the result read on `adcbTimedOut` so
+a timeout yields the safe 0 V rather than a stale register. The bounded-wait
+guard — and therefore `adcbEocTimeouts` — is live again on every pass.
 
-### 8.4 The ADC trigger rate is 6.64 kSPS, not 10 kHz
+### 8.4 The ADC trigger rate is 99.67 kSPS, one sweep per switching period
 
-**Status: the trigger defect is FIXED. The rate is still not what the comments
-in `bts_user_settings.h` said, and anything derived from those comments is
-wrong by a factor of 1.5.**
+**Status: FIXED, twice over.** The original trigger defect is fixed, and the
+rate has since been taken to its final value. Note that **three different
+figures appear in the history below** — 9.97 kSPS, 6.645 kSPS and 99.67 kSPS.
+Only the last is current. Anything derived from an earlier one — filter
+coefficients, ISR budgets, aliasing arguments — is stale.
 
 `BTS_HAL_setupAdcTrigger(EPWM1_BASE)` (`bts_cpu1.c:923`) used to set `EPWM1`
 TBPRD to `DEVICE_SYSCLK_FREQ / 10000 - 1` and enable SOCA on `TBCTR == 0`,
@@ -840,8 +852,11 @@ anyway.
 
 **Fixed** the way this section originally recommended —
 `EPWM_setADCTriggerEventPrescale()`, which divides the SOC *event* and leaves
-the switching period alone. `BTS_HAL_setupAdcTrigger()` (`bts_hal.c:1818`) is
-now three calls and no TBPRD write at all:
+the switching period alone. That the divider is now 1 does not make the API
+choice moot: writing TBPRD here would still be overwritten twenty-six lines
+later, and the prescaler remains the only knob that can slow acquisition
+without moving the switching frequency. `BTS_HAL_setupAdcTrigger()`
+(`bts_hal.c:1818`) is three calls and no TBPRD write at all:
 
 ```c
 EPWM_enableADCTrigger(EPWM_BASE, EPWM_SOC_A);
@@ -865,9 +880,9 @@ Five registers settle it with nothing left to infer:
 | `EPwm1Regs.TBCTL` | `0x8010` | up-count; `HSPCLKDIV` and `CLKDIV` both ÷1 → TBCLK = EPWMCLK |
 | `EPwm1Regs.TBPRD` | `902` | 90e6 / 903 = **99.67 kHz** switching |
 | `EPwm1Regs.ETPS` | `0x0820` | `SOCPSSEL` **set** → the extended divider in `ETSOCPS` is live, not `ETPS.SOCAPRD` |
-| `EPwm1Regs.ETSOCPS` | `0x005F` | `SOCAPRD2` = **15** |
+| `EPwm1Regs.ETSOCPS` | — | `SOCAPRD2` = `BTS_ADC_SOC_PRESCALE`. Was `0x005F` (15); **now 1** |
 
-**99.67 kHz / 15 = 6.645 kSPS.**
+**99.67 kHz / 1 = 99.67 kSPS.** At prescale 15 it read 6.645 kSPS.
 
 The `ETPS`/`ETSOCPS` distinction is the easy one to get wrong: with `SOCPSSEL`
 set, reading `ETPS.SOCAPRD` gives you a stale two-bit field that no longer
@@ -875,26 +890,49 @@ controls anything. The live divider is the 5-bit `SOCAPRD2` in `ETSOCPS` at
 offset `0x33`.
 
 This matters beyond documentation. The CLA's filter coefficient is
-`2*pi*fc/fs`, so a wrong `fs` is a wrong cutoff: `BTS_CLA_ALPHA` was initially
-derived as 0.012605 against the assumed 9.97 kSPS and delivered 13.3 Hz instead
-of the specified 20. Corrected to **0.018912**. The derivation is recorded in
-`bts_cla_shared.h` register by register so the next person does not have to
-re-measure it.
+`2*pi*fc/fs`, so a wrong `fs` is a wrong cutoff. `BTS_CLA_ALPHA` has been
+re-derived at each rate and the 20 Hz corner held throughout:
 
-#### ADCA INT1 is still sourced from SOC0
+| `fs` assumed | `BTS_CLA_ALPHA` | Actual corner |
+|---|---|---|
+| 9.97 kSPS *(never real)* | 0.012605 | 13.3 Hz — wrong |
+| 6.645 kSPS | 0.018912 | 20 Hz |
+| **99.67 kSPS** *(current)* | **0.0012608** | **20 Hz** |
 
-ADCA INT1 fires on **SOC0** (`bts_hal.c:1709`) while `adcCellVoltageISR` reads
+The derivation is recorded in `bts_cla_shared.h` register by register so the
+next person does not have to re-measure it.
+
+#### Why 1:1 is affordable — and why the ISR had to go
+
+At prescale 1 the sweep runs every 10.03 µs. ADCA is the busiest converter at
+7 SOCs; at 622 ns per SOC that is a 4.36 µs sweep inside that period, about
+43 % utilisation, with the sweep comfortably complete before the next trigger.
+The converter can take it.
+
+**CPU1 could not.** An ADCA INT1 every 10.03 µs would land on a core already
+servicing eight ADS131M08 DRDY interrupts. So `INT_ADCA1` is masked in the PIE
+(`Interrupt_disable(INT_ADCA1)` in `main()`) and the ADC's INT1 is put into
+**continuous mode** (`ADC_enableContinuousMode(ADCA_BASE, ADC_INT_NUMBER1)` in
+`BTS_HAL_setupADC()`) so the converter does not stall waiting for an
+acknowledgement that will never arrive. The ISR body is left registered so a
+bring-up build can restore it by deleting one line.
+
+That masking is what made the fast CLA filter mandatory rather than optional.
+With the ISR dead, `CellVoltage_16b[]` is never written, so `CellVoltage_V`
+would have frozen at its last value — and the reverse-polarity check would
+have gone on trusting it. `BTS_refreshCellFromCla()` re-sources that pair from
+the CLA's fast filter; see [§7.1](#71-what-cla1-does-here) and
+[`data-flow.md` §2](data-flow.md#2-measurement-path--silicon-to-phone).
+
+#### ADCA INT1 was sourced from SOC0 — now moot
+
+ADCA INT1 fires on **SOC0** (`bts_hal.c:1709`) while `adcCellVoltageISR` read
 SOC0–SOC6, so SOC1–SOC6 — including the SOC6 reference subtracted from every
-current reading — are one conversion cycle stale. At 6.645 kSPS that is 150 µs
-rather than the ~10 µs it was, which is less comfortable than it looks on
-paper, though still far inside any real signal's bandwidth.
-
-`ADC_setInterruptPulseMode(ADCA_BASE, ADC_PULSE_END_OF_CONV)` (`bts_hal.c:1781`)
-narrows it slightly — the flag now asserts at end-of-conversion rather than
-end-of-acquisition — but does not close it. **CLA1 does not have this problem**:
-it triggers off SOC6, the last conversion in the sweep, so every register it
-reads is from the current period. If the ISR's staleness ever matters, the fix
-is the same one: move ADCA INT1 to SOC6 as well.
+current reading — were one conversion cycle stale. This no longer has a
+consumer: the ISR is masked. **CLA1 never had the problem**, because it
+triggers off SOC6, the last conversion in the sweep, so every register it
+reads is from the current period. If ADCA INT1 is ever re-enabled for
+bring-up, move it to SOC6 at the same time.
 ---
 
 ## 9. Rules

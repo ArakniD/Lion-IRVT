@@ -49,31 +49,34 @@ extern "C" {
 //
 // Single-pole IIR coefficient:  y += alpha * (x - y)
 //
-//   alpha = 2*pi*fc / fs,  fc = 20 Hz,  fs = 6.645 kSPS
-//         = 2*pi*20 / 6645 = 0.018912
+//   alpha = 2*pi*fc / fs,  fc = 20 Hz,  fs = 99.67 kSPS
+//         = 2*pi*20 / 99670 = 0.0012608
 //
-// fs is set by the ADC trigger chain and was VERIFIED ON HARDWARE rather
-// than derived from the settings header, which contradicts itself:
+// fs is the ADC trigger rate, which since the prescaler went to 1 is the
+// switching frequency itself. The chain was VERIFIED ON HARDWARE rather than
+// derived from the settings header, which used to contradict itself:
 //
 //   PERCLKDIVSEL = 0x51      -> EPWMCLKDIV /2, so EPWMCLK = SYSCLK/2 = 90 MHz
 //   SYSCLK       = 180 MHz   -> device.h non-LaunchPad branch (IMULT 18)
 //   EPwm1Regs.TBCTL  = 0x8010 -> up-count, both TB dividers /1
 //   EPwm1Regs.TBPRD  = 902    -> 90e6 / 903 = 99.67 kHz switching
 //   EPwm1Regs.ETPS   = 0x0820 -> SOCPSSEL set, so ETSOCPS holds the divider
-//   EPwm1Regs.ETSOCPS= 0x005F -> SOCAPRD2 = 15
+//   EPwm1Regs.ETSOCPS-> SOCAPRD2 = BTS_ADC_SOC_PRESCALE
 //
-//   99.67 kHz / 15 = 6.645 kSPS
+//   99.67 kHz / 1 = 99.67 kSPS
 //
-// BTS_ADC_SOC_PRESCALE is 15, not the 10 its own comment block claims - and
-// SYSCLK is 180 MHz, not the 200 MHz implied by "EPWMCLK = 100 MHz". Both
-// errors predate the CLA. Taking the header at its word gives alpha 0.012605
-// and a 13.3 Hz corner, which is NOT the 20 Hz this filter is specified at.
+// ALPHA IS TIED TO fs, SO THE TWO MOVE TOGETHER. The corner stays at 20 Hz
+// across the rate change; only the per-sample step shrinks, because there are
+// 15x as many samples in the same second. Settling is ~36.6 ms to within 1%,
+// against the 100 ms telemetry period - so a reported value is still a true
+// average of the interval rather than a snapshot of part of it.
 //
-// ~12 ms to settle to within 1%, against the 100 ms telemetry period - so the
-// reported value is a true average of the interval rather than the 1.2 ms
-// aliased snapshot the 8-deep ring gives.
+// History, because two earlier values are recorded in commits and in the
+// docs: 0.012605 assumed 9.97 kSPS and delivered a 13.3 Hz corner, and
+// 0.018912 was correct for the 6.645 kSPS the prescaler used to give. Neither
+// is right for this rate.
 //
-#define BTS_CLA_ALPHA   0.018912f
+#define BTS_CLA_ALPHA   0.0012608f
 
 //
 // Filter state and liveness counter. Written by Cla1Task1 at the ADC rate,
@@ -82,8 +85,8 @@ extern "C" {
 // Both sides see a 32-bit aligned float, so a read is a single access on the
 // C28x and a single store on the CLA - no lock is needed and none is possible
 // (the CLA cannot be made to wait). A torn value is not reachable for the
-// floats; BTS_claRunCount is 16-bit and therefore single-access on both sides
-// too.
+// floats; BTS_claRunCount is a 32-bit object at an even address, so it is a
+// single MOVL on the C28x and a single MMOV32 on the CLA - also untearable.
 //
 // Units are raw ADC counts, NOT volts. C1() applies the same
 // counts -> engineering conversion BTS_monitor_Iout_Vout() uses.
@@ -96,16 +99,56 @@ extern volatile float32_t BTS_claCellCurrentFilt[BTS_CLA_NUM_CH];
 // actually running; if it ever stops advancing the telemetry falls back to the
 // unfiltered value rather than reporting a frozen - or zero - reading.
 //
-// 16-bit on purpose. It is only ever tested for inequality, and at 6.645 kSPS
-// it wraps every 9.86 s against a 100 ms observation period - so a wrap can
-// never alias two consecutive reads into looking equal.
+// 32-BIT, AND THE WIDTH IS LOAD BEARING. The test is inequality against the
+// value seen on the previous pass, so the counter must not be able to wrap
+// back onto that value inside one observation period.
 //
-extern volatile uint16_t BTS_claRunCount;
+// It very nearly could. At 99.67 kSPS a 16-bit counter wraps every 657 ms,
+// and while C1()'s NOMINAL period is 100 ms, C1() was MEASURED ON HARDWARE at
+// 0.69 Hz - a ~1.45 s period, longer than the wrap. CPU1's whole A/B/C task
+// chain runs about 9x below nominal and the cause is still open; see the
+// project note bts-cpu1-task-chain-runs-slow.
+//
+// A 16-bit counter could therefore read the same value on two consecutive
+// passes with the CLA running perfectly, claFastStale would latch to 1,
+// BTS_refreshCellFromCla() would stop updating, and the cell readings the
+// reverse polarity check trusts would freeze - the exact failure this counter
+// exists to detect, produced by the detector itself. At 32 bits the wrap is
+// ~12 hours, which no plausible task rate can alias.
+//
+// This is why the rate change had to widen it: at the old 6.645 kSPS the
+// 16-bit wrap was 9.86 s and even the measured 1.45 s period had 6.8x margin.
+//
+extern volatile uint32_t BTS_claRunCount;
+
+//
+// FAST filter state - the protection path's copy.
+//
+// Separate from the 20 Hz pair above because the two exist for opposite
+// reasons. The 20 Hz filter is for a display and may lag; THIS pair replaces
+// what adcCellVoltageISR's 8-deep ring used to provide to the reverse
+// polarity check, group supervision and BTS_cellVoltageAsCtrl16b(), and those
+// must not lag.
+//
+// BTS_CLA_FAST_ALPHA is set so the response matches the old ring's: the ring
+// was an 8-sample box mean, and a single-pole IIR with alpha = 2/(N+1) has
+// the same settling time as an N-sample mean. At 99.67 kSPS that is ~184 us
+// to settle within 1%, against the 1204 us the ring spanned at the old rate -
+// so the protection path got faster, not slower, as well as being refreshed
+// every sweep instead of once per telemetry pass.
+//
+extern volatile float32_t BTS_claCellVoltageFast[BTS_CLA_NUM_CH];
+extern volatile float32_t BTS_claCellCurrentFast[BTS_CLA_NUM_CH];
+
+//
+//   alpha = 2 / (N + 1),  N = BTS_f28AverageFactor = 8
+//
+#define BTS_CLA_FAST_ALPHA   0.22222f
 
 //
 // 0 until the task has run once. The first pass loads the state with the raw
 // sample instead of filtering towards it from zero, so the reported voltage
-// does not ramp up from 0 V over the first 12 ms of every boot.
+// does not ramp up from 0 V over the first 37 ms of every boot.
 //
 extern volatile uint16_t BTS_claPrimed;
 

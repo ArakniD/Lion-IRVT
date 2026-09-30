@@ -6,26 +6,39 @@
  *
  * WHY THIS EXISTS
  * ---------------
- * The internal ADC runs at ~6.645 kSPS (EPWM1 TBPRD 902 at EPWMCLK 90 MHz,
- * SOC event prescaler /15 - all four values read back off the live device;
- * see the derivation in bts_cla_shared.h). adcCellVoltageISR stores each
- * sample into an 8-deep ring - 1.2 ms of history - and BTS_monitor_Iout_Vout
- * averages that ring at 10 Hz in C1(). Telemetry therefore reports a 1.2 ms
- * snapshot taken once every 100 ms: 98.8% of the samples are discarded, and
- * whatever ripple happens to sit inside that window aliases straight
- * through.
+ * The internal ADC runs at 99.67 kSPS - 1:1 with EPWM1's switching period,
+ * since the SOC event prescaler went to 1 (EPWM1 TBPRD 902 at EPWMCLK
+ * 90 MHz; see the derivation in bts_cla_shared.h).
  *
- * This task runs on EVERY conversion and folds every sample into a running
- * average, so the number C1() picks up is a true 20 Hz-bandwidth estimate of
- * the whole interval. It costs the C28x nothing - the CLA is a separate
+ * THIS TASK IS WHY THAT RATE IS AFFORDABLE. The C28x is not in the fast path
+ * at all: ADCA INT1 is armed in the ADC but masked in the PIE, so there is no
+ * interrupt every 10.03 us on a core already running eight control loops off
+ * the ADS131M08 DRDY interrupts. The CLA consumes every sweep and the C28x
+ * reads the result at 10 Hz in C1().
+ *
+ * It replaced adcCellVoltageISR, which stored each sample into an 8-deep ring
+ * that BTS_monitor_Iout_Vout averaged at 10 Hz - so telemetry reported a
+ * 1.2 ms snapshot taken once every 100 ms, discarding 98.8% of the samples
+ * and aliasing whatever ripple sat inside that window. This task folds EVERY
+ * sample into two running averages instead. It costs the C28x nothing - the CLA is a separate
  * processor with its own bus to the ADC result registers.
  *
  * TELEMETRY ONLY
  * --------------
- * Nothing here feeds the control loop or any protection path. The reverse
- * polarity check, group supervision and BTS_cellVoltageAsCtrl16b() all keep
- * reading the unfiltered CellVoltage_V / CellCurrent_I. A 20 Hz filter adds
- * ~12 ms of lag, which is fine for a display and not fine for a trip.
+ * TWO OUTPUTS, FOR TWO CONSUMERS WITH OPPOSITE REQUIREMENTS.
+ *
+ * The 20 Hz pair (...Filt) is telemetry and may lag - ~37 ms to settle,
+ * against a 100 ms reporting period.
+ *
+ * The fast pair (...Fast) is what the protection path reads, and it is tuned
+ * to settle in ~184 us, matching the 8-sample ring it replaced. The reverse
+ * polarity check, group supervision and BTS_cellVoltageAsCtrl16b() take this
+ * one. They are faster now than they were: the ring spanned 1204 us at the
+ * old rate and was only re-read once per 100 ms telemetry pass.
+ *
+ * THE OVER-CURRENT TRIPS DO NOT READ EITHER OF THESE. They run off the
+ * ADS131M08 in BTS_tripEpwm() and off the CMPSS comparators in hardware,
+ * neither of which involves this task.
  *
  * TRIGGER
  * -------
@@ -132,6 +145,8 @@ __interrupt void Cla1Task1(void)
         {
             BTS_claCellVoltageFilt[i] = vRaw[i];
             BTS_claCellCurrentFilt[i] = iRaw[i] - refRaw;
+            BTS_claCellVoltageFast[i] = vRaw[i];
+            BTS_claCellCurrentFast[i] = iRaw[i] - refRaw;
         }
         BTS_claPrimed = 1U;
     }
@@ -140,26 +155,44 @@ __interrupt void Cla1Task1(void)
         //
         //   y += alpha * (x - y)
         //
-        // One multiply-accumulate per channel in float32. The CLA's MFLOAT32
-        // pipeline does this in a handful of cycles against a 150 us sample
-        // period, so there is no risk of overrunning the next trigger - and
-        // MSTF's overflow flag would show it if there ever were.
+        // TWO filters per channel, for two different consumers:
+        //
+        //   ...Filt  20 Hz, for telemetry. May lag; a host display does not
+        //            care about 37 ms.
+        //   ...Fast  the protection path's copy, tuned to match the settling
+        //            of the 8-sample ring this replaced. The reverse polarity
+        //            check, group supervision and the CV loop read this, and
+        //            none of them may lag.
+        //
+        // Four multiply-accumulates per channel in float32. At 99.67 kSPS the
+        // period is 10.03 us and the whole task - 17 ADC reads and 32 MACs -
+        // is a small fraction of it, so there is no risk of overrunning the
+        // next trigger. MSTF's overflow flag would show it if there were.
         //
         for (i = 0; i < BTS_CLA_NUM_CH; i++)
         {
-            BTS_claCellVoltageFilt[i] +=
-                BTS_CLA_ALPHA * (vRaw[i] - BTS_claCellVoltageFilt[i]);
+            float32_t vNew = vRaw[i];
+            float32_t iNew = iRaw[i] - refRaw;
 
+            BTS_claCellVoltageFilt[i] +=
+                BTS_CLA_ALPHA * (vNew - BTS_claCellVoltageFilt[i]);
             BTS_claCellCurrentFilt[i] +=
-                BTS_CLA_ALPHA * ((iRaw[i] - refRaw) -
-                                 BTS_claCellCurrentFilt[i]);
+                BTS_CLA_ALPHA * (iNew - BTS_claCellCurrentFilt[i]);
+
+            BTS_claCellVoltageFast[i] +=
+                BTS_CLA_FAST_ALPHA * (vNew - BTS_claCellVoltageFast[i]);
+            BTS_claCellCurrentFast[i] +=
+                BTS_CLA_FAST_ALPHA * (iNew - BTS_claCellCurrentFast[i]);
         }
     }
 
     //
-    // Liveness. C1() compares this against the value it saw 100 ms ago; if it
-    // has not moved, the filtered telemetry falls back to the unfiltered
-    // value rather than reporting a frozen reading as if it were live.
+    // Liveness. C1() compares this against the value it saw on its PREVIOUS
+    // pass - not against a fixed 100 ms, because the measured C1() rate is
+    // 0.69 Hz rather than its nominal 10 Hz. If it has not moved, the
+    // filtered telemetry falls back to the unfiltered value rather than
+    // reporting a frozen reading as if it were live. 32-bit so it cannot wrap
+    // onto the previous value between passes; see bts_cla_shared.h.
     //
     BTS_claRunCount++;
 }

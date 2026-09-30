@@ -33,6 +33,12 @@
 #error "BTS_CLA_NUM_CH in bts_cla_shared.h must match NUM_CHANNELS"
 #endif
 
+#pragma DATA_SECTION(BTS_claCellVoltageFast, "CLADataLS5")
+volatile float32_t BTS_claCellVoltageFast[BTS_CLA_NUM_CH];
+
+#pragma DATA_SECTION(BTS_claCellCurrentFast, "CLADataLS5")
+volatile float32_t BTS_claCellCurrentFast[BTS_CLA_NUM_CH];
+
 #pragma DATA_SECTION(BTS_claCellVoltageFilt, "CLADataLS5")
 volatile float32_t BTS_claCellVoltageFilt[BTS_CLA_NUM_CH];
 
@@ -40,7 +46,7 @@ volatile float32_t BTS_claCellVoltageFilt[BTS_CLA_NUM_CH];
 volatile float32_t BTS_claCellCurrentFilt[BTS_CLA_NUM_CH];
 
 #pragma DATA_SECTION(BTS_claRunCount, "CLADataLS5")
-volatile uint16_t BTS_claRunCount;
+volatile uint32_t BTS_claRunCount;
 
 #pragma DATA_SECTION(BTS_claPrimed, "CLADataLS5")
 volatile uint16_t BTS_claPrimed;

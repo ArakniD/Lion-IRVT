@@ -49,6 +49,15 @@ static void publishStatusToCpu2(void);
 //
 static void BTS_initCla(void);
 static void BTS_updateFilteredTelemetry(void);
+static void BTS_refreshCellFromCla(void);
+
+//
+// 1 while CLA1 is not demonstrably advancing BTS_claRunCount. Set by
+// BTS_updateFilteredTelemetry() and read by BTS_refreshCellFromCla(), which
+// leaves the cell readings alone rather than fabricating a 0 V when it is
+// set. Non-static so it can be watched from the debugger during bring-up.
+//
+volatile uint16_t claFastStale = 1U;
 void updateStatusRegisters(void);
 void modeCallback(float value, uint16_t channel);
 void BTS_HandleRegisterWrite(void);
@@ -1032,8 +1041,19 @@ void main(void)
     BTS_HAL_setupInterrupt();
 
     // Register ADC interrupt for cell voltages and currents
+    //
+    // ADCA INT1 is NOT enabled in the PIE. The internal ADC now triggers 1:1
+    // with EPWM1 at 99.67 kHz, and the CLA consumes every sweep; a C28x ISR
+    // at that rate would be an interrupt every 10.03 us on a core already
+    // running the control loops off the ADS131M08 DRDY interrupts.
+    //
+    // adcCellVoltageISR() is still registered so the vector is valid and the
+    // handler can be re-enabled from the debugger for a bring-up check, but
+    // nothing calls it in normal operation. See BTS_HAL_setupADC() for the
+    // ADC-side half of this, and bts_cla.cla for what replaced it.
+    //
     Interrupt_register(INT_ADCA1, &adcCellVoltageISR);
-    Interrupt_enable(INT_ADCA1);
+    Interrupt_disable(INT_ADCA1);
 
     //
     // Every vector is populated now, so it is safe to let interrupts run.
@@ -1688,10 +1708,56 @@ void BTS_monitor_Iout_Vout(BTS_measValue* measValues)
     measValues->Isense_A = measValues->IoutGain_A * avgValue + measValues->IoutOffset_A;
     avgValue = (float32_t)measValues->Sum_V / ((float32_t)BTS_senseAverageFactor * BTS_ADS131_FULLSCALE);
     measValues->Vsense_V = measValues->VoutGain_V * avgValue + measValues->VoutOffset_V;
-    avgValue = (float32_t)measValues->Sum_CellV / ((float32_t)BTS_f28AverageFactor * 4096.0);
-    measValues->CellVoltage_V = (avgValue * 2.5f) * measValues->F28V_Gain + measValues->F28V_Offset;
-    avgValue = (float32_t)measValues->Sum_CellI / ((float32_t)BTS_f28AverageFactor * 4096.0);
-    measValues->CellCurrent_I = (avgValue * 2.5f) * measValues->F28I_Gain + measValues->F28I_Offset;
+    //
+    // The internal-ADC pair is NOT derived from Sum_CellV/Sum_CellI any more.
+    //
+    // Those sums come from the 8-deep ring adcCellVoltageISR used to fill,
+    // and that ISR is masked in the PIE now that the ADC triggers 1:1 with
+    // EPWM1 - see BTS_HAL_setupADC(). Leaving this arithmetic in place would
+    // have produced a plausible-looking number frozen at whatever the ring
+    // held when the ISR was last serviced, which the reverse-polarity check
+    // would then have trusted.
+    //
+    // BTS_refreshCellFromCla() writes CellVoltage_V / CellCurrent_I from the
+    // CLA's fast filter instead, and runs immediately before these calls in
+    // C1(). The sums are still accumulated above so a bring-up build that
+    // re-enables the ISR still works.
+    //
+}
+
+//
+// Publishes the CLA's FAST filter into the fields the protection path reads.
+//
+// CellVoltage_V and CellCurrent_I are what the reverse-polarity check, group
+// supervision and BTS_cellVoltageAsCtrl16b() consume. They used to come from
+// the 8-deep ring that adcCellVoltageISR filled; with the ADC triggering 1:1
+// with EPWM1 that ISR is masked and the ring is dead, so the values come from
+// CLA1 instead.
+//
+// This is a change of source, not of meaning: same counts, same scaling, and
+// a faster response than the ring gave (~184 us to settle against 1204 us).
+//
+// IF THE CLA IS NOT RUNNING these fields are left ALONE rather than zeroed. A
+// stale voltage is a far better failure than a fabricated 0 V, which the
+// reverse-polarity check reads as a fault and which would stop every slot.
+// claNotRunning is published so the condition is visible rather than silent.
+//
+static void BTS_refreshCellFromCla(void)
+{
+    uint16_t ch;
+
+    if ((BTS_claPrimed == 0U) || (claFastStale != 0U)) {
+        return;
+    }
+
+    for (ch = 0U; ch < NUM_CHANNELS; ch++) {
+        BTS_measValue *m = &BTS_measValues[ch];
+
+        m->CellVoltage_V = ((BTS_claCellVoltageFast[ch] / 4096.0f) * 2.5f) *
+                           m->F28V_Gain + m->F28V_Offset;
+        m->CellCurrent_I = ((BTS_claCellCurrentFast[ch] / 4096.0f) * 2.5f) *
+                           m->F28I_Gain + m->F28I_Offset;
+    }
 }
 
 //
@@ -1715,24 +1781,34 @@ void BTS_monitor_Iout_Vout(BTS_measValue* measValues)
 //
 static void BTS_updateFilteredTelemetry(void)
 {
-    static uint16_t lastRunCount = 0U;
-    static uint16_t claSeenRunning = 0U;
-    uint16_t nowRunCount = BTS_claRunCount;
+    static uint32_t lastRunCount = 0U;
+    uint16_t claSeenRunning;
+    uint32_t nowRunCount = BTS_claRunCount;
     uint16_t ch;
 
     //
-    // At 6.645 kSPS the counter advances ~665 times between calls and wraps
-    // every 9.86 s, so equality across a 100 ms gap means it genuinely is not
-    // running. The first pass cannot tell - lastRunCount starts at 0 and the
-    // CLA may legitimately be at 0 - so claSeenRunning latches only once a
-    // difference has actually been observed.
+    // At 99.67 kSPS the counter advances ~9967 times per nominal 100 ms pass,
+    // so equality across a pass means the CLA genuinely is not running. The
+    // first pass cannot tell - lastRunCount starts at 0 and the CLA may
+    // legitimately be at 0 - so the stale flag only latches once a difference
+    // has actually been observed.
     //
-    if (nowRunCount != lastRunCount) {
-        claSeenRunning = 1U;
-    } else {
-        claSeenRunning = 0U;
-    }
+    // THIS COMPARISON IS WHY BTS_claRunCount IS 32-BIT. This observer is
+    // slower than nominal: C1() was measured on hardware at 0.69 Hz, a
+    // ~1.45 s period, against the 657 ms a 16-bit counter takes to wrap at
+    // this ADC rate. A 16-bit counter could alias to the same value across two
+    // passes and latch claFastStale on a perfectly healthy CLA, freezing the
+    // readings this flag is supposed to protect. 32 bits wraps in ~12 hours.
+    //
+    claSeenRunning = (nowRunCount != lastRunCount) ? 1U : 0U;
     lastRunCount = nowRunCount;
+
+    //
+    // Published for BTS_refreshCellFromCla(), which runs BEFORE this on the
+    // next pass and needs the same liveness answer. Also the one place the
+    // condition is observable from a debugger.
+    //
+    claFastStale = (claSeenRunning != 0U) ? 0U : 1U;
 
     for (ch = 0U; ch < NUM_CHANNELS; ch++) {
         BTS_measValue *m = &BTS_measValues[ch];
@@ -1974,6 +2050,14 @@ static void serviceTripArming(void)
 
 void C1(void)
 {
+    //
+    // FIRST: refresh the internal-ADC pair from CLA1. Everything below reads
+    // CellVoltage_V / CellCurrent_I - the reverse-polarity check, group
+    // supervision, the telemetry publish - and the ring that used to supply
+    // them is no longer filled.
+    //
+    BTS_refreshCellFromCla();
+
     BTS_monitor_Iout_Vout(&BTS_measValues_ch1);
     BTS_monitor_Iout_Vout(&BTS_measValues_ch2);
     BTS_monitor_Iout_Vout(&BTS_measValues_ch3);
@@ -2275,18 +2359,37 @@ static void updateInputVoltage(void)
         adcWait++;
     }
 
-    if (adcWait >= BTS_ADCB_EOC_MAX_POLLS) {
+    bool     adcbTimedOut  = (adcWait >= BTS_ADCB_EOC_MAX_POLLS);
+    uint16_t busVoltageRaw = adcbTimedOut ? 0U :
+                             ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER1);
+
+    if (adcbTimedOut) {
         //
         // Treat a timeout as "input voltage unknown", which is the safe
         // reading: 0 V drives unitState to charge-disabled below rather
         // than leaving a stale value that looks healthy.
         //
         adcbEocTimeouts++;
-        ADC_clearInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1);
     }
 
-    uint16_t busVoltageRaw = (adcWait >= BTS_ADCB_EOC_MAX_POLLS) ? 0U :
-                             ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER1);
+    //
+    // Clear on BOTH paths, and only after the result has been read.
+    //
+    // This used to clear on the timeout branch alone. Nothing else clears
+    // ADCB INT1 - the only other ADC_clearInterruptStatus(ADCB_BASE, ...) is
+    // the one-time setup in BTS_HAL_setupADC() - so from the second call
+    // onward the flag was already set on entry and the wait above exited
+    // immediately, before the freshly-forced conversion had landed. The
+    // reading was one call old: 100 ms at the 10 Hz C1() rate.
+    //
+    // At that timescale a stale bus voltage is still usable, so the guard
+    // behaved correctly and the bug was invisible. The real cost was that the
+    // bounded wait became dead code after the first pass - adcbEocTimeouts
+    // could never increment again, so a genuinely stuck ADCB would have been
+    // indistinguishable from a healthy one and the "treat a timeout as 0 V"
+    // protection above would never have fired.
+    //
+    ADC_clearInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1);
 
     //
     // Ratiometric against the external 1.25 V on ADC-A0, so the ADC's own

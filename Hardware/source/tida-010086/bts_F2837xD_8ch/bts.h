@@ -32,6 +32,7 @@ extern "C" {
 #include "DCL_fdlog.h"
 #include "DCL_TCM.h"
 #include "registers.h"
+#include "bts_cla_shared.h"   // BTS_claCellVoltageFast, read by the CV loop
 
 #if(BTS_DRV_EPWM_HR_ENABLED == true)
     #include "SFO_V8.h"
@@ -473,21 +474,26 @@ static inline int16_t BTS_cellVoltageAsCtrl16b(const BTS_measValue* measValue,
 {
     float32_t volts;
     float32_t pu;
+    uint16_t  ch = (uint16_t)(measValue - &BTS_measValues[0]);
 
     //
-    // Newest sample rather than the ring-buffer average: averaging
-    // BTS_f28AverageFactor samples would add phase lag the CV loop cannot
-    // tolerate. F28Index has already advanced past the most recent write.
+    // Reads CLA1's FAST filter, not the ring.
     //
-    uint16_t idx = (measValue->F28Index == 0U)
-                 ? (uint16_t)(BTS_f28AverageFactor - 1U)
-                 : (uint16_t)(measValue->F28Index - 1U);
-
+    // The ring is no longer filled: the internal ADC triggers 1:1 with EPWM1
+    // at 99.67 kSPS and adcCellVoltageISR is masked in the PIE, because a
+    // C28x interrupt every 10.03 us is not affordable on a core already
+    // running the control loops. Reading the ring here would have returned
+    // whatever it held when that ISR was last serviced - a fixed number the
+    // CV loop would have regulated against forever.
+    //
+    // The fast filter settles in ~184 us against the ring's 1204 us, so the
+    // CV loop sees LESS lag than it would have, not more - which matters
+    // because this runs at the ADS131M08 DRDY rate, not at 10 Hz.
     //
     // Counts to volts, matching how BTS_monitor_Iout_Vout() scales the same
     // reading: 12-bit unsigned against the 2.5 V reference.
     //
-    volts = (((float32_t)measValue->CellVoltage_16b[idx] / (float32_t)4096.0)
+    volts = ((BTS_claCellVoltageFast[ch] / (float32_t)4096.0)
              * (float32_t)2.5) * measValue->F28V_Gain + measValue->F28V_Offset;
 
     //
