@@ -363,7 +363,23 @@
 // through BTS_SFRA_IS_ACTIVE(). A tuning binary strapped to a normal mode
 // behaves exactly like a production one.
 //
+// SELECTED BY THE BUILD CONFIGURATION, not by editing this line. The
+// "cpu1_sfra" configuration passes --define=BTS_SFRA_BUILD=1; "cpu1" does
+// not. Both are flash builds and are otherwise identical, so a tuning image
+// and a production image can be produced from one source tree without a
+// working-tree change between them.
+//
+// Overriding on the command line works too: -DBTS_SFRA_BUILD=1.
+//
+#ifndef BTS_SFRA_BUILD
+#define BTS_SFRA_BUILD 0
+#endif
+
+#if (BTS_SFRA_BUILD != 0)
+#define BTS_SFRA_ENABLED (true)
+#else
 #define BTS_SFRA_ENABLED (false)
+#endif
 
 //
 // True only when a sweep is actually running: the library is compiled in AND
