@@ -1099,16 +1099,56 @@ typedef enum {
     eModeOctet             = 3,  // 1-8 as one group
     eModeIndependentIntAdc = 4,  // as above, internal ADC voltage control
     eModePairsIntAdc       = 5,
-    eModeQuadsIntAdc       = 6,
-    eModeOctetIntAdc       = 7,
+    //
+    // SLOT TUNING (SFRA), one slot at a time. These two replaced
+    // eModeQuadsIntAdc and eModeOctetIntAdc, which are gone - a grouped
+    // internal-ADC mode was never used, and SFRA needed two mode values
+    // because the sweep has to be run against whichever converter closes
+    // the loop.
+    //
+    // The slot under test is chosen by the ENABLE straps, not by the mode.
+    //
+    eModeSfraIntAdc        = 6,  // SFRA sweep, voltage loop on the internal ADC
+    eModeSfraAds131        = 7,  // SFRA sweep, voltage loop on the ADS131M08
 } BTS_SlotMode;
 
-// Slots per group: 1, 2, 4 or 8.
-#define BTS_MODE_GROUP_SIZE(m)      ((uint16_t)1U << ((uint16_t)(m) & 0x3U))
+//
+// SLOT TUNING MODES. Modes 6 and 7 run an SFRA sweep instead of a test.
+//
+// This is the one place the mode is NOT a bit field. Modes 0-5 encode group
+// size in the low two bits and the converter in bit 2, and the two macros
+// below used to be pure bit arithmetic over all eight values. The SFRA modes
+// break that pattern deliberately, so both macros special-case them - see
+// the comments on each.
+//
+#define BTS_MODE_IS_SFRA(m)         (((uint16_t)(m)) >= (uint16_t)eModeSfraIntAdc)
 
-// Modes 4-7 close the voltage loop on the C2000's internal ADC instead of
-// the ADS131M08.
-#define BTS_MODE_USES_INT_ADC(m)    ((((uint16_t)(m)) & 0x4U) != 0U)
+//
+// Slots per group: 1, 2, 4 or 8.
+//
+// SFRA SWEEPS ONE SLOT, so its group size is 1 regardless of the bit pattern.
+// Without this case mode 6 would report a group of 4 and mode 7 a group of 8
+// - their old quads/octet meanings - and BTS_HAL_setupGroupPhase(),
+// BTS_HAL_setupTripRouting() and BTS_GROUP_LEADER() would every one of them
+// be configured for a grouping the sweep does not use: interleaved ePWM
+// phases, trips routed to a leader, and followers mirroring a duty that the
+// injection is perturbing.
+//
+#define BTS_MODE_GROUP_SIZE(m)      (BTS_MODE_IS_SFRA(m) ? (uint16_t)1U : \
+                                     ((uint16_t)1U << ((uint16_t)(m) & 0x3U)))
+
+//
+// Which converter closes the voltage loop.
+//
+// Modes 4-5 use the C2000's internal ADC, 0-3 the ADS131M08. Bit 2 said so
+// for the whole range until the SFRA modes took 6 and 7: both have bit 2
+// set, but only mode 6 sweeps the internal-ADC loop. Mode 7 sweeps the
+// ADS131M08 loop and must NOT report the internal ADC, or the sweep would
+// be injected into one loop and measured on the other.
+//
+#define BTS_MODE_USES_INT_ADC(m)    (((uint16_t)(m)) == (uint16_t)eModeSfraIntAdc || \
+                                     ((((uint16_t)(m)) & 0x4U) != 0U && \
+                                      !BTS_MODE_IS_SFRA(m)))
 
 // The group leader is the lowest-numbered slot in the group. Group sizes are
 // powers of two, so masking off the low bits of the channel index gives it.

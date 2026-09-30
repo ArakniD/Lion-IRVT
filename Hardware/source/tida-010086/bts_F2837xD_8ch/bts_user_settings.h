@@ -353,7 +353,31 @@
 #define BTS_SFRA_MODE_CC_PLANT  0
 #define BTS_SFRA_MODE_CC_CLOSED 1
 
+//
+// Whether the SFRA library is COMPILED IN.
+//
+// This stays a build switch: the library, its five sweep arrays and the GUI
+// serial comms are real flash and RAM, and a production unit has no reason
+// to carry them. What is no longer a build switch is whether a sweep RUNS -
+// that is selected by the MODE straps at boot (modes 6 and 7) and tested
+// through BTS_SFRA_IS_ACTIVE(). A tuning binary strapped to a normal mode
+// behaves exactly like a production one.
+//
 #define BTS_SFRA_ENABLED (false)
+
+//
+// True only when a sweep is actually running: the library is compiled in AND
+// the straps selected a slot-tuning mode.
+//
+// In a production build this is the constant 0, so every guarded branch
+// collapses at compile time and the control ISR carries no test at all -
+// the runtime switch costs a production unit nothing.
+//
+#if (BTS_SFRA_ENABLED == true)
+    #define BTS_SFRA_IS_ACTIVE()   (btsSfraActive != 0U)
+#else
+    #define BTS_SFRA_IS_ACTIVE()   (0)
+#endif
 #if BTS_SFRA_ENABLED == true
 #warning "SFRA IS ENABLED BY DEFINITION"
 #endif

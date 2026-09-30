@@ -45,6 +45,12 @@ uint16_t btsSlotEnabled[PWM_CH_MAX]    = {1, 1, 1, 1, 1, 1, 1, 1};
 uint16_t btsGroupMembers[PWM_CH_MAX]   = {1, 1, 1, 1, 1, 1, 1, 1};
 uint16_t btsSlotUsesIntAdc[PWM_CH_MAX] = {0, 0, 0, 0, 0, 0, 0, 0};
 
+//
+// Slot tuning (SFRA). Latched from the straps in main(); see bts.h.
+//
+uint16_t btsSfraActive = 0U;
+uint16_t btsSfraSlot   = 0U;
+
 BTS_DCL_CTRL_TYPE   BTS_ctrl_cc[PWM_CH_MAX]
     = { BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,
         BTS_DCL_CTRL_DEFAULTS,BTS_DCL_CTRL_DEFAULTS,

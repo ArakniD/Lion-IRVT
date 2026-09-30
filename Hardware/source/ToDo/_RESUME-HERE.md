@@ -13,7 +13,7 @@ progress. Last commit is `7bdddfd`.
 | 04 LED timer + CCCV | DONE | `ac1bb42` |
 | 05 HA register mirror | **NOT STARTED** — do this next | — |
 | 06 Slot tuning registers | **PART 1 DONE** | `6c2c838` |
-| 07 SFRA runtime switch | **NOT STARTED, BLOCKED** | — |
+| 07 SFRA runtime switch | DONE | `PENDING07` |
 
 Working tree carries only untracked `Docs/hardware-todo.md`, which is the
 user's own file and marked "AGENT IGNORE THIS FILE". Leave it.
@@ -47,23 +47,20 @@ different conventions for the same identifier families (byte offsets and masks
 vs register indices and bit positions), so copying a line across compiles and
 is silently wrong.
 
-## ToDo 07 is BLOCKED — needs a decision from the user
+## ToDo 07 — RESOLVED and DONE
 
-Do not start it without resolving this. **The user has seen it and said "flag
-any conflicts and we'll address the mode table after."**
+The mode-table conflict was decided by the user in the notes below: modes 6
+and 7 (the unused grouped internal-ADC modes) became the two SFRA modes, and
+**mode 0 was left alone** — which is the safe outcome, since an unstrapped
+board decodes to mode 0 through the pull-ups.
 
-ToDo 06 says MODE `0b000` is unused and should select SFRA. It is not:
+Both mode macros had to stop being pure bit arithmetic: group size is forced
+to 1 for a sweep, and the converter test is explicit because bit 2 is set for
+both tuning modes while only mode 6 sweeps the internal-ADC loop.
 
-- `registers.h:1032` maps mode 0 to `eModeIndependent` (8 independent slots).
-  The low two bits of the mode are the group size, so 0 is structurally
-  "group of 1".
-- **MODE and ENABLE are pulled high.** An unstrapped board reads `0b111`,
-  which `truth_table[7]` in `bts_hal.c` maps to **0**.
-
-So mode 0 is both a real mode and the unstrapped default. Assigning SFRA to it
-would put every unstrapped unit into calibration mode at power-on, with the AT
-console replaced by the SFRA serial port. Three options are written out in
-`ToDo/07...md`.
+SFRA now runs on a strap-latched runtime flag; the library remains a build
+switch. SCIA ownership rides the same strap because CPUSEL is boot-time only.
+See `ToDo/07...md` for the full changelog.
 
 ## What the user confirmed this session
 
@@ -103,3 +100,19 @@ and the CCCV switch is not a risk item.
   command lines contain `--diag_warning=225` and match naive error greps.
 - A function called above its definition in `com_cpu2.c` links only with a
   forward declaration; this cost one failed CPU2 link this session.
+
+## Human notes for resumption
+
+typedef enum {
+    eModeIndependent       = 0,  // 8 independent slots
+    eModePairs             = 1,  // 1+2, 3+4, 5+6, 7+8
+    eModeQuads             = 2,  // 1-4, 5-8
+    eModeOctet             = 3,  // 1-8 as one group
+    eModeIndependentIntAdc = 4,  // as above, internal ADC voltage control
+    eModePairsIntAdc       = 5,
+    eModeQuadsIntAdc       = 6,
+    eModeOctetIntAdc       = 7,
+} BTS_SlotMode;
+
+change eModeQuadsIntAdc to SFRA on INTERNAL ADC
+chaneg eModeOctetIntAdc to SFRA on ADS131M08 ADC

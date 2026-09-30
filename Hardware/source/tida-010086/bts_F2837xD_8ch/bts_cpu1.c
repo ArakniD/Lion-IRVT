@@ -1037,6 +1037,18 @@ void main(void)
     // latched in BTS_HAL_setupGPIO() above, and the phase registers may only
     // be written while the time bases are still stopped.
     //
+    //
+    // Latch the slot-tuning selection BEFORE anything reads it: the SCIA
+    // ownership decision below, BTS_initSlotGrouping() and the ePWM phase
+    // setup all branch on it.
+    //
+    // The slot under test comes from the ENABLE straps. ENABLE normally
+    // means "highest enabled slot", but in a tuning mode there is only one
+    // slot under test, so the same three pins name it directly.
+    //
+    btsSfraActive = BTS_MODE_IS_SFRA((uint16_t)startup_mode) ? 1U : 0U;
+    btsSfraSlot   = (uint16_t)startup_enable & 0x7U;
+
     BTS_initSlotGrouping((uint16_t)startup_mode, (uint16_t)startup_enable);
     BTS_HAL_setupGroupPhase(BTS_MODE_GROUP_SIZE((uint16_t)startup_mode));
 
@@ -1166,14 +1178,20 @@ void main(void)
     // console when BTS_DEBUG_CONSOLE is set. CPU1 needs it only for
     // the SFRA GUI. They cannot both have it.
     //
-#if (BTS_SFRA_ENABLED == true)
+    // THE STRAP DECIDES, not the build. btsSfraActive was latched from
+    // startup_mode a few lines above, so a tuning binary hands SCIA to CPU1
+    // only when the operator actually strapped a slot-tuning mode; strapped
+    // to anything else it gives SCIA to CPU2 and the console and LED driver
+    // work normally. That is the whole point of making SFRA runtime: one
+    // binary, and the sweep costs nothing until it is asked for.
     //
-    // Leave SCIA with CPU1 for the SFRA GUI. CPU2's LED driver and, if
-    // selected, its console will not function.
+    // This cannot be changed after boot. CPUSEL is a one-shot ownership
+    // write, which is exactly why the selection rides on the MODE strap -
+    // itself latched once at reset - rather than on a host register.
     //
-#else
-    SysCtl_selectCPUForPeripheral(SYSCTL_CPUSEL5_SCI, 1, SYSCTL_CPUSEL_CPU2); // SCIA
-#endif
+    if (btsSfraActive == 0U) {
+        SysCtl_selectCPUForPeripheral(SYSCTL_CPUSEL5_SCI, 1, SYSCTL_CPUSEL_CPU2); // SCIA
+    }
 
     //
     // Hand CPU2 the GPIO pins its peripherals use.

@@ -360,7 +360,75 @@ shutdown, but it sets `finished` and leaves `stopped` clear, so a host can
 tell a charge that reached its termination current from one an operator
 halted. END persists until the slot is started again.
 
-### 2.4 Mode register
+### 2.4 MODE strap - slot grouping and slot tuning
+
+| MODE | Meaning | Group size | Voltage loop |
+|---|---|---|---|
+| 0 | 8 independent slots | 1 | ADS131M08 |
+| 1 | pairs: 1+2, 3+4, 5+6, 7+8 | 2 | ADS131M08 |
+| 2 | quads: 1-4, 5-8 | 4 | ADS131M08 |
+| 3 | octet: 1-8 as one group | 8 | ADS131M08 |
+| 4 | 8 independent slots | 1 | internal ADC |
+| 5 | pairs | 2 | internal ADC |
+| **6** | **slot tuning (SFRA)** | **1** | **internal ADC** |
+| **7** | **slot tuning (SFRA)** | **1** | **ADS131M08** |
+
+Modes 6 and 7 replaced the grouped internal-ADC modes (`eModeQuadsIntAdc`,
+`eModeOctetIntAdc`), which were never used. SFRA needs two values because a
+sweep has to be run against whichever converter closes the loop being tuned.
+
+**Mode 0 was NOT taken for SFRA, despite the original spec.** The MODE and
+ENABLE straps are pulled high, so an unstrapped board reads `0b111`, which
+the SN74HC148 truth table maps to **mode 0**. Mode 0 is therefore both a real
+mode and the unstrapped default - putting slot tuning there would have sent
+every unstrapped unit into a calibration sweep at power-on, with no slot
+running and the AT console replaced by the SFRA serial port. The tuning modes
+sit at the far end of the table instead, where they require a deliberate
+strap.
+
+**The slot under test comes from the ENABLE straps.** ENABLE normally names
+the highest enabled slot; in a tuning mode there is only one slot under test,
+so the same three pins name it directly.
+
+#### The mode is not purely a bit field any more
+
+Modes 0-5 encode group size in the low two bits and the converter in bit 2,
+and `BTS_MODE_GROUP_SIZE()` / `BTS_MODE_USES_INT_ADC()` were pure bit
+arithmetic over all eight values. The tuning modes break that pattern and both
+macros now special-case them:
+
+- **Group size is forced to 1.** By bit pattern mode 6 would be a group of 4
+  and mode 7 a group of 8 - their old quads/octet meanings. A sweep drives one
+  slot, so without the override `BTS_HAL_setupGroupPhase()`,
+  `BTS_HAL_setupTripRouting()` and `BTS_GROUP_LEADER()` would each be set up
+  for a grouping the sweep does not use: interleaved ePWM phases, trips routed
+  to a leader, and followers mirroring a duty the injection is perturbing.
+- **Bit 2 no longer decides the converter.** Both tuning modes have bit 2 set,
+  but only mode 6 sweeps the internal-ADC loop. Mode 7 must report the
+  ADS131M08, or the sweep would be injected into one loop and measured on the
+  other.
+
+#### SFRA is selected at runtime, not compiled in per sweep
+
+`BTS_SFRA_ENABLED` still decides whether the SFRA **library** is compiled in -
+it is real flash and RAM that a production unit has no reason to carry. What
+is no longer a build switch is whether a sweep **runs**: that is
+`BTS_SFRA_IS_ACTIVE()`, which is the strap-latched `btsSfraActive` in a tuning
+build and the literal `0` in a production one, so a production binary carries
+no test at all in its control ISR.
+
+One tuning binary therefore serves every slot and both loops. Strapped to a
+normal mode it behaves exactly like a production unit.
+
+**SCIA ownership rides on the same strap.** SCIA is contended four ways -
+CPU2's AT console, CPU2's WS2812B LED driver, channel 1's GPIO trip on
+GPIO28, and CPU1's SFRA GUI - and `SysCtl_selectCPUForPeripheral()` is a
+one-shot boot-time write. CPU1 keeps SCIA only when the straps selected a
+tuning mode; otherwise it hands it to CPU2 as before. This is why the
+selection has to ride on a strap latched at reset rather than on a host
+register: the ownership cannot be changed once the unit is running.
+
+### 2.4.1 Mode register
 
 `eChX_Mode` gains two command bits alongside the existing run/direction bits:
 

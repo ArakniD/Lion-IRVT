@@ -314,6 +314,30 @@ extern uint16_t   BTS_sfoStatus;
 void BTS_setupSfra(void);
 void BTS_setupSfraGui(void);
 
+//
+// ==================== Slot tuning (SFRA) at runtime ====================
+//
+// 1 when the MODE straps selected a slot-tuning mode at boot, 0 otherwise.
+//
+// SFRA used to be purely compile-time: BTS_SFRA_ENABLED gated ~20 #if sites
+// and a tuning build was a different binary. It still gates whether the SFRA
+// library is COMPILED IN - that part cannot be runtime, because the library,
+// its sweep arrays and the GUI comms are real flash and RAM that a
+// production build has no reason to carry - but WHETHER IT RUNS is now
+// decided by the strap, so one tuning binary serves every slot and every
+// mode instead of needing a rebuild per sweep.
+//
+// Latched once in main() from startup_mode. Never changes while running: it
+// selects SCIA's owning CPU, which is a boot-time CPUSEL write.
+//
+extern uint16_t btsSfraActive;
+
+//
+// The slot under test, 0-7, taken from the ENABLE straps. Meaningless unless
+// btsSfraActive is set.
+//
+extern uint16_t btsSfraSlot;
+
 void BTS_setupHrpwmMepScaleFactor(void);
 
 void BTS_updateReference(BTS_userInput *, BTS_ctrlLoopVariable *);
@@ -590,9 +614,15 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
 
 #if((BTS_ISR_CL_MODE == BTS_ISR_CL_MODE_CCCV)|| (BTS_ISR_CL_MODE == BTS_ISR_CL_MODE_CV))
 
-#if(BTS_SFRA_ENABLED== (false))
-    ctrlLoopVariable->voutSet_pu= ctrlLoopVariable->voutRef_pu;
-#endif
+    //
+    // The CV setpoint. In a tuning build SFRA perturbs this instead, but only
+    // while a sweep is actually active - so the test is on the runtime flag,
+    // not on the compile-time macro alone. A tuning binary strapped to a
+    // normal mode runs exactly like a production one.
+    //
+    if (!BTS_SFRA_IS_ACTIVE()) {
+        ctrlLoopVariable->voutSet_pu= ctrlLoopVariable->voutRef_pu;
+    }
     ctrlLoopVariable->ek_cv_pu = ctrlLoopVariable->direction_coeff *(ctrlLoopVariable->voutSet_pu - ctrlLoopVariable->voutSense_pu);
     ctrlLoopVariable->uk_cv_pu = BTS_DCL_RUN_IMMEDIATE(ctrl_cv, ctrlLoopVariable->ek_cv_pu);
 
@@ -636,9 +666,9 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
     ctrlLoopVariable->ctrlMode_logic=1;
 
 #elif(BTS_ISR_CL_MODE == BTS_ISR_CL_MODE_CC)
-#if(BTS_SFRA_ENABLED== (false))
-    ctrlLoopVariable->ioutSet_pu = ctrlLoopVariable->direction_coeff* ctrlLoopVariable->ioutRef_pu;
-#endif
+    if (!BTS_SFRA_IS_ACTIVE()) {
+        ctrlLoopVariable->ioutSet_pu = ctrlLoopVariable->direction_coeff* ctrlLoopVariable->ioutRef_pu;
+    }
     ctrlLoopVariable->ctrlMode_logic=0;
 
 #endif
@@ -686,9 +716,9 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
 
 #if(BTS_ISR_MODE == BTS_ISR_MODE_OPEN_LOOP)
 
-#if(BTS_SFRA_ENABLED== (false))
-    ctrlLoopVariable->dutySet_pu = ctrlLoopVariable->dutySetRef_pu;
-#endif
+    if (!BTS_SFRA_IS_ACTIVE()) {
+        ctrlLoopVariable->dutySet_pu = ctrlLoopVariable->dutySetRef_pu;
+    }
     if(ctrlLoopVariable->dutySet_pu <= BTS_DUTY_SET_MIN_PU)
     {
         BTS_HAL_updateDuty(EPWM_BASE,BTS_DUTY_SET_MIN_PU,BTS_DUTY_SET_MIN_PU);
