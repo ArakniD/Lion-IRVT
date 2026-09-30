@@ -24,6 +24,7 @@
  */
 
 #include <stdio.h>
+#include "at_console.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -196,4 +197,24 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "ready, free heap %u", (unsigned)esp_get_free_heap_size());
+
+    /*
+     * The AT console goes LAST, and the ordering is load bearing: starting it
+     * silences ESP_LOG on UART0, so everything above still reports its own
+     * failures to a console that is watching. Bring it up first and a WiFi or
+     * BLE error would vanish.
+     *
+     * It takes the port because it has to. An AT dialogue and a log stream
+     * cannot share a UART - log lines would interleave with responses and
+     * break any parser expecting a clean "+NAME=value\r\nOK\r\n". Losing
+     * the serial log was accepted deliberately; logs are still reachable over
+     * the network interfaces.
+     *
+     * Not fatal, for the same reason the web API is not: a tester with no AT
+     * console is still a usable tester over BLE and HTTP.
+     */
+    err = at_console_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "AT console unavailable: %s", esp_err_to_name(err));
+    }
 }

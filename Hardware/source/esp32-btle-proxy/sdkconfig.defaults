@@ -42,6 +42,18 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 # Keep a usable log level on the console; the proxy is a bench instrument.
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
+# IRAM: the SPI *slave* driver keeps its ISR in IRAM by default, and this
+# firmware has no SPI slave at all - the display is SPI master. Reclaiming it
+# is what made room for the AT console's UART driver, which overflowed
+# iram0_0_seg by 1792 bytes without this.
+CONFIG_SPI_SLAVE_ISR_IN_IRAM=n
+
+# The SPI *master* ISR only needs to be in IRAM if transfers must continue
+# while the flash cache is disabled. The only SPI master here is the ST7789
+# display, driven through esp_lcd panel IO, which never transfers during a
+# flash write - so its ISR can live in flash like everything else.
+CONFIG_SPI_MASTER_ISR_IN_IRAM=n
+
 # Flash/monitor defaults for the CP210x bridge on this unit.
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
