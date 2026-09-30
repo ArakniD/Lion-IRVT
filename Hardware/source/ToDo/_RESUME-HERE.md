@@ -13,7 +13,7 @@ progress. Last commit is `7bdddfd`.
 | 04 LED timer + CCCV | DONE | `ac1bb42` |
 | 05 HA register mirror | **NOT STARTED** — do this next | — |
 | 06 Slot tuning registers | **PART 1 DONE** | `6c2c838` |
-| 07 SFRA runtime switch | DONE | `PENDING07` |
+| 07 SFRA runtime switch | DONE | `b253cf5` |
 
 Working tree carries only untracked `Docs/hardware-todo.md`, which is the
 user's own file and marked "AGENT IGNORE THIS FILE". Leave it.
