@@ -1102,14 +1102,33 @@ typedef enum {
     //
     // SLOT TUNING (SFRA), one slot at a time. These two replaced
     // eModeQuadsIntAdc and eModeOctetIntAdc, which are gone - a grouped
-    // internal-ADC mode was never used, and SFRA needed two mode values
-    // because the sweep has to be run against whichever converter closes
-    // the loop.
+    // internal-ADC mode was never used.
+    //
+    // BOTH SWEEP THE ADS131M08 LOOP. The two values select WHAT is being
+    // measured, not which converter:
+    //
+    //   PLANT   injects at the duty cycle and measures the current response,
+    //           so the sweep characterises the converter itself with the
+    //           control loop open. This is the measurement a new set of DCL
+    //           coefficients is derived FROM.
+    //
+    //   CLOSED  injects at the current setpoint and measures the same
+    //           current, so the sweep characterises the closed loop as
+    //           tuned. This is the measurement that CONFIRMS a set of
+    //           coefficients once they are in.
+    //
+    // They are separate modes rather than a runtime command because the
+    // injection point is wired at build time - see BTS_ISR_SFRA() - so the
+    // choice has to be made before the sweep starts, not during it.
+    //
+    // THE INTERNAL ADC IS NOT SWEPT. It is a 12-bit converter feeding a
+    // telemetry filter, not a control loop worth tuning; the ADS131M08 is
+    // what the CC loop regulates against.
     //
     // The slot under test is chosen by the ENABLE straps, not by the mode.
     //
-    eModeSfraIntAdc        = 6,  // SFRA sweep, voltage loop on the internal ADC
-    eModeSfraAds131        = 7,  // SFRA sweep, voltage loop on the ADS131M08
+    eModeSfraAds131Plant   = 6,  // SFRA sweep, open-loop plant (duty -> Iout)
+    eModeSfraAds131Closed  = 7,  // SFRA sweep, closed loop (Iset -> Iout)
 } BTS_SlotMode;
 
 //
@@ -1121,7 +1140,12 @@ typedef enum {
 // break that pattern deliberately, so both macros special-case them - see
 // the comments on each.
 //
-#define BTS_MODE_IS_SFRA(m)         (((uint16_t)(m)) >= (uint16_t)eModeSfraIntAdc)
+#define BTS_MODE_IS_SFRA(m)         (((uint16_t)(m)) >= (uint16_t)eModeSfraAds131Plant)
+
+//
+// Which sweep a tuning mode runs. Only meaningful when BTS_MODE_IS_SFRA().
+//
+#define BTS_MODE_SFRA_IS_CLOSED(m)  (((uint16_t)(m)) == (uint16_t)eModeSfraAds131Closed)
 
 //
 // Slots per group: 1, 2, 4 or 8.
@@ -1141,14 +1165,14 @@ typedef enum {
 // Which converter closes the voltage loop.
 //
 // Modes 4-5 use the C2000's internal ADC, 0-3 the ADS131M08. Bit 2 said so
-// for the whole range until the SFRA modes took 6 and 7: both have bit 2
-// set, but only mode 6 sweeps the internal-ADC loop. Mode 7 sweeps the
-// ADS131M08 loop and must NOT report the internal ADC, or the sweep would
-// be injected into one loop and measured on the other.
+// for the whole range until the SFRA modes took 6 and 7: both have bit 2 set,
+// but NEITHER sweeps the internal ADC - both tune the ADS131M08 loop, which
+// is what the CC loop actually regulates against. Reporting otherwise would
+// inject into one loop and measure on the other, producing a plausible Bode
+// plot of nothing.
 //
-#define BTS_MODE_USES_INT_ADC(m)    (((uint16_t)(m)) == (uint16_t)eModeSfraIntAdc || \
-                                     ((((uint16_t)(m)) & 0x4U) != 0U && \
-                                      !BTS_MODE_IS_SFRA(m)))
+#define BTS_MODE_USES_INT_ADC(m)    (((((uint16_t)(m)) & 0x4U) != 0U) && \
+                                     !BTS_MODE_IS_SFRA(m))
 
 // The group leader is the lowest-numbered slot in the group. Group sizes are
 // powers of two, so masking off the low bits of the channel index gives it.

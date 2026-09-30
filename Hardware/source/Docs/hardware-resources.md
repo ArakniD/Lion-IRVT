@@ -821,6 +821,29 @@ and does not pass through the PIE, so `ledTimerISR` must **not** call
 `Interrupt_clearACKGroup()`. Both the live handler and its no-op stub had that
 call for Timer 0 and both lost it.
 
+### 8.2.1 SCIA is contended four ways, and a production unit loses its console
+
+Not a defect - a consequence worth stating in one place, because it is why the
+ESP32 grew an AT console of its own.
+
+| Claimant | Pins | Selected by |
+|---|---|---|
+| AT command console | GPIO28 RX, GPIO29 TX | `BTS_DEBUG_CONSOLE == true` |
+| WS2812B LED driver | GPIO29 TX only | `BTS_DEBUG_CONSOLE == false` |
+| Channel 1 GPIO trip | GPIO28 as a digital input | `BTS_DEBUG_CONSOLE == false` |
+| CPU1's SFRA GUI | the whole port | MODE strap 6 or 7, in an SFRA build |
+
+The first three are resolved at build time by one switch. The fourth is
+resolved at **boot** by `SysCtl_selectCPUForPeripheral()`, which is a one-shot
+ownership write - CPU1 keeps SCIA only when the straps selected a tuning mode,
+otherwise it hands the port to CPU2. That is precisely why SFRA selection has
+to ride on a strap latched at reset rather than on a host register: the
+ownership cannot be changed while the unit runs.
+
+**A production build therefore has no AT console.** The ESP32 proxy carries
+the same grammar on its own UART and reaches the registers over I2C - see
+[`at-command-specification.md`](at-command-specification.md).
+
 ### 8.3 The ADCB end-of-conversion flag was never cleared on the success path
 
 **Status: FIXED.** Minor, in the supervision path. Not previously known.

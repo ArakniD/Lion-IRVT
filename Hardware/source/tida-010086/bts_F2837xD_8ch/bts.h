@@ -800,14 +800,34 @@ static inline void BTS_runSlot(uint16_t ch, BTS_DCL_CTRL_TYPE* ctrl_cc,
 static inline void BTS_ISR_SFRA(void){
 
 #if(BTS_SFRA_ENABLED == (true))
-//SFRA INJECT
-#if(BTS_SFRA_CAPTURE_SETTINGS == BTS_SFRA_CAPTURE_DUTY_IOUT)
-    BTS_ctrlLoopVariable_chx.dutySet_pu = BTS_SFRA_INJECT(BTS_ctrlLoopVariable_chx.dutySetRef_pu);
-#elif((BTS_SFRA_CAPTURE_SETTINGS == BTS_SFRA_CAPTURE_ISET_IOUT) ||(BTS_SFRA_CAPTURE_SETTINGS == BTS_SFRA_CAPTURE_ISET_VOUT))
-    BTS_ctrlLoopVariable_chx.ioutSet_pu = BTS_SFRA_INJECT(BTS_ctrlLoopVariable_chx.ioutRef_pu);
-#elif(BTS_SFRA_CAPTURE_SETTINGS ==BTS_SFRA_CAPTURE_VSET_VOUT)
-    BTS_ctrlLoopVariable_chx.voutSet_pu = BTS_SFRA_INJECT(BTS_ctrlLoopVariable_chx.voutRef_pu);
-#endif
+    //
+    // SFRA INJECT - PLANT or CLOSED, chosen by the MODE strap at boot.
+    //
+    // The two sweeps differ only in where the perturbation enters:
+    //
+    //   PLANT  (mode 6) injects at the DUTY CYCLE, so the loop is open and
+    //          the sweep measures the converter itself - duty in, current
+    //          out. This is what a new set of DCL coefficients is derived
+    //          FROM.
+    //
+    //   CLOSED (mode 7) injects at the CURRENT SETPOINT, so the loop is
+    //          closed and the sweep measures the tuned system - Iset in,
+    //          current out. This is what CONFIRMS a set of coefficients
+    //          once they are installed.
+    //
+    // Both collect the same signal (ioutSense_pu), so only the injection
+    // point moves. The selection is a runtime branch rather than the #if it
+    // used to be, because the mode arrives on a strap and a single tuning
+    // binary has to serve both sweeps - otherwise a system builder would
+    // reflash between measuring the plant and checking the result.
+    //
+    if (BTS_MODE_SFRA_IS_CLOSED((uint16_t)startup_mode)) {
+        BTS_ctrlLoopVariable_chx.ioutSet_pu =
+            BTS_SFRA_INJECT(BTS_ctrlLoopVariable_chx.ioutRef_pu);
+    } else {
+        BTS_ctrlLoopVariable_chx.dutySet_pu =
+            BTS_SFRA_INJECT(BTS_ctrlLoopVariable_chx.dutySetRef_pu);
+    }
 
     BTS_storeValuesAds(&BTS_measValues_chx,BTS_ADC_current, BTS_ADC_voltage);
 
@@ -817,16 +837,17 @@ static inline void BTS_ISR_SFRA(void){
 
     BTS_ctrlISR(&BTS_ctrl_cc_chx,&BTS_ctrl_cv_chx,EPWMx_BASE, &BTS_ctrlLoopVariable_chx, BTS_ADC_current, BTS_ADC_voltage);
 
-    //SFRA COLLECT
-#if(BTS_SFRA_CAPTURE_SETTINGS == BTS_SFRA_CAPTURE_DUTY_IOUT)
-    BTS_SFRA_COLLECT(&(BTS_ctrlLoopVariable_chx.dutySet_pu),&(BTS_ctrlLoopVariable_chx.ioutSense_pu));
-#elif((BTS_SFRA_CAPTURE_SETTINGS == BTS_SFRA_CAPTURE_ISET_IOUT))
-    BTS_SFRA_COLLECT(&(BTS_ctrlLoopVariable_chx.ioutSet_pu),&(BTS_ctrlLoopVariable_chx.ioutSense_pu));
-#elif((BTS_SFRA_CAPTURE_SETTINGS ==BTS_SFRA_CAPTURE_ISET_VOUT))
-    BTS_SFRA_COLLECT(&(BTS_ctrlLoopVariable_chx.ioutSet_pu),&(BTS_ctrlLoopVariable_chx.voutSense_pu));
-#elif((BTS_SFRA_CAPTURE_SETTINGS ==BTS_SFRA_CAPTURE_VSET_VOUT))
-    BTS_SFRA_COLLECT(&(BTS_ctrlLoopVariable_chx.voutSet_pu),&(BTS_ctrlLoopVariable_chx.voutSense_pu));
-#endif
+    //
+    // SFRA COLLECT - the reference is whichever signal was injected, and the
+    // response is always the sensed current.
+    //
+    if (BTS_MODE_SFRA_IS_CLOSED((uint16_t)startup_mode)) {
+        BTS_SFRA_COLLECT(&(BTS_ctrlLoopVariable_chx.ioutSet_pu),
+                         &(BTS_ctrlLoopVariable_chx.ioutSense_pu));
+    } else {
+        BTS_SFRA_COLLECT(&(BTS_ctrlLoopVariable_chx.dutySet_pu),
+                         &(BTS_ctrlLoopVariable_chx.ioutSense_pu));
+    }
 
 #endif
 }

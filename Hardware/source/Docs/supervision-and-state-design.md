@@ -370,12 +370,33 @@ halted. END persists until the slot is started again.
 | 3 | octet: 1-8 as one group | 8 | ADS131M08 |
 | 4 | 8 independent slots | 1 | internal ADC |
 | 5 | pairs | 2 | internal ADC |
-| **6** | **slot tuning (SFRA)** | **1** | **internal ADC** |
-| **7** | **slot tuning (SFRA)** | **1** | **ADS131M08** |
+| **6** | **slot tuning (SFRA) - open-loop PLANT** | **1** | **ADS131M08** |
+| **7** | **slot tuning (SFRA) - CLOSED loop** | **1** | **ADS131M08** |
 
 Modes 6 and 7 replaced the grouped internal-ADC modes (`eModeQuadsIntAdc`,
-`eModeOctetIntAdc`), which were never used. SFRA needs two values because a
-sweep has to be run against whichever converter closes the loop being tuned.
+`eModeOctetIntAdc`), which were never used.
+
+**Both tuning modes sweep the ADS131M08 loop.** The two values select what is
+being *measured*, not which converter:
+
+| Mode | Injects at | Measures | Purpose |
+|---|---|---|---|
+| 6 `eModeSfraAds131Plant` | duty cycle | sensed current | characterises the converter with the loop **open** - the measurement new DCL coefficients are derived **from** |
+| 7 `eModeSfraAds131Closed` | current setpoint | sensed current | characterises the **tuned closed loop** - the measurement that **confirms** coefficients once installed |
+
+Both collect the same signal, so only the injection point moves.
+
+**The internal ADC is not swept at all.** It is a 12-bit converter feeding a
+telemetry filter, not a control loop worth tuning; the ADS131M08 is what the
+CC loop regulates against. An earlier revision had mode 6 sweeping the
+internal-ADC loop, which is why `BTS_MODE_USES_INT_ADC()` carried a special
+case for it - that case is gone now that neither tuning mode uses it.
+
+**The choice must be made before the sweep starts.** The injection point is
+part of the control ISR, so it is selected from the latched strap rather than
+by a command mid-sweep. It is a runtime branch rather than the `#if` it used
+to be, so one tuning binary serves both sweeps - otherwise a system builder
+would have to reflash between measuring the plant and checking the result.
 
 **Mode 0 was NOT taken for SFRA, despite the original spec.** The MODE and
 ENABLE straps are pulled high, so an unstrapped board reads `0b111`, which
@@ -404,9 +425,9 @@ macros now special-case them:
   for a grouping the sweep does not use: interleaved ePWM phases, trips routed
   to a leader, and followers mirroring a duty the injection is perturbing.
 - **Bit 2 no longer decides the converter.** Both tuning modes have bit 2 set,
-  but only mode 6 sweeps the internal-ADC loop. Mode 7 must report the
-  ADS131M08, or the sweep would be injected into one loop and measured on the
-  other.
+  but **neither** sweeps the internal ADC - both tune the ADS131M08 loop.
+  Reporting otherwise would inject into one loop and measure on the other,
+  producing a plausible Bode plot of nothing.
 
 #### SFRA is selected at runtime, not compiled in per sweep
 
@@ -416,6 +437,22 @@ is no longer a build switch is whether a sweep **runs**: that is
 `BTS_SFRA_IS_ACTIVE()`, which is the strap-latched `btsSfraActive` in a tuning
 build and the literal `0` in a production one, so a production binary carries
 no test at all in its control ISR.
+
+**And it is no longer chosen by editing a header.** `BTS_SFRA_ENABLED` is
+derived from `BTS_SFRA_BUILD` through an `#ifndef` guard, and the build
+configuration supplies it:
+
+| Configuration | Defines | SFRA library | Flash-based |
+|---|---|---|---|
+| `cpu1` | - | absent | yes |
+| `cpu1_sfra` | `BTS_SFRA_BUILD=1` | compiled in | yes |
+| `cpu2` | - | n/a | yes |
+
+The two CPU1 configurations are otherwise identical - same linker command
+file, same `--ram_model`, same `_FLASH` define, same include paths - so a
+tuning image and a production image come from one source tree with no
+working-tree change between them. `-DBTS_SFRA_BUILD=1` on a command line works
+the same way.
 
 One tuning binary therefore serves every slot and both loops. Strapped to a
 normal mode it behaves exactly like a production unit.
