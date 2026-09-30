@@ -342,6 +342,25 @@ void BTS_monitor_program_update(uint16_t channel);
 void BTS_loadCalibrationFromRegisters(uint16_t channel);
 
 //
+// Seeds the slot-tuning registers from the compile-time BTS_DCL_* constants.
+//
+// Called once before CPU2's F-RAM load can arrive, so the registers hold the
+// shipped tuning rather than zero if the unit has never been tuned - a zeroed
+// biquad would make the controller output constant 0 and no slot would
+// regulate at all.
+//
+void BTS_seedSlotTuningRegisters(void);
+
+//
+// Applies the slot-tuning registers to every channel's CC and CV controller.
+//
+// One tuning for the whole unit: each slot is the same converter with the
+// same passives. Called at boot after CPU2's F-RAM reload and again whenever
+// the host writes one of the coefficients.
+//
+void BTS_applySlotTuning(void);
+
+//
 //=============================================================================
 // static inline functions
 //=============================================================================

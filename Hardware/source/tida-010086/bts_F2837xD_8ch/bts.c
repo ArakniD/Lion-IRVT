@@ -396,6 +396,80 @@ void BTS_initProgramVariables(void)
     }
 }
 
+//
+// ==================== Slot tuning ====================
+//
+// The DCL biquad coefficients live in registers[] so a system builder can
+// tune a unit in the field, rather than in the BTS_DCL_* constants which
+// would need a rebuild and a reflash of both cores.
+//
+// The constants are still the source of the DEFAULTS. BTS_seedSlotTuningRegisters()
+// runs before CPU2's F-RAM reload can arrive, so a unit that has never been
+// tuned - or whose stored record fails validation - runs on the shipped
+// tuning instead of on whatever registers[] happens to hold.
+//
+// THAT MATTERS MORE THAN IT LOOKS. registers[] starts zeroed, and a biquad
+// with every coefficient zero produces a constant zero output: the duty would
+// never move off its floor and no slot would regulate at all. A silent total
+// failure to control, from a block of registers most users never touch.
+//
+void BTS_seedSlotTuningRegisters(void)
+{
+    registers[BTS_REG_IDX(eDCL_CC_B0)] = BTS_DCL_CC_B0;
+    registers[BTS_REG_IDX(eDCL_CC_B1)] = BTS_DCL_CC_B1;
+    registers[BTS_REG_IDX(eDCL_CC_B2)] = BTS_DCL_CC_B2;
+    registers[BTS_REG_IDX(eDCL_CC_A1)] = BTS_DCL_CC_A1;
+    registers[BTS_REG_IDX(eDCL_CC_A2)] = BTS_DCL_CC_A2;
+
+    registers[BTS_REG_IDX(eDCL_CV_Z0)] = BTS_DCL_CV_Z0;
+    registers[BTS_REG_IDX(eDCL_CV_Z1)] = BTS_DCL_CV_Z1;
+    registers[BTS_REG_IDX(eDCL_CV_P1)] = BTS_DCL_CV_P1;
+
+    registers[BTS_REG_IDX(eDCL_CV_B0)] = BTS_DCL_CV_B0;
+    registers[BTS_REG_IDX(eDCL_CV_B1)] = BTS_DCL_CV_B1;
+    registers[BTS_REG_IDX(eDCL_CV_B2)] = BTS_DCL_CV_B2;
+    registers[BTS_REG_IDX(eDCL_CV_A1)] = BTS_DCL_CV_A1;
+    registers[BTS_REG_IDX(eDCL_CV_A2)] = BTS_DCL_CV_A2;
+}
+
+//
+// Pushes the tuning registers into all eight CC and CV controllers.
+//
+// The CV zero/pole frequencies (Z0/Z1/P1) are carried as registers for
+// provenance only - the DCL runs the biquad coefficients directly and never
+// reads them. They record what the coefficients were derived from so a later
+// re-derivation does not have to work backwards.
+//
+// A zeroed or implausible set is REJECTED rather than installed: b0 is the
+// direct feed-through term and a biquad with b0 == 0 and b1 == 0 cannot
+// respond to its input at all. Falling back to the shipped tuning keeps the
+// unit controllable.
+//
+void BTS_applySlotTuning(void)
+{
+    uint16_t ch;
+    float32_t ccB0 = registers[BTS_REG_IDX(eDCL_CC_B0)];
+    float32_t cvB0 = registers[BTS_REG_IDX(eDCL_CV_B0)];
+
+    if ((ccB0 == (float32_t)0.0) || (cvB0 == (float32_t)0.0)) {
+        BTS_seedSlotTuningRegisters();
+    }
+
+    for (ch = 0; ch < PWM_CH_MAX; ch++) {
+        BTS_ctrl_cc[ch].b0 = registers[BTS_REG_IDX(eDCL_CC_B0)];
+        BTS_ctrl_cc[ch].b1 = registers[BTS_REG_IDX(eDCL_CC_B1)];
+        BTS_ctrl_cc[ch].b2 = registers[BTS_REG_IDX(eDCL_CC_B2)];
+        BTS_ctrl_cc[ch].a1 = registers[BTS_REG_IDX(eDCL_CC_A1)];
+        BTS_ctrl_cc[ch].a2 = registers[BTS_REG_IDX(eDCL_CC_A2)];
+
+        BTS_ctrl_cv[ch].b0 = registers[BTS_REG_IDX(eDCL_CV_B0)];
+        BTS_ctrl_cv[ch].b1 = registers[BTS_REG_IDX(eDCL_CV_B1)];
+        BTS_ctrl_cv[ch].b2 = registers[BTS_REG_IDX(eDCL_CV_B2)];
+        BTS_ctrl_cv[ch].a1 = registers[BTS_REG_IDX(eDCL_CV_A1)];
+        BTS_ctrl_cv[ch].a2 = registers[BTS_REG_IDX(eDCL_CV_A2)];
+    }
+}
+
 void BTS_initController(void)
 {
     /*

@@ -135,6 +135,22 @@
 #define STATE_FRAM_STRIDE     64U
 
 //
+// Slot tuning, one record for the whole unit: 0x0700 .. 0x077F.
+//
+// Placed AFTER the per-slot state region, which ends at 0x06FF, so it does
+// not collide the way channel 4's calibration block once collided with the
+// global voltage thresholds. 128 bytes for a 13-float payload plus header
+// and CRC leaves room to extend without moving anything.
+//
+// Written once by the system builder during slot tuning and read at boot.
+// This is not runtime state and is never written on a timer.
+//
+#define TUNING_FRAM_ADDR      0x0700U
+#define TUNING_FRAM_BYTES     128U
+#define BTS_TUNING_HEADER     0xA5710000UL
+#define BTS_TUNING_HEADER_MASK 0xFFFF0000UL
+
+//
 // Polling bound for the blocking I2C helpers. At 160 MHz this is a few
 // hundred microseconds - long enough for a 400 kHz transfer to complete,
 // short enough that a DRDY ISR talking to an absent device does not stall
@@ -304,6 +320,19 @@ __interrupt void ads1119Drdy2ISR(void);
 //
 void BTS_serviceADS1119(void);
 void BTS_serviceDeferredWork(void);
+bool saveSlotTuning(void);
+static bool loadSlotTuning(void);
+
+//
+// Set when a host writes any slot-tuning register; cleared once the record
+// has been committed to F-RAM by BTS_serviceDeferredWork().
+//
+// A flag rather than a direct write because the register write arrives in an
+// I2C ISR and the F-RAM transfer blocks on the same peripheral family. The
+// whole block is written as one record, so several coefficients written back
+// to back coalesce into a single save instead of one per register.
+//
+static volatile uint16_t tuningSavePending = 0U;
 
 void uartSendResponse(const char* response);
 void saveCalibration(uint16_t channel);
@@ -1268,6 +1297,16 @@ void loadCalibration(void)
     }
 
     //
+    // Slot tuning. On failure registers[] keeps whatever CPU1 seeded from the
+    // compile-time BTS_DCL_* constants, which is the safe outcome: the unit
+    // runs on the shipped tuning instead of on zeros.
+    //
+    // CPU1 applies both this and the calibration above when it sees the
+    // single CAL_RELOAD flag raised after this function returns.
+    //
+    (void)loadSlotTuning();
+
+    //
     // The register file is now complete and consistent - tell CPU1 to
     // recalculate its program variables from it and go.
     //
@@ -1352,6 +1391,123 @@ static bool saveCalibrationFlags(uint16_t channel, uint32_t extraFlags)
     }
 
     return written;
+}
+
+//
+// ==================== Slot tuning persistence ====================
+//
+// The DCL coefficients are unit-wide, not per slot, so this is a single
+// record rather than eight. Layout on the wire, little-endian 16-bit words
+// exactly as the calibration blocks use:
+//
+//   word 0..1    header  (BTS_TUNING_HEADER)
+//   word 2..27   13 x float32, in BTS_TUNE_* index order
+//   word 28..29  crc32 over words 0..27
+//
+static uint32_t tuningCrc32(const uint16_t *words, uint16_t nWords)
+{
+    uint32_t crc = 0xFFFFFFFFUL;
+    uint16_t i;
+    uint16_t b;
+    uint16_t bit;
+
+    for (i = 0; i < nWords; i++) {
+        for (b = 0; b < 2U; b++) {
+            crc ^= (uint32_t)((words[i] >> (b * 8U)) & 0xFFU);
+            for (bit = 0; bit < 8U; bit++) {
+                crc = (crc & 1UL) ? ((crc >> 1) ^ 0xEDB88320UL) : (crc >> 1);
+            }
+        }
+    }
+    return ~crc;
+}
+
+#define TUNING_PAYLOAD_WORDS  (2U + (BTS_TUNING_COUNT * 2U))
+#define TUNING_TOTAL_WORDS    (TUNING_PAYLOAD_WORDS + 2U)
+
+//
+// Persists the tuning block from registers[] to F-RAM.
+//
+// Called from BTS_serviceDeferredWork(), never from an ISR - the I2C helpers
+// block, and the bus is shared with the ADS1119 converters.
+//
+bool saveSlotTuning(void)
+{
+    uint16_t words[TUNING_TOTAL_WORDS];
+    uint16_t bytes[TUNING_TOTAL_WORDS * 2U];
+    uint32_t crc;
+    uint16_t i;
+
+    words[0] = (uint16_t)(BTS_TUNING_HEADER & 0xFFFFUL);
+    words[1] = (uint16_t)((BTS_TUNING_HEADER >> 16) & 0xFFFFUL);
+
+    for (i = 0; i < BTS_TUNING_COUNT; i++) {
+        float32_t v = registers[BTS_REG_IDX(BTS_TUNING_BASE_ADDR) + i];
+        const uint16_t *src = (const uint16_t *)&v;
+        words[2U + (i * 2U)]      = src[0];
+        words[2U + (i * 2U) + 1U] = src[1];
+    }
+
+    crc = tuningCrc32(words, TUNING_PAYLOAD_WORDS);
+    words[TUNING_PAYLOAD_WORDS]      = (uint16_t)(crc & 0xFFFFUL);
+    words[TUNING_PAYLOAD_WORDS + 1U] = (uint16_t)((crc >> 16) & 0xFFFFUL);
+
+    for (i = 0; i < TUNING_TOTAL_WORDS; i++) {
+        bytes[i * 2U]      = words[i] & 0xFFU;
+        bytes[i * 2U + 1U] = (words[i] >> 8) & 0xFFU;
+    }
+
+    return i2cWriteBlock(EEPROM_I2C_ADDR, TUNING_FRAM_ADDR, bytes,
+                         TUNING_TOTAL_WORDS * 2U);
+}
+
+//
+// Restores the tuning block into registers[] at boot.
+//
+// Returns false and leaves registers[] ALONE if the record is absent, the
+// header does not match, or the CRC fails. CPU1 has already seeded the
+// compile-time defaults by then, so a never-tuned or corrupted unit runs on
+// the shipped tuning rather than on zeros - a zeroed biquad outputs a
+// constant zero and no slot would regulate at all.
+//
+static bool loadSlotTuning(void)
+{
+    uint16_t bytes[TUNING_TOTAL_WORDS * 2U];
+    uint16_t words[TUNING_TOTAL_WORDS];
+    uint32_t header;
+    uint32_t stored;
+    uint16_t i;
+
+    if (!i2cReadBlock(EEPROM_I2C_ADDR, TUNING_FRAM_ADDR, bytes,
+                      TUNING_TOTAL_WORDS * 2U)) {
+        return false;
+    }
+
+    for (i = 0; i < TUNING_TOTAL_WORDS; i++) {
+        words[i] = (bytes[i * 2U] & 0xFFU) |
+                   ((bytes[i * 2U + 1U] & 0xFFU) << 8);
+    }
+
+    header = (uint32_t)words[0] | ((uint32_t)words[1] << 16);
+    if ((header & BTS_TUNING_HEADER_MASK) != BTS_TUNING_HEADER) {
+        return false;
+    }
+
+    stored = (uint32_t)words[TUNING_PAYLOAD_WORDS] |
+             ((uint32_t)words[TUNING_PAYLOAD_WORDS + 1U] << 16);
+    if (stored != tuningCrc32(words, TUNING_PAYLOAD_WORDS)) {
+        return false;
+    }
+
+    for (i = 0; i < BTS_TUNING_COUNT; i++) {
+        float32_t v;
+        uint16_t *dst = (uint16_t *)&v;
+        dst[0] = words[2U + (i * 2U)];
+        dst[1] = words[2U + (i * 2U) + 1U];
+        registers[BTS_REG_IDX(BTS_TUNING_BASE_ADDR) + i] = v;
+    }
+
+    return true;
 }
 
 void saveCalibration(uint16_t channel)
@@ -3198,6 +3354,21 @@ static void applyHostRegisterWrite(uint16_t regIdx, float32_t value)
     }
 
     //
+    // A slot-tuning coefficient changed. Persist the whole block.
+    //
+    // Unconditional rather than commit-on-command: this block is written
+    // once during slot tuning by a system builder who has no reason to know
+    // a separate save step exists, and losing a tuning to a power cut would
+    // mean repeating the whole SFRA sweep. The flag coalesces a run of
+    // writes into one record, so writing all thirteen costs one F-RAM
+    // transfer, not thirteen.
+    //
+    if ((regIdx >= BTS_REG_IDX(BTS_TUNING_BASE_ADDR)) &&
+        (regIdx <  BTS_REG_IDX(BTS_TUNING_BASE_ADDR) + BTS_TUNING_COUNT)) {
+        tuningSavePending = 1U;
+    }
+
+    //
     // A slot limit changed: mark that slot for an immediate save rather than
     // waiting out the 6 s periodic sweep, so a power cut seconds after an
     // operator sets a charge current cannot lose it. The write itself still
@@ -3360,6 +3531,23 @@ void BTS_serviceDeferredWork(void)
                 break;
             }
         }
+    }
+
+    //
+    // Slot tuning commit. Same deferral rule as everything else that touches
+    // F-RAM: the request is raised in the register-write ISR and the transfer
+    // happens here, on an idle bus.
+    //
+    if (tuningSavePending != 0U) {
+        if (i2cbFramAcquire()) {
+            tuningSavePending = 0U;
+            (void)saveSlotTuning();
+            i2cbFramRelease();
+        }
+        //
+        // If the bus was busy the flag stays set and the save is retried on
+        // the next pass - deferred, never dropped.
+        //
     }
 
     //

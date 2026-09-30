@@ -1078,7 +1078,18 @@ void main(void)
     //
     BTS_initUserVariables();
     BTS_initProgramVariables();
+    //
+    // Seed the tuning registers from the compile-time BTS_DCL_* constants
+    // BEFORE the controllers are built, so a unit that has never been tuned
+    // - or whose F-RAM record fails to validate - starts on the shipped
+    // tuning rather than on a zeroed registers[], which would give every
+    // biquad a constant-zero output and leave no slot able to regulate.
+    //
+    // CPU2's F-RAM reload arrives later over IPC and overwrites these.
+    //
+    BTS_seedSlotTuningRegisters();
     BTS_initController();
+    BTS_applySlotTuning();
 
     //
     // Configure DCL and SFRA libraries
@@ -1696,6 +1707,23 @@ void BTS_HandleRegisterWrite(void)
                 //
                 BTS_loadCalibrationFromRegisters(channel);
             }
+        } else if ((regIdx >= BTS_REG_IDX(BTS_TUNING_BASE_ADDR)) &&
+                   (regIdx <  BTS_REG_IDX(BTS_TUNING_BASE_ADDR) +
+                              BTS_TUNING_COUNT)) {
+            //
+            // A slot-tuning coefficient changed. Push the whole block into
+            // every controller rather than the single field - the biquad is
+            // only meaningful as a set, and a host writing five coefficients
+            // one at a time would otherwise run four passes with a mixed
+            // tuning installed.
+            //
+            // This decode is NOT optional. The tuning block sits above the
+            // unit registers, so without a branch here the index falls
+            // outside every other test, the IPC flag is acked, and the write
+            // is accepted by CPU2 and silently dropped - registers[] would
+            // show the new value while the controllers kept the old one.
+            //
+            BTS_applySlotTuning();
         } else if (regIdx == BTS_REG_IDX(eCalCommand)) {
             //
             // The runtime calibration command. This decode is not optional:
@@ -1727,6 +1755,11 @@ void BTS_HandleRegisterWrite(void)
         for (ch = 0; ch < NUM_CHANNELS; ch++) {
             BTS_loadCalibrationFromRegisters(ch);
         }
+        //
+        // The same reload carries the slot tuning: CPU2 restores it from
+        // F-RAM alongside the calibration and raises this one flag for both.
+        //
+        BTS_applySlotTuning();
         IPC_ackFlagRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_CAL_RELOAD);
     }
 

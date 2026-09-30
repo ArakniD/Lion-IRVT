@@ -214,7 +214,19 @@ const RegisterConfig regConfig[TOTAL_REGISTERS] = {
     {eWatchdogRemaining_s, REG_ACCESS_RO, 4}, {eCalAdsV_pu, REG_ACCESS_RO, 4},
     {eCalAdsI_pu, REG_ACCESS_RO, 4}, {eCalAdsV_V, REG_ACCESS_RO, 4}, {eCalAdsI_A, REG_ACCESS_RO, 4},
     {eCalF28V_pu, REG_ACCESS_RO, 4}, {eCalF28I_pu, REG_ACCESS_RO, 4},
-    {eCalF28V_V, REG_ACCESS_RO, 4}, {eCalF28I_A, REG_ACCESS_RO, 4}, {eCalTemp_C, REG_ACCESS_RO, 4}
+    {eCalF28V_V, REG_ACCESS_RO, 4}, {eCalF28I_A, REG_ACCESS_RO, 4}, {eCalTemp_C, REG_ACCESS_RO, 4},
+    //
+    // Slot tuning. RW - this block exists to be written by the system
+    // builder, unlike the calibration telemetry above it.
+    //
+    {eDCL_CC_B0, REG_ACCESS_RW, 4}, {eDCL_CC_B1, REG_ACCESS_RW, 4},
+    {eDCL_CC_B2, REG_ACCESS_RW, 4}, {eDCL_CC_A1, REG_ACCESS_RW, 4},
+    {eDCL_CC_A2, REG_ACCESS_RW, 4},
+    {eDCL_CV_Z0, REG_ACCESS_RW, 4}, {eDCL_CV_Z1, REG_ACCESS_RW, 4},
+    {eDCL_CV_P1, REG_ACCESS_RW, 4},
+    {eDCL_CV_B0, REG_ACCESS_RW, 4}, {eDCL_CV_B1, REG_ACCESS_RW, 4},
+    {eDCL_CV_B2, REG_ACCESS_RW, 4}, {eDCL_CV_A1, REG_ACCESS_RW, 4},
+    {eDCL_CV_A2, REG_ACCESS_RW, 4}
 };
 
 const UARTRegisterConfig uartRegConfig[TOTAL_REGISTERS] = {
@@ -494,5 +506,18 @@ const UARTRegisterConfig uartRegConfig[TOTAL_REGISTERS] = {
     {eCalF28I_pu, "CALFIPU", "CalF28I_pu", REG_ACCESS_RO},
     {eCalF28V_V, "CALFVV", "CalF28V_V", REG_ACCESS_RO},
     {eCalF28I_A, "CALFIA", "CalF28I_A", REG_ACCESS_RO},
-    {eCalTemp_C, "CALTEMP", "CalTemp_C", REG_ACCESS_RO}
+    {eCalTemp_C, "CALTEMP", "CalTemp_C", REG_ACCESS_RO},
+    {eDCL_CC_B0, "CCB0", "DCL_CC_B0", REG_ACCESS_RW},
+    {eDCL_CC_B1, "CCB1", "DCL_CC_B1", REG_ACCESS_RW},
+    {eDCL_CC_B2, "CCB2", "DCL_CC_B2", REG_ACCESS_RW},
+    {eDCL_CC_A1, "CCA1", "DCL_CC_A1", REG_ACCESS_RW},
+    {eDCL_CC_A2, "CCA2", "DCL_CC_A2", REG_ACCESS_RW},
+    {eDCL_CV_Z0, "CVZ0", "DCL_CV_Z0", REG_ACCESS_RW},
+    {eDCL_CV_Z1, "CVZ1", "DCL_CV_Z1", REG_ACCESS_RW},
+    {eDCL_CV_P1, "CVP1", "DCL_CV_P1", REG_ACCESS_RW},
+    {eDCL_CV_B0, "CVB0", "DCL_CV_B0", REG_ACCESS_RW},
+    {eDCL_CV_B1, "CVB1", "DCL_CV_B1", REG_ACCESS_RW},
+    {eDCL_CV_B2, "CVB2", "DCL_CV_B2", REG_ACCESS_RW},
+    {eDCL_CV_A1, "CVA1", "DCL_CV_A1", REG_ACCESS_RW},
+    {eDCL_CV_A2, "CVA2", "DCL_CV_A2", REG_ACCESS_RW}
 };

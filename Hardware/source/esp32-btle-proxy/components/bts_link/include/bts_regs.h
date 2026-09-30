@@ -49,8 +49,16 @@
  * REGIONS
  * -------
  *   runtime   RO   base 0     stride 48 B (12 regs)    0 - 383
- *   settings  RW   base 384   stride 96 B (24 regs)    384 - 1151
- *   unit      mixed base 1152                          1152 - 1252
+ *   settings  RW   base 384   stride 72 B (18 regs)    384 - 959
+ *   unit      mixed base 960                           960 - 1064
+ *   tuning    RW   base 1068  13 regs, unit-wide       1068 - 1116
+ *
+ * This comment described the v1 map long after the values below moved to
+ * v2.1 - settings went to an 18-register stride when the charge and
+ * discharge limits merged, which pulled the unit base down from 1152 to 960.
+ * The #defines were correct throughout; only this block was stale. The Home
+ * Assistant integration's own mirror still carries the v1 numbers and is
+ * tracked separately.
  *
  * The strides are deliberately larger than the fields in use, so adding a
  * field later does not move every slot again.
@@ -69,7 +77,7 @@ extern "C" {
 #define BTS_I2C_ADDRESS         0x50
 #define BTS_NUM_CHANNELS        8
 #define BTS_REGISTER_SIZE       4
-#define BTS_TOTAL_REGISTERS     267
+#define BTS_TOTAL_REGISTERS     280
 
 /* Region bases and per-channel byte strides. */
 #define BTS_RT_BASE             0
@@ -177,6 +185,42 @@ extern "C" {
 
 /* Registers 1008..1064 inclusive, readable as one burst. */
 #define BTS_CAL_WINDOW_COUNT            15
+
+/*
+ * Slot tuning, 1068..1116. The DCL biquad coefficients for the CC and CV
+ * control loops, held as writable registers so a unit can be tuned in the
+ * field instead of rebuilt.
+ *
+ * NOT part of any poll window, deliberately. These are written once by the
+ * system builder during slot tuning and read back only when someone asks;
+ * an end user never touches them, and adding them to the 9-transaction poll
+ * cycle would cost a round trip every 250 ms for data that changes once in
+ * the life of a unit.
+ *
+ * ONE SET FOR THE WHOLE UNIT - every slot is the same converter, so there is
+ * no per-slot stride here.
+ *
+ * Z0/Z1/P1 are the CV zero and pole frequencies the coefficients were
+ * derived from. The firmware does not use them; they are carried so a later
+ * re-derivation has the design intent rather than having to work backwards
+ * from the biquad.
+ */
+#define BTS_REG_DCL_CC_B0               1068
+#define BTS_REG_DCL_CC_B1               1072
+#define BTS_REG_DCL_CC_B2               1076
+#define BTS_REG_DCL_CC_A1               1080
+#define BTS_REG_DCL_CC_A2               1084
+#define BTS_REG_DCL_CV_Z0               1088
+#define BTS_REG_DCL_CV_Z1               1092
+#define BTS_REG_DCL_CV_P1               1096
+#define BTS_REG_DCL_CV_B0               1100
+#define BTS_REG_DCL_CV_B1               1104
+#define BTS_REG_DCL_CV_B2               1108
+#define BTS_REG_DCL_CV_A1               1112
+#define BTS_REG_DCL_CV_A2               1116
+
+#define BTS_TUNING_BASE                 BTS_REG_DCL_CC_B0
+#define BTS_TUNING_COUNT                13
 
 /*
  * Unit poll window: eCalibrationMode (976) .. eHostWatchdog_s (1004), the

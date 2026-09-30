@@ -43,7 +43,13 @@
 #define NUM_RUNTIME_REGISTERS   (NUM_CHANNELS * BTS_RT_REGS_PER_CH)   // 96
 #define NUM_SETTINGS_REGISTERS  (NUM_CHANNELS * BTS_SET_REGS_PER_CH)  // 144
 #define NUM_UNIT_REGISTERS      (27)
-#define TOTAL_REGISTERS (NUM_RUNTIME_REGISTERS + NUM_SETTINGS_REGISTERS + NUM_UNIT_REGISTERS) // 267
+//
+// Slot tuning: 13 DCL coefficients at 1068-1116, appended above the unit
+// block. Written once by the system builder and persisted in F-RAM.
+//
+#define NUM_TUNING_REGISTERS    (13)
+#define TOTAL_REGISTERS (NUM_RUNTIME_REGISTERS + NUM_SETTINGS_REGISTERS + \
+                         NUM_UNIT_REGISTERS + NUM_TUNING_REGISTERS)  // 280
 
 // CAN bus configuration
 #define CAN_BITRATE 500000 // 500 kbps
@@ -405,6 +411,39 @@ typedef enum {
     eCalF28V_V = 1056,
     eCalF28I_A = 1060,
     eCalTemp_C = 1064,
+    //
+    // ==================== Slot tuning, base 1068 ====================
+    //
+    // The DCL controller coefficients for the CC and CV loops, held as
+    // writable registers instead of the compile-time BTS_DCL_* constants.
+    //
+    // NOT RUNTIME REGISTERS. These are set once by the system builder during
+    // slot tuning and then persist in F-RAM; an end user never touches them.
+    // That is why they sit ABOVE the unit block rather than inside it - the
+    // ESP32's 9-transaction poll cycle does not read this far, so adding
+    // them costs nothing per poll.
+    //
+    // ONE SET FOR THE WHOLE UNIT, not per slot: every slot is the same
+    // converter with the same passives, so one tuning applies to all eight.
+    //
+    // The values are the biquad coefficients the DCL runs directly, and the
+    // CV zero/pole frequencies they were derived from. The frequencies are
+    // carried so a later re-derivation has the design intent and does not
+    // have to work backwards from the coefficients.
+    //
+    eDCL_CC_B0 = 1068,
+    eDCL_CC_B1 = 1072,
+    eDCL_CC_B2 = 1076,
+    eDCL_CC_A1 = 1080,
+    eDCL_CC_A2 = 1084,
+    eDCL_CV_Z0 = 1088,
+    eDCL_CV_Z1 = 1092,
+    eDCL_CV_P1 = 1096,
+    eDCL_CV_B0 = 1100,
+    eDCL_CV_B1 = 1104,
+    eDCL_CV_B2 = 1108,
+    eDCL_CV_A1 = 1112,
+    eDCL_CV_A2 = 1116,
 } RegisterAddress;
 
 //
@@ -413,6 +452,31 @@ typedef enum {
 //
 #define BTS_CAL_REGS_PER_CH         (12U)
 #define BTS_TEMP_REGS_PER_CH        (2U)
+
+//
+// Slot tuning block. Contiguous from eDCL_CC_B0, so CPU2 can walk it as one
+// run when saving to and loading from F-RAM.
+//
+#define BTS_TUNING_BASE_ADDR        ((uint16_t)eDCL_CC_B0)
+#define BTS_TUNING_COUNT            (NUM_TUNING_REGISTERS)
+
+//
+// Index within the block, matching the register order above. Used by the
+// F-RAM record and by BTS_applySlotTuning().
+//
+#define BTS_TUNE_CC_B0   0U
+#define BTS_TUNE_CC_B1   1U
+#define BTS_TUNE_CC_B2   2U
+#define BTS_TUNE_CC_A1   3U
+#define BTS_TUNE_CC_A2   4U
+#define BTS_TUNE_CV_Z0   5U
+#define BTS_TUNE_CV_Z1   6U
+#define BTS_TUNE_CV_P1   7U
+#define BTS_TUNE_CV_B0   8U
+#define BTS_TUNE_CV_B1   9U
+#define BTS_TUNE_CV_B2  10U
+#define BTS_TUNE_CV_A1  11U
+#define BTS_TUNE_CV_A2  12U
 
 typedef struct {
     uint16_t virtualAddr;   // Register address (from RegisterAddress enum)

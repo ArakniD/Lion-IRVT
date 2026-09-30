@@ -164,7 +164,48 @@ the two by reading `eHostWatchdog_s`, which is in the same burst. CPU2 owns
 it and writes it straight into `registers[]` — no IPC, since CPU2 owns both
 the register file and the timebase.
 
-### 1.6 Registers removed
+### 1.6 Slot tuning block - base 1068
+
+The DCL biquad coefficients for the CC and CV control loops, held as writable
+registers instead of the compile-time `BTS_DCL_*` constants so a unit can be
+tuned in the field rather than rebuilt and reflashed on both cores.
+
+| Address | Name | Meaning |
+|---|---|---|
+| 1068-1084 | `DCL_CC_B0..B2`, `A1..A2` | CC loop biquad |
+| 1088-1096 | `DCL_CV_Z0`, `Z1`, `P1` | CV zero/pole frequencies - provenance only |
+| 1100-1116 | `DCL_CV_B0..B2`, `A1..A2` | CV loop biquad |
+
+Four properties, each deliberate:
+
+**Above the unit block, not inside it.** These are written once by a system
+builder during slot tuning and read back only on request. The ESP32's
+9-transaction poll cycle does not reach this far, so the block costs nothing
+per poll.
+
+**One set for the whole unit.** Every slot is the same converter with the same
+passives, so there is no per-slot stride.
+
+**Z0/Z1/P1 are carried but never used.** The DCL runs the biquad coefficients
+directly. The frequencies record what those coefficients were derived from, so
+a later re-derivation has the design intent instead of having to work backwards.
+
+**Defaults are seeded before F-RAM can load.** `BTS_seedSlotTuningRegisters()`
+runs on CPU1 at boot, before CPU2's restore arrives, and `BTS_applySlotTuning()`
+rejects a set whose `b0` is zero. Both guard the same failure: `registers[]`
+starts zeroed, and a biquad with every coefficient zero produces a constant
+zero output - the duty would never leave its floor and **no slot would
+regulate at all**. A never-tuned unit, or one whose stored record fails its
+CRC, runs the shipped tuning instead.
+
+Persistence is a single F-RAM record at `0x0700` (128 B, header + 13 floats +
+CRC-32), placed after the per-slot state region that ends at `0x06FF`. A host
+write to any coefficient marks the whole block for saving; the transfer runs
+from `BTS_serviceDeferredWork()` on an idle bus, never from the ISR the write
+arrives in. Writing all thirteen coefficients therefore costs one F-RAM
+transfer, not thirteen.
+
+### 1.6.1 Registers removed
 
 **In the v2 reorder.** `eChX_MinVoltage` and `eChX_MaxVoltage` (v1 324/328)
 were declared RO and never written on either core — 16 registers of permanent
