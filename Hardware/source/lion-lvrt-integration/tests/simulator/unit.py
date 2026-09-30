@@ -95,6 +95,11 @@ class SimSlot:
 
     running: bool = False
     charging: bool = False
+    #: Which half of the CCCV loop is regulating. False is constant current,
+    #: which is where a charge starts and where a discharge stays throughout;
+    #: a charge flips this once the cell reaches its voltage limit and the
+    #: current begins to taper toward termination.
+    const_voltage: bool = False
     paused: bool = False
     wd_tripped: bool = False
     restored: bool = False
@@ -123,8 +128,13 @@ class SimSlot:
         elif self.running or self.paused:
             bits |= StatusBit.DISCHARGING
         if self.running:
-            # CC-only build: bit 7 is always set while running, bit 6 never.
-            bits |= StatusBit.CONST_CURRENT
+            # CCCV: the loop reports which half is regulating. A charge
+            # crosses CC -> CV at the voltage limit and then tapers toward
+            # termination. Exactly one of the two is set while running.
+            if self.const_voltage:
+                bits |= StatusBit.CONST_VOLTAGE
+            else:
+                bits |= StatusBit.CONST_CURRENT
         if self.follower:
             bits |= StatusBit.SLAVE_MODE
         if self.voltage_v < 0:
@@ -200,11 +210,16 @@ class SimulatedUnit:
         self._registers[regs.REG_DISCHARGE_DISABLE_V] = 16.0
         self._registers[regs.REG_HOST_WATCHDOG_S] = self.host_watchdog_s
         for ch in range(self.slot_count):
-            self._registers[regs.set_addr(ch, regs.SET_CHARGE_V_MAX)] = 4.2
-            self._registers[regs.set_addr(ch, regs.SET_DISCHARGE_V_MIN)] = 2.5
-            self._registers[regs.set_addr(ch, regs.SET_CHARGE_I_MAX)] = 2.0
-            self._registers[regs.set_addr(ch, regs.SET_DISCHARGE_I_MAX)] = 2.0
-            self._registers[regs.set_addr(ch, regs.SET_MIN_CELL_TEMP)] = 5.0
+            # Direction-agnostic since v2.1: one voltage pair and one
+            # current pair, with the mode register selecting the direction.
+            # The previous seeds wrote charge and discharge values to what
+            # are now the same two addresses - and because both currents
+            # were 2.0 the collision was invisible, so the simulator would
+            # have kept agreeing with a mirror that had the merge wrong.
+            self._registers[regs.set_addr(ch, regs.SET_V_MAX)] = 4.2
+            self._registers[regs.set_addr(ch, regs.SET_V_MIN)] = 2.5
+            self._registers[regs.set_addr(ch, regs.SET_I_MAX)] = 2.0
+            self._registers[regs.set_addr(ch, regs.SET_I_MIN)] = 0.05
             self._registers[regs.set_addr(ch, regs.SET_MAX_CELL_TEMP)] = 45.0
 
     def read_register(self, address: int) -> float:
@@ -575,6 +590,8 @@ class SimulatedUnit:
             s.discharge_mah,
             s.discharge_mwh,
             s.discharge_seconds,
+            1 if (s.running and s.const_voltage) else 0,
+            1 if (s.running and not s.const_voltage) else 0,
         )
 
     def slot_config_bytes(self, index: int) -> bytes:

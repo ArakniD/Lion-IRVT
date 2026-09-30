@@ -54,11 +54,25 @@ class UnitNumberDescription(NumberEntityDescription):
     address: int
 
 
+#
+# FIVE entities, not eight.
+#
+# There were separate charge_* and discharge_* entities until the firmware
+# merged the limits into one direction-agnostic pair (v2.1). Two entities
+# pointing at one register is not a cosmetic duplicate: each caches its own
+# value and reads back after a write, so setting one would silently change
+# the other on its next poll and an operator would watch a value they did not
+# touch move on its own.
+#
+# The voltage and current minima are also not merely bounds any more - they
+# are the CCCV termination thresholds - so the names say "limit" rather than
+# a direction, and the descriptions say what the value terminates.
+#
 SLOT_NUMBERS: tuple[SlotNumberDescription, ...] = (
     SlotNumberDescription(
-        key="charge_voltage_max",
-        translation_key="charge_voltage_max",
-        offset=regs.SET_CHARGE_V_MAX,
+        key="voltage_max",
+        translation_key="voltage_max",
+        offset=regs.SET_V_MAX,
         device_class=NumberDeviceClass.VOLTAGE,
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         native_min_value=0.0,
@@ -68,11 +82,14 @@ SLOT_NUMBERS: tuple[SlotNumberDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
     ),
     SlotNumberDescription(
-        key="charge_voltage_min",
-        translation_key="charge_voltage_min",
-        offset=regs.SET_CHARGE_V_MIN,
+        key="voltage_min",
+        translation_key="voltage_min",
+        offset=regs.SET_V_MIN,
         device_class=NumberDeviceClass.VOLTAGE,
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        # Zero is meaningful and must stay reachable: it DISABLES the
+        # discharge termination check rather than asking the slot to run to
+        # 0 V.
         native_min_value=0.0,
         native_max_value=UNIT_MAX_VOLTAGE_V,
         native_step=0.01,
@@ -80,33 +97,9 @@ SLOT_NUMBERS: tuple[SlotNumberDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
     ),
     SlotNumberDescription(
-        key="discharge_voltage_min",
-        translation_key="discharge_voltage_min",
-        offset=regs.SET_DISCHARGE_V_MIN,
-        device_class=NumberDeviceClass.VOLTAGE,
-        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
-        native_min_value=0.0,
-        native_max_value=UNIT_MAX_VOLTAGE_V,
-        native_step=0.01,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-    ),
-    SlotNumberDescription(
-        key="discharge_voltage_max",
-        translation_key="discharge_voltage_max",
-        offset=regs.SET_DISCHARGE_V_MAX,
-        device_class=NumberDeviceClass.VOLTAGE,
-        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
-        native_min_value=0.0,
-        native_max_value=UNIT_MAX_VOLTAGE_V,
-        native_step=0.01,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-    ),
-    SlotNumberDescription(
-        key="charge_current_max",
-        translation_key="charge_current_max",
-        offset=regs.SET_CHARGE_I_MAX,
+        key="current_max",
+        translation_key="current_max",
+        offset=regs.SET_I_MAX,
         device_class=NumberDeviceClass.CURRENT,
         native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
         native_min_value=0.0,
@@ -116,28 +109,18 @@ SLOT_NUMBERS: tuple[SlotNumberDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
     ),
     SlotNumberDescription(
-        key="discharge_current_max",
-        translation_key="discharge_current_max",
-        offset=regs.SET_DISCHARGE_I_MAX,
+        key="current_min",
+        translation_key="current_min",
+        offset=regs.SET_I_MIN,
         device_class=NumberDeviceClass.CURRENT,
         native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        # The charge termination current: the slot ends once the current has
+        # fallen this far while the loop is holding voltage. Exposed here
+        # because it has no entity before now, and a charge cannot terminate
+        # without it.
         native_min_value=0.0,
         native_max_value=UNIT_MAX_CURRENT_A,
-        native_step=0.05,
-        mode=NumberMode.BOX,
-        entity_category=EntityCategory.CONFIG,
-    ),
-    SlotNumberDescription(
-        key="min_cell_temp",
-        translation_key="min_cell_temp",
-        offset=regs.SET_MIN_CELL_TEMP,
-        device_class=NumberDeviceClass.TEMPERATURE,
-        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
-        # The converter's fourth-order fit bottoms out near +18 C for 0 V in
-        # and saturates near 81 C, so values outside that are not meaningful.
-        native_min_value=-10.0,
-        native_max_value=80.0,
-        native_step=0.5,
+        native_step=0.01,
         mode=NumberMode.BOX,
         entity_category=EntityCategory.CONFIG,
     ),
@@ -147,6 +130,8 @@ SLOT_NUMBERS: tuple[SlotNumberDescription, ...] = (
         offset=regs.SET_MAX_CELL_TEMP,
         device_class=NumberDeviceClass.TEMPERATURE,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        # The converter's fourth-order fit bottoms out near +18 C for 0 V in
+        # and saturates near 81 C, so values outside that are not meaningful.
         native_min_value=-10.0,
         native_max_value=80.0,
         native_step=0.5,

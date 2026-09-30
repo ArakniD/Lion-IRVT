@@ -93,15 +93,31 @@ UNIT_STATUS_V5_FMT: Final = "<BBBBIfIBBHfBBBB"
 UNIT_STATUS_LEN: Final = struct.calcsize(UNIT_STATUS_FMT)
 UNIT_STATUS_V5_LEN: Final = struct.calcsize(UNIT_STATUS_V5_FMT)
 
-# ble_slot_status_t, 68 B (proto 3; was 40 B before the bts_* block).
+# ble_slot_status_t, 70 B (proto 6; 68 B in proto 3-5, 40 B before that).
 #   B slot  B state  B fault  B configured
 #   f voltage_v  f current_a  f temp_c  f live_mah  f live_mwh  f progress
 #   I elapsed_s  I state_elapsed_s  I status_bits
 #   B bts_paused  B bts_wd_tripped  B bts_restored  B bts_ended
 #   f bts_charge_mah  f bts_charge_mwh  f bts_charge_seconds
 #   f bts_discharge_mah  f bts_discharge_mwh  f bts_discharge_seconds
-SLOT_STATUS_FMT: Final = "<BBBBffffffIIIBBBBffffff"
+#   B bts_const_voltage  B bts_const_current                    <- proto 6
+#
+# The two regulation flags were appended at the END of the record, so every
+# offset above is unchanged and the 68-byte prefix still decodes exactly as
+# it did. They report which half of the CCCV law is running: a charge crosses
+# CC -> CV at the voltage limit and then tapers toward termination, so seeing
+# CV is what says the taper has begun.
+#
+# They read false on any firmware before the control law moved to CCCV -
+# status bits 6 and 7 existed from the start but the CC-only loop pinned
+# ctrlMode_logic to 0 and never set them.
+SLOT_STATUS_FMT: Final = "<BBBBffffffIIIBBBBffffffBB"
 SLOT_STATUS_LEN: Final = struct.calcsize(SLOT_STATUS_FMT)
+
+#: The proto 3-5 record, before the regulation flags were appended. Kept so a
+#: unit on older firmware still decodes rather than being rejected outright.
+SLOT_STATUS_V3_FMT: Final = "<BBBBffffffIIIBBBBffffff"
+SLOT_STATUS_V3_LEN: Final = struct.calcsize(SLOT_STATUS_V3_FMT)
 
 #: The proto-2 prefix, for decoding a record from older firmware.
 SLOT_STATUS_V2_FMT: Final = "<BBBBffffffIII"
@@ -144,7 +160,8 @@ REGISTER_CMD_LEN: Final = struct.calcsize(REGISTER_CMD_FMT)
 # and ble_proto.h have drifted, which must fail loudly at import rather than
 # produce plausible-looking rubbish at runtime.
 assert UNIT_STATUS_LEN == 24, UNIT_STATUS_LEN
-assert SLOT_STATUS_LEN == 68, SLOT_STATUS_LEN
+assert SLOT_STATUS_LEN == 70, SLOT_STATUS_LEN
+assert SLOT_STATUS_V3_LEN == 68, SLOT_STATUS_V3_LEN
 assert SLOT_CONFIG_LEN == 80, SLOT_CONFIG_LEN
 assert SLOT_RESULT_LEN == 116, SLOT_RESULT_LEN
 assert CATALOG_ENTRY_LEN == 96, CATALOG_ENTRY_LEN
@@ -295,6 +312,11 @@ class SlotStatus:
     bts_discharge_mah: float = 0.0
     bts_discharge_mwh: float = 0.0
     bts_discharge_seconds: float = 0.0
+    #: Which half of the CCCV loop is regulating. Exactly one is set while a
+    #: slot runs; both are false when it is stopped, because the firmware
+    #: publishes the loop's state rather than the slot's intent.
+    bts_const_voltage: bool = False
+    bts_const_current: bool = False
 
     @classmethod
     def decode(cls, data: bytes) -> "SlotStatus":
@@ -310,8 +332,17 @@ class SlotStatus:
             fault = SlotFault.NONE
 
         tail: tuple = ()
+        if len(data) >= SLOT_STATUS_V3_LEN:
+            tail = struct.unpack("<BBBBffffff", data[40:SLOT_STATUS_V3_LEN])
+
+        # Proto 6 appended the two regulation flags. Decoded separately from
+        # the tail above so a proto 3-5 record - which stops at 68 bytes -
+        # still yields everything it carries instead of being discarded.
+        regulation: tuple = ()
         if len(data) >= SLOT_STATUS_LEN:
-            tail = struct.unpack("<BBBBffffff", data[40:SLOT_STATUS_LEN])
+            regulation = struct.unpack(
+                "<BB", data[SLOT_STATUS_V3_LEN:SLOT_STATUS_LEN]
+            )
 
         return cls(
             slot=head[0],
@@ -337,6 +368,8 @@ class SlotStatus:
             bts_discharge_mah=tail[7] if tail else 0.0,
             bts_discharge_mwh=tail[8] if tail else 0.0,
             bts_discharge_seconds=tail[9] if tail else 0.0,
+            bts_const_voltage=bool(regulation[0]) if regulation else False,
+            bts_const_current=bool(regulation[1]) if regulation else False,
         )
 
     @property

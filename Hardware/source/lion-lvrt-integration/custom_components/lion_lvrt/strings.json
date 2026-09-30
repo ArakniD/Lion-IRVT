@@ -106,13 +106,10 @@
       "abort_all": { "name": "Abort all slots" }
     },
     "number": {
-      "charge_voltage_max": { "name": "Charge voltage max" },
-      "charge_voltage_min": { "name": "Charge voltage min" },
-      "discharge_voltage_min": { "name": "Discharge voltage min" },
-      "discharge_voltage_max": { "name": "Discharge voltage max" },
-      "charge_current_max": { "name": "Charge current max" },
-      "discharge_current_max": { "name": "Discharge current max" },
-      "min_cell_temp": { "name": "Cell temperature min" },
+      "voltage_max": { "name": "Voltage max" },
+      "voltage_min": { "name": "Voltage min (discharge cut-off)" },
+      "current_max": { "name": "Current max" },
+      "current_min": { "name": "Current min (charge termination)" },
       "max_cell_temp": { "name": "Cell temperature max" },
       "charge_disable_v": { "name": "Charge disable threshold" },
       "charge_restrict_v": { "name": "Charge restrict threshold" },

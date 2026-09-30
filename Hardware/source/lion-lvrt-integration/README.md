@@ -204,7 +204,7 @@ byte.
 custom_components/lion_lvrt/
   protocol/         wire codecs — no Home Assistant imports
     ble.py            little-endian GATT records
-    registers.py      big-endian register map v2
+    registers.py      big-endian register map v2.1
     can.py            mixed-endian CAN frames
   transport/        one class per link
     base.py           capability interface
