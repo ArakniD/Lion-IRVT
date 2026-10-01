@@ -33,7 +33,7 @@ DEVICE_NAME = "BTS-Tester"
 # flags at its end, and decode_slot() now unpacks 70 bytes. A proto-5 unit
 # returns 68 and is short by exactly those two, so it must be rejected rather
 # than silently reported as CC.
-MIN_PROTO_VERSION = 6
+MIN_PROTO_VERSION = 7
 
 # e5f1xxxx-9a4c-4b7d-8f2e-1c3a5b7d9f01
 def uuid(disc):
@@ -90,9 +90,10 @@ assert UNIT_LEN == 24, UNIT_LEN
 #   f bts_charge_mah  f bts_charge_mwh  f bts_charge_seconds
 #   f bts_discharge_mah  f bts_discharge_mwh  f bts_discharge_seconds
 #   B bts_const_voltage  B bts_const_current            (proto 6)
-SLOT_FMT = "<BBBBffffffIIIBBBBffffffBB"
+#   B bts_waiting  B bts_balancing  B bts_ready  B bts_soft_start  (proto 7)
+SLOT_FMT = "<BBBBffffffIIIBBBBffffffBBBBBB"
 SLOT_LEN = struct.calcsize(SLOT_FMT)
-assert SLOT_LEN == 70, SLOT_LEN
+assert SLOT_LEN == 74, SLOT_LEN
 
 
 def decode_unit(b):
@@ -117,7 +118,8 @@ def decode_slot(b):
      elapsed, state_elapsed, status,
      paused, wd_tripped, restored, ended,
      c_mah, c_mwh, c_s, d_mah, d_mwh, d_s,
-     const_v, const_i) = struct.unpack(SLOT_FMT, b[:SLOT_LEN])
+     const_v, const_i,
+     waiting, balancing, ready, soft_start) = struct.unpack(SLOT_FMT, b[:SLOT_LEN])
     return {
         "slot": slot, "state": state, "fault": fault,
         "configured": bool(configured),
@@ -130,6 +132,10 @@ def decode_slot(b):
         "bts_charge": [round(c_mah, 2), round(c_mwh, 2), round(c_s, 0)],
         "bts_discharge": [round(d_mah, 2), round(d_mwh, 2), round(d_s, 0)],
         "bts_regulation": "CV" if const_v else ("CC" if const_i else "-"),
+        "bts_precharge": ("SOFT_START" if soft_start else
+                          "READY" if ready else
+                          "BALANCING" if balancing else
+                          "WAITING" if waiting else "-"),
     }
 
 

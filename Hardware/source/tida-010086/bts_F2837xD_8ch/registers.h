@@ -501,6 +501,15 @@ typedef struct {
     uint32_t constVoltage;
     uint32_t constCurrent;
     //
+    // Pre-charge balance (ToDo 08). waiting is the armed state and stays set
+    // through balancing and ready, so one test covers "in the pre-charge
+    // sequence"; the other three say where in it.
+    //
+    uint32_t waiting;
+    uint32_t balancing;
+    uint32_t ready;
+    uint32_t softStart;
+    //
     // Grouping state. Packed into bits 8-11 of the published status word.
     // The word is carried to the host as a float32, whose 24-bit significand
     // makes integers exact only to bit 23 - do not extend past that.
@@ -559,6 +568,34 @@ typedef struct {
 // rather than duplicated at bit 16. Bit 16 is therefore free.
 //
 #define BTS_STATUS_PAUSED            15U
+//
+// ==================== Pre-charge balance (ToDo 08) ====================
+//
+// The sequence a slot runs between STOPPED and RUNNING so a cell can be
+// seated onto a rail that already matches it:
+//
+//   WAITING    armed, watching the ADS path for a cell approaching the
+//              contacts. The converter is off.
+//   BALANCING  driving the output capacitors to match the ADS reading. The
+//              cell is NOT yet connected to the rail.
+//   READY      rails matched. Re-verified continuously, because an unloaded
+//              capacitor drifts - this bit CLEARS and returns to BALANCING if
+//              the differential re-opens while the operator is seating it.
+//   SOFT_START diode-emulation (DCM) start into the now-connected cell, with
+//              the synchronous rectifier held off so current cannot flow
+//              backwards out of the cell.
+//
+// MONITORING from the original brief is deliberately absent: an armed slot is
+// by definition watching, so it would never be observably distinct from
+// WAITING, and status bits are nearly exhausted.
+//
+// Bit 16 is used here because it was the one free low bit; the rest continue
+// above 18. The ceiling is bit 23 - see the note below.
+//
+#define BTS_STATUS_WAITING           16U
+#define BTS_STATUS_BALANCING         19U
+#define BTS_STATUS_READY             20U
+#define BTS_STATUS_SOFT_START        21U
 #define BTS_STATUS_END               BTS_STATUS_FINISHED
 #define BTS_STATUS_WD_TRIPPED        17U  /* paused by the host watchdog   */
 #define BTS_STATUS_RESTORED          18U  /* paused by a FRAM boot restore */
@@ -572,6 +609,12 @@ typedef struct {
 #define BTS_MODE_CALIBRATE           0x04U
 #define BTS_MODE_PAUSE               0x08U
 #define BTS_MODE_RESUME              0x10U
+//
+// Arms the pre-charge sequence. Only reachable from STOPPED or END - a
+// stopped slot never auto-arms, which is what keeps a slot that an operator
+// deliberately stopped from driving its rail on its own.
+//
+#define BTS_MODE_WAITING             0x20U
 
 // Bitfield for eTripStatus register
 typedef struct {
@@ -689,6 +732,17 @@ typedef struct _BTS_slotRuntimeState
 #define BTS_STATE_F_RUNNING    0x00000001UL
 #define BTS_STATE_F_CHARGING   0x00000002UL
 #define BTS_STATE_F_END        0x00000004UL
+//
+// Armed for pre-charge balance. Persisted so a slot an operator armed is
+// still armed after a power cycle - otherwise a rack that lost power would
+// come back with every slot disarmed and no indication of it.
+//
+// Only WAITING survives. BALANCING, READY and SOFT_START are transient states
+// the supervisor re-derives within a few passes of boot from the live sense
+// readings, so persisting them would restore a stale position in a sequence
+// whose inputs have moved on.
+//
+#define BTS_STATE_F_WAITING    0x00000008UL
 
 //
 //=============================================================================
@@ -869,8 +923,14 @@ typedef struct {
     uint32_t restoreFlags;   // 3 bits per slot: BTS_STATE_F_* << (ch * 3)
 } BTS_supervision;
 
-#define BTS_STATE_FLAGS_SHIFT(ch)  ((uint16_t)(ch) * 3U)
-#define BTS_STATE_FLAGS_MASK       0x7UL
+//
+// FOUR bits per slot, not three. Widened for BTS_STATE_F_WAITING.
+//
+// 8 slots x 4 bits is exactly 32, so restoreFlags is now completely full -
+// a fifth per-slot flag needs a wider carrier, not another bit.
+//
+#define BTS_STATE_FLAGS_SHIFT(ch)  ((uint16_t)(ch) * 4U)
+#define BTS_STATE_FLAGS_MASK       0xFUL
 
 // CPU2 -> CPU1 single register mailbox. Lives in CPU2TOCPU1RAM.
 typedef struct {

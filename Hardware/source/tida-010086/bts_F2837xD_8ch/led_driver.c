@@ -17,6 +17,7 @@ static const uint16_t colorRed[3]   = COLOR_RED;
 static const uint16_t colorGreen[3] = COLOR_GREEN;
 static const uint16_t colorBlue[3]  = COLOR_BLUE;
 static const uint16_t colorWhite[3] = COLOR_WHITE;
+static const uint16_t colorYellow[3] = COLOR_YELLOW;
 
 // LED buffer (GRB order)
 static uint16_t ledBuffer[LED_BUFFER_SIZE];
@@ -105,6 +106,23 @@ void LEDDriver_update(void) {
                 (status & ((1UL << BTS_STATUS_WD_TRIPPED) |
                            (1UL << BTS_STATUS_RESTORED))) ? colorRed : colorBlue;
             color = ((tick % LED_PAUSE_PERIOD) < LED_PAUSE_ON) ? pauseColor : 0;
+        } else if (status & ((1UL << BTS_STATUS_BALANCING) |
+                             (1UL << BTS_STATUS_SOFT_START))) {
+            //
+            // Driving the rail, or starting into a freshly seated cell.
+            // Ranked below every fault - a slot that trips while balancing
+            // must still read as tripped - and above the direction states,
+            // which it precedes.
+            //
+            color = ((tick % LED_BALANCE_PERIOD) < LED_BALANCE_ON)
+                        ? colorYellow : 0;
+        } else if (status & (1UL << BTS_STATUS_READY)) {
+            //
+            // Rails matched: it is safe to seat a cell. Flashing, because
+            // solid green is idle.
+            //
+            color = ((tick % LED_READY_PERIOD) < LED_READY_ON)
+                        ? colorGreen : 0;
         } else if (status & ((1UL << BTS_STATUS_CHARGING) |
                              (1UL << BTS_STATUS_DISCHARGING))) {
             if (status & (1UL << BTS_STATUS_RUNNING)) {

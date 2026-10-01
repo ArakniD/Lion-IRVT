@@ -308,7 +308,116 @@ semantic, do not add a second bit for the same thing.
 **Entering PAUSED always zeroes the converter reference first**, then clears
 `enable_logic`. Same ordering as a trip exit.
 
-### 2.5 Termination — how a slot reaches END
+### 2.5 Pre-charge balance — how a cell is seated safely
+
+A lithium cell is a stiff voltage source. Dropping one onto a flat output
+capacitor dumps charge through the contacts, and closing the synchronous
+rectifier onto a pre-biased cell drives current backwards through the power
+stage. The pre-charge sequence drives the rail to match the cell *before*
+contact, so the connection closes across near-zero volts.
+
+```
+STOPPED --(mode 0x20)--> WAITING
+                            |
+                  ADS path > 0.25 V
+                            v
+                        BALANCING <-------+
+                            |             |
+                  voltages match AND      | rail drifts
+                  current is zero         |
+                            v             |
+                          READY ----------+
+                            |
+                  current appears on a matched rail
+                            v
+                       SOFT_START --(trip)--> 100 ms hold, retry (max 40)
+                            |
+                  average current >= 0
+                            v
+                         RUNNING
+```
+
+**Why the current reading is what decides it.** The output capacitors sit
+*after* the current sense resistor, so the shunt only sees current the
+switching FETs produce — never charge moving between a cell and the rail
+through the contacts. That single fact makes the sequence decidable:
+
+| Voltages | Current | Meaning |
+|---|---|---|
+| match | zero | rail balanced, no cell yet → READY |
+| match | flowing | a cell is bridging the contacts → SOFT_START |
+| differ | — | rail needs driving → BALANCING |
+
+Without it, "balanced successfully" and "cell inserted" would be the same
+reading and the sequence could not be sequenced at all.
+
+**READY is not a latch.** An unloaded output capacitor drifts — leakage, the
+divider network, self-discharge — and an operator may take a while to seat the
+cell. The supervisor re-verifies every pass and drops back to BALANCING if the
+differential re-opens.
+
+**Soft start is diode emulation.** The synchronous rectifier is held off so
+current cannot flow backwards out of the cell, and the converter runs in DCM
+until the average current is no longer negative. A trip is expected rather
+than exceptional — inrush into a pre-biased cell is exactly what this exists
+to survive — so a trip holds for ~100 ms and retries, up to 40 times before
+faulting.
+
+**Removing the cell clears a fault.** If the ADS path falls below 0.25 V the
+slot returns to WAITING from any point in the sequence, including a fault.
+Pull the cell, re-seat it, and the sequence runs again.
+
+**Entry is guarded on calibration.** The two sense paths are independently
+calibrated, so on an uncalibrated slot the differential between them is
+meaningless — and this sequence drives the power stage based on exactly that
+differential. `BTS_MODE_WAITING` is refused unless `CAL_V_VALID` is set. An
+uncalibrated slot still runs normally; it just does not get the pre-charge.
+
+**Grouped modes balance as one converter.** The members' outputs are
+physically paralleled onto a single rail, so the leader balances for all of
+them and the state propagates to every member. Followers have no control loop
+of their own to run.
+
+**Protection is live throughout.** `enable_logic` is set while balancing, so
+the hardware trip zones are armed exactly as they are for a running slot, and
+the reverse-polarity check stops a balancing slot as readily as a running one.
+The accumulators are the one exception: they key off `running`, which the
+pre-charge states never set, so no charge is counted while capacitors are
+being filled.
+
+**Only WAITING survives a power cycle.** It is carried in the F-RAM state
+record as `BTS_STATE_F_WAITING`, so a slot an operator armed comes back armed.
+The other three are transient and the supervisor re-derives them within a few
+passes from readings that are current rather than remembered.
+
+#### Where it runs, and why not in C1
+
+The supervisor lives in **B1**, which was empty. The brief asks for a 100 ms
+trip retry and a prompt divergence fault, and B1 runs three times faster than
+any single C task.
+
+#### Divergence fault while RUNNING
+
+A rapid rise on the converter rail that the ADS path does not follow means the
+cell is no longer bridging the contacts — pulled mid-test, or a contact that
+has opened — and the converter is driving its own output capacitor with the
+loop still asking for current. More than 20% divergence for three consecutive
+passes stops the slot and its whole group.
+
+#### Status bits
+
+| Bit | Name | Set while |
+|---|---|---|
+| 16 | `BTS_STATUS_WAITING` | anywhere in the sequence |
+| 19 | `BTS_STATUS_BALANCING` | driving the rail |
+| 20 | `BTS_STATUS_READY` | matched; safe to seat |
+| 21 | `BTS_STATUS_SOFT_START` | DCM start into a connected cell |
+
+MONITORING from the original brief is deliberately absent: an armed slot is by
+definition watching, so it would never be observably distinct from WAITING,
+and only bits 22 and 23 now remain below the float32 ceiling.
+
+### 2.6 Termination — how a slot reaches END
 
 The `──termination──> END` arrow above was specified from the start and had no
 implementation until the firmware moved to CCCV

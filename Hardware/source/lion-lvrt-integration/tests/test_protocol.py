@@ -190,6 +190,8 @@ def _slot_status(**kwargs) -> bytes:
         "bts_discharge_mah": 0.0, "bts_discharge_mwh": 0.0,
         "bts_discharge_seconds": 0.0,
         "bts_const_voltage": 0, "bts_const_current": 1,
+        "bts_waiting": 0, "bts_balancing": 0, "bts_ready": 0,
+        "bts_soft_start": 0,
     }
     values.update(kwargs)
     return struct.pack(proto.SLOT_STATUS_FMT, *values.values())

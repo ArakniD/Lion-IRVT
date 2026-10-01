@@ -421,6 +421,10 @@ static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_
     st->ended      = (status & BTS_STATUS_ENDED_MASK) != 0;
     st->const_voltage = (status & BTS_STATUS_CONST_VOLTAGE) != 0;
     st->const_current = (status & BTS_STATUS_CONST_CURRENT) != 0;
+    st->waiting       = (status & BTS_STATUS_WAITING) != 0;
+    st->balancing     = (status & BTS_STATUS_BALANCING) != 0;
+    st->ready         = (status & BTS_STATUS_READY) != 0;
+    st->soft_start    = (status & BTS_STATUS_SOFT_START) != 0;
     st->cmpss_trip = (trip_bits & BTS_TRIP_CMPSS(ch)) != 0;
     st->gpio_trip  = (trip_bits & BTS_TRIP_GPIO(ch)) != 0;
     st->valid      = true;

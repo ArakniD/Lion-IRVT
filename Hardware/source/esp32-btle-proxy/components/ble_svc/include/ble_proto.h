@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define BLE_PROTO_VERSION       6
+#define BLE_PROTO_VERSION       7
 
 /* Attribute value sizes are bounded by the negotiated MTU (247 - 3). */
 #define BLE_PROTO_MAX_PAYLOAD   244
@@ -137,6 +137,23 @@ typedef struct __attribute__((packed)) {
      */
     uint8_t  bts_const_voltage;
     uint8_t  bts_const_current;
+
+    /*
+     * Appended in proto 7: the pre-charge balance sequence. A cell is seated
+     * onto a rail already driven to match it, so the contact closes across
+     * near-zero volts instead of dumping the cell into a flat capacitor.
+     *
+     * `waiting` stays set through the whole sequence and answers "is this
+     * slot armed"; the other three say where in it. `ready` means it is safe
+     * to seat a cell right now - and it CLEARS if the rail drifts, so a
+     * client must re-read rather than latch it.
+     *
+     * At the END again, keeping every offset above unchanged.
+     */
+    uint8_t  bts_waiting;
+    uint8_t  bts_balancing;
+    uint8_t  bts_ready;
+    uint8_t  bts_soft_start;
 } ble_slot_status_t;
 
 typedef struct __attribute__((packed)) {

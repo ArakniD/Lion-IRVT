@@ -1666,6 +1666,14 @@ static bool saveSlotState(uint16_t channel)
     if ((bits & (1UL << BTS_STATUS_END)) != 0UL) {
         flags |= BTS_STATE_F_END;
     }
+    //
+    // An armed slot comes back armed. Only WAITING is carried; the rest of
+    // the pre-charge sequence is re-derived from the live sense readings
+    // within a few supervisor passes of boot.
+    //
+    if ((bits & (1UL << BTS_STATUS_WAITING)) != 0UL) {
+        flags |= BTS_STATE_F_WAITING;
+    }
 
     st.header           = BTS_STATE_MAKE_HEADER(channel);
     st.stateFlags       = flags;
@@ -3001,10 +3009,18 @@ static void mirrorCpu1Status(void)
         //
         {
             static uint32_t lastSavedBits[NUM_CHANNELS];
+            //
+            // WAITING is included so an armed slot survives a power cycle.
+            // The other three pre-charge bits are deliberately absent: they
+            // change every few passes while a rail is being driven, and
+            // writing F-RAM on each one would be constant wear for state the
+            // supervisor re-derives at boot anyway.
+            //
             uint32_t stateBits = statusBits[ch] &
                 ((1UL << BTS_STATUS_RUNNING)  | (1UL << BTS_STATUS_STOPPED) |
                  (1UL << BTS_STATUS_CHARGING) | (1UL << BTS_STATUS_DISCHARGING) |
-                 (1UL << BTS_STATUS_PAUSED)   | (1UL << BTS_STATUS_END));
+                 (1UL << BTS_STATUS_PAUSED)   | (1UL << BTS_STATUS_END) |
+                 (1UL << BTS_STATUS_WAITING));
 
             if (stateBits != lastSavedBits[ch]) {
                 lastSavedBits[ch] = stateBits;

@@ -39,7 +39,13 @@
 // Channel 1 keeps its CMPSS over-current trip in both modes. Only the
 // separate GPIO trip input is affected.
 //
-#define BTS_DEBUG_CONSOLE (true)
+// PRODUCTION since 2026-10-02. The AT console moved to the ESP32, which
+// serves the same grammar over I2C (see Docs/at-command-specification.md), so
+// nothing is lost by giving SCIA to the LED string - and two things are
+// gained: the WS2812B slot indication, and channel 1's GPIO trip input, which
+// the console build has to leave disconnected.
+//
+#define BTS_DEBUG_CONSOLE (false)
 
 #if (BTS_DEBUG_CONSOLE == true)
     //
@@ -349,6 +355,99 @@
 #define BTS_USER_TRIP_pu(x)     (BTS_userInputs[i].IoutGain_pu *BTS_USER_DEFAULT_TRIP_A + BTS_userInputs[i].IoutOffset_pu)
 #define BTS_USER_TRIP_16b(x)    ((int16_t)(BTS_USER_TRIP_pu(x) *(float32_t)32768.0))
 #define BTS_USER_TRIP_N_16b(x)  (((int16_t)-1)*BTS_USER_TRIP_16b(x))
+
+//
+//=============================================================================
+// Pre-charge balance (ToDo 08)
+//=============================================================================
+//
+// A cell is seated onto a rail that has been driven to match it, so the
+// contact closes across near-zero volts instead of dumping the cell into a
+// flat output capacitor.
+//
+// WHY THE CURRENT READING IS THE INSERTION TEST
+// ---------------------------------------------
+// The output capacitors sit AFTER the current sense resistor, so the shunt
+// only sees current the switching FETs produce - never charge moving between
+// the cell and the rail through the contacts. That is what makes the
+// sequence decidable:
+//
+//   balanced, no cell   voltages match AND current is zero
+//   cell inserted       voltages match AND current is NOT zero
+//
+// Without that placement the two conditions would be indistinguishable.
+
+//
+// ADS reading above which a cell is considered to be approaching. Below it a
+// slot is empty and the sequence re-arms.
+//
+#define BTS_INSERT_DETECT_V          ((float32_t)0.25)
+
+//
+// How closely the two paths must agree to call the rail balanced, as a
+// fraction of the ADS reading. The brief's 10%.
+//
+#define BTS_BALANCE_TOL_FRAC         ((float32_t)0.10)
+
+//
+// Absolute floor on that tolerance, so a near-zero ADS reading does not
+// demand an impossibly tight match - 10% of 0.3 V is 30 mV, which is inside
+// the noise of a 12-bit converter on a 2.5 V reference.
+//
+#define BTS_BALANCE_TOL_MIN_V        ((float32_t)0.050)
+
+//
+// Current below which the rail is considered unloaded, i.e. no cell bridging
+// the contacts yet.
+//
+#define BTS_BALANCE_ZERO_I_A         ((float32_t)0.050)
+
+//
+// Divergence between the two paths that faults a RUNNING slot, as a fraction.
+// The brief's 20%.
+//
+#define BTS_DIVERGE_FAULT_FRAC       ((float32_t)0.20)
+
+//
+// Consecutive supervisor passes a condition must hold. The supervisor runs in
+// B1 at TASKB_FREQ_HZ/3, so this is a few tens of milliseconds - long enough
+// to reject a single noisy sample, short enough to catch a real insertion.
+//
+#define BTS_BALANCE_DWELL_PASSES     ((uint16_t)3)
+
+//
+// Supervisor passes BALANCING may run before giving up and faulting.
+//
+#define BTS_BALANCE_TIMEOUT_PASSES   ((uint16_t)500)
+
+//
+// Soft-start attempts before the slot faults. Per the brief: 40.
+//
+#define BTS_SOFT_START_MAX_RETRIES   ((uint16_t)40)
+
+//
+// Supervisor passes to hold off after a trip during soft start, ~100 ms.
+//
+#define BTS_SOFT_START_RETRY_PASSES  ((uint16_t)7)
+
+//
+// Supervisor passes soft start may run before it is deemed failed and retried.
+//
+#define BTS_SOFT_START_TIMEOUT_PASSES ((uint16_t)200)
+
+//
+// Duty increment per control-ISR pass while balancing. The ISR runs at the
+// ADS131M08 sample rate, so a step this small still converges in well under
+// a second while keeping the rail's rate of change gentle.
+//
+#define BTS_BALANCE_DUTY_STEP_PU     ((float32_t)0.0002)
+
+//
+// Duty ceiling while balancing. Charging an output capacitor needs very
+// little, and a low ceiling bounds the current a bad differential could ask
+// for. Well below BTS_DUTY_SET_MAX_PU.
+//
+#define BTS_BALANCE_DUTY_MAX_PU      ((float32_t)0.15)
 
 #define BTS_SFRA_MODE_CC_PLANT  0
 #define BTS_SFRA_MODE_CC_CLOSED 1

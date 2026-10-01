@@ -74,6 +74,14 @@ typedef struct {
      */
     bool     const_voltage;
     bool     const_current;
+    /*
+     * Pre-charge balance. `waiting` stays true through the whole sequence,
+     * so it answers "is this slot armed"; the other three say where in it.
+     */
+    bool     waiting;
+    bool     balancing;
+    bool     ready;
+    bool     soft_start;
     bool     valid;            /* false until the first good read */
 } bts_channel_state_t;
 

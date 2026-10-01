@@ -44,6 +44,8 @@ static void updateInputVoltage(void);
 static void checkGroupIntegrity(void);
 static void publishStatusToCpu2(void);
 static void serviceTermination(void);
+static void servicePreChargeBalance(void);
+static void serviceDivergenceFault(void);
 
 //
 // Consecutive C1 passes each slot has satisfied its termination condition.
@@ -58,6 +60,20 @@ static void serviceTermination(void);
 // from before it was held.
 //
 static uint16_t termDwell[NUM_CHANNELS];
+
+//
+// Pre-charge balance supervisor state. All indexed by slot.
+//
+//   balanceDwell      consecutive passes the current condition has held, and
+//                     doubles as the BALANCING / SOFT_START elapsed counter
+//   softStartRetries  attempts used, against BTS_SOFT_START_MAX_RETRIES
+//   softStartHold     passes still to wait out after a trip, ~100 ms
+//
+static uint16_t balanceDwell[NUM_CHANNELS];
+static uint16_t softStartRetries[NUM_CHANNELS];
+static uint16_t softStartHold[NUM_CHANNELS];
+static uint16_t divergeDwell[NUM_CHANNELS];
+static uint16_t softStartElapsed[NUM_CHANNELS];
 
 //
 // How long a termination condition must hold. C1 is nominally 10 Hz but was
@@ -287,7 +303,113 @@ static void slotStop(uint16_t ch)
     status[ch].wdTripped = 0;
     status[ch].restored  = 0;
 
+    //
+    // THE DIRECTION BITS ARE CLEARED HERE. They were not, and a stopped slot
+    // kept whichever direction it last ran. Two things went wrong as a
+    // result: the LED driver tests CHARGING|DISCHARGING above its FINISHED
+    // branch, so a slot that had ever run could never show the finished
+    // colour and showed idle-green through the wrong path; and a host
+    // reading the status word saw a direction on a slot doing nothing.
+    //
+    // A pause is different and must NOT clear these - slotPause() leaves
+    // them deliberately, because a resume has to know which way to go.
+    //
+    status[ch].charging    = 0;
+    status[ch].discharging = 0;
+
+    //
+    // Leaving the pre-charge sequence too. A stop is an operator saying
+    // "stand down", so the slot must not keep driving its rail; re-arming is
+    // an explicit WAITING command.
+    //
+    status[ch].waiting   = 0;
+    status[ch].balancing = 0;
+    status[ch].ready     = 0;
+    status[ch].softStart = 0;
+
+    btsSlotPreCharging[ch] = 0U;
+
     termDwell[ch] = 0U;
+    balanceDwell[ch] = 0U;
+    softStartRetries[ch] = 0U;
+}
+
+//
+// ==================== Pre-charge balance lifecycle ====================
+//
+// Arms a slot to watch for a cell approaching its contacts. The converter
+// stays off - WAITING only watches.
+//
+static void slotWait(uint16_t ch)
+{
+    BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
+    BTS_userInputs[ch].enable_logic = 0;
+
+    status[ch].running   = 0;
+    status[ch].stopped   = 0;
+    status[ch].finished  = 0;
+    status[ch].paused    = 0;
+    status[ch].wdTripped = 0;
+    status[ch].restored  = 0;
+
+    status[ch].waiting   = 1;
+    status[ch].balancing = 0;
+    status[ch].ready     = 0;
+    status[ch].softStart = 0;
+
+    btsSlotPreCharging[ch] = 0U;
+    termDwell[ch] = 0U;
+    balanceDwell[ch] = 0U;
+    softStartRetries[ch] = 0U;
+}
+
+//
+// Begin driving the output capacitors toward the ADS reading.
+//
+// enable_logic goes to 1 because the converter genuinely runs here - which is
+// also what arms the trip system for this slot, and that is wanted: balancing
+// drives real current into real capacitance and every protection should be
+// live, exactly as it is for a running slot.
+//
+static void slotBalance(uint16_t ch)
+{
+    status[ch].waiting   = 1;
+    status[ch].balancing = 1;
+    status[ch].ready     = 0;
+    status[ch].softStart = 0;
+
+    //
+    // Hand the control ISR the balancing duty path BEFORE enabling the
+    // stage, so the first pass after enable_logic goes high is already a
+    // balance step and never a stale control-loop output.
+    //
+    btsSlotPreCharging[ch] = 1U;
+    BTS_userInputs[ch].enable_logic = 1;
+
+    balanceDwell[ch] = 0U;
+}
+
+//
+// Rails matched. The converter is parked - not driving, but still armed.
+//
+// This is NOT a latch. An unloaded output capacitor drifts, so the supervisor
+// re-checks every pass and drops back to BALANCING if the differential
+// re-opens while the operator is still seating the cell.
+//
+static void slotReady(uint16_t ch)
+{
+    BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
+    BTS_userInputs[ch].enable_logic = 0;
+
+    status[ch].waiting   = 1;
+    status[ch].balancing = 0;
+    status[ch].ready     = 1;
+    status[ch].softStart = 0;
+
+    btsSlotPreCharging[ch] = 0U;
+    balanceDwell[ch] = 0U;
 }
 
 //
@@ -318,7 +440,24 @@ static void slotFinish(uint16_t ch)
     status[ch].wdTripped = 0;
     status[ch].restored  = 0;
 
+    //
+    // A completed test keeps its direction bit, unlike a stop: a host wants
+    // to know which way the run that just ended was going.
+    //
+    // The pre-charge state is dropped, though. The cell that just finished is
+    // still in the holder, so the slot is not waiting for anything; the
+    // supervisor re-arms WAITING once it sees that cell removed.
+    //
+    status[ch].waiting   = 0;
+    status[ch].balancing = 0;
+    status[ch].ready     = 0;
+    status[ch].softStart = 0;
+
+    btsSlotPreCharging[ch] = 0U;
+
     termDwell[ch] = 0U;
+    balanceDwell[ch] = 0U;
+    softStartRetries[ch] = 0U;
 }
 
 //
@@ -371,6 +510,17 @@ static void applyRestoredSlotStates(void)
 
         slotStop(ch);
         status[ch].finished = ((f & BTS_STATE_F_END) != 0UL) ? 1U : 0U;
+
+        //
+        // Re-arm a slot that was armed when power went away. Only the WAITING
+        // bit is restored - the supervisor works out within a few passes
+        // whether a cell is present and where in the sequence the slot
+        // belongs, from readings that are current rather than remembered.
+        //
+        if ((f & BTS_STATE_F_WAITING) != 0UL) {
+            status[ch].waiting = 1U;
+            status[ch].stopped = 0U;
+        }
 
         if ((f & BTS_STATE_F_RUNNING) != 0UL) {
             status[ch].charging    = ((f & BTS_STATE_F_CHARGING) != 0UL) ? 1U : 0U;
@@ -1399,6 +1549,10 @@ static void publishStatusToCpu2(void)
         bitset |= (status[ch].calVoltageValid & 0x1) << BTS_STATUS_CAL_V_VALID;
         bitset |= (status[ch].calCurrentValid & 0x1) << BTS_STATUS_CAL_I_VALID;
         bitset |= (status[ch].paused & 0x1) << BTS_STATUS_PAUSED;
+        bitset |= (status[ch].waiting & 0x1) << BTS_STATUS_WAITING;
+        bitset |= (status[ch].balancing & 0x1) << BTS_STATUS_BALANCING;
+        bitset |= (status[ch].ready & 0x1) << BTS_STATUS_READY;
+        bitset |= (status[ch].softStart & 0x1) << BTS_STATUS_SOFT_START;
         bitset |= (status[ch].wdTripped & 0x1) << BTS_STATUS_WD_TRIPPED;
         bitset |= (status[ch].restored & 0x1) << BTS_STATUS_RESTORED;
         cpu1Status.statusBits[ch] = bitset;
@@ -1523,6 +1677,38 @@ void modeCallback(float value, uint16_t channel)
         // against eChargeRestrictV / eDischargeRestrictV below. The 10 Hz
         // half lives in C1().
         //
+        //
+        // Arm the pre-charge sequence. Reachable from STOPPED or END only:
+        // a running slot is already past this, and a paused one resumes
+        // rather than re-arming.
+        //
+        // Refused unless the slot's voltage calibration is valid. Both sense
+        // paths are independently calibrated, so on an uncalibrated slot the
+        // differential between them is meaningless - and this sequence drives
+        // the power stage based on exactly that differential. An uncalibrated
+        // slot still runs normally; it just does not get the pre-charge.
+        //
+        if (mode & BTS_MODE_WAITING) {
+            if (status[channel].running || status[channel].paused) {
+                return;
+            }
+            if ((calValidFlags[channel] & BTS_CAL_FLAG_V_VALID) == 0UL) {
+                return;
+            }
+
+            {
+                uint16_t m;
+                for (m = 0; m < NUM_CHANNELS; m++) {
+                    if ((btsSlotLeader[m] == channel) &&
+                        (btsSlotEnabled[m] != 0U)) {
+                        slotWait(m);
+                    }
+                }
+            }
+            updateStatusRegisters();
+            return;
+        }
+
         if (mode & BTS_MODE_CALIBRATE) {
             registers[BTS_REG_IDX(eCalSlot)] = (float32_t)channel;
             calHandleCommand((uint16_t)eCalCmdEnter, (float32_t)0.0);
@@ -1671,6 +1857,17 @@ void modeCallback(float value, uint16_t channel)
                 status[m].paused      = status[channel].paused;
                 status[m].wdTripped   = status[channel].wdTripped;
                 status[m].restored    = status[channel].restored;
+
+                //
+                // The pre-charge state travels too. The members' outputs are
+                // paralleled onto one physical rail, so they balance and soft
+                // start as one converter - a host must not see the leader
+                // balancing while its members read idle.
+                //
+                status[m].waiting     = status[channel].waiting;
+                status[m].balancing   = status[channel].balancing;
+                status[m].ready       = status[channel].ready;
+                status[m].softStart   = status[channel].softStart;
 
                 //
                 // The leader's iref_A is ALREADY its per-slot share, so this
@@ -2087,8 +2284,15 @@ void A3(void)
 void B1(void)
 {
     //
-    // Toggle on-board LED to indicate program execution
+    // Pre-charge balance and the two-path divergence check.
     //
+    // Here rather than in C1 because both need a timebase the C chain cannot
+    // offer: the brief's 100 ms soft-start retry, and a divergence fault
+    // prompt enough to matter while a cell is being seated. B1 was empty and
+    // runs three times faster than any single C task.
+    //
+    servicePreChargeBalance();
+    serviceDivergenceFault();
 
     //
     // Execute task B2 the next time CpuTimer1 decrements to 0
@@ -2247,7 +2451,14 @@ void C1(void)
     for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
         if (BTS_measValues[ch].CellVoltage_V < BTS_REVERSE_POLARITY_V) {
             status[ch].reversePolarity = 1;
-            if (status[ch].running) {
+            //
+            // A balancing or soft-starting slot is driving the stage just as
+            // a running one is, so it is stopped on the same evidence. It
+            // does not carry `running`, which is why the test cannot be
+            // slotIsRunning() alone.
+            //
+            if (status[ch].running || status[ch].balancing ||
+                status[ch].softStart) {
                 slotStop(ch);
             }
         } else {
@@ -2497,6 +2708,323 @@ static void serviceTermination(void)
         }
 
         updateStatusRegisters();
+    }
+}
+
+//
+// ==================== Pre-charge balance supervisor ====================
+//
+// Runs in B1 rather than C1. The brief asks for a 100 ms trip retry and a
+// prompt divergence fault, and B1 is both empty and three times faster than
+// the C chain. (The C chain is no longer the 0.69 Hz it was measured at in
+// September - a latent missed-clock detection was keeping the PLL off full
+// speed, and it now runs above nominal - but B1 is still the better home for
+// a 100 ms timebase.)
+//
+// THE SHUNT PLACEMENT IS WHAT MAKES THIS DECIDABLE. The output capacitors sit
+// after the current sense resistor, so the shunt only reads current the
+// switching FETs produce - never charge moving between a cell and the rail
+// through the contacts. So:
+//
+//   voltages match + current zero      rail is balanced, no cell yet
+//   voltages match + current non-zero  a cell is bridging the contacts
+//
+// Without that, "balanced successfully" and "cell inserted" would be the same
+// reading and the sequence could not be sequenced at all.
+//
+// GROUPED MODES: only the leader is supervised. The members' outputs are
+// physically paralleled onto one rail, so balancing the leader balances all
+// of them - and followers have no control loop of their own to run.
+//
+static void servicePreChargeBalance(void)
+{
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        float32_t vAds;
+        float32_t vInt;
+        float32_t iAds;
+        float32_t tol;
+        uint16_t  cellPresent;
+        uint16_t  matched;
+        uint16_t  loaded;
+
+        //
+        // Disabled slots and followers never run the sequence. A follower is
+        // driven by its leader's duty and cannot balance independently.
+        //
+        if ((btsSlotEnabled[ch] == 0U) || (btsSlotIsLeader[ch] == 0U)) {
+            continue;
+        }
+
+        //
+        // Calibration owns the slot outright. Entering it cancels an armed
+        // sequence - we are deliberately bringing up a controlled external
+        // source and must not also be driving the rail.
+        //
+        if (calSlotIsCalibrating(ch)) {
+            if (status[ch].waiting || status[ch].balancing ||
+                status[ch].ready || status[ch].softStart) {
+                slotStop(ch);
+                updateStatusRegisters();
+            }
+            continue;
+        }
+
+        vAds = BTS_measValues[ch].Vsense_V;
+        vInt = BTS_measValues[ch].CellVoltage_V;
+        iAds = fabsf(BTS_measValues[ch].Isense_A);
+
+        cellPresent = (vAds > BTS_INSERT_DETECT_V) ? 1U : 0U;
+
+        //
+        // Tolerance is a fraction of the ADS reading with an absolute floor,
+        // so a near-zero reading does not demand a match tighter than the
+        // 12-bit converter can resolve.
+        //
+        tol = vAds * BTS_BALANCE_TOL_FRAC;
+        if (tol < BTS_BALANCE_TOL_MIN_V) {
+            tol = BTS_BALANCE_TOL_MIN_V;
+        }
+        matched = (fabsf(vInt - vAds) <= tol) ? 1U : 0U;
+        loaded  = (iAds > BTS_BALANCE_ZERO_I_A) ? 1U : 0U;
+
+        //
+        // A slot that has finished its test re-arms once the cell is taken
+        // out, so the next cell is met by an armed slot without an operator
+        // having to command anything.
+        //
+        if (status[ch].finished && !cellPresent) {
+            slotWait(ch);
+            updateStatusRegisters();
+            continue;
+        }
+
+        //
+        // Nothing below applies unless the slot is in the sequence.
+        //
+        if (!status[ch].waiting) {
+            continue;
+        }
+
+        //
+        // The cell went away, at any point in the sequence. Stand the
+        // converter down and re-arm - this is also how a fault is cleared,
+        // per the brief: pull the cell, the slot goes back to waiting.
+        //
+        if (!cellPresent) {
+            if (status[ch].balancing || status[ch].ready ||
+                status[ch].softStart) {
+                slotWait(ch);
+                updateStatusRegisters();
+            }
+            continue;
+        }
+
+        //
+        // ---- SOFT_START ----
+        //
+        if (status[ch].softStart) {
+            //
+            // Holding off after a trip. The converter is already down; wait
+            // out the ~100 ms and try again.
+            //
+            if (softStartHold[ch] > 0U) {
+                softStartHold[ch]--;
+                if (softStartHold[ch] == 0U) {
+                    if (softStartRetries[ch] >= BTS_SOFT_START_MAX_RETRIES) {
+                        //
+                        // Out of attempts. Fault, and leave it faulted until
+                        // the cell is removed.
+                        //
+                        slotStop(ch);
+                        status[ch].waiting = 1;
+                        status[ch].overCurrentTrip = 1;
+                        updateStatusRegisters();
+                    } else {
+                        softStartRetries[ch]++;
+                        BTS_userInputs[ch].enable_logic = 1;
+                        balanceDwell[ch] = 0U;
+                    }
+                }
+                continue;
+            }
+
+            //
+            // A trip during soft start: drop the converter and schedule a
+            // retry rather than failing outright. Inrush into a pre-biased
+            // cell is exactly what soft start exists to survive.
+            //
+            if (BTS_ctrlLoopVariables[ch].tripFlag != 0U) {
+                BTS_userInputs[ch].enable_logic = 0;
+                softStartHold[ch] = BTS_SOFT_START_RETRY_PASSES;
+                continue;
+            }
+
+            //
+            // Done when the average current is no longer negative - the
+            // inductor current is positive across the whole cycle, so the
+            // synchronous rectifier can be engaged without the cell driving
+            // current backwards through it.
+            //
+            if (BTS_measValues[ch].Isense_A >= (float32_t)0.0) {
+                if (++balanceDwell[ch] >= BTS_BALANCE_DWELL_PASSES) {
+                    status[ch].waiting   = 0;
+                    status[ch].softStart = 0;
+                    status[ch].running   = 1;
+                    status[ch].stopped   = 0;
+                    balanceDwell[ch] = 0U;
+                    softStartRetries[ch] = 0U;
+                    updateStatusRegisters();
+                }
+            } else {
+                balanceDwell[ch] = 0U;
+
+                //
+                // Not converging. Give it a bounded time, then treat it as a
+                // failed attempt and retry - the same path a trip takes.
+                //
+                if (++softStartElapsed[ch] > BTS_SOFT_START_TIMEOUT_PASSES) {
+                    BTS_userInputs[ch].enable_logic = 0;
+                    softStartElapsed[ch] = 0U;
+                    softStartHold[ch] = BTS_SOFT_START_RETRY_PASSES;
+                }
+            }
+            continue;
+        }
+
+        //
+        // ---- READY ----
+        //
+        if (status[ch].ready) {
+            //
+            // A load appearing on a matched rail is the insertion: the shunt
+            // cannot see cell-to-rail charge transfer, so any current here is
+            // the converter meeting a cell that is now connected.
+            //
+            if (loaded) {
+                if (++balanceDwell[ch] >= BTS_BALANCE_DWELL_PASSES) {
+                    status[ch].ready     = 0;
+                    status[ch].softStart = 1;
+                    //
+                    // Out of the balancing duty path: from here the control
+                    // loop runs, in diode emulation, into a connected cell.
+                    //
+                    btsSlotPreCharging[ch] = 0U;
+                    BTS_userInputs[ch].enable_logic = 1;
+                    balanceDwell[ch] = 0U;
+                    softStartRetries[ch] = 0U;
+                    softStartHold[ch] = 0U;
+                    updateStatusRegisters();
+                }
+                continue;
+            }
+
+            //
+            // READY is re-verified, not latched: an unloaded output capacitor
+            // drifts, and the operator may take a while to seat the cell.
+            //
+            if (!matched) {
+                slotBalance(ch);
+                updateStatusRegisters();
+            } else {
+                balanceDwell[ch] = 0U;
+            }
+            continue;
+        }
+
+        //
+        // ---- BALANCING ----
+        //
+        if (status[ch].balancing) {
+            if (++balanceDwell[ch] > BTS_BALANCE_TIMEOUT_PASSES) {
+                //
+                // Could not reach the target. Stand down and fault rather
+                // than drive the rail indefinitely.
+                //
+                slotStop(ch);
+                status[ch].waiting = 1;
+                updateStatusRegisters();
+                continue;
+            }
+
+            //
+            // Balanced only when the voltages agree AND nothing is drawing -
+            // a matched pair with current flowing means a cell is already
+            // connected, which is a different state.
+            //
+            if (matched && !loaded) {
+                slotReady(ch);
+                updateStatusRegisters();
+            }
+            continue;
+        }
+
+        //
+        // ---- WAITING ----
+        //
+        // A cell is approaching. If the rail already matches there is nothing
+        // to do; otherwise drive it.
+        //
+        if (matched) {
+            slotReady(ch);
+        } else {
+            slotBalance(ch);
+        }
+        updateStatusRegisters();
+    }
+}
+
+//
+// Faults a RUNNING slot whose two sense paths have diverged.
+//
+// A rapid rise on the converter rail that the ADS path does not see means the
+// cell is no longer bridging the contacts - a cell pulled mid-test, or a
+// contact that has opened - and the converter is now driving into its own
+// output capacitor with the loop still asking for current.
+//
+static void serviceDivergenceFault(void)
+{
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        float32_t vAds;
+        float32_t vInt;
+        float32_t limit;
+
+        if ((slotIsRunning(ch) == 0U) || calSlotIsCalibrating(ch)) {
+            continue;
+        }
+
+        vAds = BTS_measValues[ch].Vsense_V;
+        vInt = BTS_measValues[ch].CellVoltage_V;
+
+        //
+        // Referenced to the ADS path, which is the one that still reads the
+        // cell. A floor keeps a near-zero reading from making any difference
+        // look like 20%.
+        //
+        limit = vAds * BTS_DIVERGE_FAULT_FRAC;
+        if (limit < BTS_BALANCE_TOL_MIN_V) {
+            limit = BTS_BALANCE_TOL_MIN_V;
+        }
+
+        if (fabsf(vInt - vAds) > limit) {
+            if (++divergeDwell[ch] >= BTS_BALANCE_DWELL_PASSES) {
+                uint16_t m;
+
+                for (m = 0; m < NUM_CHANNELS; m++) {
+                    if ((btsSlotLeader[m] == ch) && (btsSlotEnabled[m] != 0U)) {
+                        slotStop(m);
+                        status[m].groupDisconnect = 1;
+                    }
+                }
+                divergeDwell[ch] = 0U;
+                updateStatusRegisters();
+            }
+        } else {
+            divergeDwell[ch] = 0U;
+        }
     }
 }
 

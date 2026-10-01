@@ -591,9 +591,17 @@ static inline void BTS_ctrlDirection(uint32_t EPWM_BASE, BTS_ctrlLoopVariable *c
 
     }
 
-    ctrlLoopVariable->dutyH_pu = ctrlLoopVariable->dutySet_pu;
-    ctrlLoopVariable->dutyL_pu = ctrlLoopVariable->dutySet_pu;
-
+    //
+    // The two unconditional assignments that used to sit here have been
+    // removed. They overwrote dutyH_pu and dutyL_pu with dutySet_pu on every
+    // pass, discarding all four branches above - so the asymmetric duty this
+    // function computes to protect against reverse current never reached the
+    // PWM. The action-qualifier forcing still took effect, which is why the
+    // protection appeared to work; only the duty shaping was lost.
+    //
+    // Present since d184a22. Soft start needs exactly this asymmetric path,
+    // which is why it is fixed here rather than worked around.
+    //
 }
 
 #pragma FUNC_ALWAYS_INLINE(BTS_ctrlISR)
@@ -756,6 +764,64 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
 // The interleave between them comes from the ePWM phase configured at init,
 // not from anything done here.
 //
+//
+// 1 while a slot is actively driving its rail toward the ADS reading.
+//
+// Set by the supervisor in B1, read by the control ISR. A plain uint16_t per
+// slot: the ISR only tests it, and a torn read is not reachable on a 16-bit
+// aligned word on this core.
+//
+extern uint16_t btsSlotPreCharging[];
+
+//
+// One balancing step. Called from the control ISR in place of the loop.
+//
+// Moves the rail toward the target by a bounded step per sample, so the
+// approach is gradual regardless of how far away it starts. The step is tiny
+// because this runs at the ADS131M08 sample rate - thousands of passes per
+// second - so even a small increment converges quickly.
+//
+#pragma FUNC_ALWAYS_INLINE(BTS_balanceSlot)
+static inline void BTS_balanceSlot(uint16_t ch, uint32_t EPWM_BASE,
+                                   BTS_ctrlLoopVariable *ctrlLoopVariable)
+{
+    float32_t target = BTS_measValues[ch].Vsense_V;
+    float32_t actual = BTS_measValues[ch].CellVoltage_V;
+    float32_t duty   = ctrlLoopVariable->dutySet_pu;
+
+    //
+    // A trip stands the stage down immediately, the same as anywhere else.
+    //
+    if (ctrlLoopVariable->tripFlag != 0U) {
+        BTS_HAL_updateDuty(EPWM_BASE, (float32_t)0.0, (float32_t)0.0);
+        ctrlLoopVariable->dutySet_pu = (float32_t)0.0;
+        return;
+    }
+
+    if (actual < target) {
+        duty += BTS_BALANCE_DUTY_STEP_PU;
+    } else if (actual > target) {
+        duty -= BTS_BALANCE_DUTY_STEP_PU;
+    }
+
+    //
+    // Clamped well below the running maximum. Balancing charges capacitance,
+    // which needs very little duty, and a low ceiling bounds the current a
+    // fault in the differential could ask for.
+    //
+    if (duty > BTS_BALANCE_DUTY_MAX_PU) {
+        duty = BTS_BALANCE_DUTY_MAX_PU;
+    } else if (duty < BTS_DUTY_SET_MIN_PU) {
+        duty = BTS_DUTY_SET_MIN_PU;
+    }
+
+    ctrlLoopVariable->dutySet_pu = duty;
+    ctrlLoopVariable->dutyH_pu   = duty;
+    ctrlLoopVariable->dutyL_pu   = duty;
+
+    BTS_HAL_updateDuty(EPWM_BASE, duty, duty);
+}
+
 #pragma FUNC_ALWAYS_INLINE(BTS_runSlot)
 static inline void BTS_runSlot(uint16_t ch, BTS_DCL_CTRL_TYPE* ctrl_cc,
                                BTS_DCL_CTRL_TYPE* ctrl_cv, uint32_t EPWM_BASE,
@@ -768,6 +834,26 @@ static inline void BTS_runSlot(uint16_t ch, BTS_DCL_CTRL_TYPE* ctrl_cc,
     }
 
     if (btsSlotIsLeader[ch] != 0U) {
+        //
+        // BALANCING: drive the output capacitors toward the ADS reading with
+        // no cell on the rail yet.
+        //
+        // This is not the control loop. The loop regulates current into a
+        // cell; here there is no cell, only capacitance, and the target is a
+        // voltage. A slew-limited duty nudge is both sufficient and far
+        // safer than letting a current loop wind up against an open circuit.
+        //
+        // The synchronous rectifier stays commanded, because the rail must be
+        // able to move DOWN as well as up - a cell at 3.0 V meeting a rail at
+        // 3.6 V needs the low side to pull it down. That is safe here
+        // precisely because no cell is connected: there is nothing to drive
+        // current backwards out of.
+        //
+        if (btsSlotPreCharging[ch] != 0U) {
+            BTS_balanceSlot(ch, EPWM_BASE, ctrlLoopVariable);
+            return;
+        }
+
         if (btsSlotUsesIntAdc[ch] != 0U) {
             voltage_16b = BTS_cellVoltageAsCtrl16b(&BTS_measValues[ch],
                                                    &BTS_userInputs[ch]);

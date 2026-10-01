@@ -322,6 +322,8 @@ typedef enum {
 #define BTS_MODE_CALIBRATE          0x04u
 #define BTS_MODE_PAUSE              0x08u
 #define BTS_MODE_RESUME             0x10u
+/* Arms the pre-charge sequence. Only accepted from STOPPED or END. */
+#define BTS_MODE_WAITING            0x20u
 #define BTS_MODE_RUN_DISCHARGE      (BTS_MODE_RUN)
 #define BTS_MODE_RUN_CHARGE         (BTS_MODE_RUN | BTS_MODE_CHARGE)
 
@@ -368,6 +370,22 @@ typedef enum {
 #define BTS_STATUS_PAUSED           (1u << 15)
 #define BTS_STATUS_WD_TRIPPED       (1u << 17)
 #define BTS_STATUS_RESTORED         (1u << 18)
+/*
+ * Pre-charge balance. A cell is seated onto a rail already driven to match
+ * it, so the contact closes across near-zero volts.
+ *
+ *   WAITING    armed and watching for a cell; stays set through the sequence
+ *   BALANCING  driving the output capacitors to the cell's voltage
+ *   READY      rails matched - safe to seat. Clears if the rail drifts.
+ *   SOFT_START diode-emulation start into the now-connected cell
+ *
+ * MASKS, like everything else in this file, against bit POSITIONS on the
+ * C2000. See the warning above.
+ */
+#define BTS_STATUS_WAITING          (1u << 16)
+#define BTS_STATUS_BALANCING        (1u << 19)
+#define BTS_STATUS_READY            (1u << 20)
+#define BTS_STATUS_SOFT_START       (1u << 21)
 
 /*
  * A normally terminated test is FINISHED, bit 2. That bit was declared but

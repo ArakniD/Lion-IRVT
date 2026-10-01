@@ -46,6 +46,13 @@ uint16_t btsGroupMembers[PWM_CH_MAX]   = {1, 1, 1, 1, 1, 1, 1, 1};
 uint16_t btsSlotUsesIntAdc[PWM_CH_MAX] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 //
+// 1 while a slot is driving its rail toward the ADS reading during the
+// pre-charge balance. Written by the supervisor in B1, read by the control
+// ISR. See BTS_balanceSlot().
+//
+uint16_t btsSlotPreCharging[PWM_CH_MAX] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+//
 // Slot tuning (SFRA). Latched from the straps in main(); see bts.h.
 //
 uint16_t btsSfraActive = 0U;

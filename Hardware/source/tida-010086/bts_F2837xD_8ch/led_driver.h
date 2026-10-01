@@ -21,6 +21,12 @@
 #define COLOR_GREEN {255, 0, 0}     // Idle / not under control
 #define COLOR_BLUE  {0, 0, 255}     // Charging or discharging
 #define COLOR_WHITE {255, 255, 255} // Test complete
+//
+// GRB order, like every table here - not RGB. Yellow is red plus green, which
+// happens to read the same either way, but anything else written as RGB would
+// be silently wrong.
+//
+#define COLOR_YELLOW {255, 255, 0}  // Balancing / soft start
 
 //
 // Flash timing, in 12.5 ms ticks of the 80 Hz update.
@@ -46,6 +52,22 @@
 // Slower than the fault flashes: a pause is a held state, not an alarm.
 #define LED_PAUSE_PERIOD        80U   // 1000 ms
 #define LED_PAUSE_ON            40U
+
+//
+// Pre-charge balance. Yellow while the rail is being driven or the converter
+// is soft starting; green flashing at 500 ms once the rail matches and a cell
+// can be seated.
+//
+// READY flashes rather than sitting solid because solid green is already
+// "idle" - the final fallback in LEDDriver_update() - and an operator must be
+// able to tell a slot that is ready to accept a cell from one that is simply
+// doing nothing.
+//
+#define LED_BALANCE_PERIOD      24U   // 300 ms
+#define LED_BALANCE_ON          12U
+
+#define LED_READY_PERIOD        40U   // 500 ms
+#define LED_READY_ON            20U
 
 // Function prototypes
 void LEDDriver_init(void);

@@ -120,6 +120,10 @@ static void build_slot_status(uint8_t slot, const slot_status_t *st,
     out->bts_discharge_seconds = st->bts_discharge_seconds;
     out->bts_const_voltage     = st->bts_const_voltage ? 1 : 0;
     out->bts_const_current     = st->bts_const_current ? 1 : 0;
+    out->bts_waiting           = st->bts_waiting ? 1 : 0;
+    out->bts_balancing         = st->bts_balancing ? 1 : 0;
+    out->bts_ready             = st->bts_ready ? 1 : 0;
+    out->bts_soft_start        = st->bts_soft_start ? 1 : 0;
 }
 
 static void build_slot_config(uint8_t slot, ble_slot_config_t *out)

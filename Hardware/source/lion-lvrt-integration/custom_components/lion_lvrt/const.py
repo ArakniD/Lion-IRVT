@@ -200,6 +200,12 @@ class StatusBit(IntFlag):
     # PAUSED is not a direction: the slot keeps CHARGING or DISCHARGING set
     # alongside it, so a host sees both that it is paused and what it would
     # resume into. Bit 16 is unused and reads a constant 0.
+    #: Pre-charge balance (ToDo 08). WAITING stays set through the sequence.
+    WAITING = 1 << 16
+    BALANCING = 1 << 19
+    READY = 1 << 20
+    SOFT_START = 1 << 21
+
     PAUSED = 1 << 15
     WD_TRIPPED = 1 << 17
     RESTORED = 1 << 18

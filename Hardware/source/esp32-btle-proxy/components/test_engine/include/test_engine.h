@@ -186,6 +186,11 @@ typedef struct {
      */
     bool             bts_const_voltage;
     bool             bts_const_current;
+    /* Pre-charge balance, straight through from the BTS. */
+    bool             bts_waiting;
+    bool             bts_balancing;
+    bool             bts_ready;
+    bool             bts_soft_start;
     /* The BTS's per-direction counters, which survive a pause. */
     float            bts_charge_mah;
     float            bts_charge_mwh;
