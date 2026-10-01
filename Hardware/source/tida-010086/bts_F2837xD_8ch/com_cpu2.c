@@ -322,6 +322,7 @@ void BTS_serviceADS1119(void);
 void BTS_serviceDeferredWork(void);
 bool saveSlotTuning(void);
 static bool loadSlotTuning(void);
+static void seedSlotTuningDefaults(void);
 
 //
 // Set when a host writes any slot-tuning register; cleared once the record
@@ -1304,6 +1305,21 @@ void loadCalibration(void)
     // CPU1 applies both this and the calibration above when it sees the
     // single CAL_RELOAD flag raised after this function returns.
     //
+    //
+    // Seed the compile-time defaults FIRST, then let the stored record
+    // overwrite them if there is one.
+    //
+    // THIS HAS TO HAPPEN ON CPU2. registers[] lives in CPU2TOCPU1RAM, which
+    // the F2837xD makes writable only by CPU2 - CPU1's writes to it are
+    // silently discarded by the hardware. BTS_seedSlotTuningRegisters() on
+    // CPU1 therefore never took effect, and every DCL coefficient
+    // initialised to zero. A biquad with all-zero coefficients produces a
+    // constant zero output, so no slot could regulate at all.
+    //
+    // Found on hardware 2026-10-02: AT+CVB0? read 0.00 where the shipped
+    // default is 8.0377, and BTS_ctrl_cv[0].b0 was 0.0 on the live target.
+    //
+    seedSlotTuningDefaults();
     (void)loadSlotTuning();
 
     //
@@ -1470,6 +1486,34 @@ bool saveSlotTuning(void)
 // the shipped tuning rather than on zeros - a zeroed biquad outputs a
 // constant zero and no slot would regulate at all.
 //
+//
+// Writes the compile-time BTS_DCL_* constants into the tuning registers.
+//
+// The mirror of BTS_seedSlotTuningRegisters() on CPU1, which cannot work
+// because CPU1 may not write CPU2TOCPU1RAM. CPU1 keeps its copy for the
+// clamp check in BTS_applySlotTuning(), which only READS registers[].
+//
+static void seedSlotTuningDefaults(void)
+{
+    uint16_t base = BTS_REG_IDX(BTS_TUNING_BASE_ADDR);
+
+    registers[base + BTS_TUNE_CC_B0] = BTS_DCL_CC_B0;
+    registers[base + BTS_TUNE_CC_B1] = BTS_DCL_CC_B1;
+    registers[base + BTS_TUNE_CC_B2] = BTS_DCL_CC_B2;
+    registers[base + BTS_TUNE_CC_A1] = BTS_DCL_CC_A1;
+    registers[base + BTS_TUNE_CC_A2] = BTS_DCL_CC_A2;
+
+    registers[base + BTS_TUNE_CV_Z0] = BTS_DCL_CV_Z0;
+    registers[base + BTS_TUNE_CV_Z1] = BTS_DCL_CV_Z1;
+    registers[base + BTS_TUNE_CV_P1] = BTS_DCL_CV_P1;
+
+    registers[base + BTS_TUNE_CV_B0] = BTS_DCL_CV_B0;
+    registers[base + BTS_TUNE_CV_B1] = BTS_DCL_CV_B1;
+    registers[base + BTS_TUNE_CV_B2] = BTS_DCL_CV_B2;
+    registers[base + BTS_TUNE_CV_A1] = BTS_DCL_CV_A1;
+    registers[base + BTS_TUNE_CV_A2] = BTS_DCL_CV_A2;
+}
+
 static bool loadSlotTuning(void)
 {
     uint16_t bytes[TUNING_TOTAL_WORDS * 2U];

@@ -426,23 +426,30 @@ void BTS_initProgramVariables(void)
 // never move off its floor and no slot would regulate at all. A silent total
 // failure to control, from a block of registers most users never touch.
 //
+//
+// NOTE: THIS FUNCTION CANNOT WRITE registers[] AND NO LONGER TRIES.
+//
+// registers[] is placed in CPU2TOCPU1RAM, which the F2837xD makes writable
+// only by CPU2; writes from CPU1 are silently discarded. The seeding is done
+// by seedSlotTuningDefaults() in com_cpu2.c instead, before the F-RAM record
+// is loaded over it.
+//
+// Kept as a no-op rather than deleted because the call site in main() reads
+// as the intent ("defaults before the reload arrives") and because deleting
+// it would leave bts.h's prototype dangling for the CPU2 build, which
+// compiles every root source.
+//
+// The original version assigned to registers[] here and appeared to work in
+// review: the assignments compile, the addresses are valid, and nothing
+// faults. The values simply never land. Found on hardware 2026-10-02.
+//
 void BTS_seedSlotTuningRegisters(void)
 {
-    registers[BTS_REG_IDX(eDCL_CC_B0)] = BTS_DCL_CC_B0;
-    registers[BTS_REG_IDX(eDCL_CC_B1)] = BTS_DCL_CC_B1;
-    registers[BTS_REG_IDX(eDCL_CC_B2)] = BTS_DCL_CC_B2;
-    registers[BTS_REG_IDX(eDCL_CC_A1)] = BTS_DCL_CC_A1;
-    registers[BTS_REG_IDX(eDCL_CC_A2)] = BTS_DCL_CC_A2;
-
-    registers[BTS_REG_IDX(eDCL_CV_Z0)] = BTS_DCL_CV_Z0;
-    registers[BTS_REG_IDX(eDCL_CV_Z1)] = BTS_DCL_CV_Z1;
-    registers[BTS_REG_IDX(eDCL_CV_P1)] = BTS_DCL_CV_P1;
-
-    registers[BTS_REG_IDX(eDCL_CV_B0)] = BTS_DCL_CV_B0;
-    registers[BTS_REG_IDX(eDCL_CV_B1)] = BTS_DCL_CV_B1;
-    registers[BTS_REG_IDX(eDCL_CV_B2)] = BTS_DCL_CV_B2;
-    registers[BTS_REG_IDX(eDCL_CV_A1)] = BTS_DCL_CV_A1;
-    registers[BTS_REG_IDX(eDCL_CV_A2)] = BTS_DCL_CV_A2;
+    //
+    // Intentionally empty on CPU1. See the note above: the writes this used
+    // to make were discarded by the hardware. seedSlotTuningDefaults() in
+    // com_cpu2.c does the work, on the core that owns the memory.
+    //
 }
 
 //

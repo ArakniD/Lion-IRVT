@@ -1251,7 +1251,26 @@ void main(void)
     //
     BTS_seedSlotTuningRegisters();
     BTS_initController();
-    BTS_applySlotTuning();
+
+    //
+    // DELIBERATELY NOT calling BTS_applySlotTuning() here.
+    //
+    // registers[] lives in CPU2TOCPU1RAM and is populated by CPU2, which at
+    // this point in CPU1's boot has not run yet - the block still reads all
+    // zeros. BTS_initController() has just installed valid coefficients from
+    // the compile-time BTS_DCL_* constants, and applying a zeroed register
+    // block over the top would replace them with a biquad that outputs a
+    // constant zero, leaving no slot able to regulate.
+    //
+    // CPU2 seeds the defaults, loads any stored tuning over them, and then
+    // raises BTS_IPC_FLAG_CAL_RELOAD. The apply happens there, by which time
+    // the registers hold real values. A host write to any tuning register
+    // re-applies as well.
+    //
+    // Found on hardware 2026-10-02: the controllers read 0.0 at runtime
+    // while registers[] held the correct values, because this call ran
+    // before CPU2 had written them.
+    //
 
     //
     // Configure DCL and SFRA libraries
