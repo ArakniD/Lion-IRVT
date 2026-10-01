@@ -236,9 +236,9 @@ that before adding one.
 
 ## 2. Slot state model
 
-### 2.1 The five states
+### 2.1 The states
 
-A slot is in exactly one of:
+Five run states, plus the four-state pre-charge sequence that precedes a run.
 
 | State | Meaning |
 |---|---|
@@ -248,9 +248,23 @@ A slot is in exactly one of:
 | **PAUSED** | Was charging or discharging; converter off, direction remembered, counters frozen and intact. |
 | **END** | Test finished normally. Converter off, counters hold final values. |
 
+The pre-charge states, detailed in [§2.5](#25-pre-charge-balance--how-a-cell-is-seated-safely):
+
+| State | Meaning |
+|---|---|
+| **WAITING** | Armed and watching for a cell. Converter off. |
+| **BALANCING** | Driving the rail to match the approaching cell. No cell connected yet. |
+| **READY** | Rails matched — safe to seat a cell. Re-verified, not latched. |
+| **SOFT_START** | Diode-emulation start into a cell that has just made contact. |
+
 `PAUSED` is **not** a direction of its own. A paused slot keeps its
 `CHARGING` or `DISCHARGING` status bit set alongside `PAUSED`, so a host can
 see both that it is paused and what it will resume into.
+
+**None of the pre-charge states is `running`.** Every supervisor that keys off
+`slotIsRunning()` — the accumulators chief among them — therefore ignores a
+balancing slot, which is deliberate: it is charging capacitors, not a cell.
+The protections that must apply anyway are listed in §2.5.
 
 ### 2.2 Status bits
 
@@ -290,23 +304,85 @@ semantic, do not add a second bit for the same thing.
 
 ### 2.3 Transitions
 
-```
-  STOPPED ──start(charge)──> CHARGING ──┐
-  STOPPED ──start(discharge)─> DISCHARGING ──┐
-                                             │
-  CHARGING/DISCHARGING ──watchdog timeout──> PAUSED (+WD_TRIPPED)
-  CHARGING/DISCHARGING ──pause command────> PAUSED
-  CHARGING/DISCHARGING ──trip/fault───────> STOPPED
-  CHARGING/DISCHARGING ──termination──────> END
+The whole slot lifecycle, including the pre-charge sequence that precedes a
+run. The pre-charge states are detailed in [§2.5](#25-pre-charge-balance--how-a-cell-is-seated-safely);
+they are shown here so the one place a reader looks for "what can a slot do"
+is complete.
 
-  PAUSED ──resume command──> CHARGING or DISCHARGING  (whichever it held)
-  PAUSED ──stop command────> STOPPED
-  END    ──start───────────> CHARGING or DISCHARGING
-  boot with saved run ─────> PAUSED (+RESTORED)
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    STOPPED: STOPPED
+    STOPPED: idle, converter off
+    CHARGING: CHARGING
+    DISCHARGING: DISCHARGING
+    PAUSED: PAUSED
+    PAUSED: held, direction remembered
+    END: END
+    END: ran to termination
+
+    [*] --> STOPPED
+
+    state "Pre-charge sequence" as PRE {
+        direction TB
+        WAITING: WAITING
+        WAITING: armed, converter off
+        BALANCING: BALANCING
+        BALANCING: driving the rail, no cell yet
+        READY: READY
+        READY: matched - safe to seat a cell
+        SOFT_START: SOFT_START
+        SOFT_START: diode emulation into a seated cell
+
+        WAITING --> BALANCING: ADS above 0.25 V<br/>and rails differ
+        WAITING --> READY: ADS above 0.25 V<br/>and rails already match
+        BALANCING --> READY: matched AND<br/>current zero
+        READY --> BALANCING: rail drifts<br/>READY is not a latch
+        READY --> SOFT_START: current appears<br/>on a matched rail
+        SOFT_START --> SOFT_START: trip, 100 ms hold,<br/>retry up to 40 times
+    }
+
+    STOPPED --> WAITING: mode 0x20<br/>needs CAL_V_VALID
+    STOPPED --> CHARGING: start charge
+    STOPPED --> DISCHARGING: start discharge
+
+    SOFT_START --> CHARGING: avg current<br/>no longer negative
+    SOFT_START --> DISCHARGING: avg current<br/>no longer negative
+
+    CHARGING --> PAUSED: pause cmd<br/>watchdog timeout
+    DISCHARGING --> PAUSED: pause cmd<br/>watchdog timeout
+    PAUSED --> CHARGING: resume
+    PAUSED --> DISCHARGING: resume
+    PAUSED --> STOPPED: stop
+
+    CHARGING --> STOPPED: trip, fault,<br/>reverse polarity
+    DISCHARGING --> STOPPED: trip, fault,<br/>reverse polarity
+    CHARGING --> END: termination
+    DISCHARGING --> END: termination
+
+    END --> WAITING: cell removed<br/>auto re-arm
+    END --> CHARGING: start
+    END --> DISCHARGING: start
+
+    PRE --> STOPPED: stop cmd,<br/>reverse polarity,<br/>balance timeout
+    PRE --> WAITING: cell removed<br/>clears a fault
+
+    [*] --> PAUSED: boot with a saved run<br/>plus RESTORED
+    [*] --> WAITING: boot with a saved arm<br/>BTS_STATE_F_WAITING
 ```
 
 **Entering PAUSED always zeroes the converter reference first**, then clears
-`enable_logic`. Same ordering as a trip exit.
+`enable_logic`. Same ordering as a trip exit — and the same ordering every
+pre-charge helper uses.
+
+**PAUSED is not a direction.** A paused slot keeps its `CHARGING` or
+`DISCHARGING` bit, which is how a resume knows which way to go. A **stop**
+clears them; a pause does not.
+
+**The pre-charge states are not `running`.** Only `SOFT_START` leads into a
+run, and the transition sets `running` at the moment it happens. This matters
+to every supervisor that keys off `slotIsRunning()` — see §2.5.
 
 ### 2.5 Pre-charge balance — how a cell is seated safely
 
@@ -316,25 +392,54 @@ rectifier onto a pre-biased cell drives current backwards through the power
 stage. The pre-charge sequence drives the rail to match the cell *before*
 contact, so the connection closes across near-zero volts.
 
-```
-STOPPED --(mode 0x20)--> WAITING
-                            |
-                  ADS path > 0.25 V
-                            v
-                        BALANCING <-------+
-                            |             |
-                  voltages match AND      | rail drifts
-                  current is zero         |
-                            v             |
-                          READY ----------+
-                            |
-                  current appears on a matched rail
-                            v
-                       SOFT_START --(trip)--> 100 ms hold, retry (max 40)
-                            |
-                  average current >= 0
-                            v
-                         RUNNING
+What the supervisor does on each pass, for one armed slot. This runs in `B1`,
+so every decision below is re-evaluated a few hundred times a second.
+
+```mermaid
+flowchart TD
+    START(["B1 pass, slot armed"]) --> READ["Read both paths:<br/>Vsense_V (ADS)<br/>CellVoltage_V (internal)<br/>Isense_A"]
+    READ --> CELL{"ADS > 0.25 V ?"}
+
+    CELL -->|no| REARM["Stand converter down<br/>return to WAITING"]
+    REARM --> DONE([end of pass])
+
+    CELL -->|yes| WHERE{"where in the<br/>sequence ?"}
+
+    WHERE -->|WAITING| MATCH1{"rails match<br/>within 10% ?"}
+    MATCH1 -->|yes| TOREADY["READY"]
+    MATCH1 -->|no| TOBAL["BALANCING<br/>enable_logic = 1"]
+
+    WHERE -->|BALANCING| BAL{"matched AND<br/>current zero ?"}
+    BAL -->|yes| TOREADY
+    BAL -->|no| TIMEOUT{"timeout<br/>exceeded ?"}
+    TIMEOUT -->|yes| FAULT["stand down, FAULT"]
+    TIMEOUT -->|no| DRIVE["step duty toward<br/>the ADS reading"]
+
+    WHERE -->|READY| LOAD{"current<br/>flowing ?"}
+    LOAD -->|"yes - a cell is<br/>bridging the contacts"| TOSS["SOFT_START<br/>enable_logic = 1"]
+    LOAD -->|no| DRIFT{"still<br/>matched ?"}
+    DRIFT -->|yes| HOLD["stay READY"]
+    DRIFT -->|"no - rail drifted"| TOBAL
+
+    WHERE -->|SOFT_START| TRIP{"tripped ?"}
+    TRIP -->|yes| RETRY{"retries<br/>left ?"}
+    RETRY -->|yes| HOLDOFF["converter off<br/>100 ms hold, retry"]
+    RETRY -->|"no - 40 used"| FAULT
+    TRIP -->|no| AVG{"average current<br/>>= 0 ?"}
+    AVG -->|yes| RUN(["RUNNING"])
+    AVG -->|no| WAITDCM["keep ramping in DCM"]
+
+    TOREADY --> DONE
+    TOBAL --> DONE
+    DRIVE --> DONE
+    HOLD --> DONE
+    TOSS --> DONE
+    HOLDOFF --> DONE
+    WAITDCM --> DONE
+    FAULT --> DONE
+
+    style FAULT stroke:#c00
+    style RUN stroke:#0a0
 ```
 
 **Why the current reading is what decides it.** The output capacitors sit
@@ -392,9 +497,19 @@ passes from readings that are current rather than remembered.
 
 #### Where it runs, and why not in C1
 
-The supervisor lives in **B1**, which was empty. The brief asks for a 100 ms
-trip retry and a prompt divergence fault, and B1 runs three times faster than
-any single C task.
+The supervisor lives in **B1**, which was empty.
+
+B1 dispatches at `TASKB_FREQ_HZ` and each of its three sub-tasks therefore
+runs three times faster than a C sub-task. That margin is what makes the
+brief's 100 ms trip retry expressible at all: the retry hold is counted in
+supervisor passes, so it needs a timebase comfortably finer than 100 ms.
+
+The C chain would now *almost* do — it was re-measured at 28.6 Hz per
+sub-task on 2026-10-02, having been 0.69 Hz before a missed-clock detection
+fix — but C1 already carries the input-voltage guard, the reverse-polarity
+sweep, group integrity and termination. B1 was empty, and a supervisor that
+drives FETs is better placed where it is not queued behind four other
+passes.
 
 #### Divergence fault while RUNNING
 
@@ -416,6 +531,100 @@ passes stops the slot and its whole group.
 MONITORING from the original brief is deliberately absent: an armed slot is by
 definition watching, so it would never be observably distinct from WAITING,
 and only bits 22 and 23 now remain below the float32 ceiling.
+
+### 2.5.1 Slot indication — the WS2812B string
+
+Eight WS2812B pixels, one per slot, refreshed at 80 Hz from CPU Timer 2 on
+CPU2. **Production build only**: the string needs GPIO29, which the AT console
+takes when `BTS_DEBUG_CONSOLE` is true. Since the AT console moved to the
+ESP32 the unit ships with `BTS_DEBUG_CONSOLE` false, so the LEDs are live and
+channel 1's GPIO trip input comes back with them.
+
+**They are RGB, not RGBW** — three bytes per pixel, and the colour tables are
+in **GRB order**, so `COLOR_RED` is `{0, 255, 0}`. Yellow reads the same
+either way, but any new colour written as RGB would be silently wrong.
+
+#### Priority is safety-first, and the order is load bearing
+
+`LEDDriver_update()` is a single if/else-if chain: the **first** condition
+that matches wins, so a slot that is both tripped and calibrating shows the
+trip. Reading down the chain is reading the priority.
+
+```mermaid
+flowchart TD
+    S(["slot status word"]) --> D{SLOT_DISABLED}
+    D -->|yes| DC["RED solid<br/><i>strap masked it off</i>"]
+    D -->|no| T{OVERCURRENT_TRIP}
+    T -->|yes| TC["RED 2000/500 ms"]
+    T -->|no| R{REVERSE_POLARITY}
+    R -->|yes| RC["RED 125/125 ms"]
+    R -->|no| G{GROUP_DISCONNECT}
+    G -->|yes| GC["RED 250/250 ms"]
+    G -->|no| C{CALIBRATING}
+    C -->|yes| CC["WHITE 150/150 ms"]
+    C -->|no| P{PAUSED}
+    P -->|yes| PC["RED if watchdog/restore<br/>BLUE if deliberate<br/>500/500 ms"]
+    P -->|no| B{"BALANCING or<br/>SOFT_START"}
+    B -->|yes| BC["YELLOW 150/150 ms"]
+    B -->|no| RY{READY}
+    RY -->|yes| RYC["GREEN 250/250 ms<br/><i>safe to seat a cell</i>"]
+    RY -->|no| CH{"CHARGING or<br/>DISCHARGING"}
+    CH -->|yes| CHC{RUNNING}
+    CHC -->|yes| CHR["BLUE solid"]
+    CHC -->|no| CHS["GREEN solid"]
+    CH -->|no| F{FINISHED}
+    F -->|yes| FC["WHITE solid"]
+    F -->|no| IC["GREEN solid<br/><i>idle</i>"]
+
+    style DC stroke:#c00
+    style TC stroke:#c00
+    style RC stroke:#c00
+    style GC stroke:#c00
+    style BC stroke:#da0
+    style RYC stroke:#0a0
+    style IC stroke:#0a0
+```
+
+#### Why the new states sit where they do
+
+**Above the direction states.** A slot that has ever run keeps its
+`CHARGING`/`DISCHARGING` bit until it is stopped, so anything ranked below
+that branch is unreachable for such a slot. Balancing and ready are tested
+first.
+
+**Below every fault.** A slot that trips while balancing must still read as
+tripped — the same reasoning the calibration flash already carried.
+
+**READY flashes rather than sitting solid**, because solid green is already
+the idle colour and the final fallback. An operator has to be able to tell a
+slot that is ready to accept a cell from one doing nothing at all. Yellow was
+free on the unit, so balancing and soft start share it — they are one
+operation from the operator's side: *the slot is preparing itself, do not
+seat a cell yet*.
+
+| Meaning | Colour | Pattern |
+|---|---|---|
+| Strap-disabled | red | solid |
+| Over-current trip | red | 2000 ms on / 500 off |
+| Reverse polarity | red | 125/125 |
+| Group disconnect | red | 250/250 |
+| Calibrating | white | 150/150 |
+| Paused (watchdog or restore) | red | 500/500 |
+| Paused (deliberate) | blue | 500/500 |
+| **Balancing / soft start** | **yellow** | **150/150** |
+| **Ready — seat a cell now** | **green** | **250/250** |
+| Running | blue | solid |
+| Finished | white | solid |
+| Idle | green | solid |
+
+#### A fix that came with this work
+
+`slotStop()` did not clear the direction bits, so a stopped slot kept
+whichever direction it last ran. Two consequences, both visible here: the
+`FINISHED` branch was unreachable for any slot that had ever run, and a
+stopped slot reached idle-green through the wrong branch. Fixed — a **stop**
+clears the direction bits; a **pause** still keeps them, because a resume
+needs to know which way to go.
 
 ### 2.6 Termination — how a slot reaches END
 
@@ -455,9 +664,12 @@ current, and the check works for every MODE strap rather than only those with
 Both conditions must hold for `BTS_TERM_DWELL_PASSES` consecutive C1 passes.
 Current is the noisiest quantity measured here and a single sample dipping
 under `I_MIN` is not a finished charge. The dwell is expressed in **passes,
-not seconds**, because C1 is nominally 10 Hz but was measured on hardware at
-0.69 Hz — 5 passes is ~0.5 s nominal and ~7 s measured, both short against a
-real charge and long against noise.
+not seconds**, because the C-task rate has moved twice: it was measured at
+0.69 Hz per sub-task in September 2025, and **re-measured at 28.6 Hz on
+2026-10-02** after a latent missed-clock detection — which had been holding
+the PLL off full speed — was fixed. Five passes is therefore ~0.17 s today,
+against the ~7 s the earlier figure implied. Short against a real charge
+either way, which is the point of expressing it in passes.
 
 **In a group, only the leader decides, and it ends the whole group.**
 Followers mirror the leader's duty and run no controller, so a follower's own
@@ -469,7 +681,7 @@ shutdown, but it sets `finished` and leaves `stopped` clear, so a host can
 tell a charge that reached its termination current from one an operator
 halted. END persists until the slot is started again.
 
-### 2.4 MODE strap - slot grouping and slot tuning
+### 2.7 MODE strap - slot grouping and slot tuning
 
 | MODE | Meaning | Group size | Voltage loop |
 |---|---|---|---|
@@ -574,7 +786,7 @@ tuning mode; otherwise it hands it to CPU2 as before. This is why the
 selection has to ride on a strap latched at reset rather than on a host
 register: the ownership cannot be changed once the unit is running.
 
-### 2.4.1 Mode register
+### 2.7.1 Mode register
 
 `eChX_Mode` gains two command bits alongside the existing run/direction bits:
 
