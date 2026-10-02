@@ -30,7 +30,7 @@ never actually writes, that is called out rather than glossed over.
 > ever sees the C2000's byte order**.
 >
 > This matters because the same quantity — say `ads_v_pu` — appears in both
-> formats: at register 1224 over I2C as big-endian, and at offset 12 of
+> formats: at register 1032 over I2C as big-endian, and at offset 12 of
 > characteristic `000c` as little-endian. A client that reads one and assumes
 > the other's order gets a plausible-looking but wrong float. Python clients
 > should use `"<"` prefixes throughout (as `ble_verify.py` and `calibrate.py`
@@ -160,10 +160,13 @@ Offsets sum to 24: 4×1 + 4 + 4 + 4 + 1 + 1 + 2 + 4. `tools/ble_verify.py`
 asserts `struct.calcsize(UNIT_FMT) == 24`.
 
 > **There is no remaining-seconds field.** The BTS publishes a live countdown
-> at `eWatchdogRemaining_s` (register 1220), but the ESP32's register mirror
-> does not yet know that register exists, so nothing on this interface
-> carries it — a client can show whether supervision is armed and at what
-> timeout, but not a countdown. See `api-specification.md` §2.11.
+> at `eWatchdogRemaining_s` (register **1028**). The ESP32's mirror knows that
+> register — it is `BTS_REG_WATCHDOG_REMAINING_S`, and the calibration burst
+> reads straight across it — but no notify record carries it, so this record
+> says whether supervision is armed and at what timeout, not how long is left.
+> A client that needs the countdown can read 1028 through characteristic
+> `000d` (§3.12). See `api-specification.md` §2.11 for the off-by-one this
+> register caused when the mirror was missing it.
 >
 > `watchdog_timeout_s` reading 0 means the watchdog has been **disabled**, not
 > that it has fired. A disabled watchdog means no slot will be paused if this
@@ -602,7 +605,7 @@ calibration (`eCalSlot`), and is unaffected by slot-select.
 
 Python: `struct.unpack("<BBBBII" + "f" * 9, data)`
 
-The nine floats are exactly registers 1224–1256 in order. `_pu` means the
+The nine floats are exactly registers **1032–1064** in order. `_pu` means the
 normalised converter reading **before** any calibration gain or offset — that
 is the quantity the two-point fit consumes, and it is what the `< 0.2` /
 `> 0.8` capture windows are checked against. All nine are zero when no slot
@@ -1132,10 +1135,20 @@ serialises a byte.
 | `tools/calibrate.py:66-68` | `CAL_STATUS_FMT` was 44 B with the ticks last and `result` as a `uint8`; the struct is 48 B with the ticks at offsets 2–3 and `result` a `uint32` at offset 8. The length check (`< 44`) passed a 48-byte record, so it misdecoded rather than failing. See §3.11 | fixed |
 | `tools/ble_verify.py:46-50` | `STATUS_BITS` listed 12 names, stopping at `slotDisabled` (bit 11). Bits 12–14 (`calibrating`, `calVoltageValid`, `calCurrentValid`) were missing, so `decode_status_bits()` silently dropped them | fixed |
 | `tools/ble_verify.py:144` | Sliced the model name out of `ble_slot_config_t` at `cfg[28:52]`. `model_name` is at offset **24**, length 24 — the correct slice is `cfg[24:48]` | fixed |
-| `components/bts_link/include/bts_regs.h` | The mirror was missing `eWatchdogRemaining_s` (1220), so `BTS_REG_CAL_ADS_V_PU` started at 1220 instead of 1224 and **all nine calibration telemetry floats read one register low** — `ads_v_pu` actually carried the watchdog countdown. `BTS_TOTAL_REGISTERS` was 314 against the C2000's 315, the same off-by-one. `poll_cal_window()` indices shifted with it. Found and fixed 2026-09-20 | fixed |
+| `components/bts_link/include/bts_regs.h` | The mirror was missing `eWatchdogRemaining_s` (then 1220), so `BTS_REG_CAL_ADS_V_PU` started at 1220 instead of 1224 and **all nine calibration telemetry floats read one register low** — `ads_v_pu` actually carried the watchdog countdown. `BTS_TOTAL_REGISTERS` was 314 against the C2000's 315, the same off-by-one. `poll_cal_window()` indices shifted with it. Found and fixed 2026-09-20 | fixed |
+| `tools/calibrate.py:135-136` | `REG_CAL_BASE`/`REG_CAL_STRIDE` were `384 + 44` and `96`, the v1 geometry. After the 2026-09-22 compression the per-slot calibration block is at **408**, stride **72**. Slot 1 read five registers past its block and every other slot read a different slot's gains — silently, because the read succeeded and returned plausible floats. Found and fixed 2026-10-02 | fixed |
+| `tools/ble_verify.py` | `STATUS_BITS` marked bit 16 `"-"` ("unused and always 0") and stopped at bit 18. Bit 16 is `WAITING` and bits 19–21 are `BALANCING`/`READY`/`SOFT_START`, all added with proto 7 — `decode_slot()` already unpacked them from the record while `decode_status_bits()` dropped them from the status word. Found and fixed 2026-10-02 | fixed |
+
+The addresses in the 2026-09-20 row are the **v1** ones that were current when
+it was found; the same registers are 1028 and 1032 today. Historical rows are
+not renumbered — a changelog that silently adopts new addresses stops being
+evidence of what happened.
 
 The root cause in each case was writing the format from a design document
-rather than from the header. Where the two disagree, the header wins.
+rather than from the header. Where the two disagree, the header wins. Note the
+second failure mode the 2026-10-02 rows share with the first: **every address
+in this map is a valid float somewhere else in it**, so a stale constant does
+not fault, it returns the wrong number.
 
 `ble_verify.py` now carries the sizes as **assertions** rather than comments:
 

@@ -246,7 +246,9 @@ typedef struct __attribute__((packed)) {
  *
  * The 9 telemetry floats are the raw pre-gain per-unit readings and the
  * post-gain engineering values of both measurement paths, as the unit
- * publishes them at 1056-1088.
+ * publishes them at 1032-1064 - the top of the 15-register calibration
+ * window that starts at eCalSlot (1008). These were v1's 1056-1088 until
+ * the 2026-09-22 settings compression pulled the unit block down.
  */
 typedef struct __attribute__((packed)) {
     uint8_t  slot;          /* 255 = none                            */

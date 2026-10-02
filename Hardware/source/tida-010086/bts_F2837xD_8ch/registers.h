@@ -24,18 +24,24 @@
 
 //
 //=============================================================================
-// Register map v2
+// Register map v2.1
 //=============================================================================
 //
-// Three regions with fixed, generous per-slot strides, so a future field does
-// not shift every address again:
+// Four regions with fixed per-slot strides, so a future field does not shift
+// every address again:
 //
 //   runtime   base    0, stride 12 regs (48 B), all RO  - one host burst/slot
-//   settings  base  384, stride 24 regs (96 B)          - one host burst/slot
-//   unit      base 1152
+//   settings  base  384, stride 18 regs (72 B)          - one host burst/slot
+//   unit      base  960, 27 regs                        - 960 to 1064
+//   tuning    base 1068, 13 regs, unit-wide RW          - 1068 to 1116
 //
 // Runtime ch7 ends at 383, immediately before the settings base; settings ch7
-// ends at 1151, immediately before the unit base. Top address is 1256.
+// ends at 959, immediately before the unit base. Top address is 1116.
+//
+// The settings stride was 24 regs (96 B) with a unit base of 1152 until the
+// 2026-09-22 compression merged the charge/discharge limit pairs. Anything
+// still quoting those numbers - or a 1224-1256 telemetry window, or a top of
+// 1256 - predates it. The enum below is authoritative.
 //
 #define BTS_RT_REGS_PER_CH          (12U)
 #define BTS_SET_REGS_PER_CH         (18U)
@@ -382,7 +388,12 @@ typedef enum {
     eCh7_VoutOffset_V = 956,
     //
     // Unit block, base 960. eWatchdogRemaining_s is the live
-    // countdown; calibration telemetry follows at 1224-1256.
+    // countdown; calibration telemetry follows at 1032-1064.
+    //
+    // The 15 registers from eCalSlot (1008) to eCalTemp_C (1064) are the
+    // calibration window the ESP32 reads as one burst. eWatchdogRemaining_s
+    // sits INSIDE it, between eCalResult and the telemetry - a reader that
+    // skips it takes every telemetry float one register low.
     //
     eChargeDisableV = 960,
     eChargeRestrictV = 964,
@@ -448,7 +459,8 @@ typedef enum {
 
 //
 // Sub-blocks within a slot's settings region. The calibration group is 12
-// registers at offset 11; BTS_cpu1Status sizes an array with that count.
+// registers at offset 6 (see BTS_CAL_BASE); BTS_cpu1Status sizes an array
+// with that count. It was offset 11 before the 2026-09-22 compression.
 //
 #define BTS_CAL_REGS_PER_CH         (12U)
 #define BTS_TEMP_REGS_PER_CH        (2U)
@@ -565,7 +577,8 @@ typedef struct {
 //
 // END is an ALIAS for FINISHED (bit 2), not a new bit: that bit was declared
 // from the start and never written, so it is driven now with the END meaning
-// rather than duplicated at bit 16. Bit 16 is therefore free.
+// rather than duplicated at bit 16. Bit 16 was left free here and has since
+// been taken by BTS_STATUS_WAITING below.
 //
 #define BTS_STATUS_PAUSED            15U
 //
@@ -1099,15 +1112,23 @@ typedef struct
 //   runtime   12 regs/slot  eCh0_Status  .. eCh7_DischargeRuntime_s  (RO)
 //   settings  18 regs/slot  eCh0_Mode    .. eCh7_VoutOffset_V
 //   unit      27 regs total eChargeDisableV .. eCalTemp_C
+//   tuning    13 regs total eDCL_CC_B0      .. eDCL_CV_A2   (unit-wide, RW)
+//
+// The tuning block has no per-slot stride and is indexed by
+// BTS_TUNING_BASE_ADDR rather than through a BASE(ch) macro.
 //
 #define BTS_REG_IDX(addr)           ((uint16_t)((addr) / 4U))
 
 #define BTS_RT_BASE(ch)     (BTS_REG_IDX(eCh0_Status) + (ch) * BTS_RT_REGS_PER_CH)
 #define BTS_SET_BASE(ch)    (BTS_REG_IDX(eCh0_Mode)   + (ch) * BTS_SET_REGS_PER_CH)
 
-// The 12 calibration registers sit at settings offset 11 and keep their
-// internal BTS_CAL_* order, so saveCalibration()/loadCalibration() index
-// through this exactly as before.
+// The 12 calibration registers sit at settings offset 6 - the compression
+// moved them down from 11 - and keep their internal BTS_CAL_* order, so
+// saveCalibration()/loadCalibration() index through this exactly as before.
+//
+// NOTE: this is REGISTER-INDEX arithmetic. The ESP32 mirror's BTS_SET_CAL_FIRST
+// expresses the same offset in BYTES (24). The two files use the same names
+// for different units - do not copy a line between them.
 #define BTS_CAL_BASE(ch)    (BTS_SET_BASE(ch) + 6U)
 #define BTS_TEMP_BASE(ch)   (BTS_SET_BASE(ch) + 5U)
 

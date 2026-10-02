@@ -56,9 +56,12 @@
  * This comment described the v1 map long after the values below moved to
  * v2.1 - settings went to an 18-register stride when the charge and
  * discharge limits merged, which pulled the unit base down from 1152 to 960.
- * The #defines were correct throughout; only this block was stale. The Home
- * Assistant integration's own mirror still carries the v1 numbers and is
- * tracked separately.
+ * The #defines were correct throughout; only this block was stale.
+ *
+ * There is a THIRD transcription of this map, in the Home Assistant
+ * integration at lion-lvrt-integration/.../protocol/registers.py. It is
+ * current as of v2.1, but it is a separate file with no build coupling to
+ * either this one or registers.h, so a map change means editing all three.
  *
  * The strides are deliberately larger than the fields in use, so adding a
  * field later does not move every slot again.

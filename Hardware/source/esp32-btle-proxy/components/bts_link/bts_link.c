@@ -431,7 +431,7 @@ static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_
 }
 
 /*
- * Refreshes the calibration window, registers 1200-1256, as one burst.
+ * Refreshes the calibration window, registers 1008-1064, as one burst.
  *
  * Called only when calibration is live or a command has just been issued:
  * this feature is idle almost all of the time and there is no reason to
@@ -449,7 +449,7 @@ static void poll_cal_window(bts_cal_state_t *cal, const bts_channel_state_t *cha
     const uint32_t slot = (uint32_t)w[0];
 
     /*
-     * Indices are offsets from BTS_REG_CAL_SLOT (1200), four bytes apart:
+     * Indices are offsets from BTS_REG_CAL_SLOT (1008), four bytes apart:
      *   0 eCalSlot      1 eCalCommand   2 eCalArgument  3 eCalStatus
      *   4 eCalResult    5 eWatchdogRemaining_s          6.. telemetry
      *

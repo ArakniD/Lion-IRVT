@@ -124,7 +124,7 @@ typedef struct {
 } bts_unit_status_t;
 
 /*
- * Calibration window, registers 1200-1252.
+ * Calibration window, registers 1008-1064 - 15 registers.
  *
  * Only refreshed while the unit reports calibration active; the fields hold
  * their last values otherwise, and `active` is what tells them apart. The

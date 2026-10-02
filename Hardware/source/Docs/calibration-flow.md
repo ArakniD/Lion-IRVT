@@ -191,22 +191,22 @@ sequenceDiagram
     BLE->>ESP: bts_link_cal_capture_voltage(slot, v)
 
     Note over ESP,C2: I2C wire format is BIG-endian — opposite to BLE
-    ESP->>C2: write eCalArgument (1044) = 0.849683f<br/>S 0x50+W | 0x04 0x14 | b0 b1 b2 b3 | P
-    ESP->>C2: write eCalCommand (1040) = 3.0f
+    ESP->>C2: write eCalArgument (1016) = 0.849683f<br/>S 0x50+W | 0x03 0xF8 | b0 b1 b2 b3 | P
+    ESP->>C2: write eCalCommand (1012) = 3.0f
     C2->>C2: i2cSlaveISR -> applyHostRegisterWrite()
     C2->>C1: ipcMsg{regAddr, value} + IPC_FLAG0
 
-    Note over C1: The new 1036+ block MUST be added to the<br/>BTS_HandleRegisterWrite() decode, or the command<br/>is acked and silently discarded
-    C1->>C1: BTS_HandleRegisterWrite() decodes 1040
+    Note over C1: The 1008+ block MUST be in the<br/>BTS_HandleRegisterWrite() decode, or the command<br/>is acked and silently discarded
+    C1->>C1: BTS_HandleRegisterWrite() decodes 1012
     C1->>C1: sample both paths at this instant:<br/>ADS pu and internal-ADC volts-at-pin
     C1->>C1: classify by ADS pu: <0.2 low, >0.8 high<br/>else CAL_ERR_PU_RANGE
     C1->>C1: store the point, set eCalStatus bit 1
     C1->>C2: cpu1Status: status bits + telemetry
 
-    C2->>C2: mirror eCalStatus (1048), eCalResult (1052)<br/>and the 9 telemetry registers (1056-1088)
-    ESP->>C2: burst read 1036..1088, one transaction
+    C2->>C2: mirror eCalStatus (1020), eCalResult (1024)<br/>and the 9 telemetry registers (1032-1064)
+    ESP->>C2: burst read 1008..1064, one transaction
     Note over ESP,C2: skip the lead-in pad byte — the C2000 clocks out<br/>a stale TX byte before its ISR can run
-    C2-->>ESP: pad, then 14 big-endian floats
+    C2-->>ESP: pad, then 15 big-endian floats
     ESP->>ESP: bts_wire_to_f32() -> bts_cal_state_t
     ESP->>BLE: snapshot updated
     BLE-->>PY: notify e5f1000c at 2 Hz<br/>+ explicit read after the command

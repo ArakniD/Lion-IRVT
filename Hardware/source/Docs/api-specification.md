@@ -564,7 +564,7 @@ target's auto-increment.
 Generic register write, the mirror of the read above.
 
 ```json
-{"addr": 1044, "value": 0.84968}
+{"addr": 1016, "value": 0.84968}
 ```
 
 Both keys are required.
@@ -576,9 +576,11 @@ Both keys are required.
 | `502` | The I2C write failed; the message is the `esp_err_t` name |
 
 Range is `0` to `(BTS_TOTAL_REGISTERS - 1) * 4` inclusive. The ESP32's
-`BTS_TOTAL_REGISTERS` is **267**, giving a ceiling of **1064**, which is the
-unit's own top address. The whole map is reachable through this endpoint —
-the one-register shortfall described in earlier revisions of §2.11 is fixed.
+`BTS_TOTAL_REGISTERS` is **280**, giving a ceiling of **1116** — the top of
+the slot tuning block, which is the unit's own top address. The whole map is
+reachable through this endpoint, including the tuning registers above the unit
+block; the one-register shortfall described in earlier revisions of §2.11 is
+fixed.
 
 > **Deliberately unguarded beyond the address checks.** This is the escape
 > hatch for bring-up and for anything the typed endpoints do not cover
@@ -594,7 +596,7 @@ the one-register shortfall described in earlier revisions of §2.11 is fixed.
 > sanitisation the typed endpoints apply. In particular
 > `bts_link_cal_capture_current()` takes `fabsf()` of the measured amps
 > (`bts_link.c:330`); writing a signed value straight into `eCalArgument`
-> (1044) does not get that, and a negative current capture inverts the slot's
+> (1016) does not get that, and a negative current capture inverts the slot's
 > stored gain in a way that passes validation and looks plausible
 > afterwards.
 
@@ -675,14 +677,14 @@ out, the persisted-validity ticks, and the selected slot's stored gains.
 | `status` | The raw `eCalStatus` bitfield, §1.16.2 |
 | `result` / `result_text` | `eCalResult` of the last command and its text, §1.16.3 |
 | `captures.*` | The status bits broken out, so a client need not carry its own copy of the numbering |
-| `live.*` | Registers 1056–1088. `_pu` is the raw **pre-gain** reading; `_v`/`_a` are post-gain. 5 dp on the pu values, 4 dp on the engineering values, 1 dp on the temperature |
+| `live.*` | Registers 1032–1064. `_pu` is the raw **pre-gain** reading; `_v`/`_a` are post-gain. 5 dp on the pu values, 4 dp on the engineering values, 1 dp on the temperature |
 | `ticks.*` | Slot status bits 13/14 — the **persisted** validity, so a slot calibrated last month still shows its ticks |
-| `gains` | The selected slot's 12-register calibration block, read live from 592 + slot×48. **Omitted** when `slot` is 255 or the read fails |
+| `gains` | The selected slot's 12-register calibration block, read live from **408 + slot×72** (`BTS_CAL_ADDR(ch, 0)`). **Omitted** when `slot` is 255 or the read fails |
 
 Status: `200` always. `live.*` holds its last values when calibration is not
 active — `active` is what tells them apart.
 
-> **Freshness.** The `bts_link` poll task reads the 1036–1088 window as one
+> **Freshness.** The `bts_link` poll task reads the 1008–1064 window as one
 > burst, but **only** while calibration is active or a command has just been
 > issued (`bts_link.c:504-519`). The cycle is 250 ms. Reading this endpoint
 > immediately after a POST can return the pre-command state; allow one poll
@@ -737,13 +739,13 @@ goes on the bus (`bts_link.c:320-322`), and the unit clamps again. 1.0 pu ≈
 Each action is **three I2C transactions under one take of the bus mutex**
 (`cal_command()`, `bts_link.c:242-277`):
 
-1. write `eCalArgument` (1044)
-2. write `eCalCommand` (1040)
-3. read `eCalResult` (1052)
+1. write `eCalArgument` (1016)
+2. write `eCalCommand` (1012)
+3. read `eCalResult` (1024)
 
 They cannot be interleaved with the poll task or another caller, because the
 opcode is **consumed on write and self-clears** — an argument that arrived
-afterwards would be applied to nothing. `enter` writes `eCalSlot` (1036)
+afterwards would be applied to nothing. `enter` writes `eCalSlot` (1008)
 first, as a fourth transaction outside that group.
 
 #### 1.16.2 `status` bitfield (`eCalStatus`)
@@ -893,7 +895,7 @@ no authentication.
 
 # Part 2 — I2C register map
 
-The BTS is an **I2C target** exposing a flat array of 267 IEEE-754 `float32`
+The BTS is an **I2C target** exposing a flat array of 280 IEEE-754 `float32`
 registers. This is the interface the ESP32 proxy uses
 (`components/bts_link/`), and it is available to any other host on the same
 bus.
@@ -904,9 +906,9 @@ bus.
 | **Target address** | `0x50`, 7-bit (`BTS_I2C_TARGET_ADDRESS`) |
 | **Bus speed** | **50 kHz** — see §2.2 |
 | **Register size** | 4 bytes, always |
-| **Register count** | 267 (`TOTAL_REGISTERS`) |
+| **Register count** | 280 (`TOTAL_REGISTERS`) |
 | **Map version** | **v2.1** — see the warning below |
-| **Address space** | Byte addresses 0 to 1064 inclusive, always a multiple of 4 |
+| **Address space** | Byte addresses 0 to 1116 inclusive, always a multiple of 4 |
 | **Index** | `index = address / 4` |
 | **Payload byte order** | **Big-endian** |
 
@@ -1039,8 +1041,8 @@ if (((currentRegAddr + 4U) / 4U) < TOTAL_REGISTERS) {
 }
 ```
 
-At the top of the map (address 1064) the pointer stops advancing, and a read
-that continues past it **repeats register 1064** indefinitely. Unbounded it
+At the top of the map (address 1116) the pointer stops advancing, and a read
+that continues past it **repeats register 1116** indefinitely. Unbounded it
 would walk off the end and stay there — and since the address persists across
 transactions, every later read would return out of range
 (`com_cpu2.c:2570-2577`).
@@ -1318,9 +1320,9 @@ The only register that causes an action rather than storing a value.
 
 ## 2.8 The complete register map
 
-**267 registers, byte addresses 0 to 1064.** `index = address / 4`.
+**280 registers, byte addresses 0 to 1116.** `index = address / 4`.
 
-Three regions, each with a fixed per-slot stride so that adding a field later
+Four regions, each with a fixed per-slot stride so that adding a field later
 does not move every address again:
 
 | Region | Base | Stride | Regs/slot | Access | Range |
@@ -1328,14 +1330,24 @@ does not move every address again:
 | **Runtime** | 0 | 48 B (12 regs) | 12 | all RO | 0 – 383 |
 | **Settings** | 384 | 72 B (18 regs) | 18 | mostly RW | 384 – 959 |
 | **Unit** | 960 | — | 27 total | mixed | 960 – 1064 |
+| **Slot tuning** | 1068 | — | 13 total | RW | 1068 – 1116 |
 
 The arithmetic closes exactly: runtime channel 7 ends at 383, immediately
 before the settings base; settings channel 7 ends at 959, immediately before
-the unit base.
+the unit base; the unit block ends at 1064, immediately before the tuning
+base.
+
+**The map does not end at 1064.** The slot tuning block — the DCL biquad
+coefficients for the current and voltage control loops — sits above the unit
+block and is part of the reachable address space. Several documents, and the
+header comment in `registers.h` itself, still describe a 267-register map
+topping out at 1064; they predate that block. `BTS_TOTAL_REGISTERS` is 280 in
+both headers, and both `web_api.c`'s POST ceiling and `ble_svc.c`'s range
+check already enforce 1116.
 
 > **The settings region was compressed on 2026-09-22**, from 24 registers per
 > slot to 18, which moved the unit block down from 1152 to **960** and the top
-> of the map from 1256 to **1064**. Charge and discharge no longer carry
+> of the unit block from 1256 to **1064**. Charge and discharge no longer carry
 > separate limits — a slot's direction comes from the mode register, so one
 > `VoltageMin`/`VoltageMax` and one `CurrentMin`/`CurrentMax` pair serves both.
 > `eChX_MinCellTemp` and the per-slot spare are gone; only a maximum cell
@@ -1545,7 +1557,34 @@ block at risk.
 | 1060 | `eCalF28I_A` | RO | A | Internal ADC current, post-gain |
 | 1064 | `eCalTemp_C` | RO | °C | Live cell temperature of the slot under calibration |
 
-**1064 is the top of the map.** A read past it repeats 1064 (§2.4).
+**1064 is the top of the unit block**, but not of the map — the slot tuning
+block follows at 1068.
+
+#### Slot tuning — 1068 to 1116
+
+The DCL biquad coefficients for the CC and CV control loops, held as writable
+registers instead of the compile-time `BTS_DCL_*` constants so a unit can be
+tuned in the field rather than rebuilt and reflashed on both cores.
+
+| Addr | Enum | Access | Meaning |
+|---|---|---|---|
+| 1068 – 1084 | `eDCL_CC_B0`…`B2`, `A1`, `A2` | RW | CC loop biquad coefficients |
+| 1088 – 1096 | `eDCL_CV_Z0`, `Z1`, `P1` | RW | CV zero/pole frequencies — provenance only, the DCL does not read them |
+| 1100 – 1116 | `eDCL_CV_B0`…`B2`, `A1`, `A2` | RW | CV loop biquad coefficients |
+
+**One set for the whole unit, not per slot** — every slot is the same
+converter with the same passives, so there is no stride here. They sit above
+the unit block precisely because they are written once by a system builder
+and never polled: the ESP32's 9-transaction cycle stops below them, so the
+block costs nothing per poll. See `supervision-and-state-design.md` §1.6.
+
+> A biquad of all zeros produces a constant zero output, so a slot with an
+> unseeded tuning would never leave its duty floor. `BTS_applySlotTuning()`
+> rejects a set whose `b0` is zero and the shipped tuning is seeded at boot
+> before F-RAM can load — do not write a partial set through §1.13 expecting
+> to fill in the rest afterwards.
+
+**1116 is the top of the map.** A read past it repeats 1116 (§2.4).
 
 #### Global voltage thresholds — 960 to 972
 
@@ -1795,20 +1834,32 @@ unaffected and the unit looked healthy — the corruption would have surfaced as
 plausible but wrong captured per-unit values during a bench calibration.
 
 **2026-09-22 — the settings compression.** The settings stride went from 24
-registers to 18, moving the unit base from 1152 to 960 and the top of the map
-from 1256 to 1064. The mirror was updated in the same change.
+registers to 18, moving the unit base from 1152 to 960 and the top of the unit
+block from 1256 to 1064. The mirror was updated in the same change. The slot
+tuning block was added above it afterwards, taking the map to 280 registers
+and a top address of 1116.
 
 **Current state, verified against both headers:**
 
 | | `registers.h` (authoritative) | `bts_regs.h` (mirror) |
 |---|---|---|
-| Register count | 267 | `BTS_TOTAL_REGISTERS` 267 |
+| Register count | 280 | `BTS_TOTAL_REGISTERS` 280 |
+| Top byte address | 1116 | 1116 |
 | Runtime base / stride | 0 / 12 regs | `BTS_RT_BASE` 0, `BTS_RT_STRIDE` 48 B |
 | Settings base / stride | 384 / 18 regs | `BTS_SET_BASE` 384, `BTS_SET_STRIDE` 72 B |
+| Per-slot calibration block | `BTS_CAL_BASE(ch)` = `BTS_SET_BASE(ch) + 6` regs | `BTS_CAL_ADDR(ch, 0)` = 408 + ch × 72 B |
 | Unit base | 960 | `BTS_UNIT_BASE` 960 |
 | `eWatchdogRemaining_s` | 1028 | `BTS_REG_WATCHDOG_REMAINING_S` 1028 |
 | Calibration telemetry | 1032 – 1064 | 1032 – 1064 |
 | Calibration burst | 15 registers from 1008 | `BTS_CAL_WINDOW_COUNT` 15 |
+| Slot tuning | 1068 – 1116, 13 regs | `BTS_TUNING_BASE` 1068, `BTS_TUNING_COUNT` 13 |
+
+> **The header comment in `registers.h` is itself stale** — it still describes
+> a 96-byte settings stride, a unit base of 1152, calibration telemetry at
+> 1224–1256 and a top address of 1256, all v1 numbers. The enum beneath it is
+> correct and is what the hardware answers on. Read the enum, not the comment.
+> `ble_proto.h` carries the same drift above `ble_cal_status_t` ("1056-1088"),
+> as does `bts_link.c`'s `poll_cal_window()` ("1200").
 
 **The C2000 addresses are what the hardware answers on. Fix the mirror against
 `registers.h`, never the other way round.** There is still no build coupling,

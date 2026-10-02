@@ -7,20 +7,21 @@ This document is the contract for the **mathematics, the opcodes, the state
 machine and the F-RAM layout**. Implementations must not deviate from those
 without updating this file first.
 
-> ### The register addresses in this document are from the v1 map and are stale
+> ### Addresses here are the v2.1 map, but §2.8 of the API spec is authoritative
 >
-> It was written before the v2 reorder (2026-09-19) and the settings
-> compression (2026-09-22), and its addresses — `eCalSlot` at 1036, the
-> telemetry window at 1056–1088, the per-slot calibration block at settings
-> offset 11 — are all superseded. The calibration control block now lives at
-> **1008–1024** and its telemetry at **1032–1064**, with the calibration group
-> at `BTS_SET_BASE(ch) + 6`.
+> This document was written before the v2 reorder (2026-09-19) and the settings
+> compression (2026-09-22), which moved every address in it. The addresses have
+> since been brought forward: the calibration control block is **1008–1024**,
+> its telemetry **1032–1064**, and the per-slot calibration group sits at
+> `BTS_SET_BASE(ch) + 6` registers — byte address **408 + ch × 72**.
 >
+> This is a *design* document, so where an address appears it is illustrative.
 > **For any address, read
 > [`api-specification.md`](api-specification.md) §2.8**, which is verified
-> against `registers.h`. Everything else here — the two-point fit, the capture
-> windows, the opcode and status-bit numbering, the validation limits and the
-> F-RAM block layout — is current and is still the contract.
+> against `registers.h` and is where a drift will be caught first. Everything
+> else here — the two-point fit, the capture windows, the opcode and status-bit
+> numbering, the validation limits and the F-RAM block layout — is current and
+> is still the contract.
 
 ---
 
@@ -76,8 +77,8 @@ These were each verified in source and each one invalidates an obvious guess:
    `BTS_HandleRegisterWrite()` (`bts_cpu1.c:568, 576-577`) only decodes indices
    below `eCh0_CurrentAcc` and inside the calibration block. Everything else —
    including `eCalibrationMode` at index 244 — has its `IPC_FLAG0` acked and
-   silently discarded. The new block at 1036+ falls in the same hole and
-   **must be added to the decode explicitly**, or every calibration command will
+   silently discarded. The calibration block (1008+) falls in the same hole and
+   **must be in the decode explicitly**, or every calibration command will
    be accepted by CPU2 and quietly ignored by CPU1.
 
 4. **F-RAM writes never happen in an ISR.** Writing `eCalibrationMode = 2.0f`
@@ -155,9 +156,14 @@ this is a two-line fix in the same function being edited anyway.
 ## 4. Register map additions
 
 All addresses are byte addresses; index = address / 4. Appended contiguously
-above `eGroupSize` (1032). Update `registers.h` enum, `NUM_*` counts,
-`TOTAL_REGISTERS`, `regConfig[]` and `uartRegConfig[]` **together** — the tables
-are sized `TOTAL_REGISTERS` and must stay index-aligned.
+above `eGroupSize`, which is **1000** in the current map. Update `registers.h`
+enum, `NUM_*` counts, `TOTAL_REGISTERS`, `regConfig[]` and `uartRegConfig[]`
+**together** — the tables are sized `TOTAL_REGISTERS` and must stay
+index-aligned.
+
+The addresses below are **as built**, re-verified against `registers.h`. They
+are not the ones this section originally proposed: the v2 reorder (2026-09-19)
+and the settings compression (2026-09-22) both moved them.
 
 ### 4.1 Calibration control block (unit-level, 5 registers)
 
@@ -166,28 +172,37 @@ per-slot. That is a deliberate RAM decision — see §9.
 
 | Addr | Enum | Access | Meaning |
 |---|---|---|---|
-| 1036 | `eCalSlot` | RW | Slot under calibration, 0–7. 255 = none. |
-| 1040 | `eCalCommand` | RW | Command opcode, see §5. Write triggers action. |
-| 1044 | `eCalArgument` | RW | Float payload for the command. Write **before** the opcode. |
-| 1048 | `eCalStatus` | RO | Progress bitfield, see §5.2. |
-| 1052 | `eCalResult` | RO | Result code of the last command, see §5.3. |
+| 1008 | `eCalSlot` | RW | Slot under calibration, 0–7. 255 = none. |
+| 1012 | `eCalCommand` | RW | Command opcode, see §5. Write triggers action. |
+| 1016 | `eCalArgument` | RW | Float payload for the command. Write **before** the opcode. |
+| 1020 | `eCalStatus` | RO | Progress bitfield, see §5.2. |
+| 1024 | `eCalResult` | RO | Result code of the last command, see §5.3. |
 
 ### 4.2 Calibration live telemetry (unit-level, 9 registers)
 
 Live values for the slot named by `eCalSlot`, so the operator can watch the
 calibration converge. Zero when no slot is selected.
 
+One register separates this block from §4.1: `eWatchdogRemaining_s` (**1028**),
+the live host-watchdog countdown. It is not calibration telemetry, but it sits
+inside the burst below and a mirror that omits it reads every float here one
+register low — see §2.11 of
+[`api-specification.md`](api-specification.md) for the defect that caused.
+
 | Addr | Enum | Access | Meaning |
 |---|---|---|---|
-| 1056 | `eCalAdsV_pu` | RO | ADS131M08 voltage, per-unit (raw, pre-gain) |
-| 1060 | `eCalAdsI_pu` | RO | ADS131M08 current, per-unit (raw, pre-gain) |
-| 1064 | `eCalAdsV_V` | RO | ADS131M08 voltage, volts (post-gain) |
-| 1068 | `eCalAdsI_A` | RO | ADS131M08 current, amps (post-gain) |
-| 1072 | `eCalF28V_pu` | RO | Internal ADC voltage, per-unit (raw, pre-gain) |
-| 1076 | `eCalF28I_pu` | RO | Internal ADC current, per-unit (raw, pre-gain) |
-| 1080 | `eCalF28V_V` | RO | Internal ADC voltage, volts (post-gain) |
-| 1084 | `eCalF28I_A` | RO | Internal ADC current, amps (post-gain) |
-| 1088 | `eCalTemp_C` | RO | Live cell temperature of the slot under calibration |
+| 1032 | `eCalAdsV_pu` | RO | ADS131M08 voltage, per-unit (raw, pre-gain) |
+| 1036 | `eCalAdsI_pu` | RO | ADS131M08 current, per-unit (raw, pre-gain) |
+| 1040 | `eCalAdsV_V` | RO | ADS131M08 voltage, volts (post-gain) |
+| 1044 | `eCalAdsI_A` | RO | ADS131M08 current, amps (post-gain) |
+| 1048 | `eCalF28V_pu` | RO | Internal ADC voltage, per-unit (raw, pre-gain) |
+| 1052 | `eCalF28I_pu` | RO | Internal ADC current, per-unit (raw, pre-gain) |
+| 1056 | `eCalF28V_V` | RO | Internal ADC voltage, volts (post-gain) |
+| 1060 | `eCalF28I_A` | RO | Internal ADC current, amps (post-gain) |
+| 1064 | `eCalTemp_C` | RO | Live cell temperature of the slot under calibration |
+
+1064 is the top of the unit block. The **slot tuning** registers (DCL biquad
+coefficients, 1068–1116) sit above it; the map does not end at 1064.
 
 "Per-unit (raw, pre-gain)" is the normalised converter reading **before** any
 calibration gain/offset is applied — this is the quantity the two-point maths
@@ -202,17 +217,21 @@ exactly — the gain/offset pair is defined against it.
 
 ### 4.3 Per-slot external ADC engineering values (16 registers)
 
-Fixes §3.2. Stride 8 bytes, base 1092.
+Fixes §3.2. **Built differently from the proposal below.** Rather than a
+separate region above the unit block, the two values were folded into each
+slot's existing runtime block, where the rest of that slot's live measurements
+already are:
 
 | Addr | Enum | Access | Meaning |
 |---|---|---|---|
-| 1092 + ch*8 | `eChX_SenseVoltage` | RO | `Vsense_V`, ADS131M08 volts |
-| 1096 + ch*8 | `eChX_SenseCurrent` | RO | `Isense_A`, ADS131M08 amps |
+| `BTS_RT_BASE(ch)` + 12 | `eChX_SenseVoltage` | RO | `Vsense_V`, ADS131M08 volts |
+| `BTS_RT_BASE(ch)` + 16 | `eChX_SenseCurrent` | RO | `Isense_A`, ADS131M08 amps |
 
-Range 1092–1152 (16 registers, stride 4). Add `BTS_SENSE_BASE(ch)` alongside the
-existing base macros.
+With the runtime stride of 48 bytes that is 12/16 for slot 1 through 348/352
+for slot 8. There is no `BTS_SENSE_BASE(ch)` — the runtime base macro covers
+them, and a reader looking for a separate sense region will not find one.
 
-**Total added: 30 registers** (`TOTAL_REGISTERS` 259 → 289).
+**Total registers: 280**, top byte address **1116**.
 
 ### 4.4 Status bits
 
@@ -519,18 +538,28 @@ simply needs a rebuild and a glance at the map.
 
 ### 10.1 `bts_regs.h`
 
-Mirror everything above: new addresses, `BTS_SENSE_ADDR(ch)`, the calibration
-command/status/result enums, the per-channel calibration block offsets (currently
-absent — only `BTS_CAL_BASE`/`STRIDE`/`ADDR` exist), and status bits 8–14.
+Mirror everything above: the calibration command/status/result enums, the
+per-channel calibration block offsets and status bits 8–14. **Done** — the
+mirror now carries `BTS_REG_CAL_SLOT` … `BTS_REG_CAL_TEMP_C`,
+`BTS_CAL_WINDOW_COUNT` and `BTS_CAL_ADDR(ch, off)`. There is no
+`BTS_SENSE_ADDR(ch)`: the sense values live in each slot's runtime block (§4.3),
+so `BTS_RT_ADDR(ch, off)` reaches them.
+
+Watch the two conventions that differ between the files. `registers.h` gives
+`BTS_STATUS_*`/`BTS_CAL_ST_*` as bit **positions** and the `BTS_CAL_*`/`BTS_RT_*`
+offsets as register **indices**; `bts_regs.h` gives the same names as bit
+**masks** and **byte** offsets. Copying a line across compiles and is silently
+wrong.
 
 ### 10.2 `bts_link`
 
 - Add `bts_link_cal_*()` wrappers for each opcode. Each writes `eCalArgument`
   then `eCalCommand`, then reads back `eCalResult`.
 - Extend `bts_snapshot_t` with a `bts_cal_state_t` sub-struct.
-- Poll the calibration window (registers 1036–1088, one burst) **only while
-  calibration is active**, to avoid adding cost to the normal 25-transaction
-  250 ms cycle.
+- Poll the calibration window (**15 registers from `eCalSlot` at 1008 to
+  `eCalTemp_C` at 1064**, one burst) **only while calibration is active**, to
+  avoid adding cost to the normal 25-transaction 250 ms cycle. The burst spans
+  `eWatchdogRemaining_s` at 1028; index it, do not skip it.
 - Keep the existing lead-in pad-byte handling in `bus_read_block()` — the C2000
   clocks out a stale TX byte before its ISR runs, and new read paths must not
   reintroduce that bug.

@@ -27,27 +27,31 @@ currently masked anyway.)
 
 ## Physical
 
-> ### The working baud rate is ~7267, not 115200
+> ### Connect at 115200 — the ~7267 advice is withdrawn
 >
-> **Open issue, root cause not established.** `BTS_CONSOLE_BAUDRATE` is
-> `115200` and `SCI_setConfig()` computes BRR = 42 from `DEVICE_LSPCLK_FREQ`,
-> which by the arithmetic should give about **145 kbaud** — already not what
-> the constant says. In practice the console only works when the host
-> connects at **approximately 7267 baud**. At 115200 the port answers but
-> every received byte is framing garbage: sending `A`, `T`, `+` produced 254,
-> 248, 254, 245.
+> **Resolved.** An earlier revision of this file said to connect at ~7267
+> baud. That was wrong. The console runs at the configured **115200 8N1**.
 >
-> The rate that works implies the real LSPCLK is far below what
-> `DEVICE_LSPCLK_FREQ` claims. That has **not** been confirmed — reading
-> `ClkCfgRegs` over JTAG returned all zeros, which is a known artefact on
-> this part when the registers are read while the core is running.
+> What looked like a wrong baud rate was **build skew**, not a hardware
+> fault. The console is served by **CPU2**, `SCI_setConfig()` derives BRR
+> from `DEVICE_LSPCLK_FREQ`, and the clock configuration was edited
+> repeatedly with only CPU1 rebuilt and reloaded — so CPU2 kept a divisor
+> built for the previous clock and the apparent baud moved every time. Every
+> "independent" clock measurement came back through that same console and
+> shared the confound.
 >
-> **Halt the core before judging the PLL, and do not change the baud
-> constant** until the clock tree has been read properly. The same LSPCLK
-> feeds SPI and the LED driver's 800 kbaud WS2812B timing, so a change made
-> to fix the console may break either.
+> The clock was never wrong: SYSCLK measures **179.7 MHz** against a
+> configured 180 MHz, LSPCLK is 45 MHz, and the driver programs BRR = 47 for
+> 117188 baud — 1.7 % off 115200 and inside UART tolerance.
+>
+> **Rebuild and reload BOTH cores after any clock change.** A CPU1-only
+> reload leaves CPU2 running stale divisors and stale register addresses, and
+> looks like a peripheral fault.
+>
+> A bare `AT` with no reply is **by design** — `uartRxISR()` matches only
+> `"AT+"`. Probe with `AT+InputVoltage?`.
 
-- **SCIA**, GPIO28 = RX, GPIO29 = TX, 8N1 — **connect at ~7267 baud**
+- **SCIA**, GPIO28 = RX, GPIO29 = TX, 8N1 — **connect at 115200**
 - Reaches the TMDSCNCD28379D's isolated FTDI backchannel — the COM port that
   enumerates on the same USB cable as the XDS debug probe. No extra adapter.
 - Line termination accepted: `\r`, `\n` or `\r\n`. Responses end `\r\n`.

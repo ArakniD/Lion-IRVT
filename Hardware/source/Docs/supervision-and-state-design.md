@@ -46,7 +46,7 @@ contiguously makes it **one burst per slot**.
 
 ### 1.2 Layout
 
-Three regions. Per-slot strides are fixed and generous so a future field does
+Four regions. Per-slot strides are fixed and generous so a future field does
 not shift everything again.
 
 | Region | Base | Stride | Regs/slot | Range |
@@ -54,19 +54,23 @@ not shift everything again.
 | **Runtime** (RO) | 0 | 48 B (12 regs) | 12 | 0 – 383 |
 | **Settings** (RW) | 384 | 72 B (18 regs) | 18 | 384 – 959 |
 | **Unit** | 960 | — | 27 total | 960 – 1064 |
+| **Slot tuning** (RW) | 1068 | — | 13 total | 1068 – 1116 |
 
 Verified arithmetic: runtime ch7 ends at 383, immediately before the settings
-base; settings ch7 ends at 959, immediately before the unit base.
+base; settings ch7 ends at 959, immediately before the unit base; the unit
+block ends at 1064, immediately before the tuning base.
 
-**Total 267 registers**, top address 1064.
+**Total 280 registers**, top address 1116 — the tuning block of §1.6 is part
+of the map, not an appendix to it.
 
 > **Revised 2026-09-22.** This document originally specified a 24-register
 > settings stride, a unit base of 1152 and 315 registers in total. The
 > settings region was then compressed to 18 registers per slot — the
 > charge/discharge limit split collapsed into one direction-agnostic pair of
 > each, and `eChX_MinCellTemp` and the per-slot spare were removed. The tables
-> below are the current layout. Costs **534 words** of `CPU2TOCPU1RAM` for the
-> register file. Confirm against the map file after building — overflow here
+> below are the current layout. Costs **560 words** of `CPU2TOCPU1RAM` for the
+> register file — 280 registers at two words each. (534 was the figure before
+> the 13 slot-tuning registers were appended.) Confirm against the map file after building — overflow here
 > is a link-time failure (`#10099-D`).
 
 ### 1.3 Runtime block — `BTS_RT_BASE(ch)`, stride 48
@@ -225,7 +229,9 @@ registers.
 
 A slot only ever runs in one direction at a time and the mode register says
 which, so the split pairs were never both in force. The saving moved the unit
-block down 192 bytes and the top of the map from 1256 to 1064.
+block down 192 bytes and the top of the unit block from 1256 to 1064. The slot
+tuning block (§1.6) was added above it afterwards, so the map now tops out at
+**1116**.
 
 **There is no spare register left in any region.** A new per-slot field now
 means another stride change, which moves every address below it and breaks

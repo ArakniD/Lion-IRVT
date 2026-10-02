@@ -73,7 +73,7 @@ when adding a new read path.
 | Write to an `REG_ACCESS_RO` register | Silently dropped — no NACK, no error |
 | Write to an address ≥ `TOTAL_REGISTERS` | Silently dropped |
 | Read of an address ≥ `TOTAL_REGISTERS` | Returns `-1.0f`, a valid float, not an error |
-| Auto-increment past the top (1256) | Stops advancing; a continuing read repeats register 1256 |
+| Auto-increment past the top (1116) | Stops advancing; a continuing read repeats register 1116 |
 | Read with no preceding address write | Continues from wherever the last transaction left off |
 | Concurrent I2C / UART / CAN writes | Last writer wins; CPU1 is notified of the final value only |
 | NaN / Inf written to an RW register | Stored verbatim; the device does not sanitise |
@@ -177,7 +177,7 @@ where a read is unambiguous — the address phase is shared with a write. It
 sits before the `txCount == 0` guard, so it runs once per transmitted byte
 rather than once per register; harmless, since the feed is idempotent.
 
-**Verified on hardware:** `eWatchdogRemaining_s` (1220) holds steady at 30.0
+**Verified on hardware:** `eWatchdogRemaining_s` (1028) holds steady at 30.0
 while the ESP32 polls, with no writes on the bus.
 
 ---
@@ -266,8 +266,8 @@ RESTORED** with the converter off. A slot never resumes power by itself.
 transcription of `registers.h` with **no build coupling**.
 
 > **They have drifted before.** In the v2 reorder the mirror lost
-> `eWatchdogRemaining_s` (1220), putting its calibration telemetry at
-> 1220-1252 where the C2000 has 1224-1256, `BTS_TOTAL_REGISTERS` 314 against
+> `eWatchdogRemaining_s` (then 1220), putting its calibration telemetry at
+> 1220-1252 where the C2000 had 1224-1256, `BTS_TOTAL_REGISTERS` 314 against
 > `TOTAL_REGISTERS` 315, and `BTS_CAL_WINDOW_COUNT` 14 against a 15-register
 > window. `poll_cal_window()` would have misdecoded every telemetry value
 > during a bench calibration — shifted by one register, with `temp_c` picking
@@ -275,7 +275,17 @@ transcription of `registers.h` with **no build coupling**.
 > calibration is live. Normal polling looked healthy throughout. Found and
 > fixed 2026-09-20; details in `Docs/api-specification.md` §2.11.
 >
-> When either file changes, diff them register by register. `registers.h` is
+> **Those are the v1 addresses, deliberately not renumbered.** The same
+> registers are 1028 and 1032-1064 under v2.1, and the window count is still
+> 15. A record of a defect stops being evidence once it is rewritten to match
+> the map that replaced it.
+>
+> There is also a **third** transcription, in the Home Assistant integration
+> at `lion-lvrt-integration/.../protocol/registers.py`. It is current, but it
+> has no build coupling to either of the others, so a map change means editing
+> all three.
+>
+> When any of them changes, diff them register by register. `registers.h` is
 > authoritative.
 
 Every region base, stride and per-slot offset otherwise agrees, as do the
@@ -294,8 +304,8 @@ family rather than the one line you came for.
 The proxy's poll task runs a **9-transaction cycle every 250 ms**
 (`bts_link.c`) — one 12-register burst per slot plus the unit window. That is
 down from 33 under the v1 map, and the reduction is the whole point of the v2
-reorder. The calibration window at 1200-1256 is one extra burst, taken **only
-while calibration is active** (or once after a calibration command, via
+reorder. The calibration window at 1008-1064 — 15 registers — is one extra
+burst, taken **only while calibration is active** (or once after a calibration command, via
 `s_cal_poll_due`), so a feature used on a bench once per unit does not cost
 the normal cycle anything.
 

@@ -10,11 +10,11 @@ a calibration.
 
 | File | What it is |
 |---|---|
-| [`api-specification.md`](api-specification.md) | Part 1 the HTTP API; Part 2 the **complete I2C register map** — 267 registers in three regions, verified against `registers.h`. The authority for any address |
+| [`api-specification.md`](api-specification.md) | Part 1 the HTTP API; Part 2 the **complete I2C register map** — 280 registers in four regions, verified against `registers.h`. The authority for any address |
 | [`ble-specification.md`](ble-specification.md) | The GATT service: 12 characteristics, packed record layouts, notify behaviour, protocol versioning |
 | [`data-flow.md`](data-flow.md) | How measurements, commands, settings and calibration move between CPU1, CPU2, the ESP32 and a host. Diagrams, the measured rates, the CLA telemetry filter, and the dead paths |
 | [`supervision-and-state-design.md`](supervision-and-state-design.md) | The design contract for the PAUSED state, the host watchdog and F-RAM state persistence |
-| [`calibration-design.md`](calibration-design.md) | The calibration mathematics, opcodes and state machine. **Its register addresses are stale** — use `api-specification.md` for those |
+| [`calibration-design.md`](calibration-design.md) | The calibration mathematics, opcodes and state machine. A design document — for any address, `api-specification.md` §2.8 is the authority |
 | [`calibration-flow.md`](calibration-flow.md) | The calibration procedure and state machine as diagrams |
 | [`hardware-resources.md`](hardware-resources.md) | PIE, ACK groups, XINT, X-BAR, ADC base and CLA1 allocation across both cores |
 
