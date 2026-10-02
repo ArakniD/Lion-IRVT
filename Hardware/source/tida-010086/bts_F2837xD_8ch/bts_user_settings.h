@@ -41,9 +41,7 @@
 //
 // PRODUCTION since 2026-10-02. The AT console moved to the ESP32, which
 // serves the same grammar over I2C (see Docs/at-command-specification.md), so
-// nothing is lost by giving SCIA to the LED string - and two things are
-// gained: the WS2812B slot indication, and channel 1's GPIO trip input, which
-// the console build has to leave disconnected.
+// nothing is lost by giving SCIA to the LED string.
 //
 #define BTS_DEBUG_CONSOLE (false)
 
@@ -62,17 +60,26 @@
     // GPIO29 is the console TX, so the LED string cannot have it.
     #define BTS_LED_DRIVER_ENABLED    (false)
 
-    // GPIO28 is the console RX, so channel 1's GPIO trip cannot have it.
     #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #else
     //
-    // Production: no console. GPIO29 is transmit-only for the LED string and
-    // GPIO28 returns to channel 1's trip input.
+    // Production: no console. GPIO29 is transmit-only for the LED string.
     //
     #define BTS_CONSOLE_ENABLED       (false)
     #define BTS_LED_DRIVER_ENABLED    (true)
-    #define BTS_TRIP_GPIO_CH1_ENABLED (true)
+    #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #endif
+
+//
+// CHANNEL 1'S GPIO TRIP INPUT IS NEVER ENABLED, in either build.
+//
+// It is not useful: channel 1 keeps its CMPSS over-current trip in both
+// modes, which is the hardware comparator that actually protects the slot and
+// responds in nanoseconds. The separate GPIO trip was a second, slower path
+// on a pin that is contended with the console RX, and nothing depends on it.
+//
+// Hard-coded false above rather than left as a build option so the two
+// branches cannot drift, and so GPIO28 stays a plain input in every build.
 
 #define BTS_ENABLE_DETECT_CODE (false)
 

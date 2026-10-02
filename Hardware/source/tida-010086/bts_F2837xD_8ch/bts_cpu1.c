@@ -1196,7 +1196,27 @@ void main(void)
     // means "highest enabled slot", but in a tuning mode there is only one
     // slot under test, so the same three pins name it directly.
     //
-    btsSfraActive = BTS_MODE_IS_SFRA((uint16_t)startup_mode) ? 1U : 0U;
+    //
+    // THE BUILD GETS A VETO, not just the strap.
+    //
+    // btsSfraActive gates whether CPU1 keeps SCIA for the SFRA GUI. In a
+    // build with no SFRA library compiled in there is nothing to keep it
+    // FOR - and keeping it strands the port: CPU1 never calls
+    // SysCtl_selectCPUForPeripheral(), so CPU2's LED driver writes to a
+    // peripheral it does not own and every SCIA register reads back zero.
+    //
+    // That is not hypothetical. Observed on hardware 2026-10-02 with the LED
+    // string connected and dark: the MODE straps were open, pull-ups made
+    // them read 0b111, truth_table[7] decoded that to mode 7
+    // (eModeSfraAds131Closed), btsSfraActive latched to 1, and SCIA was held
+    // by a core with no SFRA code in it. Pin muxing and GPIO ownership were
+    // both correct, which is what made it hard to see.
+    //
+    // BTS_SFRA_ENABLED is a compile-time constant, so in a production build
+    // this whole expression folds to 0 and the strap cannot strand the port.
+    //
+    btsSfraActive = (BTS_SFRA_ENABLED == true) &&
+                    BTS_MODE_IS_SFRA((uint16_t)startup_mode) ? 1U : 0U;
     btsSfraSlot   = (uint16_t)startup_enable & 0x7U;
 
     BTS_initSlotGrouping((uint16_t)startup_mode, (uint16_t)startup_enable);
@@ -1382,11 +1402,15 @@ void main(void)
 
     //
     // GPIO29 is CPU2's in both modes: console TX when debugging, WS2812B LED
-    // output in production. GPIO28 is CPU2's console RX only in a debug
-    // build - in production it stays with CPU1 as channel 1's trip input.
+    // output in production.
+    //
+    // GPIO28 goes to CPU2 only when it is the console RX. Keyed on the
+    // console rather than on BTS_TRIP_GPIO_CH1_ENABLED, which is now always
+    // false - testing the trip macro would have handed GPIO28 to CPU2 in
+    // every build, including production where nothing on CPU2 uses it.
     //
     GPIO_setControllerCore(29, GPIO_CORE_CPU2);
-#if (BTS_TRIP_GPIO_CH1_ENABLED == false)
+#if (BTS_CONSOLE_ENABLED == true)
     GPIO_setControllerCore(28, GPIO_CORE_CPU2);
 #endif
 
