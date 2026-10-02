@@ -71,7 +71,26 @@
 
 // Function prototypes
 void LEDDriver_init(void);
+
+//
+// Rebuilds the pixel buffer and clocks it out over SCIA.
+//
+// MUST NOT be called from an interrupt. It blocks on the SCI TX FIFO and then
+// busy-waits ~60 us for the WS2812B reset pulse - roughly 360 us in total at
+// 800 kbaud for 24 bytes. Call it from the idle loop; LEDDriver_due() says
+// when.
+//
 void LEDDriver_update(void);
+
+//
+// True once per refresh interval, consumed by the caller.
+//
+// The timer ISR only sets a flag now. Doing the transfer in the ISR blocked
+// every other interrupt on CPU2 for its whole duration, including the I2C
+// target ISR that serves the ESP32 at several kHz - see the note in
+// led_driver.c.
+//
+bool LEDDriver_due(void);
 __interrupt void ledTimerISR(void);
 
 #endif // LED_DRIVER_H

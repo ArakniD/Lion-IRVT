@@ -51,6 +51,8 @@
 #include "bts_link.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -129,6 +131,55 @@ const bts_at_register_t *bts_at_register_find(const char *name)
 }
 
 /*
+ * AT+SYSINFO? - proxy diagnostics, not a BTS register.
+ *
+ * Exists because starting this console silences ESP_LOG on UART0, which
+ * also hides a panic banner and a boot message. Without it, an ESP32 that
+ * is rebooting in a loop looks identical from the serial port to one that
+ * is merely failing to reach the BTS - the symptom an operator sees, a
+ * display cycling between "WAITING FOR BTS" and live data, is the same
+ * either way.
+ *
+ * Uptime is the discriminator: if it keeps returning to a small number the
+ * proxy is restarting; if it climbs steadily the proxy is up and the link
+ * is dropping.
+ */
+static void at_report_sysinfo(void)
+{
+    char line[96];
+    const char *why;
+
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  why = "POWERON";  break;
+    case ESP_RST_EXT:      why = "EXT";      break;
+    case ESP_RST_SW:       why = "SW";       break;
+    case ESP_RST_PANIC:    why = "PANIC";    break;
+    case ESP_RST_INT_WDT:  why = "INT_WDT";  break;
+    case ESP_RST_TASK_WDT: why = "TASK_WDT"; break;
+    case ESP_RST_WDT:      why = "WDT";      break;
+    case ESP_RST_BROWNOUT: why = "BROWNOUT"; break;
+    case ESP_RST_DEEPSLEEP: why = "DEEPSLEEP"; break;
+    case ESP_RST_SDIO:     why = "SDIO";     break;
+    default:               why = "UNKNOWN";  break;
+    }
+
+    snprintf(line, sizeof(line), "+SYSINFO=reset:%s", why);
+    at_respond(line);
+
+    snprintf(line, sizeof(line), "+SYSINFO=uptime_s:%u",
+             (unsigned)(esp_timer_get_time() / 1000000));
+    at_respond(line);
+
+    snprintf(line, sizeof(line), "+SYSINFO=heap:%u",
+             (unsigned)esp_get_free_heap_size());
+    at_respond(line);
+
+    snprintf(line, sizeof(line), "+SYSINFO=heap_min:%u",
+             (unsigned)esp_get_minimum_free_heap_size());
+    at_respond(line);
+}
+
+/*
  * AT+C<n>PAUSE / AT+C<n>RESUME.
  *
  * Present because an operator should not have to compute a mode bitmask to
@@ -187,6 +238,17 @@ static void at_handle_line(char *line)
             return;
         }
         at_respond("ERROR: Invalid command");
+        return;
+    }
+
+    /*
+     * Proxy-local queries, answered without touching the BTS. Checked after
+     * the slot commands and before the register lookup, so a register could
+     * never be shadowed by one.
+     */
+    if ((query != NULL) && (strcmp(cmd, "SYSINFO") == 0)) {
+        at_report_sysinfo();
+        at_respond("OK");
         return;
     }
 

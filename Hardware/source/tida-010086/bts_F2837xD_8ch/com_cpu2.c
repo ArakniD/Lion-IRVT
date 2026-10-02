@@ -4270,6 +4270,15 @@ void main(void)
         //
         BTS_serviceADS1119();
         BTS_serviceDeferredWork();
+
+        //
+        // The WS2812B refresh. Here rather than in the timer ISR because it
+        // blocks for ~360 us - long enough to mask the I2C target interrupts
+        // that serve the ESP32 at several kHz. See led_driver.c.
+        //
+        if (LEDDriver_due()) {
+            LEDDriver_update();
+        }
     }
 }
 
