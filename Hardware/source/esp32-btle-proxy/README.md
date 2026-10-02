@@ -18,6 +18,9 @@ a GATT service (for a Web Bluetooth UI) and a JSON HTTP API.
 | Flash | 4 MB |
 | Programming port | COM6 (Silicon Labs CP210x) |
 | BTS link | I2C master, SDA = GPIO21, SCL = GPIO22, 100 kHz |
+| Status panel | ST7789 on SPI2/HSPI, MOSI = GPIO23, SCK = GPIO18, DC = GPIO16, RST = GPIO17, BL = GPIO4 |
+| Slot LEDs | 8x WS2812B on SPI3/VSPI, DIN = GPIO13 |
+| Encoder | A = GPIO15, B = GPIO27, switch = GPIO2 |
 | BTS address | `0x50` |
 | Unit envelope | 0–5 V and ±10 A per channel, 8 channels |
 

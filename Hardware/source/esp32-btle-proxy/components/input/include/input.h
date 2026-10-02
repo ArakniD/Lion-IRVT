@@ -6,7 +6,7 @@
  * WIRING
  * ------
  *   A    GPIO15      quadrature channel A
- *   B    GPIO13      quadrature channel B
+ *   B    GPIO27      quadrature channel B
  *   SW   GPIO2       push switch to ground, internal pull-up
  *
  * A NOTE ON THESE PINS
@@ -22,7 +22,12 @@
  *          reads high when idle - which is fine for a normal boot, but if
  *          you ever enter download mode by hand, do not hold the encoder
  *          button down at the same time.
- *   GPIO13 has no boot role and is unconditionally safe.
+ *   GPIO27 has no boot role and is unconditionally safe.
+ *
+ * B was on GPIO13 until the WS2812B driver claimed that pin for SPI3 MOSI
+ * (see led_strip.h). GPIO14 would also have worked electrically, but it is
+ * MTMS: with A already on MTDO, putting a second JTAG pin on the encoder
+ * would make the board awkward to debug over JTAG. GPIO27 has neither role.
  *
  * None of this affects normal running, and the pins are otherwise free on
  * the LOLIN32. See the pin table in README.md.

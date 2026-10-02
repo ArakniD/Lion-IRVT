@@ -29,9 +29,9 @@
 //
 //   BTS_DEBUG_CONSOLE == false  (production)
 //     GPIO28 = channel 1 GPIO trip input (digital in).
-//     GPIO29 = SCITXDA, transmit-only, driving the WS2812B LED string at
-//     800 kbaud. The AT command console is not available in this build -
-//     there is no free SCI port for it, so the host uses I2C or CAN.
+//     GPIO29 = SCITXDA, idle. The AT command console is not available in
+//     this build - there is no free SCI port for it, so the host uses I2C
+//     or CAN.
 //
 // SCIB is not an alternative: GPIO18 is SPICLKA and GPIO19 is the ADC1 chip
 // select for the external 24-bit SPI ADCs.
@@ -40,11 +40,33 @@
 // separate GPIO trip input is affected.
 //
 // PRODUCTION since 2026-10-02. The AT console moved to the ESP32, which
-// serves the same grammar over I2C (see Docs/at-command-specification.md), so
-// nothing is lost by giving SCIA to the LED string.
+// serves the same grammar over I2C (see Docs/at-command-specification.md).
+//
+// THE LED STRING ALSO MOVED TO THE ESP32, 2026-10-02, and the SCIA driver
+// that used to feed it is permanently off - see BTS_LED_DRIVER_ENABLED.
 //
 #define BTS_DEBUG_CONSOLE (false)
 
+//
+// BTS_LED_DRIVER_ENABLED IS FALSE IN BOTH ARMS AND SHOULD STAY THAT WAY.
+//
+// The WS2812B string is driven by the ESP32 now, over SPI3 on its GPIO13.
+// The C2000 driver that used to do it could never have worked: it clocked
+// raw colour bytes out of SCIA at 800 kbaud, but a WS2812B decodes pulse
+// WIDTHS - 400 ns high is a 0, 800 ns high is a 1 - and a UART cannot
+// produce them. It forces a LOW start bit before every byte and holds each
+// data bit for a full 1250 ns bit time, so the strip saw framing noise and
+// latched nothing. No pixel ever lit from this core.
+//
+// Driving it properly needs a peripheral that can emit a free-running bit
+// pattern, which here means SPI. GPIO29 - the wire that is physically
+// present - has no SPI mux option (GPIO, SCITXDA, EM1SDCKE, OUTPUTXBAR6,
+// EQEP3B, SD2_C3), and both usable SPI ports are held by the ADS131M08
+// pair. Hence the move. See esp32-btle-proxy/components/led_strip/.
+//
+// Setting this true again re-enables dead code AND hands SCIA to it, so do
+// not do it to get the console back - use BTS_DEBUG_CONSOLE for that.
+//
 #if (BTS_DEBUG_CONSOLE == true)
     //
     // Bench debug: SCIA carries the AT console on the FTDI backchannel.
@@ -63,10 +85,11 @@
     #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #else
     //
-    // Production: no console. GPIO29 is transmit-only for the LED string.
+    // Production: no console. GPIO29 is left muxed to SCITXDA and idle -
+    // the LED string it used to feed is driven by the ESP32 now.
     //
     #define BTS_CONSOLE_ENABLED       (false)
-    #define BTS_LED_DRIVER_ENABLED    (true)
+    #define BTS_LED_DRIVER_ENABLED    (false)
     #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #endif
 
