@@ -1072,6 +1072,13 @@ typedef struct
     float32_t dutyH_pu;
     float32_t dutyL_pu;
 
+    //
+    // Set while the converter is held off, cleared when the biquad has been
+    // seeded on the release edge. See BTS_tripEpwm() for why the seed cannot
+    // be written from the task level.
+    //
+    uint16_t seedPending;
+
     uint16_t ctrlMode_logic;
     uint16_t direction_logic;
 

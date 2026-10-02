@@ -179,16 +179,23 @@
 // Keep these in step with DEFAULT_F28V_GAIN / DEFAULT_F28V_OFFSET /
 // DEFAULT_F28I_GAIN / DEFAULT_F28I_OFFSET in com_cpu2.c, which are what CPU2
 // writes into registers[] when a channel has no valid stored calibration.
-// Unity gain means the reading is the raw ADC scaling with no correction
-// applied: BTS_monitor_Iout_Vout() already converts counts to volts via
-// (sum / (avgFactor * 4096)) * 2.5, so a gain of 1.0 yields the uncorrected
-// sense-chain voltage rather than zero.
+// BTS_monitor_Iout_Vout() converts counts to volts via
+// (sum / (avgFactor * 4096)) * 2.5, which yields VOLTS AT THE ADC PIN. The
+// cell sits behind a ~2.412:1 resistive divider, so the gain is what turns a
+// pin voltage back into a cell voltage.
 //
-// Note validateCalibration() in com_cpu2.c rejects an F28V_Gain outside
-// 0.5..2.0, so 0.0 is an invalid value there too - these defaults sit inside
-// that accepted band.
+// THIS WAS 1.0 AND THAT WAS WRONG. Unity gain does not mean "uncorrected" in
+// any useful sense - it means the divider is never undone, so every host read
+// the pin voltage while the register was named for the cell. Measured on
+// hardware 2026-10-02: a 3.492 V cell reported as 1.45 V. The error is not
+// cosmetic, because a discharge cut-off is compared against this number: at a
+// 2.5 V floor the slot reads as already empty while the cell is still full.
 //
-#define BTS_F28V_GAIN_DEFAULT             ((float32_t)1.0)
+// Note validateCalibration() in com_cpu2.c accepts an F28V_Gain in 2.0..3.0.
+// That band used to be 0.5..2.0, which could not express 2.412 at all while
+// admitting the wrong default of 1.0.
+//
+#define BTS_F28V_GAIN_DEFAULT             ((float32_t)2.4121)
 #define BTS_F28V_OFFSET_DEFAULT           ((float32_t)0.0)
 //
 // Default current gain for the on-chip ADC path.

@@ -212,7 +212,12 @@
 // a real gain/offset pair is established by the calibration procedure and
 // stored in EEPROM.
 //
-#define DEFAULT_F28V_GAIN            1.0f
+//
+// ~2.412:1 divider on the cell-voltage sense, measured on hardware
+// 2026-10-02 (3.492 V cell -> 1.4478 V at the ADC pin). Unity here
+// reported the pin voltage as if it were the cell voltage.
+//
+#define DEFAULT_F28V_GAIN            2.4121f
 #define DEFAULT_F28V_OFFSET          0.0f
 /* Must track BTS_F28I_GAIN_DEFAULT - see the derivation there. */
 #define DEFAULT_F28I_GAIN            9.66f
@@ -1103,7 +1108,20 @@ static bool validateCalibration(const BTS_channelCalibration* cal, uint16_t chan
     if (cal->MaxCellTemp < -40.0f || cal->MaxCellTemp > 100.0f) {
         return false;
     }
-    if (cal->F28V_Gain < 0.5f || cal->F28V_Gain > 2.0f || cal->F28V_Offset < -1.0f || cal->F28V_Offset > 1.0f) {
+    //
+    // The voltage gain band is 2.0..3.0 because the on-chip cell-voltage
+    // sense sits behind a ~2.412:1 resistive divider: the ADC sees
+    // 1.4478 V for a 3.492 V cell, and the gain is what undoes that.
+    //
+    // It used to be 0.5..2.0, which could not express 2.412 AT ALL. The
+    // default of 1.0 sat inside that band and looked valid, so nothing
+    // complained - and every host read the voltage AT THE PIN while calling
+    // it a cell voltage. Measured on hardware 2026-10-02: a 3.492 V cell
+    // reported as 1.45 V. A discharge cut-off of 2.5 V compares against that
+    // number, so the slot reads as already below its floor while the cell is
+    // still full.
+    //
+    if (cal->F28V_Gain < 2.0f || cal->F28V_Gain > 3.0f || cal->F28V_Offset < -1.0f || cal->F28V_Offset > 1.0f) {
         return false;
     }
     //

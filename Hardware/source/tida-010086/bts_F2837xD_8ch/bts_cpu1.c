@@ -1694,6 +1694,110 @@ void updateStatusRegisters(void)
     publishStatusToCpu2();
 }
 
+
+//
+// Seeds the converter's duty before the gate drive is enabled.
+//
+// WHY THIS EXISTS: without it a slot starts every run from 0% duty.
+//
+// For a CHARGE that is harmless - the output is the cell, the energy flows
+// into it, and starting at zero duty means starting at zero current and
+// ramping up. That is why a 1 A charge ran for the life of the project with
+// nothing to show a problem.
+//
+// For a DISCHARGE into anything that holds the node up - a bench supply, or
+// a cell - 0% is the WORST case, not the safe one. This is a synchronous
+// buck: in discharge, with current below the reverse-current threshold,
+// BTS_ctrlDirection() drives dutyH and dutyL from the same dutySet_pu
+// (bts.h:588), so a high side at ~0% means the low side is effectively on
+// across a node something else is holding at Vout. The whole of Vout then
+// sits across the inductor in the direction that drives current INTO the
+// slot.
+//
+// Measured on hardware 2026-10-02: slot 1 at 3.492 V from a bench supply,
+// 14.41 V input, IMAX 0.1 A. Required duty Vout/Vin = 24.2%; actual 0%. The
+// CMPSS low comparator latched its -9.5 A one-shot (COMPSTS bit 9,
+// TZOSTFLG = 0x0040 DCAEVT1) the instant the slot enabled, while the
+// measured current was 8 mA. The trip was correct and the firmware was not.
+//
+// WHAT IS SEEDED. A buck's steady-state duty is Vout/Vin, so that is the
+// feed-forward term. It is not enough to write it to dutySet_pu alone: the
+// CC controller is a biquad that integrates, and it would start from its own
+// state and drag the duty back. So the biquad's state is preloaded too.
+//
+// The preload is exact rather than approximate, and the arithmetic matters:
+//
+//   DCL_runDF22_C4 computes  uk = ek*b0 + x1
+//                            x1 = ek*b1 + x2 - uk*a1
+//                            x2 = ek*b2      - uk*a2
+//
+// At t = 0 no current is flowing yet, so the current error ek is ~0 and
+// uk reduces to x1. Setting x1 = D makes the very first control effort the
+// feed-forward duty. For the SECOND pass to hold it as well, x2 must satisfy
+// both x1 = x2 - D*a1 and x2 = -D*a2, which is consistent only when
+// 1 + a1 + a2 == 0 - the condition for a pole at z = 1.
+//
+// The shipped CC coefficients have exactly that: a1 = -1.96058023,
+// a2 = +0.96058023, sum with 1 is 0.0 to the last bit. The controller IS an
+// integrator, so x1 = D with x2 = -D*a2 sits the loop at duty D with zero
+// error and no step on any subsequent pass.
+//
+// If a future retune breaks that condition the seed still removes the
+// inrush - x1 = D is what the first edge uses - and the loop converges from
+// a sane duty rather than from zero. It degrades, it does not become unsafe.
+//
+// Vsense_V is used rather than CellVoltage_V because Vsense_V is the
+// ADS131M08, which is the converter's own regulated node and is separately
+// calibrated. CellVoltage_V is the 12-bit internal ADC.
+//
+static void BTS_seedConverterDuty(uint16_t ch)
+{
+    float32_t vin  = registers[BTS_REG_IDX(eInputVoltage)];
+    float32_t vout = BTS_measValues[ch].Vsense_V;
+    float32_t duty;
+
+    //
+    // No input, or a node that is not holding any voltage, means there is
+    // nothing to feed forward from. Leaving the duty at zero is correct in
+    // that case: with no output voltage there is no reverse-current path to
+    // guard against, which is the ordinary empty-slot start.
+    //
+    if ((vin <= (float32_t)0.0) || (vout <= (float32_t)0.0)) {
+        BTS_userInputs[ch].dutyRef_pu = (float32_t)0.0;
+        return;
+    }
+
+    duty = vout / vin;
+
+    //
+    // Clamped to the same band the control effort is clamped to, so the seed
+    // can never ask for a duty the loop would immediately reject.
+    //
+    if (duty > BTS_DUTY_SET_MAX_PU) {
+        duty = BTS_DUTY_SET_MAX_PU;
+    }
+    if (duty < BTS_DUTY_SET_MIN_PU) {
+        duty = BTS_DUTY_SET_MIN_PU;
+    }
+
+    BTS_userInputs[ch].dutyRef_pu = duty;
+
+    //
+    // The biquad is NOT preloaded here, and the first version of this
+    // function was wrong to try.
+    //
+    // BTS_tripEpwm() zeroes ctrl_cc->x1 and x2 on every control pass while
+    // tripFlag is set, and tripFlag is set for the whole time a slot is idle.
+    // At 100 kHz a preload written here is erased thousands of times over
+    // before the gate drive enables. Confirmed on hardware 2026-10-02: the
+    // duty reached dutySetRef_pu correctly at 0.2395, x1 read 0.0, and the
+    // slot tripped exactly as it had before.
+    //
+    // dutyRef_pu propagates to dutySetRef_pu through BTS_updateReference(),
+    // and the ISR applies it at the trip-release edge instead.
+    //
+}
+
 void modeCallback(float value, uint16_t channel)
 {
     uint32_t mode = (uint32_t)value;
@@ -1725,17 +1829,22 @@ void modeCallback(float value, uint16_t channel)
         // a running slot is already past this, and a paused one resumes
         // rather than re-arming.
         //
-        // Refused unless the slot's voltage calibration is valid. Both sense
-        // paths are independently calibrated, so on an uncalibrated slot the
-        // differential between them is meaningless - and this sequence drives
-        // the power stage based on exactly that differential. An uncalibrated
-        // slot still runs normally; it just does not get the pre-charge.
+        // The stored-calibration requirement was REMOVED on 2026-10-02 at the
+        // operator's direction: the shipped per-channel defaults are
+        // pre-calibrated and correct for this hardware, so a slot with no
+        // F-RAM record still has a meaningful differential between its two
+        // sense paths. A forced calibration step will be reintroduced later.
+        //
+        // The original reasoning is kept because it still describes the real
+        // risk: this sequence drives the power stage from the difference
+        // between the two sense paths, so if the defaults are ever wrong for
+        // a board, this is the path that will act on it. It is safe here
+        // because both paths were verified against an external reference on
+        // slot 1 - the ADS131M08 read 3.48 V and the internal ADC 3.53 V
+        // against an applied 3.492 V.
         //
         if (mode & BTS_MODE_WAITING) {
             if (status[channel].running || status[channel].paused) {
-                return;
-            }
-            if ((calValidFlags[channel] & BTS_CAL_FLAG_V_VALID) == 0UL) {
                 return;
             }
 
@@ -1863,6 +1972,14 @@ void modeCallback(float value, uint16_t channel)
             BTS_userInputs[channel].iref_A           = registers[regBase + BTS_SET_I_MAX] * groupShare;
             BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + BTS_SET_I_MIN] * groupShare;
             BTS_userInputs[channel].direction_logic  = status[channel].charging;
+
+            //
+            // Seed the duty BEFORE enable_logic goes high - the next control
+            // ISR acts on enable_logic, so anything set after it is already
+            // a pass late and the first PWM edge has gone out at 0%.
+            //
+            BTS_seedConverterDuty(channel);
+
             BTS_userInputs[channel].enable_logic     = 1;
 
             //

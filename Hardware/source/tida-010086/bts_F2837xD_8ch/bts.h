@@ -425,9 +425,69 @@ static inline void BTS_tripEpwm(uint32_t EPWM_BASE, BTS_DCL_CTRL_TYPE* ctrl_cc, 
         ctrl_cc->x1=0.0;
         ctrl_cc->x2=0.0;
 
+        //
+        // Re-arm the seed for the next release.
+        //
+        // The two lines above run on EVERY pass while tripFlag is set, and
+        // tripFlag is set the whole time a slot is idle (BTS_updateReference
+        // ties it to enable_logic, bts.c:720-725). That is correct - a
+        // controller must not accumulate state while its output is forced
+        // low - but it also means a seed written from the task level is
+        // erased long before the gate drive ever enables.
+        //
+        // So the seed is applied HERE, on the release edge, and this flag is
+        // what remembers that it is still owed.
+        //
+        ctrlLoopVariable->seedPending = 1U;
     }
 
     else{
+        //
+        // TRIP RELEASE EDGE - the only moment the biquad may be seeded.
+        //
+        // A synchronous buck started from zero duty is safe in charge and
+        // dangerous in discharge: with dutyH = dutyL = 0 the low side is
+        // effectively across a node something else is holding up, and the
+        // whole of Vout appears across the inductor driving current INTO the
+        // slot. Measured 2026-10-02: a 3.492 V bench supply on slot 1 with a
+        // 0.1 A limit latched the CMPSS -9.5 A one-shot the instant the slot
+        // enabled, at 8 mA of real current.
+        //
+        // dutySetRef_pu carries the feed-forward duty Vout/Vin computed by
+        // BTS_seedConverterDuty() at slot start. In THIS build it has no
+        // other reader - the open-loop branch that consumes it (bts.h, the
+        // BTS_ISR_MODE_OPEN_LOOP block) is compiled out - so it is free to
+        // act as the seed channel without a new field in message RAM.
+        //
+        // WHY x1 AND x2, AND WHY EXACTLY THESE VALUES
+        //
+        //   DCL_runDF22_C4:  uk = ek*b0 + x1
+        //                    x1 = ek*b1 + x2 - uk*a1
+        //                    x2 = ek*b2      - uk*a2
+        //
+        // At the release edge no current is flowing yet, so ek is ~0 and uk
+        // collapses to x1: setting x1 = D puts the FIRST PWM edge at the
+        // feed-forward duty. For the second pass to hold it, x2 must satisfy
+        // both x1 = x2 - D*a1 and x2 = -D*a2, which is consistent only when
+        // 1 + a1 + a2 == 0 - a pole at z = 1.
+        //
+        // The shipped CC coefficients satisfy it exactly: a1 = -1.96058023,
+        // a2 = +0.96058023, and 1 + a1 + a2 is 0.0 to the last bit. The
+        // controller IS an integrator, so this pair is a true equilibrium -
+        // the loop sits at duty D with zero error and takes no step on any
+        // later pass.
+        //
+        // If a retune ever breaks that condition the seed still removes the
+        // inrush, because x1 = D is what the first edge uses; the loop then
+        // converges from a sane duty instead of from zero. It degrades, it
+        // does not become unsafe.
+        //
+        if (ctrlLoopVariable->seedPending != 0U) {
+            ctrl_cc->x1 = ctrlLoopVariable->dutySetRef_pu;
+            ctrl_cc->x2 = -(ctrlLoopVariable->dutySetRef_pu * ctrl_cc->a2);
+            ctrlLoopVariable->seedPending = 0U;
+        }
+
         //
         // Clears the OST flag this function's own EPWM_forceTripZoneEvent()
         // raises, so a software trip releases once tripFlag drops.

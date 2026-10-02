@@ -1097,13 +1097,52 @@ void BTS_HAL_setupSyncBuckPwm(uint32_t EPWM_BASE)
     //
     // Configure Dead Band Generator for active high complementary PWMs
     //
+    // BOTH EDGES COME FROM EPWMA, AND THAT IS THE WHOLE POINT.
+    //
+    // A complementary pair has to be generated from ONE source. The deadband
+    // unit takes that single edge, delays the rise for the high side and the
+    // fall for the low side, and inverts one of them - which is what makes
+    // overlap impossible by construction rather than by arithmetic.
+    //
+    // The falling edge was previously taken from EPWMB (DBCTL IN_MODE = 2),
+    // which fed the two delays from two INDEPENDENT sources. Overlap then
+    // depended entirely on CMPA and CMPB holding a sane relationship, and
+    // BTS_HAL_updateDuty() writes them separately. In the discharge path
+    // BTS_ctrlDirection() sets dutyH_pu == dutyL_pu == dutySet_pu, so the two
+    // compares were IDENTICAL: EPWMA and EPWMB transitioned at the same
+    // instant and the deadband had no distinct edges to separate. Both FETs
+    // conducted.
+    //
+    // Observed on hardware 2026-10-02: slot 1, discharge into a 3.492 V bench
+    // supply at a 0.1 A limit, tripped the CMPSS low comparator (COMPSTS bit
+    // 9, TZOSTFLG = 0x0040) on every enable while the supply's own meter read
+    // a correct ~100 mA and the ADS131M08 read 8 mA. A shoot-through pulse is
+    // tens of nanoseconds - far too short for either to see, and exactly what
+    // a comparator with a 3-sample filter exists to catch.
+    //
+    // A CHARGE at 1 A never showed this: that branch sets dutyL_pu = 1.0, so
+    // the two compares differed and the edges stayed distinct.
+    //
+    // CONSEQUENCE, and it is deliberate: the deadband stage sits AFTER the
+    // action qualifier, so with both inputs on EPWMA neither CMPB nor an AQ
+    // software force on OUTPUT_B reaches the pins any more. That makes the
+    // charge-mode reverse-current branch in BTS_ctrlDirection() - which
+    // forces OUTPUT_B high and asks for dutyL_pu = 1.0 - inert. The discharge
+    // branch is unaffected, because it forces OUTPUT_A, which IS the
+    // deadband's input. Trip zones are unaffected either way: TZ is after DB.
+    //
+    // This is the correct trade for a synchronous buck-boost running in CCM,
+    // where the two gates must be complementary at all times. Restoring the
+    // asymmetric charge-mode branch needs a different mechanism - one that
+    // keeps a single deadband source - not a second input.
+    //
     EPWM_setDeadBandDelayMode(EPWM_BASE, EPWM_DB_RED, true);
     EPWM_setDeadBandDelayMode(EPWM_BASE, EPWM_DB_FED, true);
 
     EPWM_setRisingEdgeDeadBandDelayInput(EPWM_BASE,
                                          EPWM_DB_INPUT_EPWMA);
     EPWM_setFallingEdgeDeadBandDelayInput(EPWM_BASE,
-                                          EPWM_DB_INPUT_EPWMB);// old value EPWMA
+                                          EPWM_DB_INPUT_EPWMA);
 
     EPWM_setDeadBandDelayPolarity(EPWM_BASE,
                                   EPWM_DB_FED,
