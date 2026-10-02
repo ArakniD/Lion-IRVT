@@ -286,6 +286,65 @@ a site can retune a cutoff without a firmware build.
 
 ---
 
+## Slot indicators
+
+Eight WS2812B pixels, one per BTS slot, are driven from this firmware —
+`components/led_strip/`, one `SPI3_HOST` transfer every 25 ms from a FreeRTOS
+task at priority 4. Colour comes from `bts_link_get_snapshot()`, so the
+indicators ride on the poll that was already running and there is nothing to
+feed them.
+
+**This used to be the C2000's job, and it never lit a single pixel.**
+`LEDDriver_update()` clocked raw colour bytes out of SCIA at 800 kbaud, but a
+WS2812B decodes pulse *widths* — 400 ns high is a 0, 800 ns high is a 1, each
+inside a 1250 ns slot — and a UART cannot produce them: it forces a low start
+bit before every byte and holds each data bit for a full bit time, so the strip
+saw framing noise and latched nothing. Fixing it in place needed a peripheral
+that emits a free-running bit pattern, which on that device means SPI — and
+GPIO29, the wire that physically exists, has no SPI mux option, while both
+usable SPI ports are held by the ADS131M08 pair. The full account, including
+the per-slot colour priority chain, is in
+[`Docs/supervision-and-state-design.md` §2.5.1](../Docs/supervision-and-state-design.md#251-slot-indication--the-ws2812b-string).
+
+**SPI3 and not SPI2.** The ST7789 panel holds SPI2, which *is* HSPI: it sits on
+GPIO23/GPIO18 — VSPI's IO_MUX default pads — but reaches them through the GPIO
+matrix, so SPI3 was the genuinely free host. Sharing one would let an LED frame
+stall a panel repaint and vice versa.
+
+**Four SPI bits per WS2812B bit at 2.5 MHz** (80 MHz / 32, so one SPI bit is
+400 ns): `1000` is a 0, `1100` is a 1, landing both symbols on the part's exact
+nominal widths with a 1600 ns slot well inside the 650–1850 ns it tolerates.
+Two WS2812B bits pack into one SPI byte, so the whole eight-LED frame is 96
+bytes in a single 307 us DMA transfer, and MOSI rests low afterwards — which
+covers the 50 us reset latch for free. The rate is a deliberate departure from
+the commonly-cited **3.333 MHz**, where the same `1100` symbol gives
+T1H = 600 ns, *below* the 650 ns minimum for a logic 1. That works on some
+strips and fails on others, which on a safety indicator is the worst failure
+mode available.
+
+**The encoder's B channel moved from GPIO13 to GPIO27** to free the MOSI pin.
+GPIO14 was the other candidate and was rejected: it is MTMS, and with A already
+on MTDO (GPIO15) a second JTAG pin on one encoder would make the box awkward to
+debug later. GPIO27 carries no strapping or JTAG role.
+
+### What it costs
+
+**Indication lags by up to one poll.** Colour derives from the 250 ms I2C
+snapshot rather than from the unit's registers directly, so a state change can
+take ~250 ms longer to reach the strip than a C2000-resident driver would have
+needed. Against an operator's reaction time that is nothing; it is recorded
+because it is a real difference.
+
+**The strip now depends on this firmware being alive.** If the ESP32 is
+unplugged, crashes, or is held in reset it sends no frames at all — and a
+WS2812B latch holds its last colour **indefinitely**, which is a green pixel
+for a slot that has since tripped. All eight flashing amber in unison covers
+the case where this firmware is running but cannot reach the unit; by
+construction it cannot cover this firmware being dead. Treat the strip as an
+indicator, never as evidence that a slot is safe.
+
+---
+
 ## BLE interface
 
 One primary service, `e5f10001-9a4c-4b7d-8f2e-1c3a5b7d9f01`. Every

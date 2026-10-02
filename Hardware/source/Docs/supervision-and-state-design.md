@@ -534,25 +534,100 @@ and only bits 22 and 23 now remain below the float32 ceiling.
 
 ### 2.5.1 Slot indication — the WS2812B string
 
-Eight WS2812B pixels, one per slot, refreshed at 80 Hz from CPU Timer 2 on
-CPU2. **Production build only**: the string needs GPIO29, which the AT console
-takes when `BTS_DEBUG_CONSOLE` is true. Since the AT console moved to the
-ESP32 the unit ships with `BTS_DEBUG_CONSOLE` false, so the LEDs are live and
-channel 1's GPIO trip input comes back with them.
+Eight WS2812B pixels, one per slot, driven by the **ESP32 proxy** over SPI3
+and refreshed every 25 ms. The C2000 no longer touches them.
 
-**They are RGB, not RGBW** — three bytes per pixel, and the colour tables are
-in **GRB order**, so `COLOR_RED` is `{0, 255, 0}`. Yellow reads the same
-either way, but any new colour written as RGB would be silently wrong.
+#### The C2000 version never lit a pixel
+
+This is not a regression that was repaired — the function moved because it
+could never have worked where it was. `LEDDriver_update()` clocked **raw
+colour bytes out of SCIA at 800 kbaud**. A WS2812B does not decode bytes; it
+decodes **pulse widths** — 400 ns high is a 0, 800 ns high is a 1, each inside
+a 1250 ns slot. A UART cannot produce them. It forces a LOW start bit before
+every byte and holds each data bit for a full bit time, so the strip saw
+framing noise and latched nothing.
+
+Three real bugs were found in this area before anyone questioned the
+transport: the Timer 0 double-booking
+([`hardware-resources.md`](hardware-resources.md) §8.2), the LED ISR's ~360 us
+of masked interrupts starving CPU2's I2C target, and SCIA being stranded by an
+unstrapped MODE strap. All three were genuine and all three were worth fixing.
+**None of them could ever have lit the string**, because what arrived at the
+first pixel was never a WS2812B symbol to begin with.
+
+#### Why it could not be fixed on the C2000
+
+Driving a WS2812B needs a peripheral that emits a **free-running bit
+pattern**, which on this device means SPI. Three constraints close the door
+together:
+
+- **GPIO29 — the wire that physically exists — has no SPI mux option.** Its
+  choices are GPIO, SCITXDA, EM1SDCKE, OUTPUTXBAR6, EQEP3B and SD2_C3.
+- **Both usable SPI ports are held by the ADS131M08 pair**, SPIA and SPIC.
+- **The Output X-BAR carries no ePWM source.** That kills the one remaining
+  idea — an eCAP APWM routed out through OUTPUTXBAR6 — on cost rather than on
+  wiring: it works electrically, but needs **192 software duty updates per
+  refresh**, which is the ISR starvation that had just been fixed, rebuilt
+  from scratch.
+
+#### How the ESP32 drives it
+
+Implemented in
+[`led_strip.c`](../esp32-btle-proxy/components/led_strip/led_strip.c), started
+from [`main.c`](../esp32-btle-proxy/main/main.c).
+
+| | |
+|---|---|
+| Bus | `SPI3_HOST` (VSPI), MOSI on **GPIO13** |
+| Clock | **2.5 MHz** — 80 MHz / 32 |
+| Encoding | four SPI bits per WS2812B bit: `1000` = 0, `1100` = 1 |
+| Frame | 12 bytes per LED, **96 bytes for all eight in one DMA transfer**, 307 us |
+| Refresh | FreeRTOS task `led_strip`, priority 4, 3072-byte stack, every 25 ms |
+| Brightness | 64/255, scaled linearly per channel |
+
+**Neither SCLK nor CS is routed.** The WS2812B is a one-wire part and its
+clock is implicit in the bit pattern, so routing either would burn a pin to
+drive nothing.
+
+**SPI3 and not SPI2.** The ST7789 panel holds SPI2, which *is* HSPI. It sits
+on GPIO23/GPIO18 — VSPI's IO_MUX default pads — but reaches them through the
+GPIO matrix, so SPI3 was the genuinely free host. Sharing one host would let
+an LED frame stall a panel repaint and vice versa.
+
+**2.5 MHz, not the 3.333 MHz the commonly-cited article uses.** At 2.5 MHz an
+SPI bit is 400 ns, so `1000` gives T0H = 400 ns and `1100` gives T1H = 800 ns
+— both *exactly* the WS2812B's nominal widths, with the resulting 1600 ns slot
+well inside the 650–1850 ns the part tolerates. At 3.333 MHz the same `1100`
+symbol gives **T1H = 600 ns, under the 650 ns minimum for a logic 1**. That
+works on some strips and fails on others, which is the worst failure mode
+available here: intermittently wrong colours on a safety indicator. The
+deviation from the article is deliberate.
+
+**The reset latch comes free.** Every symbol ends in a 0 bit, so MOSI rests
+low between frames and the >50 us the part needs to latch is covered many
+times over by the 25 ms until the next refresh.
+
+**It is a scheduled task, not a timer ISR.** That is the structural difference
+from the C2000 driver, which blocked with interrupts masked. A task at
+priority 4 cannot starve the I2C poll, the BLE stack or the panel — the
+scheduler simply runs them.
 
 #### Priority is safety-first, and the order is load bearing
 
-`LEDDriver_update()` is a single if/else-if chain: the **first** condition
-that matches wins, so a slot that is both tripped and calibrating shows the
-trip. Reading down the chain is reading the priority.
+**The per-slot chain is preserved exactly** from the C2000 version.
+`colour_for()` is the same single if/else-if ladder in the same order: the
+**first** condition that matches wins, so a slot that is both tripped and
+calibrating shows the trip. Reading down the chain is reading the priority.
+
+One gate is new, and it sits **above** the whole chain: if the proxy cannot
+see the unit, no per-slot colour is trustworthy, so no per-slot colour is
+shown.
 
 ```mermaid
 flowchart TD
-    S(["slot status word"]) --> D{SLOT_DISABLED}
+    S(["refresh tick"]) --> OFF{"unit offline or<br/>slot data not valid ?"}
+    OFF -->|yes| AM["AMBER 250/250<br/><i>all eight, in unison</i>"]
+    OFF -->|no| D{SLOT_DISABLED}
     D -->|yes| DC["RED solid<br/><i>strap masked it off</i>"]
     D -->|no| T{OVERCURRENT_TRIP}
     T -->|yes| TC["RED 2000/500 ms"]
@@ -576,6 +651,7 @@ flowchart TD
     F -->|yes| FC["WHITE solid"]
     F -->|no| IC["GREEN solid<br/><i>idle</i>"]
 
+    style AM stroke:#da0
     style DC stroke:#c00
     style TC stroke:#c00
     style RC stroke:#c00
@@ -604,6 +680,7 @@ seat a cell yet*.
 
 | Meaning | Colour | Pattern |
 |---|---|---|
+| **Link down — proxy cannot see the unit** | **amber** | **250/250, all eight in unison** |
 | Strap-disabled | red | solid |
 | Over-current trip | red | 2000 ms on / 500 off |
 | Reverse polarity | red | 125/125 |
@@ -616,6 +693,89 @@ seat a cell yet*.
 | Running | blue | solid |
 | Finished | white | solid |
 | Idle | green | solid |
+
+Patterns are quoted **on / off in milliseconds** throughout.
+
+#### Link down — all eight amber, in unison
+
+Taken when `!snap.unit.online`, meaning the last I2C poll cycle did not
+complete, or when an individual slot's `valid` is still false because it has
+never been read successfully.
+
+**Unison is the cue, and it is the whole point.** No real per-slot condition
+ever synchronises across the entire strip, so eight pixels blinking together
+is a pattern the hardware cannot otherwise produce. An operator can read
+*"the proxy cannot see the unit"* from across a bench without consulting a
+colour key.
+
+The two obvious alternatives were both rejected, for the same reason:
+
+- **Holding the last known colours** would keep asserting slot states that may
+  no longer be true — a green idle pixel for a slot that has since tripped.
+- **Going dark** is indistinguishable from the box being powered off.
+
+#### Two sharp edges the port removed
+
+**Colour tables are written RGB in source and reordered at encode time.**
+`encode_pixel()` emits green, red, blue — the WS2812B's wire order — from an
+`rgb_t` that reads normally. The C2000 tables were stored **pre-swapped into
+GRB**, so `COLOR_RED` was literally `{0, 255, 0}` and every line needed a
+comment explaining that yellow only looked right by coincidence. Any new
+colour written the obvious way was silently wrong.
+
+**Flash periods are in milliseconds.** They are divided by `refresh_ms` to get
+a tick count, so they stay in real time whatever the refresh rate is. The
+C2000 version expressed them in units of an 80 Hz timer tick, which meant
+retuning that timer would have silently changed every flash rate in the table.
+
+#### What this costs
+
+Two trade-offs, both real and neither hidden:
+
+**Indication now lags by up to one poll interval.** Colour derives from
+`bts_link_get_snapshot()` — the ESP32's existing **250 ms** I2C poll — rather
+than from `registers[]` directly. A state change can therefore take up to
+~250 ms longer to reach the strip than a C2000-resident driver would have
+needed. Against an operator's reaction time this is nothing; it is recorded
+because it is a genuine difference, not because it is a problem.
+
+**The strip now depends on the proxy being alive.** If the ESP32 is unplugged,
+crashes, or is held in reset, it sends no frames at all — and a WS2812B latch
+holds its last colour **indefinitely**. That is precisely the *"frozen LED
+showing running for a slot that has since tripped"* hazard that
+[`hardware-resources.md`](hardware-resources.md) §8.2 called actively
+misleading, and it has not been eliminated, only moved. The amber-unison state
+covers the case where the ESP32 is **alive but cannot reach the unit**; by
+construction it cannot cover the ESP32 itself being dead. **Treat the strip as
+an indicator, never as evidence that a slot is safe.**
+
+#### What is left on the C2000
+
+`BTS_LED_DRIVER_ENABLED` is `(false)` in **both** arms of the
+`BTS_DEBUG_CONSOLE` switch in
+[`bts_user_settings.h`](../tida-010086/bts_F2837xD_8ch/bts_user_settings.h), so
+`LEDDriver_init()`, `LEDDriver_update()` and `LEDDriver_due()` are the no-op
+stubs in **every** build.
+[`led_driver.c`](../tida-010086/bts_F2837xD_8ch/led_driver.c) and its header
+remain in the project and still compile; the idle-loop call
+`if (LEDDriver_due()) LEDDriver_update();` at
+[`com_cpu2.c:4297`](../tida-010086/bts_F2837xD_8ch/com_cpu2.c) still exists and
+now does nothing.
+
+Two consequences worth recording:
+
+**CPU Timer 2 on CPU2 is now free.** `ledTimerISR` is never registered and
+`INT_TIMER2` is no longer claimed on that core at all. This makes the Timer 0
+double-booking in [`hardware-resources.md`](hardware-resources.md) §8.2
+**historical** — worth keeping as a record of what broke and why, but it no
+longer describes a live allocation. Timer 0 on CPU2 remains the ADS1119 settle
+dwell's alone.
+
+**GPIO29 is idle in a production build.** It is still muxed to
+`GPIO_29_SCITXDA` unconditionally in `BTS_HAL_setupCpu2Pins()`
+([`bts_hal.c:1394`](../tida-010086/bts_F2837xD_8ch/bts_hal.c)) and simply
+drives nothing. See [§2.7](#27-mode-strap---slot-grouping-and-slot-tuning) for
+what that frees up.
 
 #### A fix that came with this work
 
@@ -778,13 +938,32 @@ the same way.
 One tuning binary therefore serves every slot and both loops. Strapped to a
 normal mode it behaves exactly like a production unit.
 
-**SCIA ownership rides on the same strap.** SCIA is contended four ways -
-CPU2's AT console, CPU2's WS2812B LED driver, channel 1's GPIO trip on
-GPIO28, and CPU1's SFRA GUI - and `SysCtl_selectCPUForPeripheral()` is a
-one-shot boot-time write. CPU1 keeps SCIA only when the straps selected a
-tuning mode; otherwise it hands it to CPU2 as before. This is why the
-selection has to ride on a strap latched at reset rather than on a host
-register: the ownership cannot be changed once the unit is running.
+**SCIA ownership rides on the same strap.** It used to be contended four ways.
+Two of those claimants are gone: the WS2812B LED driver moved to the ESP32
+([§2.5.1](#251-slot-indication--the-ws2812b-string)) and channel 1's GPIO trip
+on GPIO28 is hard-coded `(false)` in both arms, because channel 1 keeps its
+CMPSS over-current trip either way and the GPIO path was only ever a second,
+slower one. What remains is two:
+
+| Claimant | Pins | Selected by |
+|---|---|---|
+| CPU2's AT console | GPIO28 RX, GPIO29 TX | `BTS_DEBUG_CONSOLE == true` |
+| CPU1's SFRA GUI | the whole port | MODE strap 6 or 7 |
+
+The first is a build-time switch. The second is resolved at **boot** by
+`SysCtl_selectCPUForPeripheral()`
+([`bts_cpu1.c:1382`](../tida-010086/bts_F2837xD_8ch/bts_cpu1.c)), a one-shot
+ownership write: CPU1 keeps SCIA only when the straps selected a tuning mode,
+otherwise it hands it to CPU2 as before. This is why the selection has to ride
+on a strap latched at reset rather than on a host register: the ownership
+cannot be changed once the unit is running.
+
+**A production build no longer has to give up its console.** The reason it
+lost one was that the LED string needed GPIO29; that constraint is gone, and
+the C2000 AT console could now be carried at no cost. The project keeps
+`BTS_DEBUG_CONSOLE` false deliberately and uses the ESP32's console instead -
+this is recorded because the trade-off no longer exists, not as a reason to
+change the switch.
 
 ### 2.7.1 Mode register
 
@@ -1017,10 +1196,12 @@ Pause/resume are reachable by writing the mode register, but add
 `AT+C0PAUSE` / `AT+C0RESUME` as well — an operator at a serial console should
 not have to compute a bitmask to stop a cell safely.
 
-> The AT console is **conditional**: `BTS_DEBUG_CONSOLE` must be `true`, and in
-> that build the WS2812B LED driver and channel 1's GPIO trip are compiled out
-> (they share GPIO28/29). Serial testing and LED testing cannot happen in the
-> same build.
+> The AT console is **conditional**: `BTS_DEBUG_CONSOLE` must be `true`. It no
+> longer costs anything to enable — the WS2812B string moved to the ESP32
+> ([§2.5.1](#251-slot-indication--the-ws2812b-string)) and channel 1's GPIO
+> trip is hard-coded off in both arms, so nothing else wants GPIO28/29. Serial
+> testing and LED testing can now happen in the same build. The unit still
+> ships with `BTS_DEBUG_CONSOLE` false and uses the ESP32's console instead.
 
 ---
 
