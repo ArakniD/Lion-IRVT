@@ -416,7 +416,6 @@ to the log; the procedure is driven over BLE or HTTP.
 | A slot shows `restored` after you power-cycled the unit | The F-RAM state block. It was mid-run when the unit went down, and came back paused with its counters rather than resuming into a cell that may have been changed. | Working as designed. Stop it before calibrating; resume it only if you know the same cell is still in the slot. |
 | All eight LEDs flashing amber together | The ESP32 proxy cannot reach the unit over I2C. The proxy itself is alive — it is still driving the strip — but it has nothing current to show. Amber is used for nothing else, so this is always the link, never a slot condition. | Check the I2C wiring between the proxy and the unit, and `GET /api/i2c_diag`. Everything the proxy reports — display, HTTP, BLE — is stale until it clears. |
 | The LEDs are frozen on a colour and never change | The ESP32 is dead, unplugged or held in reset. It drives the strip, and a WS2812B holds its last colour indefinitely once the frames stop — so you are looking at whatever was true when the proxy stopped. **Do not trust them.** A slot showing green may have tripped since. | Confirm it: the display, HTTP and BLE all come from the same ESP32, so they will be gone too. Power-cycle the proxy, then read the slot state back before touching anything. |
-| The AT console prints `WARNING: host watchdog DISABLED` repeatedly | **Known bug.** The message is spurious — supervision is armed. | Ignore it. Confirm with `AT+WD?`, which should answer `+WD=30.00`. |
 | The AT console answers only garbage | **Build skew**, not a hardware fault. The console is served by **CPU2**, and `SCI_setConfig()` derives its divisor from `DEVICE_LSPCLK_FREQ`. Editing the clock config and rebuilding only CPU1 leaves CPU2's divisor built for the old clock. | Rebuild and reload **both** cores, then connect at **115200 8N1**. |
 | The AT console says nothing at all to `AT` | **By design.** `uartRxISR()` matches only `"AT+"`; a bare `AT` is dropped with no `OK` and no `ERROR`. | Probe with a real command, e.g. `AT+InputVoltage?`. |
 | Current reads the right size with the wrong sign afterwards | A signed value was entered where a magnitude was wanted. | Recalibrate that slot's current. Enter the absolute value. |
@@ -475,8 +474,10 @@ Verify the result independently before you trust the unit:
 
 ## Known issues
 
-One cosmetic defect in the debug console. It does not affect calibration
-accuracy or the safety paths, but it will waste your time if you meet it cold.
+None in the debug console today. The spurious
+`WARNING: host watchdog DISABLED` banner that earlier revisions described here
+was removed from the firmware on 2026-09-22; if you see it, the unit is
+running an old build.
 
 > ### The AT console baud rate is no longer an issue — it works at 115200
 >
@@ -501,18 +502,3 @@ accuracy or the safety paths, but it will waste your time if you meet it cold.
 > `AT+InputVoltage?` — a bare `AT` is silently ignored by design, which reads
 > exactly like a dead console.
 
-### A spurious watchdog-disabled warning
-
-The console periodically prints:
-
-```
-WARNING: host watchdog DISABLED - slots will not pause if the host stops responding
-```
-
-**This is wrong.** `AT+WD?` answers `+WD=30.00` and the countdown at
-`eWatchdogRemaining_s` is healthy. The flag that raises the message is set
-only where a write of `0.0` arrives at `eHostWatchdog_s`, and it reads 0 when
-sampled, so the trigger has not been identified.
-
-Cosmetic — supervision is verifiably armed — but alarming and wrong. Confirm
-with `AT+WD?` rather than believing the banner.

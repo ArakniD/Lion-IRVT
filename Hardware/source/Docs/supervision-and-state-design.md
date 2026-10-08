@@ -1255,5 +1255,5 @@ Build and load both cores plus the ESP32, then:
 
 Bench preconditions that otherwise waste time: input supply above
 `eChargeDisableV` or nothing starts; a latched `TZOSTFLG` cannot be cleared
-while its source is asserted; and with hardware trips disabled, do not leave
-high-current tests unattended.
+while its source is asserted; and with the hardware trip level still untested
+against a real over-current, do not leave high-current tests unattended.

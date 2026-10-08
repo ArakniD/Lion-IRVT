@@ -187,7 +187,7 @@ while the ESP32 polls, with no writes on the bus.
 | Property | Value |
 |---|---|
 | Pins | **GPIO40 = SDAB, GPIO41 = SCLB** |
-| Speed | 400 kHz |
+| Speed | **100 kHz** — 10 kΩ pull-ups rule out 400 kHz. See `Docs/hardware-resources.md` §10 |
 | Devices | FM24V10 F-RAM `0x50`; ADS1119 `0x40` (slots 1-4), `0x41` (slots 5-8) |
 | DRDY | GPIO42 → XINT1, GPIO43 → XINT2 |
 

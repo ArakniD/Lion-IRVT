@@ -17,7 +17,7 @@ a GATT service (for a Web Bluetooth UI) and a JSON HTTP API.
 | Target | `esp32` (Xtensa, dual core) |
 | Flash | 4 MB |
 | Programming port | COM6 (Silicon Labs CP210x) |
-| BTS link | I2C master, SDA = GPIO21, SCL = GPIO22, 100 kHz |
+| BTS link | I2C controller, SDA = GPIO21, SCL = GPIO22, **50 kHz** (see below) |
 | Status panel | ST7789 on SPI2/HSPI, MOSI = GPIO23, SCK = GPIO18, DC = GPIO16, RST = GPIO17, BL = GPIO4 |
 | Slot LEDs | 8x WS2812B on SPI3/VSPI, DIN = GPIO13 |
 | Encoder | A = GPIO15, B = GPIO27, switch = GPIO2 |
@@ -28,6 +28,31 @@ The backup cell is why `test_engine_init()` stops the channels at boot: the
 proxy can outlive a BTS power cycle, so at startup it cannot know what the
 unit is doing and must not assume the channels are idle. The one exception is
 a slot the BTS reports `PAUSED` — see the watchdog and pause section below.
+
+### The I2C link runs at 50 kHz
+
+`main.c` asks for 100 kHz, but `bts_link.c` sets the device to **50 kHz**,
+and that is what runs. The BTS board pulls the bus up with only 10 kΩ, over a
+ribbon, so rise time — not bandwidth — is the limit: at 100 pF a 10 k
+pull-up takes ~850 ns to rise, against the 1000 ns standard mode allows. The
+ESP32's internal pull-ups are enabled as well. A poll cycle is nine
+transactions, so 50 kHz costs nothing that matters.
+
+At start-up the link tries 50 kHz and 10 kHz, in both pin orders, before
+falling back to the configured pins, so a swapped SDA/SCL or a marginal
+harness still comes up. After any failed transfer the bus is reset
+(`bus_recover()`), and the poll task does **not** scan the bus while the link
+is down — ESP-IDF v6.1's `i2c_master_probe()` leaves state behind on failure
+that crashed the next transfer.
+
+### Verified on a bare ESP32, 2026-10-08
+
+On a fresh board with no BTS attached: BLE GATT (all 12 characteristics,
+reads and notifications, proto 7, with register access correctly refused —
+`tools/ble_verify.py --no-bts`), the setup page, every WiFi and OTA error
+path, and two full WiFi updates, one rolled back by a reset during its trial
+and one confirmed. **Not yet seen:** an update confirming itself on a live
+BTS link, rather than through the 180 s fallback.
 
 ---
 
@@ -144,7 +169,7 @@ via registers, then initiate the discharge". The **populated** half of that is
 solved on the BTS side; the **host-commanded reset** half is not:
 
 - CPU1 integrates `Isense_A`/`Vsense_V` — the 16-bit ADS131M08 pair — in its
-  6.67 Hz `C1()` task and publishes both directions' totals in each slot's
+  `C1()` task and publishes both directions' totals in each slot's
   runtime block, now with a run-time seconds counter beside each mAh/mWh
   pair. Both accumulate positive magnitude into their own direction, so a
   charge and a discharge on one slot give two separate totals.
@@ -156,8 +181,8 @@ solved on the BTS side; the **host-commanded reset** half is not:
 
 **What this firmware does:** keeps its own trapezoidal integration
 (`coulomb_counter.c`) as the reported figure, because it samples on real
-elapsed time at the 250 ms poll rather than a fixed 150 ms step and does not
-lose a partial interval at the ends of a run. The BTS's own counters are read
+elapsed time at the 250 ms poll and does not lose a partial interval at the
+ends of a run. The BTS's own counters are read
 each poll and reported beside it (`bts_raw` in the result JSON, `bts` in the
 slot status) so the two can be compared. `try_reset_bts_accumulators()` still
 issues the write for a future build that makes the registers writable.
@@ -170,14 +195,19 @@ Note that `bts_link_stats_are_live()` is a **positive test only**: a unit that
 has been idle since power-up reads all-zero and is indistinguishable from an
 older firmware that never wrote these registers.
 
-### End-of-test is now signalled — but the engine still owns the cutoff
+### End-of-test: the BTS terminates, the engine sequences
 
-`BTS_STATUS_FINISHED` (bit 2) was declared and never assigned on either core.
-In v2 it carries the `END` semantic and is driven, alongside an explicit
-`BTS_STATUS_END` at bit 16; `BTS_STATUS_ENDED_MASK` accepts either, so the
-engine works against a unit built either way. It still watches cell voltage
-against the cutoff itself and issues the stop rather than depending on the
-unit to do so.
+The C2000 now ends a phase itself and reports it as END, status bit 2
+(`BTS_STATUS_FINISHED`; `BTS_STATUS_END` is an alias for it, and bit 16 is
+unused). A discharge ends at `V_MIN`; a charge ends once its CV loop holds
+`V_MAX` and the current has fallen to `I_MIN`. `bts_says_done()` treats END
+as the end of the current phase, and the engine moves on to the next step of
+the test — rest, discharge, recharge.
+
+The engine still watches the cell voltage against its own cutoffs and can
+issue the stop itself, so a unit that never asserts END still finishes a
+test. Discharge termination is verified on hardware; charge termination is
+not yet.
 
 ---
 

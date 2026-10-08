@@ -159,7 +159,7 @@ Query parameters: none.
 | `unit.online` | bool | The last I2C poll cycle to the BTS completed |
 | `unit.unit_state` | 0–4 | See §1.3.1 |
 | `unit.input_voltage_v` | float, 3 dp | DC input bus, register 1176 |
-| `unit.trip_status` | uint32 | Two bits per channel. **Always 0** — see §2.7 |
+| `unit.trip_status` | uint32 | Two bits per channel. Set by a hardware trip and **never cleared** — see §2.7 |
 | `unit.consecutive_errors` | uint32 | Failed poll cycles in a row; 0 when healthy |
 | `unit.watchdog_timeout_s` | float, 0 dp | The unit's configured host-watchdog timeout, register 1196. **0 = disabled** |
 | `unit.watchdog_enabled` | bool | `watchdog_timeout_s > 0`. Convenience only, derived from the field above |
@@ -1059,6 +1059,19 @@ bring-up probe list, where it is logged but never applied — the probe loop's
 The ESP32 enables its **internal** pull-ups in addition to the board's. Your
 own client should assume the bus is marginal and start slow.
 
+> **Why the board limits both buses.** Both I2C buses have only 10 kΩ
+> pull-ups. An RC pull-up rises in about 0.85 × R × C: 424 ns at 50 pF,
+> 847 ns at 100 pF. Fast mode (400 kHz) allows 300 ns and standard mode
+> (100 kHz) allows 1000 ns, so with 10 k neither bus can run at 400 kHz.
+> The C2000's own peripheral bus (I2CB: the F-RAM and both ADS1119s) runs at
+> **100 kHz** for exactly this reason — at 400 kHz it produced ~327 F-RAM save
+> failures and about one bus stall a second, and 0 of each at 100 kHz
+> (2026-10-08). Going faster on either bus needs ~2.2 kΩ pull-ups.
+>
+> The ESP32 starts its bring-up probe at 50 kHz and 10 kHz, in both pin
+> orders, before falling back to the configured pins, so a swapped SDA/SCL or
+> a marginal ribbon still links.
+
 ---
 
 ## 2.3 The lead-in pad byte
@@ -1155,21 +1168,32 @@ discarded.
 
 `applyHostRegisterWrite()` (`com_cpu2.c:2553`) writes `registers[]`,
 raises `IPC_FLAG0` to CPU1 with the address and value, **reloads the host
-watchdog** (§2.10), and handles three special cases:
+watchdog** (§2.10), and handles four special cases. Every F-RAM write they
+trigger happens later, from CPU2's idle loop — never inside the ISR.
 
-- `eCalibrationMode` (1168) written as exactly `2.0f` sets a deferred-save
-  flag. The F-RAM write happens from CPU2's idle loop, never in the ISR.
-  There is **no acknowledgement** — the register is not cleared and there is
-  no "save complete" indication. (`eCalStatus` bit 7 is the modern equivalent
-  for the runtime calibration path.)
-- `eCalCommand` (1204) written non-zero **self-clears to 0** immediately, and
-  clears `eCalStatus` bit 7. A host polling 1204 sees 0 as soon as the write
+- `eCalibrationMode` (976) written as exactly `2.0f` saves every slot's
+  calibration block **and the global voltage thresholds (960–972)**, which is
+  the only thing that persists the thresholds. They are written only if they
+  are in order (`ChargeDisable ≤ ChargeRestrict ≤ DischargeRestrict ≤
+  DischargeDisable`) and between **8.0 and 16.8 V**; otherwise they are
+  silently not saved and revert at the next boot. There is **no
+  acknowledgement**: the register is not cleared and nothing signals that the
+  save finished. (`eCalStatus` bit 7 is the equivalent for the runtime
+  calibration path.)
+- A **slot-tuning coefficient** (1068–1116) saves the whole tuning block,
+  with no separate commit step. A run of writes coalesces into one F-RAM
+  transfer.
+- A slot's **`V_MIN`, `V_MAX`, `I_MIN` or `I_MAX`** saves that slot's state
+  record at once, rather than at the next 6 s periodic save, so a power cut
+  just after an operator sets a limit cannot lose it.
+- `eCalCommand` (1012) written non-zero **self-clears to 0** immediately, and
+  clears `eCalStatus` bit 7. A host polling 1012 sees 0 as soon as the write
   is accepted; the opcode itself already travelled to CPU1 in the IPC
   payload.
-- `eHostWatchdog_s` (1196) written as `0.0f` raises a deferred warning on the
-  AT console. Disabling supervision on a machine that charges lithium cells
-  unattended is a legitimate bench setting and a dangerous production one, so
-  it is said out loud. See §2.10 and the known-issue note there.
+
+Writing `eHostWatchdog_s` (1004) as `0.0f` disables supervision **silently**.
+Older builds printed a warning on the AT console; it was removed in
+`8070d2e`.
 
 > **CPU1 decodes only three cases.** `BTS_HandleRegisterWrite()`
 > (`bts_cpu1.c:1398`) acts on the **settings region** — the mode register at
@@ -1208,9 +1232,9 @@ from the map**, and the accumulators are live.
 | `eChX_MinVoltage`, `eChX_MaxVoltage` | **Deleted.** They were RO and never written on either core — 16 registers of permanent 0.0. Removing them paid for most of the 16 new run-time-seconds registers. They do not exist at any address; a host that still reads their v1 addresses (324/328 + ch×24) now gets whatever v2 put there, which is live runtime data for a different slot |
 | `eChX_ChargeAcc_mAh` / `_mWh`, `eChX_DischargeAcc_mAh` / `_mWh` | **Live.** Integrated on CPU1 and published in the runtime block. See §2.8 |
 | `eChX_ChargeRuntime_s`, `eChX_DischargeRuntime_s` | **Live.** New in v2, on the same timestep as the mAh/mWh |
-| Status bit 2 (`FINISHED` / `END`) | **Now driven.** See §2.7 |
+| Status bit 2 (`FINISHED` / `END`) | **Now driven, and asserted by the C2000's own termination.** See §2.7 |
 | `eChX_SettingsSpare` | **Deleted 2026-09-22** with the settings compression. There is no spare register left in the settings region; a new per-slot setting now needs another stride change |
-| `eTripStatus` | Still always 0 in this build. See §2.7 |
+| `eTripStatus` | **Live since the hardware trips were enabled**, but never cleared. See §2.7 |
 
 The accumulators remain **RO**, so a host still cannot zero them on demand.
 The BTS zeroes a direction's set itself when that direction starts — see
@@ -1234,12 +1258,12 @@ to the host as a `float32`.
 |---|---|---|---|
 | 0 | `RUNNING` | Slot is executing a charge or discharge. **Stays set while PAUSED** — a pause is a held run | yes |
 | 1 | `STOPPED` | Slot is not running | yes |
-| 2 | `FINISHED` / `END` | Test finished normally. Converter off, counters hold final values | **yes — new in v2** |
-| 3 | `OVERCURRENT` | An over-current trip latched | **never in this build** |
+| 2 | `FINISHED` / `END` | Test finished normally. Converter off, counters hold final values | **yes** — set by the C2000's termination |
+| 3 | `OVERCURRENT` | An over-current trip latched | **yes, and never cleared** — see below |
 | 4 | `CHARGING` | Mode bit 1 was set at the last start | yes |
 | 5 | `DISCHARGING` | Mode bit 1 was clear at the last start | yes |
-| 6 | `CONST_VOLTAGE` | Loop is in CV regulation | **always 0** |
-| 7 | `CONST_CURRENT` | Loop is in CC regulation | **always 1** |
+| 6 | `CONST_VOLTAGE` | Loop is in CV regulation | yes, while running |
+| 7 | `CONST_CURRENT` | Loop is in CC regulation | yes, while running |
 | 8 | `SLAVE_MODE` | Slot follows a lower-numbered group leader | yes |
 | 9 | `GROUP_DISCONNECT` | A member of this slot's group fell out of sync | yes |
 | 10 | `REVERSE_POLARITY` | Measured cell voltage is negative | yes |
@@ -1292,27 +1316,28 @@ watchdog pause means the link died, a restore means the unit reset and the
 cell may have been swapped while it was off. Both clear on resume
 (`slotResume()`, `bts_cpu1.c:192`).
 
-Three of these bits are not what their names suggest:
+Three of these bits need more than their names:
 
-- **Bit 3 (`OVERCURRENT`) is never set in this build**, for the same reason
-  the trip word is always zero — below.
-- **Bits 6 and 7 are constants.** The build is CC-only
-  (`BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_ACMC_IOUT` → `BTS_ISR_CL_MODE_CC`,
-  `bts_user_settings.h:305-315`), so `ctrlMode_logic` is hard-assigned 0
-  (`bts.h:572-576`) and the CV branch is compiled out. Bit 7 is always 1 and
-  bit 6 always 0. They are genuinely reported now — before the calibration
-  work neither was copied out of the ISR and both read 0 — but they cannot
-  vary on this build.
+- **Bit 3 (`OVERCURRENT`) latches and never clears** — see `eTripStatus`
+  below. It is also set when a soft start runs out of retries.
+- **Bits 6 and 7 track the loop.** The build is CC-CV
+  (`BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_CCCV`), so `ctrlMode_logic` follows
+  the CV loop taking over from CC. Both bits are **0 while the slot is not
+  running**: an idle loop sits in CC, and reporting that would show every
+  stopped slot as "in CC".
+- **Bit 2 is set by the C2000's termination.** `serviceTermination()` ends a
+  running leader, and its whole group, in END when:
+  - **discharge** — the ADS131M08 reads at or below `V_MIN`
+    (`vref_discharge_V`). `V_MIN = 0` disables the check;
+  - **charge** — the CV loop is holding `V_MAX` **and** the current has fallen
+    to `I_MIN` (`iref_cuttout_A`). A charge cannot end before CV, because it
+    starts below `I_MIN`.
 
-> **Bit 2 is driven, but nothing currently asserts it.** `status[].finished`
-> is cleared on a fresh start, on a pause and on a stop, and it is
-> **restored** from the F-RAM state block at boot (`bts_cpu1.c:274`) — so a
-> slot that ended before a reset comes back showing END. But no termination
-> path in the C2000 firmware sets it to 1: `iref_cuttout_A` is loaded from
-> `eChX_CurrentMin` and never read, and termination is still the
-> ESP32's job. The bit is wired end to end and a future C2000-side
-> termination will light it without any host change; today it is only ever
-> observed non-zero across a restore.
+  Either condition must hold for 5 consecutive C1 passes. The bit is cleared
+  on a fresh start, a pause and a stop, and restored from F-RAM at boot.
+  **Discharge termination is verified on hardware; charge termination is not
+  yet** — see [`supervision-and-state-design.md`](supervision-and-state-design.md)
+  §2.6.
 
 Bits 13 and 14 are driven from the **persisted** `calFlags` that CPU2 mirrors
 into `calValidFlags[]` at boot and on each save, not from the in-session
@@ -1327,21 +1352,23 @@ bit (ch*2 + 1) GPIO group trip on channel ch
 bits 16-31     reserved
 ```
 
-> **This word is currently always zero, and so is status bit 3.** The bits
-> are set only in `epwmTripISR()` (`bts_cpu1.c:1715-1718`), whose trip-zone
-> interrupt is enabled per channel only when `BTS_TRIP_HW_CHn_ENABLED` is
-> true (`bts_hal.c:1098-1102`). All eight are `(false)` in this build
-> (`bts_user_settings.h:113-120`), which also masks both one-shot trip
-> sources at the ePWM module so a floating sense chain cannot latch a
-> spurious trip at boot.
+> **Set by real trips since 2026-10-08, and never cleared.** All eight
+> hardware trips are enabled (`BTS_TRIP_HW_CH1..8_ENABLED (true)`), so
+> `epwmTripISR()` runs on a CMPSS trip and sets the channel's bit. It latched
+> on hardware during the deadband investigation, as `TZOSTFLG` 0x0040
+> (DCAEVT1) on channel 1.
 >
-> The **software** over-current check (`BTS_tripEpwm()`, `bts.h:350-380`,
-> with `BTS_OCP_TRIGGER` true) still runs every control pass and forces the
-> trip zone, bringing the PWM down — but it sets the flags itself and does
-> not go through the ISR, so it does not raise these bits either.
+> **Nothing clears these bits.** `epwmTripISR()` only ORs into
+> `cpu1Status.tripStatus`, and status bit 3 (`status[].overCurrentTrip`) is
+> likewise never reset — so a slot that tripped once reports over-current
+> until the unit is power-cycled, even after it runs normally again. Read a
+> set bit as **"has tripped since boot"**, not "is tripped now". The GPIO bit
+> (`ch*2 + 1`) is never set: no GPIO trip is routed to the one-shot zone.
 >
-> Do not use `eTripStatus` as a fault indicator against this firmware. See
-> the bench warning in [`README.md`](README.md).
+> The **software** over-current check (`BTS_tripEpwm()`) still runs every
+> control pass as the first line, at ±8 A against the hardware's ±9.5 A. It
+> forces the trip zone itself and does not go through the ISR, so it does not
+> set these bits.
 
 ### `eChX_Mode` (settings block offset 0, RW)
 
@@ -1544,7 +1571,7 @@ spare left in this region.
 | `384 + ch*72` | 0 | `eChX_Mode` | **RW** | bitfield | Run/charge/calibrate/pause/resume command. See §2.7 |
 | `388 + ch*72` | 4 | `eChX_VoltageMin` | RW | V | Lower voltage bound. In charge it is the starting floor; in discharge it is the cutoff latched into `vref_discharge_V` |
 | `392 + ch*72` | 8 | `eChX_VoltageMax` | RW | V | Upper voltage bound. In charge it is the ceiling latched into `vref_charge_V` |
-| `396 + ch*72` | 12 | `eChX_CurrentMin` | RW | A | Termination / cutoff current. Loaded into `iref_cuttout_A` and **never read** — see §2.6 |
+| `396 + ch*72` | 12 | `eChX_CurrentMin` | RW | A | Charge termination current. Loaded into `iref_cuttout_A`; a charge ends once the CV loop holds `V_MAX` and the current falls to this — see §2.7 |
 | `400 + ch*72` | 16 | `eChX_CurrentMax` | RW | A | Current setpoint for the active direction |
 | `404 + ch*72` | 20 | `eChX_MaxCellTemp` | RW | °C | Configured upper trip limit. The only temperature limit enforced |
 | `408 + ch*72` | 24 | `eChX_F28V_Gain` | RW | V per V-at-pin | Internal-ADC voltage gain |
@@ -1614,7 +1641,7 @@ block at risk.
 | 976 | `eCalibrationMode` | **RW** | command | Writing exactly `2.0f` triggers a deferred F-RAM save of the whole calibration image. **No acknowledgement**, and the register is never cleared. Decoded with no tolerance — `1.9999f` does nothing |
 | 980 | `eUnitState` | RO | enum | `UnitState`, 0–4. See §1.3.1 |
 | 984 | `eInputVoltage` | RO | V | DC input bus voltage |
-| 988 | `eTripStatus` | RO | bitfield | Two bits per channel. **Always 0** — see §2.7 |
+| 988 | `eTripStatus` | RO | bitfield | Two bits per channel. Set by a hardware trip and **never cleared** — see §2.7 |
 | 992 | `eSlotMode` | RO | 0–7 | `BTS_SlotMode`. Low two bits = group size, bit 2 selects the converter |
 | 996 | `eSlotEnable` | RO | 0–7 | Index of the **highest enabled** slot: 0 enables slot 1 alone, 7 enables all eight |
 | 1000 | `eGroupSize` | RO | 1/2/4/8 | Slots per group, `1 << (mode & 3)` |
@@ -1816,19 +1843,14 @@ CPU1 owns `enable_logic` and the control loop.
 
 ### This is not over-current protection
 
-The watchdog is a supervision timeout measured in **seconds**. Hardware
-over-current trips are disabled in this build and the software check in
-`BTS_tripEpwm()` remains the only fast protection. Do not describe or rely on
-the watchdog as anything else.
+The watchdog is a supervision timeout measured in **seconds**. The fast
+protection is the software check in `BTS_tripEpwm()` (±8 A, every control
+pass) and the CMPSS hardware trips (±9.5 A, within the switching cycle). Do
+not describe or rely on the watchdog as anything else.
 
-> **Known issue: a spurious disable warning.** The AT console periodically
-> prints `WARNING: host watchdog DISABLED - slots will not pause if the host
-> stops responding` even when `eHostWatchdog_s` reads 30.0 and the countdown
-> is healthy. `hostWdDisableWarn` is set only where a write of `0.0` arrives
-> (`com_cpu2.c:2573`) and the flag reads 0 when sampled, so the trigger has
-> not been identified. Supervision is verifiably armed — the message is
-> cosmetic, but it is alarming and wrong. Ignore it and check
-> `eHostWatchdog_s` / `eWatchdogRemaining_s` instead.
+The spurious `WARNING: host watchdog DISABLED` that earlier revisions of this
+document described no longer exists: the warning and its flag were removed
+from the firmware on 2026-09-22 (`8070d2e`).
 
 ---
 
@@ -1967,7 +1989,7 @@ rather than softening it: `BTS_RT_STATUS` is `0U` in both files, while
 | Item | Design doc | Source |
 |---|---|---|
 | Settings region size (§1.4) | 24 registers per slot, base 1152 for the unit block | **18 per slot, unit base 960.** The design document predates the 2026-09-22 compression that removed the charge/discharge limit split, `eChX_MinCellTemp` and the per-slot spare. Read §2.8 of this file for the current layout |
-| Slot state model (§2.1) | Five states, END reached by "termination" | The five states and every transition are implemented, but **no C2000 path currently sets END**. `status[].finished` is cleared on start, pause and stop, and restored from F-RAM, but never asserted by a termination — `iref_cuttout_A` is still loaded and never read. The bit is driven end to end; nothing lights it yet |
+| Slot state model (§2.1) | Five states, END reached by "termination" | **Implemented as designed.** `serviceTermination()` asserts END on `V_MIN` for a discharge and on `I_MIN` in CV for a charge. Discharge termination is verified on hardware; charge termination is not yet |
 
 Everything else in the design document — the runtime base and stride, the
 status bit positions, the mode

@@ -396,7 +396,6 @@ Host (I2C / console / CAN)
        [eCalibrationMode == 2.0f  -> calibrationSavePending]
        [eCalCommand != 0          -> self-clear, clear eCalStatus bit 7]
        hostWatchdogFeed()                   <-- reload, every write path
-       [eHostWatchdog_s == 0.0f   -> hostWdDisableWarn, printed from the idle loop]
   -> CPU1 BTS_HandleRegisterWrite()
        settings +0       -> modeCallback()   (run / direction / cal / pause / resume)
        calibration group -> BTS_loadCalibrationFromRegisters(ch), pendingUpdate = 1
@@ -631,10 +630,11 @@ XINT1/`INPUT4` and XINT2/`INPUT5`. Set in `bts_user_settings.h`
 group moved from 1.4/1.5 to 12.1/12.3 — which is why the ACK group had to move
 with it.
 
-> **`INPUT14` is double-booked** between XINT5 and the channel-6 GPIO trip.
-> Today the trips are all compiled out so XINT5 owns it; re-enabling the
-> channel-6 hardware trip will silently kill slot 5–8 acquisition unless one of
-> them moves first. Free inputs: `INPUT1`, `2`, `3`, `7`, `8` — and note
+> **`INPUT14` is double-booked** between XINT5 and the channel-6 GPIO trip,
+> and with all eight hardware trips enabled that is live. Acquisition wins
+> because `BTS_HAL_setupExAdcGpio_Adc2()` writes `INPUT14` after the trip
+> setup, so slots 5–8 read and channel 6's GPIO trip is silently unrouted.
+> Do not reorder those calls. Free inputs: `INPUT1`, `2`, `3`, `7`, `8` — and note
 > `INPUT1`/`INPUT2` are ePWM TZ1/TZ2, sitting at their GPIO0 reset default.
 > Channels 7 and 8 have **no** X-BAR path at all: their trips target
 > `INPUT15`/`INPUT16`, which do not exist. Full picture:
@@ -650,16 +650,13 @@ authoritative over both; keep all three current.
 
 ## 7. ePWM trip source identification
 
-> **All eight hardware trips are currently disabled**
-> (`BTS_TRIP_HW_CH1..8_ENABLED (false)`). `BTS_HAL_setupEPWMTripZone()` masks
-> the one-shot trip *signals* and disables the trip-zone *interrupt* on every
-> slot, so `epwmTripISR` never runs and `eTripStatus` stays 0 — even though
-> the ISR is still registered and enabled. The trip *actions* are still
-> programmed, because the software over-current path (`BTS_tripEpwm`) forces
-> a trip through the same trip zone and must still bring the outputs low.
->
-> The section below is what applies once the trip links are wired and the
-> flags are turned back on.
+> **Superseded in part — read `Docs/hardware-resources.md` §5 first.** All
+> eight hardware trips are enabled now, and the CMPSS comparators reach the
+> trip zone through the **Digital Compare** submodule as `DCAEVT1`, not
+> through `OSHT1`/TZ1 as some paragraphs below assume. `epwmTripISR()` tests
+> `EPWM_TZ_FLAG_DCAEVT1` as well as `OST`. They arm on a slot's first run,
+> not at boot. The register-level notes below on TZFLG versus TZOSTFLG still
+> hold.
 
 driverlib has **no** `Interrupt_getVectorNumber()` — there is no
 `Interrupt_get*` API at all. A shared trip handler must identify the source
@@ -705,8 +702,8 @@ Trip-zone interrupts are `INT_EPWMx_TZ` (**PIE group 2**), not `INT_EPWMx`
 > Adding `n` bumps only the channel byte: `Interrupt_enable()` is satisfied,
 > but `Interrupt_register()` reads bits 31:16 alone and writes all eight
 > handlers into the **ePWM1** slot, leaving 2.2–2.8 on the default handler's
-> infinite loop. Masked today only because the trips are disabled — fix it
-> before enabling any. `Docs/hardware-resources.md` §7.1.
+> infinite loop. **Fixed** — `bts_hal.c` now lists the eight `INT_EPWMn_TZ`
+> constants explicitly. `Docs/hardware-resources.md` §8.1.
 
 ### Why they are masked
 

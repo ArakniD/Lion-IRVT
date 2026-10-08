@@ -30,6 +30,9 @@ claimed twice. Both have since been fixed; the timer conflict has additionally
 been dissolved, because the subsystem that was the second claimant no longer
 runs on this device at all.
 
+[§10](#10-i2c-buses) covers the two I2C buses: why both run slowly on this
+board's 10 kΩ pull-ups, and the latches that made the F-RAM fail at boot.
+
 [§7](#7-cla1-allocation) covers CLA1, which is a third processor on this die
 and does not appear in any of the PIE, X-BAR or timer tables — its trigger
 never reaches a PIE channel and its code and data live in RAM blocks the C28x
@@ -265,16 +268,25 @@ last select register; the next register is `INPUTSELECTLOCK`. There is no
 > ### `INPUT14` is double-booked
 >
 > XINT5 (CPU1's SPI ADC2 DRDY, GPIO49) and the channel-6 GPIO trip (GPIO44)
-> both target `INPUT14`. Only one can win. **Today the hardware trips are all
-> compiled out (`BTS_TRIP_HW_CH1..8_ENABLED (false)`,
-> `bts_user_settings.h:113-120`), so XINT5 owns it and slots 5–8 acquire
-> correctly.**
+> both target `INPUT14`. Only one can win.
 >
-> Re-enabling `BTS_TRIP_HW_CH6_ENABLED` without moving one of them will
-> silently repoint `INPUT14` at GPIO44 and kill slot 5–8 acquisition — the
-> same failure mode as Defect 1, in the opposite direction. Move the channel-6
-> trip to `INPUT7` or `INPUT8`, or move XINT5's DRDY to XINT4/`INPUT13` (and
-> then relocate the channel-5 trip).
+> **This is live now.** `BTS_TRIP_HW_CH1..8_ENABLED` are all `(true)`, so
+> `BTS_HAL_setupTripSystem()` writes `INPUT14` ← GPIO44. Acquisition wins
+> anyway, by running later: `BTS_HAL_setupTripSystem()` runs inside
+> `BTS_HAL_setupDevice()`, and `BTS_HAL_setupExAdcGpio_Adc2()` re-points
+> `INPUT14` at GPIO49 afterwards in `main()`. **Slots 5–8 acquire correctly,
+> and channel 6's GPIO trip is silently not routed.**
+>
+> Channel 6 is not left unprotected: its CMPSS comparator reaches the trip
+> zone through the ePWM X-BAR and Digital Compare, which never touch the
+> Input X-BAR. Only the external GPIO trip line is lost — and channels 7 and
+> 8 never had one (below). Moving the channel-6 trip to `INPUT7` or `INPUT8`
+> fixes it, as would moving XINT5's DRDY to XINT4/`INPUT13` and relocating the
+> channel-5 trip.
+>
+> **Do not reorder those two calls.** If the trip setup ever ran last, it
+> would take `INPUT14` from acquisition and slots 5–8 would stop reading —
+> Defect 1 again, in the other direction.
 
 > ### Channels 7 and 8 have no Input X-BAR path at all
 >
@@ -1205,7 +1217,108 @@ session.
 
 ---
 
-## 10. Source index
+## 10. I2C buses
+
+Two buses, both on CPU2, both with **10 kΩ pull-ups on the board** — which
+sets their speed.
+
+| | I2CA — host | I2CB — peripherals |
+|---|---|---|
+| Pins | GPIO32 SDA, GPIO33 SCL | GPIO40 SDA, GPIO41 SCL |
+| Pad config (by CPU1, `BTS_HAL_setupCpu2Pins()`) | open drain + internal pull-up, async qualification | same |
+| Role | **target** at 0x50 | **controller** |
+| Devices | the ESP32 clocks it | FM24V10 F-RAM 0x50; ADS1119 0x40 (slots 1–4), 0x41 (slots 5–8) |
+| Speed | **50 kHz**, set by the ESP32 (`bts_link.c`) | **100 kHz** (`I2C_initController(I2CB_BASE, …)`) |
+| Interrupts | `INT_I2CA` 8.1 and `INT_I2CA_FIFO` 8.2 (§1.2) | **none** — bounded polled loops from CPU2's idle loop |
+| Stuck-bus recovery | `serviceI2CTargetWatchdog()` resets the target after `BTS_I2C_TARGET_STUCK_PASSES` busy passes | `i2cRecoverBus()`: nine SCL pulses with SDA released, then a stop, then a module reset |
+
+### 10.1 Why 100 kHz, and not 400
+
+An RC pull-up rises in about 0.85 × R × C. With 10 kΩ that is 424 ns at an
+optimistic 50 pF and 847 ns at 100 pF. **Fast mode allows 300 ns**, so at
+400 kHz the bus is out of spec at any realistic capacitance: edges arrive late
+enough to be sampled wrong, which looks like a NACK, an arbitration loss, or a
+frame that never finishes. **Standard mode allows 1000 ns**, which 10 k meets
+up to about 118 pF.
+
+**Measured, 2026-10-08.** I2CB at 400 kHz: ~327 F-RAM save failures and about
+one ADS1119 bus stall a second. At 100 kHz: 0 save failures across all eight
+slots, 0 boot read failures and 0 stalls.
+
+Nothing on I2CB needs the bandwidth. The longest transfer is a 162-byte
+calibration record — ~15 ms at 100 kHz, once, at boot. Running at 400 kHz
+would need ~2.2 kΩ pull-ups.
+
+The polled loops are bounded in iterations, not time, so the speed change
+raised them 4×: `BTS_I2C_TIMEOUT_ITERATIONS` 80000, `ADS1119_PHASE_MAX_POLLS`
+8000, `ADS1119_WREG_BYTE_TIMEOUT` 80000. One byte at 100 kHz is 90 µs, so the
+longest phase is ~270 µs, and 80000 iterations is several milliseconds —
+about 10× margin, while a genuinely absent target still fails fast.
+
+### 10.2 I2CB has two users with incompatible styles
+
+The ADS1119 driver is a non-blocking state machine that leaves a transfer in
+flight across service calls; the F-RAM helpers block until done. Interleaved,
+both frames corrupt and the controller is left holding SCL.
+`i2cbFramAcquire()` grants the F-RAM the bus only while **both** converters
+are parked (`eAdsIdle` or `eAdsSettle`), and sets `i2cbFramBusy`, which the
+converter state machine checks before starting or advancing a frame. A save that cannot get the bus stays
+pending and retries; it is never dropped.
+
+### 10.3 `I2CMDR` must be written outright
+
+`I2C_setConfig()` and `I2C_sendStartCondition()` are read-modify-write and
+**preserve `STP`**. A stop left armed by an earlier transfer then rides into
+the next start: the module sends `S ADDR P` and never the memory address.
+That was the boot-time F-RAM read failure — `I2CMDR` 0x4E20, `I2CCNT` 2,
+every time — and it silently put every slot on default calibration.
+`i2cReadBlock()` and `i2cWriteBlock()` now write `I2CMDR` whole in each phase,
+and every exit waits for the stop to reach the wire, resetting the module if
+it never does. Boot-time reads retry up to 8 times, 1 ms apart
+(`framReadBoot()`).
+
+Two more latches that a module reset does **not** clear, both seen on
+hardware: `STP` itself (cleared by writing `I2CMDR` = 0 before and after
+`SysCtl_resetPeripheral()`), and `DLB`, digital loopback, which ties the
+transmitter to the receiver so the controller ACKs its own address and never
+drives the pins.
+
+### 10.4 Finding out who held the bus
+
+Every I2CB transfer records its owner (F-RAM read or write, ADS1119 command,
+read, data, mux or start, or recovery), the device and memory address, the
+count, how far it got and how it ended. `i2cbFaultSnap` freezes the **first**
+failure and is never overwritten; `i2cbHist[16]` holds the last sixteen;
+`BTS_dbgI2cbEnds[]` counts each ending; `BTS_dbgI2cbStuckOwner` names whoever
+held a bus that had to be forced free. Read them in the debugger — this is
+what found the `STP` bug above.
+
+### 10.5 The ADS1119s
+
+20 SPS continuous conversion, so DRDY falls every 50 ms on GPIO42/43 → XINT1/
+XINT2 (`INPUT4`/`INPUT5`, routed by CPU1). DRDY is armed by clearing the
+channel's stale PIE flag and acknowledging group 1 before enabling.
+
+The whole temperature path hangs off one falling edge per conversion, so a
+lost edge used to leave the state machine idle and every slot at 0.00 °C.
+Two backstops now: a converter that has published nothing for **1 s** is read
+anyway (`ADS1119_QUIET_TICKS`), and one disabled after repeated failures is
+re-armed after **10 s** (`ADS1119_REARM_TICKS`).
+
+**18.32–18.9 °C is an open input**, not a temperature — the amplifier floor
+for an empty slot.
+
+### 10.6 Rules
+
+1. **Do not raise either bus above 100 kHz** without stiffer pull-ups.
+2. **Do not halt CPU2 mid-transfer** (§9 rule 5) — the I2CA target wedges
+   with SCL low, and its recovery runs on the core you halted.
+3. **Write `I2CMDR` whole.** Never build a start on a read-modify-write of it.
+4. **The F-RAM never takes I2CB while a converter is mid-frame.**
+
+---
+
+## 11. Source index
 
 | Resource | Declared in | Applied in |
 |---|---|---|

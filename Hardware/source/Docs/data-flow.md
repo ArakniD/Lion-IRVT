@@ -611,8 +611,10 @@ unit for 30 seconds, every running slot pauses with the converter off and
 `BTS_STATUS_WD_TRIPPED` set.
 
 It is a supervision timeout measured in seconds. It is **not** over-current
-protection, and with the hardware trips disabled in this build the only fast
-protection is the bench supply's own current limit.
+protection. That is the software check in `BTS_tripEpwm()` (±8 A, every
+control pass) and the CMPSS hardware trips (±9.5 A, within a switching cycle)
+— whose level is still untested against a real over-current, so on the bench
+the supply's own current limit remains the protection to trust.
 
 ---
 

@@ -62,3 +62,31 @@ Still NOT verified on hardware: **charge termination** (the short never
 reaches CV), **the CV loop** on a real cell, and **the trip level** against a
 real over-current. Commits: `c490094` (C2000), `b373e90` (ESP32).
 
+### Addendum, 2026-10-08 (later) - ESP32 OTA, WiFi setup, HACS
+
+Not ToDo items, recorded here for the same reason:
+
+- **ESP32 firmware update over WiFi** with rollback; a new image confirms
+  itself once the BTS link answers, or after 180 s. A setup page at `/` for
+  WiFi credentials and updates. Verified on a bare ESP32 (no BTS): two full
+  updates, one rolled back by a reset mid-trial. Not yet seen confirming on a
+  live BTS link. Commits `69f847a`, `985b82b`.
+- **Home Assistant integration moved** to its own repository, ha-lion-irvt,
+  checked out as the `lion-lvrt-integration` submodule (`7d8f53e`). Release
+  v1.0.0 passes the HACS validator and hassfest on GitHub.
+- **I2CB at 100 kHz, not 400** (`c490094`): the board has 10 kOhm pull-ups,
+  out of spec for fast mode. 400 kHz caused ~327 F-RAM save failures and a
+  bus stall a second; 100 kHz, 0 of each. Recorded in
+  `Docs/hardware-resources.md` section 10.
+
+Open, found while documenting:
+
+- `eTripStatus` and status bit 3 are now set by real trips but **never
+  cleared** - a slot reads over-current until power-cycled.
+- With all hardware trips enabled, channel 6's GPIO trip loses `INPUT14` to
+  slot 5-8 acquisition (acquisition is configured later, so it wins).
+  Channel 6 keeps its CMPSS trip.
+- A calibration commit (`CALM=2`) does not set a slot's calibration-valid
+  flags.
+- The ESP32's AT console once repeated its last reply ~17,000 times.
+

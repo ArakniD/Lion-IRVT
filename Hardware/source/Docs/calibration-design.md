@@ -60,12 +60,12 @@ Results are persisted to the FM24V10 F-RAM and reloaded at boot.
 
 These were each verified in source and each one invalidates an obvious guess:
 
-1. **The build is CC-only.** `BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_ACMC_IOUT`
-   (`bts_user_settings.h:305`) selects `BTS_ISR_CL_MODE_CC`. The CV loop and the
-   CC-CV crossover in `bts.h:525-570` are **compiled out**. `voutRef_pu` is
-   computed every millisecond and ignored. Fixed-current calibration therefore
-   works with the live control path; a fixed-*voltage* calibration mode would
-   not, and is deliberately not part of this design.
+1. **Calibration drives current, never voltage.** The build was CC-only
+   when this design was written and is CC-CV now
+   (`BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_CCCV`), but calibration still only
+   uses fixed *current*: the slot is driven into a bench supply that holds the
+   voltage, which is what makes a current capture meaningful. A fixed-voltage
+   calibration mode is deliberately not part of this design.
 
 2. **The current sense side is never gain-corrected.** `ioutSense_pu =
    current_16b / 32768` (`bts.h:518`) — calibration is folded into the
@@ -139,13 +139,12 @@ This is the opposite of what the register-map naming suggests, and it must be
 fixed before calibration: the process captures both paths simultaneously and
 needs both visible.
 
-### 3.3 CC/CV status bits are tracked but never reported
+### 3.3 CC/CV status bits — done
 
-`BTS_ctrlLoopVariables[].ctrlMode_logic` tracks CC (0) vs CV (1) in the ISR
-(`bts.h:558, 564, 570, 576`) but is never copied into
-`status[].constCurrent/constVoltage`, so bits 6 and 7 are always 0. Copy it in
-`publishStatusToCpu2()` — the calibration display shows the regulation mode, and
-this is a two-line fix in the same function being edited anyway.
+`ctrlMode_logic` is now copied into `status[].constCurrent/constVoltage`, and
+under the CC-CV build it genuinely moves, so bits 6 and 7 track the loop. Both
+read 0 while a slot is not running, because an idle loop sits in CC and would
+otherwise show every stopped slot as "in CC".
 
 > Bits 2 (`FINISHED`), and the dead stats accumulators at 320/324/328/332, are
 > also never written. Those are **out of scope** here — noted so the next reader
@@ -402,13 +401,12 @@ These are not optional and must be visible in code review:
    disabled, masked or re-thresholded during calibration. A trip exits
    calibration immediately and zeroes the reference.
 
-   > **Bench warning.** All hardware over-current trips are presently disabled —
-   > `BTS_TRIP_HW_CH1..8_ENABLED (false)`, `bts_user_settings.h:113-120` — leaving
-   > the software check in `BTS_tripEpwm()` as the only over-current protection.
-   > The file's own warning at `bts_user_settings.h:100-111` says not to run
-   > unattended high-current tests in this configuration. Calibration drives real
-   > current into an external supply, so **do not run this procedure unattended**,
-   > and consider enabling hardware trips on the slot being calibrated first.
+   > **Bench warning.** The hardware over-current trips are enabled (±9.5 A,
+   > above the software check's ±8 A) and the path has been seen to latch on
+   > hardware — but the **level** has never been tested against a real
+   > over-current. Calibration drives real current into an external supply, so
+   > **do not run this procedure unattended**, and set the supply's own
+   > current limit as the protection you trust.
 
 2. **Fixed-current pu is clamped.** Reject `CAL_CMD_SET_FIXED_CURRENT` with
    argument `< 0.0` or `> 0.8` pu (≈8 A). Returns `CAL_ERR_ARG`.
