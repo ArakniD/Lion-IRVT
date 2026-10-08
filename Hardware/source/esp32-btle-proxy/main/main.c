@@ -41,6 +41,7 @@
 #include "display.h"
 #include "input.h"
 #include "led_strip.h"
+#include "ota.h"
 
 static const char *TAG = "main";
 
@@ -147,6 +148,22 @@ void app_main(void)
         .poll_interval_ms = BTS_POLL_MS,
     };
     ESP_ERROR_CHECK(bts_link_init(&bts_cfg));
+
+    /*
+     * Straight after the link, and before anything that could fail: if this
+     * image arrived over the air it is on trial, and ota_init() starts the
+     * task that confirms it once the BTS answers. On an image that is not on
+     * trial - every USB-flashed one - this returns immediately.
+     */
+    err = ota_init();
+    if (err != ESP_OK) {
+        /*
+         * Not fatal, but it does mean an OTA-delivered image will roll back
+         * on its next reboot, so it is logged loudly rather than ignored.
+         */
+        ESP_LOGE(TAG, "OTA confirm task did not start: %s - an updated image "
+                      "will roll back", esp_err_to_name(err));
+    }
 
     ESP_ERROR_CHECK(test_engine_init());
 

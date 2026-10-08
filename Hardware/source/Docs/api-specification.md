@@ -45,9 +45,9 @@ Implemented in `esp32-btle-proxy/components/web_api/web_api.c` on
 |---|---|
 | **Port** | 80 (`web_api_config_t.port`, 0 → 80) |
 | **Content type** | `application/json` on every response |
-| **Endpoints** | 28 (see §1.1) |
-| **Route table entries** | 15 (`s_routes[]`, `web_api.c:1122-1142`) |
-| **Authentication** | **None** |
+| **Endpoints** | 33 (see §1.1) |
+| **Route table entries** | 20 (`s_routes[]` in `web_api.c`) |
+| **Authentication** | **None**, except firmware upload (`X-OTA-Key`, §1.11.2) |
 | **Encryption** | **None** — plain HTTP |
 | **Network** | WiFi station, with SoftAP fallback (`BTS-Tester`, open) if no credentials are stored or the join fails |
 
@@ -89,6 +89,11 @@ network — but do not put this device on an untrusted one.
 | 26 | POST | `/api/calibration/current` | `CAL_CMD_CAPTURE_CURRENT` |
 | 27 | POST | `/api/calibration/save` | `CAL_CMD_COMPUTE_SAVE` |
 | 28 | OPTIONS | `/*` | CORS preflight |
+| 29 | GET | `/` (and `/index.html`) | The setup page — HTML, not JSON |
+| 30 | GET | `/api/wifi` | Station SSID, join state and addresses; never the password |
+| 31 | GET | `/api/ota` | Running image, trial state, whether an update key is set |
+| 32 | POST | `/api/ota/key` | Set or change the update key |
+| 33 | POST | `/api/ota` | Firmware upload — raw `.bin`, keyed |
 
 `<n>` is a **0-based** slot index, 0 to 7. Front-panel slot 3 is
 `/api/slot/2`.
@@ -509,14 +514,73 @@ request is rejected with 400 `"profile fails sanity check"`:
 ```
 
 `password` is optional (omit for an open network); `ssid` is required.
-Limits: SSID 32 chars, password 64. Stored in the default NVS partition under
-the `wifi` namespace, then the station reconnects.
+Limits: SSID 32 chars, password 8–64 or empty. Stored in the default NVS
+partition under the `wifi` namespace, then the station reconnects. Over-long
+values are **refused, not truncated** — a truncated SSID would be saved and
+then never join.
 
 | Status | When |
 |---|---|
-| `200` | `{"ok":true}` |
-| `400` | Missing body, or missing `ssid` |
-| `500` | NVS save failed |
+| `200` | `{"ok":true}` — saved and the join started |
+| `400` | Missing body or `ssid`; SSID over 32 or password over 64; password 1–7 characters |
+| `500` | NVS save failed — nothing saved |
+| `503` | Saved, but the radio would not take the new config; it applies from the next restart |
+
+After five failed joins the station retries every 30 s, not continuously, so
+the SoftAP stays usable while a wrong password is corrected — see the ESP32
+README.
+
+#### 1.11.1 `GET /api/wifi`
+
+```json
+{"ssid":"bench-net","connected":true,"ip":"192.168.1.50",
+ "ap_active":true,"ap_ssid":"BTS-Tester","ap_ip":"192.168.4.1","rssi":-61}
+```
+
+`ssid` is the live station config, `""` when none is set. `ip` is `""` and
+`rssi` 0 while not joined. **There is no password field and never will be:**
+the SoftAP is open, so anything returned here is readable by anyone in range.
+
+#### 1.11.2 Firmware update — `/api/ota`
+
+`GET /api/ota`:
+
+```json
+{"version":"c490094","date":"Oct  8 2026","time":"17:09:40","idf_version":"v6.1",
+ "running":"ota_0","next":"ota_1","pending_verify":false,"confirmed":true,
+ "rollback_possible":true,"key_set":true,"in_progress":false,"uptime_s":742}
+```
+
+`pending_verify` is true while a newly written image is on trial: it confirms
+itself once the BTS link answers a poll, or after 180 s regardless, and a
+reboot before then rolls it back.
+
+`POST /api/ota/key` — `{"current":"...","key":"..."}`. `current` is ignored
+when no key is stored (trust on first use) and must match otherwise. An empty
+`key` clears it, which disables updates.
+
+| Status | When |
+|---|---|
+| `200` | Set, changed or cleared |
+| `400` | Missing `key`, or over 64 characters |
+| `403` | `current` does not match the stored key |
+
+`POST /api/ota` — the body is the **raw** `bts_btle_proxy.bin`, not multipart;
+curl needs `--data-binary`. The key goes in the `X-OTA-Key` header. On success
+the response is sent and the proxy restarts 1.5 s later.
+
+| Status | When |
+|---|---|
+| `200` | Written, verified, boot slot switched; restarting |
+| `400` | Empty body; wrong chip, wrong project or not an app image (checked from the first 288 bytes); hash failure; upload interrupted |
+| `403` | No key set yet, or `X-OTA-Key` missing or wrong |
+| `409` | A slot is running and `?force=1` was not given — the restart would stop it; or another upload is in progress |
+| `413` | Larger than the app partition (1.875 MB) |
+| `500` | Flash write failed |
+
+> **The key is not a security boundary.** It is set through the same
+> unauthenticated API, so it protects a unit provisioned before an attacker
+> reached it, not one provisioned after. It is there to stop an accident.
 
 ---
 
@@ -802,9 +866,11 @@ Two consequences shape the whole route table.
 registered pattern that matches**. So every exact path must be registered
 **before** any wildcard that would also match it.
 
-In `s_routes[]` (`web_api.c:1122-1142`) that ordering is:
+In `s_routes[]` (`web_api.c`) that ordering is:
 
 ```
+/                      GET     exact     the setup page
+/index.html            GET     exact
 /api/status            GET     exact
 /api/catalog           GET     exact
 /api/results           GET     exact
@@ -813,7 +879,11 @@ In `s_routes[]` (`web_api.c:1122-1142`) that ordering is:
 /api/calibration       GET     exact     <-- BEFORE /api/calibration/*
 /api/i2c_diag          GET     exact
 /api/abort_all         POST    exact
+/api/wifi              GET     exact
 /api/wifi              POST    exact
+/api/ota               GET     exact
+/api/ota               POST    exact
+/api/ota/key           POST    exact
 /api/chemistry/*       POST    wildcard
 /api/calibration/*     POST    wildcard
 /api/slot/*            POST    wildcard

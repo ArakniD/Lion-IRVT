@@ -423,7 +423,12 @@ survive an operator walking away with the tablet.
 | GET | `/api/catalog` | chemistries and cell models |
 | POST | `/api/chemistry/<name>` | override and persist a chemistry profile |
 | POST | `/api/abort_all` | |
+| GET | `/` | the setup page: unit state, WiFi and firmware update |
+| GET | `/api/wifi` | station SSID, join state, addresses. Never the password |
 | POST | `/api/wifi` | `{"ssid":"...","password":"..."}` |
+| GET | `/api/ota` | running version and slot, trial state, whether a key is set |
+| POST | `/api/ota/key` | `{"current":"...","key":"..."}` — set or change the update key |
+| POST | `/api/ota` | raw `.bin` body, `X-OTA-Key` header — firmware update |
 | GET | `/api/registers?addr=&count=` | raw BTS registers, for bring-up |
 
 Route ordering matters and is not obvious: `httpd_uri_match_wildcard()`
@@ -455,6 +460,82 @@ WiFi comes up as APSTA. Stored station credentials are joined if present; the
 SoftAP stays up either way, so a tester whose site network changed is still
 reachable. The AP is open by default — a WPA2 key baked into shipped firmware
 is not a security boundary; the bench network is.
+
+### Joining a network from the setup page
+
+Join the `BTS-Tester` access point and browse to `http://192.168.4.1/`. The
+WiFi card takes an SSID and password, saves them to flash and joins at once;
+the AP stays up throughout, so a wrong password costs nothing but a retry.
+
+After five failed joins the station retries every **30 s** rather than
+continuously. The ESP32 has one radio, and a station scanning flat out drags
+the AP from channel to channel with it — which, with a mistyped password,
+would make the very AP you need to fix it unusable.
+
+The password is write-only: `GET /api/wifi` never returns it, because anything
+it returned would be readable by anyone in range of the open AP.
+
+---
+
+## Firmware update over WiFi
+
+Two app slots, `ota_0` and `ota_1`. An upload is written into whichever is not
+running, the boot slot is switched, and the proxy restarts into it.
+
+**A new image is on trial until the BTS answers.** Rollback is enabled
+(`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`), so the bootloader marks a freshly
+written image `PENDING_VERIFY`. `components/ota` confirms it once the BTS link
+completes a poll — real registers back over I2C, not merely "it booted". An
+image that never gets there and is rebooted is **rolled back** to the previous
+slot automatically.
+
+That cannot be the only rule: the proxy has a backup cell and often runs with
+the rack powered down, and an image that waited forever for the link would be
+rolled back by the next power blip. So after **180 s** without a link it is
+confirmed anyway, and the log says it was confirmed *without* the BTS. Such an
+image is still on WiFi, so it can always be replaced by another upload.
+
+### Doing an update
+
+1. Set an update key once (uploads are refused until there is one):
+   on the setup page, or
+   `curl -X POST http://$BTS/api/ota/key -d '{"key":"choose-one"}'`.
+2. Build as normal; the image is `build/bts_btle_proxy.bin`.
+3. Upload it from the setup page, or:
+
+   ```bash
+   curl -X POST http://$BTS/api/ota -H "X-OTA-Key: choose-one" \n        --data-binary @build/bts_btle_proxy.bin
+   ```
+
+4. The proxy restarts. `GET /api/ota` shows `pending_verify: true` until the
+   BTS answers, then `confirmed: true`.
+
+The upload is checked before any of it is accepted: an image for another chip,
+another ESP-IDF project, or not an app at all (a bootloader or partition table
+posted by mistake) is refused from its first 288 bytes, before a megabyte goes
+over the air. The whole image is then hash-checked before the boot slot moves.
+
+**An update is refused while any slot is running** (`409`). The restart stops
+every slot that is not paused — `test_engine_init()` has to, since a freshly
+booted proxy cannot know what an unheld channel is doing — so an update in the
+middle of a shift would end every test. Pause or finish them first, or add
+`?force=1` to the URL if you mean it.
+
+### What the key is, and is not
+
+The key stops an accidental upload and casual access on a bench LAN. **It is
+not a security boundary.** It is set through the same unauthenticated API
+(trust on first use): the first set needs nothing, every later change needs the
+current key. So it protects a unit provisioned before an attacker reached it,
+and not one provisioned after. The rest of the API has no authentication at
+all. If that matters on your network, the answer is the network.
+
+### First flash after enabling rollback
+
+Rollback changes the **bootloader**, not just the app. The first time, flash
+everything over USB (`idf.py -p COM6 flash`), not just the app — an old
+bootloader ignores the trial state, and every later OTA image would be
+accepted without confirmation.
 
 ---
 

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BTS Tester</title>
+<style>
+:root{
+  --bg:#f6f7f9; --card:#fff; --fg:#17181b; --muted:#666c75;
+  --line:#dfe3e8; --accent:#2b6cb0; --ok:#2f855a; --warn:#b7791f; --bad:#c53030;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#15171a; --card:#1d2024; --fg:#e8eaed; --muted:#9aa1ab;
+    --line:#2d3238; --accent:#63a4e0; --ok:#68d391; --warn:#f6ad55; --bad:#fc8181;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);
+  font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:820px;margin:0 auto}
+h1{font-size:18px;margin:0 0 2px}
+h2{font-size:14px;margin:0 0 10px;text-transform:uppercase;
+  letter-spacing:.06em;color:var(--muted)}
+.sub{color:var(--muted);font-size:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;
+  padding:14px;margin-bottom:12px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:5px 6px;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--muted);font-weight:600;font-size:12px}
+tr:last-child td{border-bottom:0}
+label{display:block;margin:8px 0 3px;font-size:12px;color:var(--muted)}
+input[type=text],input[type=password]{width:100%;padding:7px 9px;
+  border:1px solid var(--line);border-radius:5px;background:var(--bg);
+  color:var(--fg);font:inherit}
+button{padding:7px 14px;border:0;border-radius:5px;background:var(--accent);
+  color:#fff;font:inherit;font-weight:600;cursor:pointer;margin-top:10px}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.row>div{flex:1 1 190px}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:3px 0}
+.kv span:first-child{color:var(--muted)}
+.pill{display:inline-block;padding:1px 7px;border-radius:9px;font-size:12px;
+  font-weight:600}
+.ok{background:var(--ok);color:#06240f}.bad{background:var(--bad);color:#2c0707}
+.warn{background:var(--warn);color:#2b1c00}
+.msg{margin-top:9px;font-size:13px;min-height:19px}
+.msg.e{color:var(--bad)}.msg.g{color:var(--ok)}
+progress{width:100%;height:7px;margin-top:9px}
+.note{color:var(--muted);font-size:12px;margin-top:9px}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+</style>
+</head>
+<body><div class="wrap">
+
+<h1>BTS Tester</h1>
+<div class="sub" id="sub">connecting...</div>
+
+<div class="card">
+  <h2>Unit</h2>
+  <div class="row">
+    <div><div class="kv"><span>BTS link</span><b id="u-link">-</b></div></div>
+    <div><div class="kv"><span>Input</span><b id="u-vin">-</b></div></div>
+    <div><div class="kv"><span>Uptime</span><b id="u-up">-</b></div></div>
+  </div>
+  <table style="margin-top:10px">
+    <thead><tr><th>Slot</th><th>State</th><th>V</th><th>A</th><th>&deg;C</th><th>mAh</th></tr></thead>
+    <tbody id="slots"></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>WiFi</h2>
+  <div class="row">
+    <div><div class="kv"><span>Station</span><b id="w-sta">-</b></div></div>
+    <div><div class="kv"><span>Network</span><b id="w-ssid">-</b></div></div>
+    <div><div class="kv"><span>Address</span><b id="w-ip">-</b></div></div>
+  </div>
+  <form id="wifi">
+    <div class="row">
+      <div>
+        <label for="ssid">Network name (SSID)</label>
+        <input type="text" id="ssid" maxlength="32" autocomplete="off" required>
+      </div>
+      <div>
+        <label for="pass">Password</label>
+        <input type="password" id="pass" maxlength="64" autocomplete="off"
+               placeholder="leave blank for an open network">
+      </div>
+    </div>
+    <button type="submit">Save and join</button>
+    <div class="msg" id="w-msg"></div>
+  </form>
+  <div class="note">
+    Saved to flash and applied at once. The <code id="ap-name">BTS-Tester</code>
+    access point stays up either way, so a wrong password cannot lock you out -
+    rejoin the AP and set it again.
+  </div>
+</div>
+
+<div class="card">
+  <h2>Firmware</h2>
+  <div class="row">
+    <div><div class="kv"><span>Version</span><b id="f-ver">-</b></div></div>
+    <div><div class="kv"><span>Built</span><b id="f-built">-</b></div></div>
+    <div><div class="kv"><span>Running from</span><b id="f-part">-</b></div></div>
+  </div>
+  <div id="f-trial" style="display:none;margin-top:8px">
+    <span class="pill warn">on trial</span>
+    <span class="note">This image has not confirmed itself yet. It does that
+    once the BTS link comes up; until then a reboot rolls it back.</span>
+  </div>
+
+  <form id="key" style="margin-top:12px">
+    <label for="k-new" id="k-label">Update key</label>
+    <div class="row">
+      <div id="k-cur-wrap" style="display:none">
+        <input type="password" id="k-cur" maxlength="64" autocomplete="off"
+               placeholder="current key">
+      </div>
+      <div><input type="password" id="k-new" maxlength="64" autocomplete="off"
+                  placeholder="new key"></div>
+    </div>
+    <button type="submit">Set key</button>
+    <div class="msg" id="k-msg"></div>
+  </form>
+
+  <form id="ota" style="margin-top:12px">
+    <label for="k-up">Update key</label>
+    <input type="password" id="k-up" maxlength="64" autocomplete="off">
+    <label for="file">Firmware image (<code>bts_btle_proxy.bin</code>)</label>
+    <input type="file" id="file" accept=".bin" required>
+    <label style="display:flex;gap:6px;align-items:center;margin-top:9px">
+      <input type="checkbox" id="force">
+      Update even if slots are running (the restart stops them)
+    </label>
+    <button type="submit" id="go">Upload and restart</button>
+    <progress id="bar" value="0" max="100" style="display:none"></progress>
+    <div class="msg" id="o-msg"></div>
+  </form>
+  <div class="note">
+    The image is written to the spare slot and booted on the restart. If it
+    cannot reach the BTS it is rolled back automatically, so a bad image
+    cannot brick the tester.
+  </div>
+</div>
+
+</div>
+<script>
+var $=function(id){return document.getElementById(id)};
+function txt(id,v){$(id).textContent=v}
+function say(id,m,good){var e=$(id);e.textContent=m;e.className='msg '+(good?'g':'e')}
+function hhmmss(s){
+  var h=Math.floor(s/3600),m=Math.floor(s%3600/60);
+  return h?h+'h '+m+'m':m?m+'m':s+'s';
+}
+function err(r){
+  return r.json().then(function(j){throw new Error(j.error||r.status)},
+                       function(){throw new Error('HTTP '+r.status)});
+}
+
+var STATE=['idle','rest check','charge','rest','discharge','rest','recharge',
+           'complete','fault','aborted','held'];
+
+function poll(){
+  fetch('/api/status').then(function(r){return r.ok?r.json():err(r)})
+  .then(function(d){
+    var u=d.unit;
+    txt('sub','firmware '+($('f-ver').textContent||'')+' - '+
+        (u.online?'unit online':'unit not answering'));
+    $('u-link').innerHTML='<span class="pill '+(u.online?'ok':'bad')+'">'+
+      (u.online?'up':'down')+'</span>';
+    txt('u-vin',u.input_voltage_v.toFixed(2)+' V');
+    txt('u-up',hhmmss(u.uptime_s));
+    var rows='';
+    d.slots.forEach(function(s){
+      rows+='<tr><td>'+(s.slot+1)+'</td><td>'+(s.state||'-')+'</td><td>'+
+        s.voltage_v.toFixed(3)+'</td><td>'+s.current_a.toFixed(3)+'</td><td>'+
+        s.temp_c.toFixed(1)+'</td><td>'+
+        (s.bts.charge_mah+s.bts.discharge_mah).toFixed(1)+'</td></tr>';
+    });
+    $('slots').innerHTML=rows;
+  })
+  .catch(function(){txt('sub','no answer from the tester')});
+}
+
+function wifi(){
+  fetch('/api/wifi').then(function(r){return r.ok?r.json():err(r)})
+  .then(function(d){
+    $('w-sta').innerHTML='<span class="pill '+(d.connected?'ok':'warn')+'">'+
+      (d.connected?'joined':(d.ssid?'joining':'not set'))+'</span>';
+    txt('w-ssid',d.ssid||'none saved');
+    txt('w-ip',d.connected?d.ip:(d.ap_active?d.ap_ip+' (AP)':'-'));
+    if(d.ap_ssid)txt('ap-name',d.ap_ssid);
+    if(d.ssid&&!$('ssid').value)$('ssid').value=d.ssid;
+  }).catch(function(){});
+}
+
+function fw(){
+  fetch('/api/ota').then(function(r){return r.ok?r.json():err(r)})
+  .then(function(d){
+    txt('f-ver',d.version||'?');
+    txt('f-built',(d.date||'')+' '+(d.time||''));
+    txt('f-part',d.running+' (spare: '+d.next+')');
+    $('f-trial').style.display=d.pending_verify?'block':'none';
+    $('k-cur-wrap').style.display=d.key_set?'':'none';
+    txt('k-label',d.key_set?'Change update key':
+        'Set an update key (uploads are refused until you do)');
+  }).catch(function(){});
+}
+
+$('wifi').onsubmit=function(e){
+  e.preventDefault();
+  say('w-msg','saving...',true);
+  fetch('/api/wifi',{method:'POST',body:JSON.stringify(
+    {ssid:$('ssid').value,password:$('pass').value})})
+  .then(function(r){return r.ok?r.json():err(r)})
+  .then(function(){
+    say('w-msg','saved - joining '+$('ssid').value+
+        '. If you are on the AP you will stay connected.',true);
+    setTimeout(wifi,4000);
+  })
+  .catch(function(x){say('w-msg',x.message,false)});
+};
+
+$('key').onsubmit=function(e){
+  e.preventDefault();
+  fetch('/api/ota/key',{method:'POST',body:JSON.stringify(
+    {current:$('k-cur').value,key:$('k-new').value})})
+  .then(function(r){return r.ok?r.json():err(r)})
+  .then(function(){
+    say('k-msg',$('k-new').value?'key set':'key cleared - OTA is now refused',true);
+    $('k-cur').value='';$('k-new').value='';fw();
+  })
+  .catch(function(x){say('k-msg',x.message,false)});
+};
+
+$('ota').onsubmit=function(e){
+  e.preventDefault();
+  var f=$('file').files[0];
+  if(!f){say('o-msg','choose an image first',false);return}
+  $('go').disabled=true;
+  $('bar').style.display='';$('bar').value=0;
+  say('o-msg','uploading '+(f.size/1024).toFixed(0)+' kB...',true);
+
+  // XHR, not fetch: this is the one request where progress is worth having.
+  var x=new XMLHttpRequest();
+  x.open('POST','/api/ota'+($('force').checked?'?force=1':''));
+  x.setRequestHeader('X-OTA-Key',$('k-up').value);
+  x.upload.onprogress=function(ev){
+    if(ev.lengthComputable)$('bar').value=ev.loaded/ev.total*100;
+  };
+  x.onload=function(){
+    $('go').disabled=false;
+    var j={};try{j=JSON.parse(x.responseText)}catch(_){}
+    if(x.status===200){
+      say('o-msg','written - restarting into the new image. '+
+          'This page will reload in about 15 seconds.',true);
+      setTimeout(function(){location.reload()},15000);
+    }else{
+      $('bar').style.display='none';
+      say('o-msg',j.error||('upload failed - HTTP '+x.status),false);
+    }
+  };
+  x.onerror=function(){
+    $('go').disabled=false;$('bar').style.display='none';
+    say('o-msg','connection lost during the upload',false);
+  };
+  x.send(f);
+};
+
+poll();wifi();fw();
+setInterval(poll,2000);
+setInterval(wifi,10000);
+</script>
+</body>
+</html>
