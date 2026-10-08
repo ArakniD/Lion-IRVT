@@ -141,6 +141,28 @@ void C1(void);  //state C1
 void C2(void);  //state C2
 void C3(void);  //state C3
 
+#ifdef _STANDALONE
+//
+// Bounded CPU2 boot - see tryBootCpu2(). Declared here because main() and
+// C3() both call it and it is defined further down.
+//
+// Per-attempt ceiling on waiting for CPU2's ROM. CPU2 reaches SYSTEM_READY
+// within microseconds of reset; by the time CPU1 gets here it has spent many
+// milliseconds in its own init, so a healthy CPU2 is already waiting and
+// this only ever bounds the failure case.
+//
+#define BTS_CPU2_BOOT_TIMEOUT_US    500000UL
+#define BTS_CPU2_BOOT_POLL_US          100UL
+
+#ifdef _FLASH
+#define BTS_CPU2_BOOT_MODE   C1C2_BROM_BOOTMODE_BOOT_FROM_FLASH
+#else
+#define BTS_CPU2_BOOT_MODE   C1C2_BROM_BOOTMODE_BOOT_FROM_RAM
+#endif
+
+static bool tryBootCpu2(uint32_t timeoutUs);
+#endif
+
 // Global unit state
 volatile UnitState unitState = eInputOK;
 
@@ -1435,22 +1457,22 @@ void main(void)
     //
     // Release CPU2.
     //
-    // Only do this in a standalone (no-debugger) build. When running under
-    // CCS the debugger loads and starts CPU2 itself, and Device_bootCPU2()
-    // would block forever in its do/while waiting for the boot ROM to report
-    // C2_BOOTROM_BOOTSTS_SYSTEM_READY - leaving CPU1 stalled here and CPU2
-    // parked in boot ROM around 0x3FE00A.
+    // Standalone builds only. Under CCS the debugger loads and starts CPU2
+    // itself.
+    //
+    // This used to be a plain Device_bootCPU2() call, which spins with no
+    // timeout until CPU2's boot ROM reports ready - so a CPU2 that never got
+    // there stalled CPU1 here, before its background loop, with no control
+    // tasks, no supervision and no trip arming. tryBootCpu2() makes one
+    // bounded attempt; if CPU2 is not ready, CPU1 carries on and C3 retries.
+    // See the note above tryBootCpu2().
     //
     // This mirrors TI's own project configurations, where _STANDALONE is a
     // separate build config from plain _FLASH (see the C2000Ware dual-core
     // examples, e.g. led_ex1_blinky.projectspec).
     //
 #ifdef _STANDALONE
-#ifdef _FLASH
-    Device_bootCPU2(C1C2_BROM_BOOTMODE_BOOT_FROM_FLASH);
-#else
-    Device_bootCPU2(C1C2_BROM_BOOTMODE_BOOT_FROM_RAM);
-#endif
+    (void)tryBootCpu2(BTS_CPU2_BOOT_TIMEOUT_US);
 #endif
 
     //
@@ -1693,6 +1715,164 @@ void updateStatusRegisters(void)
 {
     publishStatusToCpu2();
 }
+
+
+//
+// ============================================================================
+// CPU2 boot, bounded and non-blocking
+// ============================================================================
+//
+// driverlib's Device_bootCPU2() spins with NO timeout until CPU2's boot ROM
+// reports C2_BOOTROM_BOOTSTS_SYSTEM_READY. If that never happens CPU1 hangs
+// right there - before its background loop starts, so the control tasks, the
+// slot supervision and the trip arming all never run. A dead comms core must
+// not be allowed to take the control core down with it.
+//
+// This does the same handshake as Device_bootCPU2() but never waits longer
+// than BTS_CPU2_BOOT_TIMEOUT_US per attempt. If CPU2's ROM is not ready yet,
+// CPU1 carries on into its background loop and retries from the C3 task
+// (~6.7 Hz) until it gets through. Every step here matches Device_bootCPU2()
+// in device/device.c exactly - only the waits differ - so the two cannot
+// disagree about the protocol.
+//
+// WHAT THIS DOES NOT FIX: a cold power-up with the XDS100 attached. If the
+// probe holds TRSTn high at reset, CPU1's own boot ROM takes the emulation
+// path (SelectMode_Boot.c), finds the EMU key at 0x0D00 cleared by the
+// power-on RAM init, and parks in WAIT_BOOT. This code never runs at all in
+// that case - it is decided in ROM. Unplug the probe for a standalone boot,
+// or let CCS start the cores.
+//
+// Only the FLASH and RAM boot modes are used here, and neither needs the pin
+// muxing Device_bootCPU2() does for the peripheral bootloaders, so that part
+// is not reproduced.
+//
+#if defined(_STANDALONE)
+
+typedef enum {
+    eCpu2BootPending  = 0,   // not yet commanded, or a command was lost
+    eCpu2BootSent     = 1,   // command issued, waiting for the ROM's ACK
+    eCpu2BootAlready  = 2,   // CPU2 was already booted (e.g. by CCS)
+    eCpu2BootAcked    = 3,   // ROM acknowledged and branched to flash
+} BTS_cpu2BootState;
+
+static BTS_cpu2BootState cpu2BootState = eCpu2BootPending;
+static uint32_t          cpu2BootAttempts = 0UL;
+
+//
+// C3 passes to wait for the ROM's ACK before treating a sent command as lost
+// and sending it again. C3 runs at ~6.7 Hz, so 10 passes is ~1.5 s - orders of
+// magnitude longer than the ROM takes to service the command.
+//
+#define BTS_CPU2_ACK_WAIT_PASSES   10U
+static uint16_t          cpu2AckWait = 0U;
+
+//
+// True once CPU2's ROM has acknowledged a boot command.
+//
+static bool cpu2AlreadyBooted(void)
+{
+    uint32_t sts = HWREG(IPC_BASE + IPC_O_BOOTSTS);
+
+    return ((sts & 0x0000000FUL) == C2_BOOTROM_BOOTSTS_C2TOC1_BOOT_CMD_ACK) &&
+           ((sts & 0x80000000UL) != 0UL);
+}
+
+//
+// One bounded attempt. Returns true once CPU2 has been commanded (or was
+// already running), false if its ROM was not ready inside the timeout.
+//
+static bool tryBootCpu2(uint32_t timeoutUs)
+{
+    uint32_t waited = 0UL;
+
+    if ((cpu2BootState == eCpu2BootAcked) ||
+        (cpu2BootState == eCpu2BootAlready)) {
+        return true;
+    }
+
+    //
+    // A command has gone out: confirm it actually landed.
+    //
+    // Sending the command is not the same as CPU2 booting. CPU2's ROM handles
+    // it inside its IPC interrupt, and only reports C2TOC1_BOOT_CMD_ACK once
+    // it has resolved the flash entry and is about to branch there. Observed
+    // 2026-10-08 with the debugger attached: the ROM consumed the command
+    // flag (IPCFLG back to 0) but BOOTSTS went back to SYSTEM_READY rather
+    // than ACK, and CPU2 stayed parked in ROM with I2CA never configured.
+    // This state machine used to record Sent and stop there, so that boot was
+    // lost for good. Now a command that is not acknowledged in time is sent
+    // again.
+    //
+    if (cpu2BootState == eCpu2BootSent) {
+        if (cpu2AlreadyBooted()) {
+            cpu2BootState = eCpu2BootAcked;
+            return true;
+        }
+        if (++cpu2AckWait < BTS_CPU2_ACK_WAIT_PASSES) {
+            return true;
+        }
+        //
+        // No ACK. Fall through and resend - but only once the ROM is back at
+        // SYSTEM_READY, which the wait below checks. Anything else means the
+        // ROM is still busy with the last command and must be left alone.
+        //
+        cpu2AckWait   = 0U;
+        cpu2BootState = eCpu2BootPending;
+    }
+
+    cpu2BootAttempts++;
+
+    //
+    // Already booted - by CCS, or by a previous attempt that this state
+    // somehow missed. Sending a second boot command would be refused by
+    // the ROM anyway; record it and stop.
+    //
+    if (cpu2AlreadyBooted()) {
+        cpu2BootState = eCpu2BootAlready;
+        return true;
+    }
+
+    //
+    // Wait for CPU2's ROM to be ready to accept a command. This is the loop
+    // Device_bootCPU2() runs with no limit.
+    //
+    //
+    // The low nibble must be exactly SYSTEM_READY. Masking with it, as
+    // Device_bootCPU2() does, also passes on 3 (ACK) - harmless there, but
+    // here it would send a second command into a ROM that has just branched.
+    //
+    while ((HWREG(IPC_BASE + IPC_O_BOOTSTS) & 0x0000000FUL) !=
+           C2_BOOTROM_BOOTSTS_SYSTEM_READY) {
+        if (waited >= timeoutUs) {
+            return false;
+        }
+        DEVICE_DELAY_US(BTS_CPU2_BOOT_POLL_US);
+        waited += BTS_CPU2_BOOT_POLL_US;
+    }
+
+    //
+    // The ROM takes the command through IPC flags 0 and 31. Both must be
+    // clear. Flag 0 doubles as BTS_IPC_FLAG_REG_WRITE, but nothing on CPU2
+    // can raise it before CPU2 is running, so it is clear here in practice.
+    //
+    while (((HWREG(IPC_BASE + IPC_O_FLG) & IPC_FLG_IPC0)  != 0UL) ||
+           ((HWREG(IPC_BASE + IPC_O_FLG) & IPC_FLG_IPC31) != 0UL)) {
+        if (waited >= timeoutUs) {
+            return false;
+        }
+        DEVICE_DELAY_US(BTS_CPU2_BOOT_POLL_US);
+        waited += BTS_CPU2_BOOT_POLL_US;
+    }
+
+    HWREG(IPC_BASE + IPC_O_BOOTMODE) = BTS_CPU2_BOOT_MODE;
+    HWREG(IPC_BASE + IPC_O_SENDCOM)  = BROM_IPC_EXECUTE_BOOTMODE_CMD;
+    HWREG(IPC_BASE + IPC_O_SET)      = 0x80000001UL;
+
+    cpu2BootState = eCpu2BootSent;
+    return true;
+}
+
+#endif  // _STANDALONE
 
 
 //
@@ -2762,6 +2942,16 @@ void C3(void)
     // PLL registers will not show it - see BTS_HAL_pollClockHealth().
     //
     BTS_HAL_pollClockHealth();
+
+#ifdef _STANDALONE
+    //
+    // Drive the CPU2 boot to completion: retry a command main() could not
+    // send, and resend one the ROM never acknowledged. Zero timeout - this
+    // runs in the background task chain and must not stall it. A no-op once
+    // CPU2 has acknowledged.
+    //
+    (void)tryBootCpu2(0UL);
+#endif
 
     //
     // Execute task C1 the next time CpuTimer2 decrements to 0
