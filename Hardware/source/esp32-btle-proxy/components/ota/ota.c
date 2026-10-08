@@ -443,6 +443,7 @@ void ota_get_status(ota_status_t *out)
         out->time[sizeof(out->time) - 1]       = '\0';
         out->idf_ver[sizeof(out->idf_ver) - 1] = '\0';
     }
+    esp_app_get_elf_sha256(out->elf_sha, sizeof(out->elf_sha));
 
     out->pending_verify     = running_is_pending_verify();
     out->confirmed          = s_confirmed;

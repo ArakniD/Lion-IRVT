@@ -467,10 +467,23 @@ Join the `BTS-Tester` access point and browse to `http://192.168.4.1/`. The
 WiFi card takes an SSID and password, saves them to flash and joins at once;
 the AP stays up throughout, so a wrong password costs nothing but a retry.
 
-After five failed joins the station retries every **30 s** rather than
-continuously. The ESP32 has one radio, and a station scanning flat out drags
-the AP from channel to channel with it — which, with a mistyped password,
-would make the very AP you need to fix it unusable.
+After five failed joins the station stops retrying continuously. The ESP32
+has one radio, so every attempt to find the saved network takes the AP off
+its channel for a scan; a client notices the beacons stop, drops the AP and
+takes its own time to rejoin. So the retry period depends on whether anyone
+is on the AP:
+
+| | Retry every | Measured, laptop on the AP, saved network absent |
+|---|---|---|
+| Nobody on the AP | **30 s** | — (nothing to disturb) |
+| A client on the AP | **5 min** | page answered 44 of 48 probes over 4 min; the 4 misses were the first 20 s, before the backoff took hold |
+
+A flat 30 s cadence, tried first, left the page unreachable for about 20 s of
+every 35 — usable, but not for typing a password.
+
+To stop it looking at all, **Forget network** on the setup page (or
+`POST /api/wifi` with `{"ssid":""}`) erases the saved credentials; the AP is
+then steady.
 
 The password is write-only: `GET /api/wifi` never returns it, because anything
 it returned would be readable by anyone in range of the open AP.

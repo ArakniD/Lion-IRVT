@@ -78,6 +78,13 @@ typedef struct {
     char        date[16];
     char        time[16];
     char        idf_ver[32];
+    /*
+     * First 16 hex digits of the running image's ELF SHA-256. The version
+     * string comes from `git describe` and the date from the compile, so two
+     * builds of one dirty tree can carry identical versions and dates; this
+     * is what proves an update actually changed the code.
+     */
+    char        elf_sha[17];
     bool        pending_verify;  /* on trial, not yet confirmed             */
     bool        confirmed;       /* this boot's image is marked VALID       */
     bool        rollback_possible;

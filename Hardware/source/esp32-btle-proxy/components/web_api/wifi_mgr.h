@@ -45,4 +45,11 @@ void wifi_mgr_get_info(wifi_mgr_info_t *out);
  */
 esp_err_t wifi_set_credentials(const char *ssid, const char *password);
 
+/*
+ * Erases the stored station credentials and stops trying to join, leaving
+ * the SoftAP alone. ESP_ERR_NOT_FINISHED means the NVS keys are gone but the
+ * radio was mid-connect; the next boot is AP-only regardless.
+ */
+esp_err_t wifi_forget_credentials(void);
+
 #endif /* WIFI_MGR_H */

@@ -90,12 +90,17 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
       </div>
     </div>
     <button type="submit">Save and join</button>
+    <button type="button" id="forget"
+            style="background:transparent;color:var(--muted);border:1px solid var(--line)">Forget network</button>
     <div class="msg" id="w-msg"></div>
   </form>
   <div class="note">
     Saved to flash and applied at once. The <code id="ap-name">BTS-Tester</code>
     access point stays up either way, so a wrong password cannot lock you out -
-    rejoin the AP and set it again.
+    rejoin the AP and set it again. While a saved network cannot be found, the
+    tester looks for it every 30 s, or every 5 minutes while you are on the
+    access point so this page stays reachable; each look can drop you from the
+    AP for a few seconds.
   </div>
 </div>
 
@@ -201,7 +206,7 @@ function fw(){
   fetch('/api/ota').then(function(r){return r.ok?r.json():err(r)})
   .then(function(d){
     txt('f-ver',d.version||'?');
-    txt('f-built',(d.date||'')+' '+(d.time||''));
+    txt('f-built',(d.date||'')+' '+(d.time||'')+' ('+(d.elf_sha||'?')+')');
     txt('f-part',d.running+' (spare: '+d.next+')');
     $('f-trial').style.display=d.pending_verify?'block':'none';
     $('k-cur-wrap').style.display=d.key_set?'':'none';
@@ -209,6 +214,15 @@ function fw(){
         'Set an update key (uploads are refused until you do)');
   }).catch(function(){});
 }
+
+$('forget').onclick=function(){
+  if(!confirm('Forget the saved network? The tester stays on its access point.'))return;
+  fetch('/api/wifi',{method:'POST',body:JSON.stringify({ssid:''})})
+  .then(function(r){return r.ok?r.json():err(r)})
+  .then(function(){say('w-msg','network forgotten - access point only',true);
+    $('ssid').value='';$('pass').value='';wifi()})
+  .catch(function(x){say('w-msg',x.message,false)});
+};
 
 $('wifi').onsubmit=function(e){
   e.preventDefault();

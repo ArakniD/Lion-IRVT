@@ -35,16 +35,24 @@ static const char *NVS_NAMESPACE = "wifi";
 #define MAX_JOIN_RETRIES    5
 
 /*
- * Once those are spent, the gap between background attempts.
+ * Once those are spent, the gap between background attempts - and a longer
+ * one while anybody is on the SoftAP.
  *
- * Not zero. The ESP32 has one radio, so while the station scans for its
- * network the SoftAP is dragged from channel to channel with it. Retrying
- * back to back - which is what a wrong password produces - keeps it scanning
- * permanently and makes the fallback AP unusable, which is precisely the
- * lockout the AP exists to prevent. 30 s of quiet between attempts leaves
- * the AP steady enough to reach the setup page and correct the password.
+ * The ESP32 has one radio, so every attempt to find the station's network
+ * takes the SoftAP off its channel for a full scan. Measured on the bench
+ * with a Windows laptop on the AP and a saved network that was not there: at
+ * a 30 s cadence the setup page was unreachable for about 20 s of every 35.
+ * The scan itself is brief; the client notices the beacons stop, drops the
+ * AP, and takes its own time to rejoin.
+ *
+ * So the 30 s cadence applies only with nobody on the AP, where nothing is
+ * disturbed. While a client is connected the retry backs off to 5 minutes,
+ * which gives an operator who joined the AP to fix a mistyped password a
+ * steady page to fix it on, and still rejoins a site network that comes
+ * back while a tablet is left on the AP.
  */
-#define BACKGROUND_RETRY_US (30LL * 1000000LL)
+#define BACKGROUND_RETRY_US     (30LL * 1000000LL)
+#define BACKGROUND_RETRY_AP_US  (300LL * 1000000LL)
 
 /* How long a credential change waits for an in-flight connect to settle. */
 #define RECONFIG_SETTLE_TRIES   20
@@ -64,6 +72,14 @@ static esp_timer_handle_t s_retry_timer;
  * which would race the new config in and fail it with ESP_ERR_WIFI_STATE.
  */
 static volatile bool      s_reconfiguring;
+/*
+ * True while a station network is configured. Without it the driver is asked
+ * to connect with an empty SSID - harmless, but it was also the path by which
+ * a network the operator had forgotten could come back.
+ */
+static volatile bool      s_have_sta;
+/* Clients on the SoftAP, refreshed from the driver on every join and leave. */
+static volatile int       s_ap_clients;
 
 bool wifi_mgr_connected(void)
 {
@@ -119,13 +135,50 @@ void wifi_mgr_get_info(wifi_mgr_info_t *out)
     }
 }
 
+static int64_t background_retry_period(void)
+{
+    return (s_ap_clients > 0) ? BACKGROUND_RETRY_AP_US : BACKGROUND_RETRY_US;
+}
+
+/* (Re)arms the background retry at the period that suits the AP's use. */
+static void schedule_background_retry(void)
+{
+    if (s_retry_timer == NULL || !s_have_sta) {
+        return;
+    }
+    esp_timer_stop(s_retry_timer);      /* not running is fine */
+    esp_timer_start_once(s_retry_timer, background_retry_period());
+}
+
+static void refresh_ap_clients(void)
+{
+    wifi_sta_list_t list;
+    if (esp_wifi_ap_get_sta_list(&list) == ESP_OK) {
+        s_ap_clients = list.num;
+    }
+
+    /*
+     * Re-time a retry that is already waiting, so a client who has just
+     * joined gets the long quiet window from now rather than whatever was
+     * left of the short one - and the short cadence resumes as soon as the
+     * last client leaves. A join attempt in flight is left alone; its
+     * failure schedules the next one at the new period.
+     */
+    if (!s_connected && s_retry_timer != NULL &&
+        esp_timer_is_active(s_retry_timer)) {
+        schedule_background_retry();
+    }
+}
+
 static void event_handler(void *arg, esp_event_base_t base,
                           int32_t id, void *data)
 {
     (void)arg;
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (s_have_sta) {
+            esp_wifi_connect();
+        }
         return;
     }
 
@@ -134,8 +187,8 @@ static void event_handler(void *arg, esp_event_base_t base,
             (const wifi_event_sta_disconnected_t *)data;
         s_connected = false;
         ble_svc_set_wifi_connected(false);
-        if (s_reconfiguring) {
-            return;     /* wifi_set_credentials() reconnects itself */
+        if (s_reconfiguring || !s_have_sta) {
+            return;     /* a credential change reconnects itself */
         }
         if (s_retries < MAX_JOIN_RETRIES) {
             s_retries++;
@@ -150,11 +203,10 @@ static void event_handler(void *arg, esp_event_base_t base,
              * meanwhile; if the real network comes back the station rejoins
              * without an operator power-cycling anything.
              */
-            ESP_LOGW(TAG, "station join failed (reason %u); retrying every "
-                          "%lld s", e->reason, BACKGROUND_RETRY_US / 1000000LL);
-            if (s_retry_timer != NULL && !esp_timer_is_active(s_retry_timer)) {
-                esp_timer_start_once(s_retry_timer, BACKGROUND_RETRY_US);
-            }
+            ESP_LOGW(TAG, "station join failed (reason %u); next try in "
+                          "%lld s", e->reason,
+                     background_retry_period() / 1000000LL);
+            schedule_background_retry();
         }
         return;
     }
@@ -173,6 +225,12 @@ static void event_handler(void *arg, esp_event_base_t base,
         const wifi_event_ap_staconnected_t *e = (const wifi_event_ap_staconnected_t *)data;
         ESP_LOGI(TAG, "AP client joined: %02x:%02x:%02x:%02x:%02x:%02x",
                  e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+        refresh_ap_clients();
+        return;
+    }
+
+    if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
+        refresh_ap_clients();
     }
 }
 
@@ -275,6 +333,7 @@ esp_err_t wifi_set_credentials(const char *ssid, const char *password)
         vTaskDelay(pdMS_TO_TICKS(RECONFIG_SETTLE_MS));
         esp_wifi_disconnect();
     }
+    s_have_sta      = true;
     s_reconfiguring = false;
 
     if (err == ESP_OK) {
@@ -294,10 +353,57 @@ esp_err_t wifi_set_credentials(const char *ssid, const char *password)
     return ESP_OK;
 }
 
+esp_err_t wifi_forget_credentials(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)nvs_erase_key(h, "ssid");     /* absent is fine */
+    (void)nvs_erase_key(h, "pass");
+    err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /*
+     * Stand everything down before the config is blanked, so the disconnect
+     * this causes does not set off a retry against the network just removed.
+     */
+    s_reconfiguring = true;
+    s_have_sta      = false;
+    if (s_retry_timer != NULL) {
+        esp_timer_stop(s_retry_timer);
+    }
+    s_retries = 0;
+    esp_wifi_disconnect();
+
+    wifi_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    for (int i = 0; i < RECONFIG_SETTLE_TRIES; i++) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+        if (err != ESP_ERR_WIFI_STATE) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(RECONFIG_SETTLE_MS));
+        esp_wifi_disconnect();
+    }
+    s_reconfiguring = false;
+
+    /*
+     * The NVS keys are gone either way, so the next boot comes up AP-only
+     * whatever the driver said. Only report the live state if it disagrees.
+     */
+    ESP_LOGI(TAG, "station credentials forgotten; AP only");
+    return (err == ESP_OK) ? ESP_OK : ESP_ERR_NOT_FINISHED;
+}
+
 static void retry_timer_cb(void *arg)
 {
     (void)arg;
-    if (!s_connected && !s_reconfiguring) {
+    if (!s_connected && !s_reconfiguring && s_have_sta) {
         esp_wifi_connect();
     }
 }
@@ -373,6 +479,7 @@ esp_err_t wifi_mgr_start(const char *ap_ssid, const char *ap_password)
             have_creds = false;
         } else {
             ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+            s_have_sta = true;
             ESP_LOGI(TAG, "joining '%s'", ssid);
         }
     }

@@ -514,21 +514,23 @@ request is rejected with 400 `"profile fails sanity check"`:
 ```
 
 `password` is optional (omit for an open network); `ssid` is required.
-Limits: SSID 32 chars, password 8–64 or empty. Stored in the default NVS
+**An empty `ssid` forgets the saved network** — erases it from NVS and stops
+the station looking for it — and the AP carries on. Limits: SSID 32 chars,
+password 8–64 or empty. Stored in the default NVS
 partition under the `wifi` namespace, then the station reconnects. Over-long
 values are **refused, not truncated** — a truncated SSID would be saved and
 then never join.
 
 | Status | When |
 |---|---|
-| `200` | `{"ok":true}` — saved and the join started |
-| `400` | Missing body or `ssid`; SSID over 32 or password over 64; password 1–7 characters |
-| `500` | NVS save failed — nothing saved |
-| `503` | Saved, but the radio would not take the new config; it applies from the next restart |
+| `200` | `{"ok":true}` — saved and the join started, or forgotten |
+| `400` | Missing body or `ssid` key; SSID over 32 or password over 64; password 1–7 characters |
+| `500` | NVS save or erase failed |
+| `503` | Saved (or forgotten), but the radio would not take the new config; it applies from the next restart |
 
-After five failed joins the station retries every 30 s, not continuously, so
-the SoftAP stays usable while a wrong password is corrected — see the ESP32
-README.
+After five failed joins the station retries every 30 s, or every 5 minutes
+while a client is on the SoftAP, so the setup page stays reachable while a
+wrong password is corrected — see the ESP32 README for the measurements.
 
 #### 1.11.1 `GET /api/wifi`
 
@@ -546,10 +548,16 @@ the SoftAP is open, so anything returned here is readable by anyone in range.
 `GET /api/ota`:
 
 ```json
-{"version":"c490094","date":"Oct  8 2026","time":"17:09:40","idf_version":"v6.1",
- "running":"ota_0","next":"ota_1","pending_verify":false,"confirmed":true,
- "rollback_possible":true,"key_set":true,"in_progress":false,"uptime_s":742}
+{"version":"7d8f53e-dirty","date":"Oct  8 2026","time":"18:52:41","idf_version":"v6.1",
+ "elf_sha":"90fe12cd5","running":"ota_0","next":"ota_1","pending_verify":false,
+ "confirmed":true,"rollback_possible":true,"key_set":true,"in_progress":false,
+ "uptime_s":742}
 ```
+
+`elf_sha` is the start of the running image's ELF SHA-256. `version` comes from
+`git describe` and the date from the compile, so two builds of one dirty tree
+can carry identical versions; the hash is what proves an update changed the
+code.
 
 `pending_verify` is true while a newly written image is on trial: it confirms
 itself once the BTS link answers a poll, or after 180 s regardless, and a
@@ -562,7 +570,7 @@ when no key is stored (trust on first use) and must match otherwise. An empty
 | Status | When |
 |---|---|
 | `200` | Set, changed or cleared |
-| `400` | Missing `key`, or over 64 characters |
+| `400` | Missing `key`, or over 64 characters — refused, not truncated |
 | `403` | `current` does not match the stored key |
 
 `POST /api/ota` — the body is the **raw** `bts_btle_proxy.bin`, not multipart;

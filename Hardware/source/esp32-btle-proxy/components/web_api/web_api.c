@@ -800,9 +800,26 @@ static esp_err_t h_wifi_post(httpd_req_t *req)
      */
     char ssid[66];
     char pass[130] = {0};
-    if (!json_get_str(body, (size_t)len, "ssid", ssid, sizeof(ssid)) ||
-        ssid[0] == '\0') {
+    if (!json_get_str(body, (size_t)len, "ssid", ssid, sizeof(ssid))) {
         return send_error(req, "400 Bad Request", "missing ssid");
+    }
+
+    /*
+     * An explicitly empty SSID forgets the network. Without this there was
+     * no way back from a wrong one short of erasing flash: the device would
+     * keep scanning for it on every boot, unsettling the AP each time.
+     */
+    if (ssid[0] == '\0') {
+        const esp_err_t err = wifi_forget_credentials();
+        if (err == ESP_ERR_NOT_FINISHED) {
+            return send_error(req, "503 Service Unavailable",
+                              "forgotten, but the radio is busy; AP only "
+                              "from the next restart");
+        }
+        if (err != ESP_OK) {
+            return send_error(req, "500 Internal Server Error", "erase failed");
+        }
+        return send_ok(req);
     }
     (void)json_get_str(body, (size_t)len, "password", pass, sizeof(pass));
 
@@ -877,6 +894,7 @@ static esp_err_t h_ota_get(httpd_req_t *req)
     json_kv_str(&j, "date", st.date);
     json_kv_str(&j, "time", st.time);
     json_kv_str(&j, "idf_version", st.idf_ver);
+    json_kv_str(&j, "elf_sha", st.elf_sha);
     json_kv_str(&j, "running", st.running_label);
     json_kv_str(&j, "next", st.next_label);
     json_kv_bool(&j, "pending_verify", st.pending_verify);
@@ -897,8 +915,15 @@ static esp_err_t h_ota_key_post(httpd_req_t *req)
         return send_error(req, "400 Bad Request", "missing body");
     }
 
-    char current[OTA_KEY_MAX] = {0};
-    char next[OTA_KEY_MAX]    = {0};
+    /*
+     * Twice the field width, for the reason h_wifi_post() gives: the JSON
+     * parser truncates without saying so. With exact-size buffers a 70
+     * character key was cut to 64 and saved, and the operator walked away
+     * holding a key the unit did not have - found on the bench. Over-sized
+     * buffers let ota_key_set() see the real length and refuse it.
+     */
+    char current[2 * OTA_KEY_MAX] = {0};
+    char next[2 * OTA_KEY_MAX]    = {0};
     (void)json_get_str(body, (size_t)len, "current", current, sizeof(current));
     if (!json_get_str(body, (size_t)len, "key", next, sizeof(next))) {
         return send_error(req, "400 Bad Request", "missing key");
@@ -909,7 +934,8 @@ static esp_err_t h_ota_key_post(httpd_req_t *req)
         return send_error(req, "403 Forbidden", "current key does not match");
     }
     if (err == ESP_ERR_INVALID_SIZE) {
-        return send_error(req, "400 Bad Request", "key too long");
+        return send_error(req, "400 Bad Request",
+                          "key is limited to 64 characters");
     }
     if (err != ESP_OK) {
         return send_error(req, "500 Internal Server Error", esp_err_to_name(err));

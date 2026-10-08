@@ -4,10 +4,16 @@ Decodes every readable characteristic against the packed structs in
 components/ble_svc/include/ble_proto.h and subscribes to both notify
 characteristics so the live path is exercised too.
 
-    python tools/ble_verify.py [--seconds N] [--address AA:BB:..]
+    python tools/ble_verify.py [--seconds N] [--address AA:BB:..] [--no-bts]
 
 Exit status is non-zero if the interface could not be verified, so this can
 be used as a bench smoke test.
+
+--no-bts is for a proxy on the bench with no BTS wired to it. Register access
+goes through to the unit over I2C, so with nothing there the proxy answers a
+register read with ATT error 0x0E (Unlikely Error). That is the correct
+answer, and with --no-bts it is expected rather than failed. Everything the
+proxy serves itself is still checked.
 """
 
 import argparse
@@ -16,6 +22,7 @@ import struct
 import sys
 
 from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakError
 
 DEVICE_NAME = "BTS-Tester"
 
@@ -213,6 +220,9 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=12.0)
     ap.add_argument("--address", default=None)
+    ap.add_argument("--no-bts", action="store_true",
+                    help="proxy has no BTS attached: expect register access "
+                         "to be refused and the unit to report offline")
     args = ap.parse_args()
 
     address = args.address
@@ -295,7 +305,24 @@ async def main():
         # would change the unit's configuration. eUnitState is a safe
         # target, and the top of the map proves the register count.
         print("\n=== register access ===")
-        if REGISTER.lower() in present:
+        if REGISTER.lower() in present and args.no_bts:
+            if unit["online"]:
+                print("FAIL: --no-bts given, but the unit reports online")
+                return 1
+            try:
+                await read_register(client, REG_UNIT_STATE)
+            except BleakError as exc:
+                # 0x0E is what handle_register_cmd() returns when the I2C
+                # transfer to the unit fails. Any other error is a real fault.
+                if "Unlikely" not in str(exc):
+                    print(f"FAIL: register read refused unexpectedly: {exc}")
+                    return 1
+                print("register read refused with ATT 0x0E (Unlikely "
+                      "Error), as expected with no BTS")
+            else:
+                print("FAIL: register read succeeded with no BTS attached")
+                return 1
+        elif REGISTER.lower() in present:
             value = await read_register(client, REG_UNIT_STATE)
             if value is None:
                 print(f"FAIL: register {REG_UNIT_STATE} read did not "
