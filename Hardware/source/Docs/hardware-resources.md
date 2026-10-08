@@ -324,6 +324,15 @@ last select register; the next register is `INPUTSELECTLOCK`. There is no
 and routed; see §5.1 for how a comparator actually reaches a trip zone, which
 is not the obvious path.
 
+**Seen on hardware, 2026-10-08.** The CMPSS1 low comparator latched
+(`TZOSTFLG` 0x0040, DCAEVT1) on every discharge enable while
+the deadband took its two delays from two independent sources (`DBCTL`
+IN_MODE 2). Both now come from EPWMA (IN_MODE 0), and 1 A charge, 1 A
+discharge and 100 mA discharge all start and run with no latch. So the trip
+path is proven end to end - comparator, ePWM X-BAR, Digital Compare, one-shot
+- but only by a fault. **The ±9.5 A level itself has not been tested against
+a real over-current.**
+
 The CMPSS comparators do **not** go through the Input X-BAR. They reach the
 ePWM trip zones through the separate **ePWM X-BAR** at `EPWMXBAR_BASE`
 `0x7A00`. Each `TRIPn` output selects among 16 muxes and **can enable several

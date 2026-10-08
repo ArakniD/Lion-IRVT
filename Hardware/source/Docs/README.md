@@ -22,7 +22,46 @@ a calibration.
 
 ## Read this first
 
-> ### The hardware over-current trips have never fired on a board
+> ### Hardware status, 2026-10-08 - converter verified, trip levels not
+>
+> Slot 1 has now run real current both ways on this firmware, and ended on its
+> own termination rule. Measured on the bench:
+>
+> | Test | Result |
+> |---|---|
+> | Charge, 1 A into a short | ran 205 s, regulated at 1.00 A, no trip |
+> | Discharge, 1 A into a 3.46 V supply | ran 206 s, 57.7 mAh, no trip on enable |
+> | Discharge, 100 mA | ran until stopped, no trip on enable |
+> | Discharge termination, `V_MIN` 0.5 V | supply wound to 0 V; slot ended as **END** (`FINISHED`), not as a trip |
+>
+> The two current paths agree at 1 A (ADS131M08 1.00 A, internal ADC 0.98 A),
+> and the charge counter integrates to the commanded current (57.0 mAh in
+> 205 s at 1 A). Before this, a discharge latched the CMPSS low comparator on
+> every enable; the deadband input fix and the converter duty seed cleared it.
+>
+> **What is still unproven is the trip LEVEL**, which is why the section below
+> stands. The comparators have now been seen to latch - wrongly, on the old
+> deadband - but never against a real over-current at the ±9.5 A threshold.
+>
+> **Two things that look like faults and are not:**
+>
+> - **A discharge that stops after a few seconds with no fault bit** is the
+>   input-bus guard. The energy a discharge removes goes back onto the input;
+>   a supply that cannot sink it rises toward `eDischargeRestrictV`, and the
+>   slot is stopped there. Raise the limits (now 16.0 / 16.8 V, and 16.8 V is
+>   the firmware ceiling) or give the input a load.
+> - **A discharge that ends at once as `FINISHED`** is the `V_MIN` cutoff, not
+>   a trip. A bench supply in current limit collapses the slot voltage the
+>   moment the converter starts drawing; give it more current headroom.
+>
+> **The internal-ADC current reads ~60 mA high at low current** (0.16 A
+> against the ADS131M08's 0.10 A at a 100 mA setpoint), while agreeing to 2%
+> at 1 A - a fixed zero offset, uncorrected because the slot has not been
+> through the two-point routine. The control loop and the counters use the
+> ADS131M08, so regulation is unaffected; anything reading `eChX_CellCurrent`
+> at low current is not.
+
+> ### The hardware over-current trips have not been tested at their level
 >
 > All eight are **enabled** in this build (`BTS_TRIP_HW_CH1..8_ENABLED (true)`,
 > [`bts_user_settings.h`](../tida-010086/bts_F2837xD_8ch/bts_user_settings.h)),
@@ -39,10 +78,10 @@ a calibration.
 > running. In an ungrouped build (MODE 0) each slot is its own group and the
 > exception does not arise.
 >
-> The caution is therefore not "there is no trip". It is this: **the trips were
-> enabled by a compile-verified change and no board has yet been seen to
-> trip.** The levels (±9.5 A hardware, above the 8 A software trip) have not
-> been measured against a real over-current.
+> The caution is therefore not "there is no trip". It is this: **the trips are
+> live and have been seen to latch, but never against a real over-current.**
+> The levels (±9.5 A hardware, above the 8 A software trip) have not been
+> measured, so treat the supply's own limit as the protection you trust.
 >
 > Three consequences, all of which matter during calibration because
 > calibration deliberately drives real current:

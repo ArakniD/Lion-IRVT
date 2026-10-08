@@ -41,3 +41,24 @@ and **CPU Timer 2 on CPU2 is free again**.
 See [`04.CPU2 Timer0 double booked for LED and ADS1119.md`](04.CPU2%20Timer0%20double%20booked%20for%20LED%20and%20ADS1119.md)
 for the full note, and `Docs/supervision-and-state-design.md` §2.5.1 for the
 current design.
+
+### Addendum, 2026-10-08 - first FET-driving runs on hardware
+
+Earlier entries here say the trips never fired, the CV coefficients never
+ran, and "nothing that drives a FET has run on hardware". The first and last
+are no longer true for slot 1:
+
+- **Charge**, 1 A into a short: 205 s at 1.00 A, no trip.
+- **Discharge**, 1 A and 100 mA from an external supply: steady, no trip on
+  enable - previously every discharge enable latched the CMPSS comparator.
+- **Discharge termination**: `V_MIN` 0.5 V, supply wound to 0 V, slot ended
+  in END (`FINISHED`).
+- **Standalone flash boot**: both cores from flash with the debugger
+  unplugged (`c490094`).
+- **F-RAM**: boot reads now succeed; slot 1's calibration, slot state and the
+  global voltage thresholds load at boot.
+
+Still NOT verified on hardware: **charge termination** (the short never
+reaches CV), **the CV loop** on a real cell, and **the trip level** against a
+real over-current. Commits: `c490094` (C2000), `b373e90` (ESP32).
+
