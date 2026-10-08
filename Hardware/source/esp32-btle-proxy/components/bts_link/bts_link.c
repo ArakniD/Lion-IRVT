@@ -43,6 +43,46 @@ static volatile bool           s_cal_poll_due;
 /* Low-level bus access. Callers must NOT hold s_bus_mutex.            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Return the controller to a clean state after a failed transfer.
+ *
+ * WHY THIS EXISTS. The proxy crashed on 2026-10-08 with a LoadProhibited
+ * inside the ESP-IDF v6.1 driver, s_i2c_write_command(), reading from
+ * 0xaeaf2135 - an op whose data pointer was 0xaeae49f1 and whose
+ * bytes_used was 55108. That op was not one of ours. It came from
+ * i2c_master_probe(), which:
+ *
+ *   - points bus->i2c_trans.ops at an array on ITS OWN STACK and never
+ *     clears it, so after it returns the bus holds a dangling op list;
+ *   - does not reset the controller FSM on a NACK or a timeout, unlike
+ *     the device transfer paths.
+ *
+ * A late interrupt from a failed probe then gives cmd_semphr
+ * unconditionally (i2c_master.c, the non-async branch of the ISR). The
+ * next transaction's s_i2c_send_commands() takes that stale semaphore
+ * straight away and walks ops[] before its own command list is in
+ * charge - reading stack memory the poll task has since reused.
+ *
+ * It only happened while the C2000 was not answering, because that is the
+ * only time this file used to probe during normal running. The fix is not
+ * to probe while the poll task runs at all, and to reset the FSM after
+ * anything that failed, so no transfer ever inherits a dirty one.
+ *
+ * i2c_master_bus_reset() is the public way to do what the driver does
+ * internally on its own errors: reset the FSM, clear the bus, and return
+ * the status to idle. Callers must hold s_bus_mutex.
+ */
+static void bus_recover(void)
+{
+    if (s_bus == NULL) {
+        return;
+    }
+    esp_err_t err = i2c_master_bus_reset(s_bus);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "bus reset failed: %s", esp_err_to_name(err));
+    }
+}
+
 static esp_err_t bus_read_block(uint16_t reg_addr, float *out, size_t count)
 {
     if (count == 0 || count > BTS_TOTAL_REGISTERS) {
@@ -75,6 +115,8 @@ static esp_err_t bus_read_block(uint16_t reg_addr, float *out, size_t count)
     esp_err_t err = i2c_master_transmit_receive(s_dev, addr_buf, sizeof(addr_buf),
                                                 rx, rx_len, BTS_XFER_TIMEOUT_MS);
     if (err != ESP_OK) {
+        /* Never let the next transfer inherit this one's state. */
+        bus_recover();
         return err;
     }
 
@@ -91,7 +133,11 @@ static esp_err_t bus_write_reg(uint16_t reg_addr, float value)
     buf[1] = (uint8_t)(reg_addr & 0xFFu);
     bts_f32_to_wire(value, &buf[2]);
 
-    return i2c_master_transmit(s_dev, buf, sizeof(buf), BTS_XFER_TIMEOUT_MS);
+    esp_err_t err = i2c_master_transmit(s_dev, buf, sizeof(buf), BTS_XFER_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        bus_recover();
+    }
+    return err;
 }
 
 /* ------------------------------------------------------------------ */
@@ -537,29 +583,28 @@ static void bts_poll_task(void *arg)
                 local.unit.watchdog_timeout_s = unit[7];
             } else {
                 cycle_ok = false;
-                /* Periodic bus scan while the link is down: tells a wiring
-                 * or address fault apart from a target that answers but
-                 * will not talk. */
-                static uint32_t scan_div;
-                if ((scan_div++ % 40u) == 0u) {
-                    int found = 0;
-                    for (uint8_t a = 0x08; a < 0x78; a++) {
-                        if (i2c_master_probe(s_bus, a, 20) == ESP_OK) {
-                            ESP_LOGW(TAG, "scan: found 0x%02X", a);
-                            found++;
-                        }
-                    }
-                    ESP_LOGW(TAG, "scan: %d device(s)", found);
-                    /* Read the pads back as plain inputs. An idle I2C bus
-                     * must read 1/1: anything else is a short, a missing
-                     * pull-up, or a peer holding the line. */
-                    {
-                        gpio_num_t sda = (gpio_num_t)s_sda_gpio;
-                        gpio_num_t scl = (gpio_num_t)s_scl_gpio;
-                        ESP_LOGW(TAG, "bus level: SDA(%d)=%d SCL(%d)=%d",
-                                 s_sda_gpio, gpio_get_level(sda),
-                                 s_scl_gpio, gpio_get_level(scl));
-                    }
+                /*
+                 * There used to be a 112-address bus scan here, run every
+                 * 40 failed cycles. It is gone, and must not come back:
+                 * i2c_master_probe() leaves the driver holding a dangling
+                 * op list and a dirty FSM (see bus_recover()), and this
+                 * branch runs exactly when the C2000 is being reset, halted
+                 * or cold-booting - when every probe fails. That is what
+                 * crashed the proxy on 2026-10-08.
+                 *
+                 * The same diagnosis is still available on demand, safely,
+                 * from GET /api/i2c_diag.
+                 */
+                static uint32_t lvl_div;
+                if ((lvl_div++ % 40u) == 0u) {
+                    /* Pad levels only - no transfer. An idle bus must read
+                     * 1/1; anything else is a short, a missing pull-up, or
+                     * a peer holding the line. */
+                    gpio_num_t sda = (gpio_num_t)s_sda_gpio;
+                    gpio_num_t scl = (gpio_num_t)s_scl_gpio;
+                    ESP_LOGW(TAG, "link down; bus level: SDA(%d)=%d SCL(%d)=%d",
+                             s_sda_gpio, gpio_get_level(sda),
+                             s_scl_gpio, gpio_get_level(scl));
                 }
             }
 
@@ -816,6 +861,14 @@ esp_err_t bts_link_init(const bts_link_config_t *config)
         probe_stats_liveness();
     }
 
+    /*
+     * Everything above may have run i2c_master_probe(), which leaves the
+     * driver holding a dangling op list (see bus_recover()). Reset before the
+     * poll task's first transfer so it never inherits that state. No mutex
+     * yet: the poll task has not been created.
+     */
+    bus_recover();
+
     BaseType_t ok = xTaskCreate(bts_poll_task, "bts_poll", BTS_POLL_TASK_STACK,
                                 NULL, BTS_POLL_TASK_PRIO, NULL);
     return (ok == pdPASS) ? ESP_OK : ESP_ERR_NO_MEM;
@@ -859,19 +912,28 @@ int bts_link_bus_diagnose(bts_bus_diag_t *diag, uint8_t *found, int max_found)
         diag->scl_high = gpio_get_level(s_scl_gpio) != 0;
     }
 
-    xSemaphoreGive(s_bus_mutex);
-
     /*
      * Only scan when both lines idle high - probing a stuck bus just
      * produces 128 timeouts and takes half a minute doing it.
      */
     if (!diag->sda_high || !diag->scl_high) {
+        xSemaphoreGive(s_bus_mutex);
         ESP_LOGE(TAG, "I2C lines stuck: SDA=%s SCL=%s",
                  diag->sda_high ? "high" : "LOW",
                  diag->scl_high ? "high" : "LOW");
         return 0;
     }
 
+    /*
+     * The scan stays under the bus mutex for its whole length.
+     *
+     * It used to release the mutex after the pin sample above and then run
+     * all 112 probes unlocked, concurrently with the poll task's transfers.
+     * Two masters driving one controller is undefined on its own; with
+     * i2c_master_probe() leaving a dangling op list behind (bus_recover()),
+     * it is a crash. This pauses polling for the length of the scan - a few
+     * seconds, on an endpoint an engineer calls by hand.
+     */
     int n = 0;
     for (uint8_t addr = 0x08; addr < 0x78; addr++) {
         if (i2c_master_probe(s_bus, addr, 50) == ESP_OK) {
@@ -882,6 +944,11 @@ int bts_link_bus_diagnose(bts_bus_diag_t *diag, uint8_t *found, int max_found)
             n++;
         }
     }
+
+    /* Leave the controller clean for the poll task. */
+    bus_recover();
+    xSemaphoreGive(s_bus_mutex);
+
     diag->target_count = n;
     if (n == 0) {
         ESP_LOGW(TAG, "I2C lines idle high but no target answered "
