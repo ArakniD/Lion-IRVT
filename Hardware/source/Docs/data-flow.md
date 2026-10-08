@@ -66,7 +66,7 @@ flowchart LR
     subgraph CPU2 ["F28379D CPU2 — comms core"]
         ADS1119["2 × ADS1119<br/>I2CB, 0x40 / 0x41"]
         MIRROR["mirrorCpu1Status()<br/>seqlock read"]
-        REGS["registers[267]<br/>CPU2TOCPU1RAM"]
+        REGS["registers[]<br/>CPU2TOCPU1RAM"]
     end
 
     subgraph ESP ["ESP32 proxy"]
@@ -542,7 +542,7 @@ flowchart TD
         HA["Home Assistant<br/>lion_lvrt"]
         PY["calibrate.py<br/>ble_verify.py"]
         BROWSER["Browser / curl"]
-        BENCH["AT console<br/>debug build only"]
+        BENCH["AT console, C2000<br/>debug build only"]
     end
 
     subgraph TRANSPORT ["Transports"]
@@ -580,13 +580,28 @@ flowchart TD
 | **BLE** | yes | only on proto ≥ 4 | an adapter or connectable proxy in range |
 | **HTTP** | yes | yes | the tester joined to your WiFi |
 | **CAN** | no | yes | SocketCAN on the host, wired to the unit |
-| **AT console** | no | yes | a debug build — the pins carry the LEDs in production |
+| **AT console** | no | yes | a debug build — the C2000’s console is now off by choice, not by pin pressure |
 
 The BLE register characteristic (`000d`) was added in `BLE_PROTO_VERSION` 4.
 A client talking to older proxy firmware has no way to reach the mode
 register, which is why the Home Assistant integration hides charge and
 discharge from the mode dropdown rather than offering an action that would
 fail.
+
+**The AT console row used to read differently, and the reason it changed is
+worth knowing.** A production build had no console because SCIA’s TX pin,
+GPIO29, was needed to drive the WS2812B string. That string left the C2000 on
+2026-10-02 (§7), `BTS_LED_DRIVER_ENABLED` is `(false)` in **both** arms of the
+`BTS_DEBUG_CONSOLE` switch, and GPIO29 is now muxed to `SCITXDA` and simply
+idle in production. **The pin constraint is gone**: a production build could
+carry the C2000 console at no cost today. The project does not, because the
+ESP32 serves the same grammar on its own UART0 and reaches the registers over
+I2C — see [`at-command-specification.md`](at-command-specification.md). The
+remaining claimants on SCIA are CPU2’s console in a debug build and CPU1’s
+SFRA GUI, which takes the whole port when the MODE strap reads 6 or 7 and
+`BTS_SFRA_ENABLED` is set. That choice is a one-shot
+`SysCtl_selectCPUForPeripheral()` write at boot and cannot be revisited at
+runtime.
 
 ### The host watchdog cuts across all of them
 
@@ -601,7 +616,153 @@ protection is the bench supply's own current limit.
 
 ---
 
-## 7. CAN telemetry
+## 7. Slot indication — the outbound path that needs no host
+
+Almost every path in this document ends at a host. Two do not: the ST7789
+panel in §2 and the eight WS2812B pixels above the slots. Both end at **a
+person standing in front of the unit**, with no client connected, no browser
+open and no phone in range. The strip is the cruder of the two and the more
+useful for it — each pixel sits physically above the slot it describes, so it
+is read at a glance and from across the room rather than studied.
+
+```mermaid
+flowchart LR
+    REGS["registers[]<br/>CPU2TOCPU1RAM"]
+    LINK["bts_link poll<br/>9 bursts / 250 ms"]
+    SNAP["bts_snapshot_t<br/>status_bits + decoded flags"]
+    TASK["led_strip task<br/>FreeRTOS, priority 4,<br/>every 25 ms"]
+    ENC["encode_pixel()<br/>RGB to GRB, brightness 64/255,<br/>4 SPI bits per WS2812B bit"]
+    SPI["SPI3 / VSPI MOSI, GPIO13<br/>2.5 MHz, 96 bytes, one DMA transfer"]
+    STRIP["8 x WS2812B<br/>one pixel per slot"]
+    EYE["Operator"]
+
+    REGS -->|"I2C, the same poll<br/>everything else rides"| LINK
+    LINK --> SNAP
+    SNAP --> TASK
+    TASK --> ENC
+    ENC --> SPI
+    SPI -->|"307 us, then MOSI idles low<br/>and the reset latch comes free"| STRIP
+    STRIP --> EYE
+```
+
+It is deliberately **not** in the clients-and-transports diagram above. Every
+arrow there carries a command inbound to a control surface; this one carries
+nothing but indication outbound, has no client at either end, and reaches no
+register.
+
+### Why the strip hangs off the proxy rather than the core that owns the slots
+
+The C2000 drove this string for most of the project’s life and **never lit a
+single pixel**. `LEDDriver_update()` clocked raw colour bytes out of SCIA at
+800 kbaud. A WS2812B does not decode bytes — it decodes **pulse widths**,
+400 ns high for a 0 and 800 ns high for a 1, inside a 1250 ns slot — and a
+UART cannot produce them. It forces a low start bit before every byte and
+holds each data bit for a whole bit time. The strip saw framing noise and
+latched nothing.
+
+That is a different class of fault from the ones fixed around it. The Timer 0
+double-booking on CPU2 ([`hardware-resources.md` §8.2](hardware-resources.md#82-cpu-timer-0-on-cpu2-was-double-booked)),
+the LED refresh starving CPU2’s I2C target ISR from inside a non-HPI
+interrupt, and SCIA being stranded by an unstrapped MODE were all real bugs
+and all worth fixing — but none of them was ever going to light the string.
+
+Nor could it be fixed in place. Driving a WS2812B needs a peripheral that
+emits a free-running bit pattern, which here means SPI: GPIO29 — the wire
+that physically exists — has **no SPI mux option at all** (GPIO, SCITXDA,
+EM1SDCKE, OUTPUTXBAR6, EQEP3B, SD2_C3), both usable SPI ports are held by the
+ADS131M08 pair, and the Output X-BAR has no ePWM source. An eCAP APWM through
+OUTPUTXBAR6 would have worked electrically at the cost of 192 software duty
+updates per refresh — reintroducing exactly the ISR starvation that had just
+been removed.
+
+So the function moved to the ESP32, which had a spare SPI host and a free
+pin, and already held a decoded copy of every slot’s state.
+
+### What the encoding costs, and the one number that is not the obvious one
+
+Each WS2812B bit becomes four SPI bits at **2.5 MHz** (80 MHz / 32): `1000`
+is a 0 at 400 ns high, `1100` is a 1 at 800 ns high. Both sit on the part’s
+exact nominal widths and the resulting 1600 ns slot is inside the 650–1850 ns
+it tolerates. Two WS2812B bits pack into one SPI byte, so 24 bits of colour
+is 12 bytes and the whole eight-pixel frame is **96 bytes in a single DMA
+transfer, 307 us**. MOSI rests low between frames, so the reset latch — which
+needs the line held low for at least 50 us — costs nothing.
+
+**2.5 MHz and not 3.333 MHz** — the rate the commonly-cited write-up of this
+technique uses — because at 3.333 MHz the `1100` symbol gives a 600 ns T1H,
+**below the 650 ns minimum for a logic 1**. It works on many strips and fails
+on others, which on a safety indicator means intermittently wrong colours. The
+deviation is deliberate.
+
+Refresh is a **FreeRTOS task** (`led_strip`, priority 4, 3072-byte stack) at
+25 ms, not a timer ISR. That is the structural difference from the C2000
+version: a scheduled task cannot starve anything the way a 360 us
+interrupts-disabled transfer did.
+
+Two smaller things the move cleaned up. Colour constants are written **RGB in
+source** and reordered to GRB in `encode_pixel()`, where the C2000 stored them
+pre-swapped and needed a comment on every line explaining that yellow only
+looked right by accident. And flash periods are now **milliseconds**, divided
+by the refresh interval to get ticks, rather than counts of an 80 Hz timer
+tick that would have silently changed every flash rate if that timer were ever
+retuned.
+
+### The priority chain is unchanged, and one state is new
+
+The order the colours are tested in came across from the C2000 untouched, and
+it is **safety-first on purpose**: a fault is shown even though a faulted slot
+is also, necessarily, not running. Testing "not running" first — as an early
+version did — made a trip look identical to an idle slot.
+
+```
+SLOT_DISABLED -> OVERCURRENT -> REVERSE_POLARITY -> GROUP_DISCONNECT
+  -> CALIBRATING -> paused -> balancing / soft start -> ready
+  -> CHARGING / DISCHARGING -> ended -> idle
+```
+
+The colour and pattern for each is in
+[`supervision-and-state-design.md` §2.5.1](supervision-and-state-design.md#251-slot-indication--the-ws2812b-string)
+and is not restated here.
+
+**One state exists that the C2000 never had.** When `snap.unit.online` is
+false, or a slot’s `valid` flag is false, **all eight flash amber in unison**.
+Unison is the whole cue: no real per-slot condition ever synchronises across
+the entire strip, so an operator can tell *the proxy cannot see the unit* from
+any genuine slot state without reading a colour key. The alternatives are
+worse — holding the last known colours asserts slot states that may no longer
+be true, and going dark is indistinguishable from the box being powered off.
+
+### Two things this costs, stated plainly
+
+**Latency.** Colour now derives from the 250 ms I2C poll rather than from
+`registers[]` directly, so a state change can take up to roughly 250 ms longer
+to reach the strip than it would have from a C2000-resident driver. For an
+indicator read by eye that is acceptable; it is still a real regression
+against a path that had none.
+
+**The strip now depends on the proxy.** If the ESP32 is unplugged, crashes or
+is held in reset, it sends no frames at all, and **the WS2812B latches hold
+their last colour indefinitely**. That is precisely the "frozen LED showing
+*running* for a slot that has since tripped" hazard that made the Timer 0
+double-booking worth fixing in the first place. The amber-unison state covers
+only the case where the ESP32 is **alive** and the I2C link is down; nothing
+covers the ESP32 itself being dead. A slot’s true state is always
+authoritative over the register bus, CAN or BLE — **the strip is an
+indicator, not evidence**.
+
+### What is left on the C2000
+
+`BTS_LED_DRIVER_ENABLED` is `(false)` in both arms of the `BTS_DEBUG_CONSOLE`
+switch, so `LEDDriver_init()`, `LEDDriver_update()` and `LEDDriver_due()` are
+the no-op stubs in **every** build. `led_driver.c` and `led_driver.h` remain
+in the project and still compile; the idle-loop call in `com_cpu2.c` still
+runs and does nothing. `ledTimerISR` is never registered, so `INT_TIMER2` is
+no longer claimed on CPU2 at all and **CPU Timer 2 is free on that core**.
+Timer 0 there remains the ADS1119 settle dwell’s alone.
+
+---
+
+## 8. CAN telemetry
 
 Message objects 1–8 carry per-channel telemetry; object 9 is a host register
 read/write.

@@ -100,6 +100,11 @@ class SimSlot:
     #: a charge flips this once the cell reaches its voltage limit and the
     #: current begins to taper toward termination.
     const_voltage: bool = False
+    #: Pre-charge balance. waiting stays set through the sequence.
+    waiting: bool = False
+    balancing: bool = False
+    ready: bool = False
+    soft_start: bool = False
     paused: bool = False
     wd_tripped: bool = False
     restored: bool = False
@@ -147,6 +152,14 @@ class SimSlot:
             bits |= StatusBit.CAL_V_VALID
         if self.cal_i_valid:
             bits |= StatusBit.CAL_I_VALID
+        if self.waiting:
+            bits |= StatusBit.WAITING
+        if self.balancing:
+            bits |= StatusBit.BALANCING
+        if self.ready:
+            bits |= StatusBit.READY
+        if self.soft_start:
+            bits |= StatusBit.SOFT_START
         if self.paused:
             bits |= StatusBit.PAUSED
         if self.wd_tripped:
@@ -592,6 +605,10 @@ class SimulatedUnit:
             s.discharge_seconds,
             1 if (s.running and s.const_voltage) else 0,
             1 if (s.running and not s.const_voltage) else 0,
+            1 if s.waiting else 0,
+            1 if s.balancing else 0,
+            1 if s.ready else 0,
+            1 if s.soft_start else 0,
         )
 
     def slot_config_bytes(self, index: int) -> bytes:

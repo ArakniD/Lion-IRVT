@@ -29,9 +29,9 @@
 //
 //   BTS_DEBUG_CONSOLE == false  (production)
 //     GPIO28 = channel 1 GPIO trip input (digital in).
-//     GPIO29 = SCITXDA, transmit-only, driving the WS2812B LED string at
-//     800 kbaud. The AT command console is not available in this build -
-//     there is no free SCI port for it, so the host uses I2C or CAN.
+//     GPIO29 = SCITXDA, idle. The AT command console is not available in
+//     this build - there is no free SCI port for it, so the host uses I2C
+//     or CAN.
 //
 // SCIB is not an alternative: GPIO18 is SPICLKA and GPIO19 is the ADC1 chip
 // select for the external 24-bit SPI ADCs.
@@ -39,8 +39,34 @@
 // Channel 1 keeps its CMPSS over-current trip in both modes. Only the
 // separate GPIO trip input is affected.
 //
-#define BTS_DEBUG_CONSOLE (true)
+// PRODUCTION since 2026-10-02. The AT console moved to the ESP32, which
+// serves the same grammar over I2C (see Docs/at-command-specification.md).
+//
+// THE LED STRING ALSO MOVED TO THE ESP32, 2026-10-02, and the SCIA driver
+// that used to feed it is permanently off - see BTS_LED_DRIVER_ENABLED.
+//
+#define BTS_DEBUG_CONSOLE (false)
 
+//
+// BTS_LED_DRIVER_ENABLED IS FALSE IN BOTH ARMS AND SHOULD STAY THAT WAY.
+//
+// The WS2812B string is driven by the ESP32 now, over SPI3 on its GPIO13.
+// The C2000 driver that used to do it could never have worked: it clocked
+// raw colour bytes out of SCIA at 800 kbaud, but a WS2812B decodes pulse
+// WIDTHS - 400 ns high is a 0, 800 ns high is a 1 - and a UART cannot
+// produce them. It forces a LOW start bit before every byte and holds each
+// data bit for a full 1250 ns bit time, so the strip saw framing noise and
+// latched nothing. No pixel ever lit from this core.
+//
+// Driving it properly needs a peripheral that can emit a free-running bit
+// pattern, which here means SPI. GPIO29 - the wire that is physically
+// present - has no SPI mux option (GPIO, SCITXDA, EM1SDCKE, OUTPUTXBAR6,
+// EQEP3B, SD2_C3), and both usable SPI ports are held by the ADS131M08
+// pair. Hence the move. See esp32-btle-proxy/components/led_strip/.
+//
+// Setting this true again re-enables dead code AND hands SCIA to it, so do
+// not do it to get the console back - use BTS_DEBUG_CONSOLE for that.
+//
 #if (BTS_DEBUG_CONSOLE == true)
     //
     // Bench debug: SCIA carries the AT console on the FTDI backchannel.
@@ -56,17 +82,27 @@
     // GPIO29 is the console TX, so the LED string cannot have it.
     #define BTS_LED_DRIVER_ENABLED    (false)
 
-    // GPIO28 is the console RX, so channel 1's GPIO trip cannot have it.
     #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #else
     //
-    // Production: no console. GPIO29 is transmit-only for the LED string and
-    // GPIO28 returns to channel 1's trip input.
+    // Production: no console. GPIO29 is left muxed to SCITXDA and idle -
+    // the LED string it used to feed is driven by the ESP32 now.
     //
     #define BTS_CONSOLE_ENABLED       (false)
-    #define BTS_LED_DRIVER_ENABLED    (true)
-    #define BTS_TRIP_GPIO_CH1_ENABLED (true)
+    #define BTS_LED_DRIVER_ENABLED    (false)
+    #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #endif
+
+//
+// CHANNEL 1'S GPIO TRIP INPUT IS NEVER ENABLED, in either build.
+//
+// It is not useful: channel 1 keeps its CMPSS over-current trip in both
+// modes, which is the hardware comparator that actually protects the slot and
+// responds in nanoseconds. The separate GPIO trip was a second, slower path
+// on a pin that is contended with the console RX, and nothing depends on it.
+//
+// Hard-coded false above rather than left as a build option so the two
+// branches cannot drift, and so GPIO28 stays a plain input in every build.
 
 #define BTS_ENABLE_DETECT_CODE (false)
 
@@ -143,16 +179,23 @@
 // Keep these in step with DEFAULT_F28V_GAIN / DEFAULT_F28V_OFFSET /
 // DEFAULT_F28I_GAIN / DEFAULT_F28I_OFFSET in com_cpu2.c, which are what CPU2
 // writes into registers[] when a channel has no valid stored calibration.
-// Unity gain means the reading is the raw ADC scaling with no correction
-// applied: BTS_monitor_Iout_Vout() already converts counts to volts via
-// (sum / (avgFactor * 4096)) * 2.5, so a gain of 1.0 yields the uncorrected
-// sense-chain voltage rather than zero.
+// BTS_monitor_Iout_Vout() converts counts to volts via
+// (sum / (avgFactor * 4096)) * 2.5, which yields VOLTS AT THE ADC PIN. The
+// cell sits behind a ~2.412:1 resistive divider, so the gain is what turns a
+// pin voltage back into a cell voltage.
 //
-// Note validateCalibration() in com_cpu2.c rejects an F28V_Gain outside
-// 0.5..2.0, so 0.0 is an invalid value there too - these defaults sit inside
-// that accepted band.
+// THIS WAS 1.0 AND THAT WAS WRONG. Unity gain does not mean "uncorrected" in
+// any useful sense - it means the divider is never undone, so every host read
+// the pin voltage while the register was named for the cell. Measured on
+// hardware 2026-10-02: a 3.492 V cell reported as 1.45 V. The error is not
+// cosmetic, because a discharge cut-off is compared against this number: at a
+// 2.5 V floor the slot reads as already empty while the cell is still full.
 //
-#define BTS_F28V_GAIN_DEFAULT             ((float32_t)1.0)
+// Note validateCalibration() in com_cpu2.c accepts an F28V_Gain in 2.0..3.0.
+// That band used to be 0.5..2.0, which could not express 2.412 at all while
+// admitting the wrong default of 1.0.
+//
+#define BTS_F28V_GAIN_DEFAULT             ((float32_t)2.4121)
 #define BTS_F28V_OFFSET_DEFAULT           ((float32_t)0.0)
 //
 // Default current gain for the on-chip ADC path.
@@ -349,6 +392,99 @@
 #define BTS_USER_TRIP_pu(x)     (BTS_userInputs[i].IoutGain_pu *BTS_USER_DEFAULT_TRIP_A + BTS_userInputs[i].IoutOffset_pu)
 #define BTS_USER_TRIP_16b(x)    ((int16_t)(BTS_USER_TRIP_pu(x) *(float32_t)32768.0))
 #define BTS_USER_TRIP_N_16b(x)  (((int16_t)-1)*BTS_USER_TRIP_16b(x))
+
+//
+//=============================================================================
+// Pre-charge balance (ToDo 08)
+//=============================================================================
+//
+// A cell is seated onto a rail that has been driven to match it, so the
+// contact closes across near-zero volts instead of dumping the cell into a
+// flat output capacitor.
+//
+// WHY THE CURRENT READING IS THE INSERTION TEST
+// ---------------------------------------------
+// The output capacitors sit AFTER the current sense resistor, so the shunt
+// only sees current the switching FETs produce - never charge moving between
+// the cell and the rail through the contacts. That is what makes the
+// sequence decidable:
+//
+//   balanced, no cell   voltages match AND current is zero
+//   cell inserted       voltages match AND current is NOT zero
+//
+// Without that placement the two conditions would be indistinguishable.
+
+//
+// ADS reading above which a cell is considered to be approaching. Below it a
+// slot is empty and the sequence re-arms.
+//
+#define BTS_INSERT_DETECT_V          ((float32_t)0.25)
+
+//
+// How closely the two paths must agree to call the rail balanced, as a
+// fraction of the ADS reading. The brief's 10%.
+//
+#define BTS_BALANCE_TOL_FRAC         ((float32_t)0.10)
+
+//
+// Absolute floor on that tolerance, so a near-zero ADS reading does not
+// demand an impossibly tight match - 10% of 0.3 V is 30 mV, which is inside
+// the noise of a 12-bit converter on a 2.5 V reference.
+//
+#define BTS_BALANCE_TOL_MIN_V        ((float32_t)0.050)
+
+//
+// Current below which the rail is considered unloaded, i.e. no cell bridging
+// the contacts yet.
+//
+#define BTS_BALANCE_ZERO_I_A         ((float32_t)0.050)
+
+//
+// Divergence between the two paths that faults a RUNNING slot, as a fraction.
+// The brief's 20%.
+//
+#define BTS_DIVERGE_FAULT_FRAC       ((float32_t)0.20)
+
+//
+// Consecutive supervisor passes a condition must hold. The supervisor runs in
+// B1 at TASKB_FREQ_HZ/3, so this is a few tens of milliseconds - long enough
+// to reject a single noisy sample, short enough to catch a real insertion.
+//
+#define BTS_BALANCE_DWELL_PASSES     ((uint16_t)3)
+
+//
+// Supervisor passes BALANCING may run before giving up and faulting.
+//
+#define BTS_BALANCE_TIMEOUT_PASSES   ((uint16_t)500)
+
+//
+// Soft-start attempts before the slot faults. Per the brief: 40.
+//
+#define BTS_SOFT_START_MAX_RETRIES   ((uint16_t)40)
+
+//
+// Supervisor passes to hold off after a trip during soft start, ~100 ms.
+//
+#define BTS_SOFT_START_RETRY_PASSES  ((uint16_t)7)
+
+//
+// Supervisor passes soft start may run before it is deemed failed and retried.
+//
+#define BTS_SOFT_START_TIMEOUT_PASSES ((uint16_t)200)
+
+//
+// Duty increment per control-ISR pass while balancing. The ISR runs at the
+// ADS131M08 sample rate, so a step this small still converges in well under
+// a second while keeping the rail's rate of change gentle.
+//
+#define BTS_BALANCE_DUTY_STEP_PU     ((float32_t)0.0002)
+
+//
+// Duty ceiling while balancing. Charging an output capacitor needs very
+// little, and a low ceiling bounds the current a bad differential could ask
+// for. Well below BTS_DUTY_SET_MAX_PU.
+//
+#define BTS_BALANCE_DUTY_MAX_PU      ((float32_t)0.15)
 
 #define BTS_SFRA_MODE_CC_PLANT  0
 #define BTS_SFRA_MODE_CC_CLOSED 1

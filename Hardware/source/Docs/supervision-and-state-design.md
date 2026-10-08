@@ -46,7 +46,7 @@ contiguously makes it **one burst per slot**.
 
 ### 1.2 Layout
 
-Three regions. Per-slot strides are fixed and generous so a future field does
+Four regions. Per-slot strides are fixed and generous so a future field does
 not shift everything again.
 
 | Region | Base | Stride | Regs/slot | Range |
@@ -54,19 +54,23 @@ not shift everything again.
 | **Runtime** (RO) | 0 | 48 B (12 regs) | 12 | 0 – 383 |
 | **Settings** (RW) | 384 | 72 B (18 regs) | 18 | 384 – 959 |
 | **Unit** | 960 | — | 27 total | 960 – 1064 |
+| **Slot tuning** (RW) | 1068 | — | 13 total | 1068 – 1116 |
 
 Verified arithmetic: runtime ch7 ends at 383, immediately before the settings
-base; settings ch7 ends at 959, immediately before the unit base.
+base; settings ch7 ends at 959, immediately before the unit base; the unit
+block ends at 1064, immediately before the tuning base.
 
-**Total 267 registers**, top address 1064.
+**Total 280 registers**, top address 1116 — the tuning block of §1.6 is part
+of the map, not an appendix to it.
 
 > **Revised 2026-09-22.** This document originally specified a 24-register
 > settings stride, a unit base of 1152 and 315 registers in total. The
 > settings region was then compressed to 18 registers per slot — the
 > charge/discharge limit split collapsed into one direction-agnostic pair of
 > each, and `eChX_MinCellTemp` and the per-slot spare were removed. The tables
-> below are the current layout. Costs **534 words** of `CPU2TOCPU1RAM` for the
-> register file. Confirm against the map file after building — overflow here
+> below are the current layout. Costs **560 words** of `CPU2TOCPU1RAM` for the
+> register file — 280 registers at two words each. (534 was the figure before
+> the 13 slot-tuning registers were appended.) Confirm against the map file after building — overflow here
 > is a link-time failure (`#10099-D`).
 
 ### 1.3 Runtime block — `BTS_RT_BASE(ch)`, stride 48
@@ -225,7 +229,9 @@ registers.
 
 A slot only ever runs in one direction at a time and the mode register says
 which, so the split pairs were never both in force. The saving moved the unit
-block down 192 bytes and the top of the map from 1256 to 1064.
+block down 192 bytes and the top of the unit block from 1256 to 1064. The slot
+tuning block (§1.6) was added above it afterwards, so the map now tops out at
+**1116**.
 
 **There is no spare register left in any region.** A new per-slot field now
 means another stride change, which moves every address below it and breaks
@@ -236,9 +242,9 @@ that before adding one.
 
 ## 2. Slot state model
 
-### 2.1 The five states
+### 2.1 The states
 
-A slot is in exactly one of:
+Five run states, plus the four-state pre-charge sequence that precedes a run.
 
 | State | Meaning |
 |---|---|
@@ -248,9 +254,23 @@ A slot is in exactly one of:
 | **PAUSED** | Was charging or discharging; converter off, direction remembered, counters frozen and intact. |
 | **END** | Test finished normally. Converter off, counters hold final values. |
 
+The pre-charge states, detailed in [§2.5](#25-pre-charge-balance--how-a-cell-is-seated-safely):
+
+| State | Meaning |
+|---|---|
+| **WAITING** | Armed and watching for a cell. Converter off. |
+| **BALANCING** | Driving the rail to match the approaching cell. No cell connected yet. |
+| **READY** | Rails matched — safe to seat a cell. Re-verified, not latched. |
+| **SOFT_START** | Diode-emulation start into a cell that has just made contact. |
+
 `PAUSED` is **not** a direction of its own. A paused slot keeps its
 `CHARGING` or `DISCHARGING` status bit set alongside `PAUSED`, so a host can
 see both that it is paused and what it will resume into.
+
+**None of the pre-charge states is `running`.** Every supervisor that keys off
+`slotIsRunning()` — the accumulators chief among them — therefore ignores a
+balancing slot, which is deliberate: it is charging capacitors, not a cell.
+The protections that must apply anyway are listed in §2.5.
 
 ### 2.2 Status bits
 
@@ -290,25 +310,489 @@ semantic, do not add a second bit for the same thing.
 
 ### 2.3 Transitions
 
-```
-  STOPPED ──start(charge)──> CHARGING ──┐
-  STOPPED ──start(discharge)─> DISCHARGING ──┐
-                                             │
-  CHARGING/DISCHARGING ──watchdog timeout──> PAUSED (+WD_TRIPPED)
-  CHARGING/DISCHARGING ──pause command────> PAUSED
-  CHARGING/DISCHARGING ──trip/fault───────> STOPPED
-  CHARGING/DISCHARGING ──termination──────> END
+The whole slot lifecycle, including the pre-charge sequence that precedes a
+run. The pre-charge states are detailed in [§2.5](#25-pre-charge-balance--how-a-cell-is-seated-safely);
+they are shown here so the one place a reader looks for "what can a slot do"
+is complete.
 
-  PAUSED ──resume command──> CHARGING or DISCHARGING  (whichever it held)
-  PAUSED ──stop command────> STOPPED
-  END    ──start───────────> CHARGING or DISCHARGING
-  boot with saved run ─────> PAUSED (+RESTORED)
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    STOPPED: STOPPED
+    STOPPED: idle, converter off
+    CHARGING: CHARGING
+    DISCHARGING: DISCHARGING
+    PAUSED: PAUSED
+    PAUSED: held, direction remembered
+    END: END
+    END: ran to termination
+
+    [*] --> STOPPED
+
+    state "Pre-charge sequence" as PRE {
+        direction TB
+        WAITING: WAITING
+        WAITING: armed, converter off
+        BALANCING: BALANCING
+        BALANCING: driving the rail, no cell yet
+        READY: READY
+        READY: matched - safe to seat a cell
+        SOFT_START: SOFT_START
+        SOFT_START: diode emulation into a seated cell
+
+        WAITING --> BALANCING: ADS above 0.25 V<br/>and rails differ
+        WAITING --> READY: ADS above 0.25 V<br/>and rails already match
+        BALANCING --> READY: matched AND<br/>current zero
+        READY --> BALANCING: rail drifts<br/>READY is not a latch
+        READY --> SOFT_START: current appears<br/>on a matched rail
+        SOFT_START --> SOFT_START: trip, 100 ms hold,<br/>retry up to 40 times
+    }
+
+    STOPPED --> WAITING: mode 0x20<br/>needs CAL_V_VALID
+    STOPPED --> CHARGING: start charge
+    STOPPED --> DISCHARGING: start discharge
+
+    SOFT_START --> CHARGING: avg current<br/>no longer negative
+    SOFT_START --> DISCHARGING: avg current<br/>no longer negative
+
+    CHARGING --> PAUSED: pause cmd<br/>watchdog timeout
+    DISCHARGING --> PAUSED: pause cmd<br/>watchdog timeout
+    PAUSED --> CHARGING: resume
+    PAUSED --> DISCHARGING: resume
+    PAUSED --> STOPPED: stop
+
+    CHARGING --> STOPPED: trip, fault,<br/>reverse polarity
+    DISCHARGING --> STOPPED: trip, fault,<br/>reverse polarity
+    CHARGING --> END: termination
+    DISCHARGING --> END: termination
+
+    END --> WAITING: cell removed<br/>auto re-arm
+    END --> CHARGING: start
+    END --> DISCHARGING: start
+
+    PRE --> STOPPED: stop cmd,<br/>reverse polarity,<br/>balance timeout
+    PRE --> WAITING: cell removed<br/>clears a fault
+
+    [*] --> PAUSED: boot with a saved run<br/>plus RESTORED
+    [*] --> WAITING: boot with a saved arm<br/>BTS_STATE_F_WAITING
 ```
 
 **Entering PAUSED always zeroes the converter reference first**, then clears
-`enable_logic`. Same ordering as a trip exit.
+`enable_logic`. Same ordering as a trip exit — and the same ordering every
+pre-charge helper uses.
 
-### 2.5 Termination — how a slot reaches END
+**PAUSED is not a direction.** A paused slot keeps its `CHARGING` or
+`DISCHARGING` bit, which is how a resume knows which way to go. A **stop**
+clears them; a pause does not.
+
+**The pre-charge states are not `running`.** Only `SOFT_START` leads into a
+run, and the transition sets `running` at the moment it happens. This matters
+to every supervisor that keys off `slotIsRunning()` — see §2.5.
+
+### 2.5 Pre-charge balance — how a cell is seated safely
+
+A lithium cell is a stiff voltage source. Dropping one onto a flat output
+capacitor dumps charge through the contacts, and closing the synchronous
+rectifier onto a pre-biased cell drives current backwards through the power
+stage. The pre-charge sequence drives the rail to match the cell *before*
+contact, so the connection closes across near-zero volts.
+
+What the supervisor does on each pass, for one armed slot. This runs in `B1`,
+so every decision below is re-evaluated a few hundred times a second.
+
+```mermaid
+flowchart TD
+    START(["B1 pass, slot armed"]) --> READ["Read both paths:<br/>Vsense_V (ADS)<br/>CellVoltage_V (internal)<br/>Isense_A"]
+    READ --> CELL{"ADS > 0.25 V ?"}
+
+    CELL -->|no| REARM["Stand converter down<br/>return to WAITING"]
+    REARM --> DONE([end of pass])
+
+    CELL -->|yes| WHERE{"where in the<br/>sequence ?"}
+
+    WHERE -->|WAITING| MATCH1{"rails match<br/>within 10% ?"}
+    MATCH1 -->|yes| TOREADY["READY"]
+    MATCH1 -->|no| TOBAL["BALANCING<br/>enable_logic = 1"]
+
+    WHERE -->|BALANCING| BAL{"matched AND<br/>current zero ?"}
+    BAL -->|yes| TOREADY
+    BAL -->|no| TIMEOUT{"timeout<br/>exceeded ?"}
+    TIMEOUT -->|yes| FAULT["stand down, FAULT"]
+    TIMEOUT -->|no| DRIVE["step duty toward<br/>the ADS reading"]
+
+    WHERE -->|READY| LOAD{"current<br/>flowing ?"}
+    LOAD -->|"yes - a cell is<br/>bridging the contacts"| TOSS["SOFT_START<br/>enable_logic = 1"]
+    LOAD -->|no| DRIFT{"still<br/>matched ?"}
+    DRIFT -->|yes| HOLD["stay READY"]
+    DRIFT -->|"no - rail drifted"| TOBAL
+
+    WHERE -->|SOFT_START| TRIP{"tripped ?"}
+    TRIP -->|yes| RETRY{"retries<br/>left ?"}
+    RETRY -->|yes| HOLDOFF["converter off<br/>100 ms hold, retry"]
+    RETRY -->|"no - 40 used"| FAULT
+    TRIP -->|no| AVG{"average current<br/>>= 0 ?"}
+    AVG -->|yes| RUN(["RUNNING"])
+    AVG -->|no| WAITDCM["keep ramping in DCM"]
+
+    TOREADY --> DONE
+    TOBAL --> DONE
+    DRIVE --> DONE
+    HOLD --> DONE
+    TOSS --> DONE
+    HOLDOFF --> DONE
+    WAITDCM --> DONE
+    FAULT --> DONE
+
+    style FAULT stroke:#c00
+    style RUN stroke:#0a0
+```
+
+**Why the current reading is what decides it.** The output capacitors sit
+*after* the current sense resistor, so the shunt only sees current the
+switching FETs produce — never charge moving between a cell and the rail
+through the contacts. That single fact makes the sequence decidable:
+
+| Voltages | Current | Meaning |
+|---|---|---|
+| match | zero | rail balanced, no cell yet → READY |
+| match | flowing | a cell is bridging the contacts → SOFT_START |
+| differ | — | rail needs driving → BALANCING |
+
+Without it, "balanced successfully" and "cell inserted" would be the same
+reading and the sequence could not be sequenced at all.
+
+**READY is not a latch.** An unloaded output capacitor drifts — leakage, the
+divider network, self-discharge — and an operator may take a while to seat the
+cell. The supervisor re-verifies every pass and drops back to BALANCING if the
+differential re-opens.
+
+**Soft start is diode emulation.** The synchronous rectifier is held off so
+current cannot flow backwards out of the cell, and the converter runs in DCM
+until the average current is no longer negative. A trip is expected rather
+than exceptional — inrush into a pre-biased cell is exactly what this exists
+to survive — so a trip holds for ~100 ms and retries, up to 40 times before
+faulting.
+
+**Removing the cell clears a fault.** If the ADS path falls below 0.25 V the
+slot returns to WAITING from any point in the sequence, including a fault.
+Pull the cell, re-seat it, and the sequence runs again.
+
+**Entry is guarded on calibration.** The two sense paths are independently
+calibrated, so on an uncalibrated slot the differential between them is
+meaningless — and this sequence drives the power stage based on exactly that
+differential. `BTS_MODE_WAITING` is refused unless `CAL_V_VALID` is set. An
+uncalibrated slot still runs normally; it just does not get the pre-charge.
+
+**Grouped modes balance as one converter.** The members' outputs are
+physically paralleled onto a single rail, so the leader balances for all of
+them and the state propagates to every member. Followers have no control loop
+of their own to run.
+
+**Protection is live throughout.** `enable_logic` is set while balancing, so
+the hardware trip zones are armed exactly as they are for a running slot, and
+the reverse-polarity check stops a balancing slot as readily as a running one.
+The accumulators are the one exception: they key off `running`, which the
+pre-charge states never set, so no charge is counted while capacitors are
+being filled.
+
+**Only WAITING survives a power cycle.** It is carried in the F-RAM state
+record as `BTS_STATE_F_WAITING`, so a slot an operator armed comes back armed.
+The other three are transient and the supervisor re-derives them within a few
+passes from readings that are current rather than remembered.
+
+#### Where it runs, and why not in C1
+
+The supervisor lives in **B1**, which was empty.
+
+B1 dispatches at `TASKB_FREQ_HZ` and each of its three sub-tasks therefore
+runs three times faster than a C sub-task. That margin is what makes the
+brief's 100 ms trip retry expressible at all: the retry hold is counted in
+supervisor passes, so it needs a timebase comfortably finer than 100 ms.
+
+The C chain would now *almost* do — it was re-measured at 28.6 Hz per
+sub-task on 2026-10-02, having been 0.69 Hz before a missed-clock detection
+fix — but C1 already carries the input-voltage guard, the reverse-polarity
+sweep, group integrity and termination. B1 was empty, and a supervisor that
+drives FETs is better placed where it is not queued behind four other
+passes.
+
+#### Divergence fault while RUNNING
+
+A rapid rise on the converter rail that the ADS path does not follow means the
+cell is no longer bridging the contacts — pulled mid-test, or a contact that
+has opened — and the converter is driving its own output capacitor with the
+loop still asking for current. More than 20% divergence for three consecutive
+passes stops the slot and its whole group.
+
+#### Status bits
+
+| Bit | Name | Set while |
+|---|---|---|
+| 16 | `BTS_STATUS_WAITING` | anywhere in the sequence |
+| 19 | `BTS_STATUS_BALANCING` | driving the rail |
+| 20 | `BTS_STATUS_READY` | matched; safe to seat |
+| 21 | `BTS_STATUS_SOFT_START` | DCM start into a connected cell |
+
+MONITORING from the original brief is deliberately absent: an armed slot is by
+definition watching, so it would never be observably distinct from WAITING,
+and only bits 22 and 23 now remain below the float32 ceiling.
+
+### 2.5.1 Slot indication — the WS2812B string
+
+Eight WS2812B pixels, one per slot, driven by the **ESP32 proxy** over SPI3
+and refreshed every 25 ms. The C2000 no longer touches them.
+
+#### The C2000 version never lit a pixel
+
+This is not a regression that was repaired — the function moved because it
+could never have worked where it was. `LEDDriver_update()` clocked **raw
+colour bytes out of SCIA at 800 kbaud**. A WS2812B does not decode bytes; it
+decodes **pulse widths** — 400 ns high is a 0, 800 ns high is a 1, each inside
+a 1250 ns slot. A UART cannot produce them. It forces a LOW start bit before
+every byte and holds each data bit for a full bit time, so the strip saw
+framing noise and latched nothing.
+
+Three real bugs were found in this area before anyone questioned the
+transport: the Timer 0 double-booking
+([`hardware-resources.md`](hardware-resources.md) §8.2), the LED ISR's ~360 us
+of masked interrupts starving CPU2's I2C target, and SCIA being stranded by an
+unstrapped MODE strap. All three were genuine and all three were worth fixing.
+**None of them could ever have lit the string**, because what arrived at the
+first pixel was never a WS2812B symbol to begin with.
+
+#### Why it could not be fixed on the C2000
+
+Driving a WS2812B needs a peripheral that emits a **free-running bit
+pattern**, which on this device means SPI. Three constraints close the door
+together:
+
+- **GPIO29 — the wire that physically exists — has no SPI mux option.** Its
+  choices are GPIO, SCITXDA, EM1SDCKE, OUTPUTXBAR6, EQEP3B and SD2_C3.
+- **Both usable SPI ports are held by the ADS131M08 pair**, SPIA and SPIC.
+- **The Output X-BAR carries no ePWM source.** That kills the one remaining
+  idea — an eCAP APWM routed out through OUTPUTXBAR6 — on cost rather than on
+  wiring: it works electrically, but needs **192 software duty updates per
+  refresh**, which is the ISR starvation that had just been fixed, rebuilt
+  from scratch.
+
+#### How the ESP32 drives it
+
+Implemented in
+[`led_strip.c`](../esp32-btle-proxy/components/led_strip/led_strip.c), started
+from [`main.c`](../esp32-btle-proxy/main/main.c).
+
+| | |
+|---|---|
+| Bus | `SPI3_HOST` (VSPI), MOSI on **GPIO13** |
+| Clock | **2.5 MHz** — 80 MHz / 32 |
+| Encoding | four SPI bits per WS2812B bit: `1000` = 0, `1100` = 1 |
+| Frame | 12 bytes per LED, **96 bytes for all eight in one DMA transfer**, 307 us |
+| Refresh | FreeRTOS task `led_strip`, priority 4, 3072-byte stack, every 25 ms |
+| Brightness | 64/255, scaled linearly per channel |
+
+**Neither SCLK nor CS is routed.** The WS2812B is a one-wire part and its
+clock is implicit in the bit pattern, so routing either would burn a pin to
+drive nothing.
+
+**SPI3 and not SPI2.** The ST7789 panel holds SPI2, which *is* HSPI. It sits
+on GPIO23/GPIO18 — VSPI's IO_MUX default pads — but reaches them through the
+GPIO matrix, so SPI3 was the genuinely free host. Sharing one host would let
+an LED frame stall a panel repaint and vice versa.
+
+**2.5 MHz, not the 3.333 MHz the commonly-cited article uses.** At 2.5 MHz an
+SPI bit is 400 ns, so `1000` gives T0H = 400 ns and `1100` gives T1H = 800 ns
+— both *exactly* the WS2812B's nominal widths, with the resulting 1600 ns slot
+well inside the 650–1850 ns the part tolerates. At 3.333 MHz the same `1100`
+symbol gives **T1H = 600 ns, under the 650 ns minimum for a logic 1**. That
+works on some strips and fails on others, which is the worst failure mode
+available here: intermittently wrong colours on a safety indicator. The
+deviation from the article is deliberate.
+
+**The reset latch comes free.** Every symbol ends in a 0 bit, so MOSI rests
+low between frames and the >50 us the part needs to latch is covered many
+times over by the 25 ms until the next refresh.
+
+**It is a scheduled task, not a timer ISR.** That is the structural difference
+from the C2000 driver, which blocked with interrupts masked. A task at
+priority 4 cannot starve the I2C poll, the BLE stack or the panel — the
+scheduler simply runs them.
+
+#### Priority is safety-first, and the order is load bearing
+
+**The per-slot chain is preserved exactly** from the C2000 version.
+`colour_for()` is the same single if/else-if ladder in the same order: the
+**first** condition that matches wins, so a slot that is both tripped and
+calibrating shows the trip. Reading down the chain is reading the priority.
+
+One gate is new, and it sits **above** the whole chain: if the proxy cannot
+see the unit, no per-slot colour is trustworthy, so no per-slot colour is
+shown.
+
+```mermaid
+flowchart TD
+    S(["refresh tick"]) --> OFF{"unit offline or<br/>slot data not valid ?"}
+    OFF -->|yes| AM["AMBER 250/250<br/><i>all eight, in unison</i>"]
+    OFF -->|no| D{SLOT_DISABLED}
+    D -->|yes| DC["RED solid<br/><i>strap masked it off</i>"]
+    D -->|no| T{OVERCURRENT_TRIP}
+    T -->|yes| TC["RED 2000/500 ms"]
+    T -->|no| R{REVERSE_POLARITY}
+    R -->|yes| RC["RED 125/125 ms"]
+    R -->|no| G{GROUP_DISCONNECT}
+    G -->|yes| GC["RED 250/250 ms"]
+    G -->|no| C{CALIBRATING}
+    C -->|yes| CC["WHITE 150/150 ms"]
+    C -->|no| P{PAUSED}
+    P -->|yes| PC["RED if watchdog/restore<br/>BLUE if deliberate<br/>500/500 ms"]
+    P -->|no| B{"BALANCING or<br/>SOFT_START"}
+    B -->|yes| BC["YELLOW 150/150 ms"]
+    B -->|no| RY{READY}
+    RY -->|yes| RYC["GREEN 250/250 ms<br/><i>safe to seat a cell</i>"]
+    RY -->|no| CH{"CHARGING or<br/>DISCHARGING"}
+    CH -->|yes| CHC{RUNNING}
+    CHC -->|yes| CHR["BLUE solid"]
+    CHC -->|no| CHS["GREEN solid"]
+    CH -->|no| F{FINISHED}
+    F -->|yes| FC["WHITE solid"]
+    F -->|no| IC["GREEN solid<br/><i>idle</i>"]
+
+    style AM stroke:#da0
+    style DC stroke:#c00
+    style TC stroke:#c00
+    style RC stroke:#c00
+    style GC stroke:#c00
+    style BC stroke:#da0
+    style RYC stroke:#0a0
+    style IC stroke:#0a0
+```
+
+#### Why the new states sit where they do
+
+**Above the direction states.** A slot that has ever run keeps its
+`CHARGING`/`DISCHARGING` bit until it is stopped, so anything ranked below
+that branch is unreachable for such a slot. Balancing and ready are tested
+first.
+
+**Below every fault.** A slot that trips while balancing must still read as
+tripped — the same reasoning the calibration flash already carried.
+
+**READY flashes rather than sitting solid**, because solid green is already
+the idle colour and the final fallback. An operator has to be able to tell a
+slot that is ready to accept a cell from one doing nothing at all. Yellow was
+free on the unit, so balancing and soft start share it — they are one
+operation from the operator's side: *the slot is preparing itself, do not
+seat a cell yet*.
+
+| Meaning | Colour | Pattern |
+|---|---|---|
+| **Link down — proxy cannot see the unit** | **amber** | **250/250, all eight in unison** |
+| Strap-disabled | red | solid |
+| Over-current trip | red | 2000 ms on / 500 off |
+| Reverse polarity | red | 125/125 |
+| Group disconnect | red | 250/250 |
+| Calibrating | white | 150/150 |
+| Paused (watchdog or restore) | red | 500/500 |
+| Paused (deliberate) | blue | 500/500 |
+| **Balancing / soft start** | **yellow** | **150/150** |
+| **Ready — seat a cell now** | **green** | **250/250** |
+| Running | blue | solid |
+| Finished | white | solid |
+| Idle | green | solid |
+
+Patterns are quoted **on / off in milliseconds** throughout.
+
+#### Link down — all eight amber, in unison
+
+Taken when `!snap.unit.online`, meaning the last I2C poll cycle did not
+complete, or when an individual slot's `valid` is still false because it has
+never been read successfully.
+
+**Unison is the cue, and it is the whole point.** No real per-slot condition
+ever synchronises across the entire strip, so eight pixels blinking together
+is a pattern the hardware cannot otherwise produce. An operator can read
+*"the proxy cannot see the unit"* from across a bench without consulting a
+colour key.
+
+The two obvious alternatives were both rejected, for the same reason:
+
+- **Holding the last known colours** would keep asserting slot states that may
+  no longer be true — a green idle pixel for a slot that has since tripped.
+- **Going dark** is indistinguishable from the box being powered off.
+
+#### Two sharp edges the port removed
+
+**Colour tables are written RGB in source and reordered at encode time.**
+`encode_pixel()` emits green, red, blue — the WS2812B's wire order — from an
+`rgb_t` that reads normally. The C2000 tables were stored **pre-swapped into
+GRB**, so `COLOR_RED` was literally `{0, 255, 0}` and every line needed a
+comment explaining that yellow only looked right by coincidence. Any new
+colour written the obvious way was silently wrong.
+
+**Flash periods are in milliseconds.** They are divided by `refresh_ms` to get
+a tick count, so they stay in real time whatever the refresh rate is. The
+C2000 version expressed them in units of an 80 Hz timer tick, which meant
+retuning that timer would have silently changed every flash rate in the table.
+
+#### What this costs
+
+Two trade-offs, both real and neither hidden:
+
+**Indication now lags by up to one poll interval.** Colour derives from
+`bts_link_get_snapshot()` — the ESP32's existing **250 ms** I2C poll — rather
+than from `registers[]` directly. A state change can therefore take up to
+~250 ms longer to reach the strip than a C2000-resident driver would have
+needed. Against an operator's reaction time this is nothing; it is recorded
+because it is a genuine difference, not because it is a problem.
+
+**The strip now depends on the proxy being alive.** If the ESP32 is unplugged,
+crashes, or is held in reset, it sends no frames at all — and a WS2812B latch
+holds its last colour **indefinitely**. That is precisely the *"frozen LED
+showing running for a slot that has since tripped"* hazard that
+[`hardware-resources.md`](hardware-resources.md) §8.2 called actively
+misleading, and it has not been eliminated, only moved. The amber-unison state
+covers the case where the ESP32 is **alive but cannot reach the unit**; by
+construction it cannot cover the ESP32 itself being dead. **Treat the strip as
+an indicator, never as evidence that a slot is safe.**
+
+#### What is left on the C2000
+
+`BTS_LED_DRIVER_ENABLED` is `(false)` in **both** arms of the
+`BTS_DEBUG_CONSOLE` switch in
+[`bts_user_settings.h`](../tida-010086/bts_F2837xD_8ch/bts_user_settings.h), so
+`LEDDriver_init()`, `LEDDriver_update()` and `LEDDriver_due()` are the no-op
+stubs in **every** build.
+[`led_driver.c`](../tida-010086/bts_F2837xD_8ch/led_driver.c) and its header
+remain in the project and still compile; the idle-loop call
+`if (LEDDriver_due()) LEDDriver_update();` at
+[`com_cpu2.c:4297`](../tida-010086/bts_F2837xD_8ch/com_cpu2.c) still exists and
+now does nothing.
+
+Two consequences worth recording:
+
+**CPU Timer 2 on CPU2 is now free.** `ledTimerISR` is never registered and
+`INT_TIMER2` is no longer claimed on that core at all. This makes the Timer 0
+double-booking in [`hardware-resources.md`](hardware-resources.md) §8.2
+**historical** — worth keeping as a record of what broke and why, but it no
+longer describes a live allocation. Timer 0 on CPU2 remains the ADS1119 settle
+dwell's alone.
+
+**GPIO29 is idle in a production build.** It is still muxed to
+`GPIO_29_SCITXDA` unconditionally in `BTS_HAL_setupCpu2Pins()`
+([`bts_hal.c:1394`](../tida-010086/bts_F2837xD_8ch/bts_hal.c)) and simply
+drives nothing. See [§2.7](#27-mode-strap---slot-grouping-and-slot-tuning) for
+what that frees up.
+
+#### A fix that came with this work
+
+`slotStop()` did not clear the direction bits, so a stopped slot kept
+whichever direction it last ran. Two consequences, both visible here: the
+`FINISHED` branch was unreachable for any slot that had ever run, and a
+stopped slot reached idle-green through the wrong branch. Fixed — a **stop**
+clears the direction bits; a **pause** still keeps them, because a resume
+needs to know which way to go.
+
+### 2.6 Termination — how a slot reaches END
 
 The `──termination──> END` arrow above was specified from the start and had no
 implementation until the firmware moved to CCCV
@@ -346,9 +830,12 @@ current, and the check works for every MODE strap rather than only those with
 Both conditions must hold for `BTS_TERM_DWELL_PASSES` consecutive C1 passes.
 Current is the noisiest quantity measured here and a single sample dipping
 under `I_MIN` is not a finished charge. The dwell is expressed in **passes,
-not seconds**, because C1 is nominally 10 Hz but was measured on hardware at
-0.69 Hz — 5 passes is ~0.5 s nominal and ~7 s measured, both short against a
-real charge and long against noise.
+not seconds**, because the C-task rate has moved twice: it was measured at
+0.69 Hz per sub-task in September 2025, and **re-measured at 28.6 Hz on
+2026-10-02** after a latent missed-clock detection — which had been holding
+the PLL off full speed — was fixed. Five passes is therefore ~0.17 s today,
+against the ~7 s the earlier figure implied. Short against a real charge
+either way, which is the point of expressing it in passes.
 
 **In a group, only the leader decides, and it ends the whole group.**
 Followers mirror the leader's duty and run no controller, so a follower's own
@@ -360,7 +847,7 @@ shutdown, but it sets `finished` and leaves `stopped` clear, so a host can
 tell a charge that reached its termination current from one an operator
 halted. END persists until the slot is started again.
 
-### 2.4 MODE strap - slot grouping and slot tuning
+### 2.7 MODE strap - slot grouping and slot tuning
 
 | MODE | Meaning | Group size | Voltage loop |
 |---|---|---|---|
@@ -457,15 +944,34 @@ the same way.
 One tuning binary therefore serves every slot and both loops. Strapped to a
 normal mode it behaves exactly like a production unit.
 
-**SCIA ownership rides on the same strap.** SCIA is contended four ways -
-CPU2's AT console, CPU2's WS2812B LED driver, channel 1's GPIO trip on
-GPIO28, and CPU1's SFRA GUI - and `SysCtl_selectCPUForPeripheral()` is a
-one-shot boot-time write. CPU1 keeps SCIA only when the straps selected a
-tuning mode; otherwise it hands it to CPU2 as before. This is why the
-selection has to ride on a strap latched at reset rather than on a host
-register: the ownership cannot be changed once the unit is running.
+**SCIA ownership rides on the same strap.** It used to be contended four ways.
+Two of those claimants are gone: the WS2812B LED driver moved to the ESP32
+([§2.5.1](#251-slot-indication--the-ws2812b-string)) and channel 1's GPIO trip
+on GPIO28 is hard-coded `(false)` in both arms, because channel 1 keeps its
+CMPSS over-current trip either way and the GPIO path was only ever a second,
+slower one. What remains is two:
 
-### 2.4.1 Mode register
+| Claimant | Pins | Selected by |
+|---|---|---|
+| CPU2's AT console | GPIO28 RX, GPIO29 TX | `BTS_DEBUG_CONSOLE == true` |
+| CPU1's SFRA GUI | the whole port | MODE strap 6 or 7 |
+
+The first is a build-time switch. The second is resolved at **boot** by
+`SysCtl_selectCPUForPeripheral()`
+([`bts_cpu1.c:1382`](../tida-010086/bts_F2837xD_8ch/bts_cpu1.c)), a one-shot
+ownership write: CPU1 keeps SCIA only when the straps selected a tuning mode,
+otherwise it hands it to CPU2 as before. This is why the selection has to ride
+on a strap latched at reset rather than on a host register: the ownership
+cannot be changed once the unit is running.
+
+**A production build no longer has to give up its console.** The reason it
+lost one was that the LED string needed GPIO29; that constraint is gone, and
+the C2000 AT console could now be carried at no cost. The project keeps
+`BTS_DEBUG_CONSOLE` false deliberately and uses the ESP32's console instead -
+this is recorded because the trade-off no longer exists, not as a reason to
+change the switch.
+
+### 2.7.1 Mode register
 
 `eChX_Mode` gains two command bits alongside the existing run/direction bits:
 
@@ -696,10 +1202,12 @@ Pause/resume are reachable by writing the mode register, but add
 `AT+C0PAUSE` / `AT+C0RESUME` as well — an operator at a serial console should
 not have to compute a bitmask to stop a cell safely.
 
-> The AT console is **conditional**: `BTS_DEBUG_CONSOLE` must be `true`, and in
-> that build the WS2812B LED driver and channel 1's GPIO trip are compiled out
-> (they share GPIO28/29). Serial testing and LED testing cannot happen in the
-> same build.
+> The AT console is **conditional**: `BTS_DEBUG_CONSOLE` must be `true`. It no
+> longer costs anything to enable — the WS2812B string moved to the ESP32
+> ([§2.5.1](#251-slot-indication--the-ws2812b-string)) and channel 1's GPIO
+> trip is hard-coded off in both arms, so nothing else wants GPIO28/29. Serial
+> testing and LED testing can now happen in the same build. The unit still
+> ships with `BTS_DEBUG_CONSOLE` false and uses the ESP32's console instead.
 
 ---
 

@@ -56,9 +56,12 @@
  * This comment described the v1 map long after the values below moved to
  * v2.1 - settings went to an 18-register stride when the charge and
  * discharge limits merged, which pulled the unit base down from 1152 to 960.
- * The #defines were correct throughout; only this block was stale. The Home
- * Assistant integration's own mirror still carries the v1 numbers and is
- * tracked separately.
+ * The #defines were correct throughout; only this block was stale.
+ *
+ * There is a THIRD transcription of this map, in the Home Assistant
+ * integration at lion-lvrt-integration/.../protocol/registers.py. It is
+ * current as of v2.1, but it is a separate file with no build coupling to
+ * either this one or registers.h, so a map change means editing all three.
  *
  * The strides are deliberately larger than the fields in use, so adding a
  * field later does not move every slot again.
@@ -322,6 +325,8 @@ typedef enum {
 #define BTS_MODE_CALIBRATE          0x04u
 #define BTS_MODE_PAUSE              0x08u
 #define BTS_MODE_RESUME             0x10u
+/* Arms the pre-charge sequence. Only accepted from STOPPED or END. */
+#define BTS_MODE_WAITING            0x20u
 #define BTS_MODE_RUN_DISCHARGE      (BTS_MODE_RUN)
 #define BTS_MODE_RUN_CHARGE         (BTS_MODE_RUN | BTS_MODE_CHARGE)
 
@@ -368,6 +373,22 @@ typedef enum {
 #define BTS_STATUS_PAUSED           (1u << 15)
 #define BTS_STATUS_WD_TRIPPED       (1u << 17)
 #define BTS_STATUS_RESTORED         (1u << 18)
+/*
+ * Pre-charge balance. A cell is seated onto a rail already driven to match
+ * it, so the contact closes across near-zero volts.
+ *
+ *   WAITING    armed and watching for a cell; stays set through the sequence
+ *   BALANCING  driving the output capacitors to the cell's voltage
+ *   READY      rails matched - safe to seat. Clears if the rail drifts.
+ *   SOFT_START diode-emulation start into the now-connected cell
+ *
+ * MASKS, like everything else in this file, against bit POSITIONS on the
+ * C2000. See the warning above.
+ */
+#define BTS_STATUS_WAITING          (1u << 16)
+#define BTS_STATUS_BALANCING        (1u << 19)
+#define BTS_STATUS_READY            (1u << 20)
+#define BTS_STATUS_SOFT_START       (1u << 21)
 
 /*
  * A normally terminated test is FINISHED, bit 2. That bit was declared but

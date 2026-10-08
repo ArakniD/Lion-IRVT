@@ -40,6 +40,7 @@
 #include "web_api.h"
 #include "display.h"
 #include "input.h"
+#include "led_strip.h"
 
 static const char *TAG = "main";
 
@@ -63,10 +64,29 @@ static const char *TAG = "main";
 /*
  * Rotary encoder with push switch. See input.h for the strapping-pin
  * caveats on GPIO15 and GPIO2 - neither affects normal running.
+ *
+ * B moved off GPIO13 when the WS2812B driver took that pin for SPI3 MOSI.
+ * GPIO27 has no strapping or JTAG role, so it is a straight swap. GPIO14
+ * was the other candidate and was not used: it is MTMS, and with A already
+ * on MTDO a second JTAG pin on the same encoder would make the box awkward
+ * to debug over JTAG later.
  */
 #define ENC_A_GPIO          15
-#define ENC_B_GPIO          13
+#define ENC_B_GPIO          27
 #define ENC_SW_GPIO         2
+
+/*
+ * WS2812B slot indicators, one per slot, on SPI3 (VSPI) MOSI.
+ *
+ * SPI3 and not SPI2: the ST7789 above holds SPI2 (HSPI), despite sitting on
+ * the GPIO23/18 pads that are VSPI's IO_MUX defaults - it reaches them
+ * through the GPIO matrix. Sharing one host would let an LED frame stall a
+ * panel repaint and vice versa.
+ *
+ * See led_strip.h for the bitstream encoding and for why this is on the
+ * ESP32 at all rather than on the C2000 that owns the slots.
+ */
+#define LED_DATA_GPIO       13
 
 #define BLE_DEVICE_NAME     "BTS-Tester"
 #define AP_SSID             "BTS-Tester"
@@ -177,6 +197,27 @@ void app_main(void)
     err = input_init(&enc_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "encoder unavailable: %s", esp_err_to_name(err));
+    }
+
+    const led_strip_config_t led_cfg = {
+        .data_gpio  = LED_DATA_GPIO,
+        /*
+         * 25 ms: fast enough that the 125 ms half-period of the quickest
+         * flash (reverse polarity) still gets five frames, and slow enough
+         * that the strip costs well under a percent of one core.
+         */
+        .refresh_ms = 25,
+        /*
+         * These sit in an operator's eyeline on a bench. Full brightness on
+         * eight WS2812Bs is both hard to look at and 480 mA if every pixel
+         * ever went white at once.
+         */
+        .brightness = 64,
+    };
+    err = led_strip_init(&led_cfg);
+    if (err != ESP_OK) {
+        /* Dark indicators; BLE, HTTP and the AT console are unaffected. */
+        ESP_LOGE(TAG, "LED strip unavailable: %s", esp_err_to_name(err));
     }
 
     ESP_ERROR_CHECK(ble_svc_init(BLE_DEVICE_NAME));

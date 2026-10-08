@@ -17,3 +17,27 @@ On completion, record the ToDo completion at the end of this Agent.mds
 | `06.SFRA Mode Enablement and Slot Control Calibration in FRAM.md` | 2026-09-30 | `6c2c838` | **PART 1 ONLY.** 13 DCL slot-tuning registers at 1068-1116 (TOTAL_REGISTERS 267 -> 280), one set unit-wide, persisted as a CRC-checked F-RAM record at 0x0700 and applied to all eight CC/CV controllers at boot and on host write. Defaults seeded from the compiled BTS_DCL_* before F-RAM can load, and a zero-b0 set is rejected - registers[] starts zeroed and a zeroed biquad outputs constant zero, so no slot would regulate at all. The runtime SFRA switch is NOT done and is filed as ToDo 07, blocked on a mode-table conflict: MODE 0b000 is both eModeIndependent and the pulled-high unstrapped default. Compile-verified on both cores and the ESP32 - no hardware. |
 | `07.SFRA runtime mode switch.md` | 2026-09-30 | `b253cf5` | MODE 6/7 repurposed from the unused grouped internal-ADC modes to the two slot-tuning (SFRA) modes - 6 sweeps the internal-ADC loop, 7 the ADS131M08 loop. Mode 0 deliberately NOT taken: the straps are pulled high so an unstrapped board decodes to 0, and SFRA there would sweep every unstrapped unit at power-on. Both mode macros stopped being pure bit arithmetic - group size forced to 1 (bit pattern said 4 and 8) and the converter test made explicit (bit 2 is set for both, but mode 7 sweeps the ADS131M08). SFRA now RUNS on a strap-latched runtime flag while the library stays a build switch, so one tuning binary serves every slot and a production build carries no test at all. SCIA ownership rides the same strap, since CPUSEL is boot-time only. Verified in BOTH build flavours - the production build compiles none of the new code. |
 | `05.Home Assistant register mirror is stale.md` | 2026-09-30 | `5c17bbe` | HA integration mirror brought from v1 to v2.1 + tuning: TOTAL_REGISTERS 315 -> 280, unit base 1152 -> 960, settings stride 96 -> 72, and the 13 tuning registers added. The charge/discharge limit merge was semantic, not just addresses - `ChannelLimits` emitted four duplicate writes where the later silently won, and `number.py` had two HA entities per merged register that would have moved each other's displayed value. `SET_I_MIN` had no entity at all, so a CCCV charge could not terminate from HA. Also caught the BLE record drifting 68 -> 70 B from ToDo 04. Added per-slot and exhaustive unit/tuning header checks - the gap that let the stride change go unnoticed for two revisions. **106 passed, 16 skipped, 0 failed.** |
+| `08.CCM-slot-mode-transition.md` | 2026-10-02 | `f6a458e` | Pre-charge balance: a cell is now seated onto a rail already driven to match it. WAITING/BALANCING/READY/SOFT_START added, supervised from B1. The decidability hinges on shunt placement - the output caps sit after the sense resistor, so matched voltages plus zero current is a balanced empty rail and matched plus current flowing is a connected cell. Soft start runs in diode emulation with 40 retries; removing the cell clears a fault. Fixed two authorised pre-existing defects: `BTS_ctrlDirection()` discarded all four of its own duty branches, and `slotStop()` never cleared the direction bits. Build switched to production, enabling the LEDs and ch1's GPIO trip. BLE proto 6 -> 7. Re-measured the C-task rate at 85.9 Hz, correcting a stale memory. Compile-verified on all three targets - **nothing that drives a FET has run on hardware.** |
+
+
+### Addendum, 2026-10-02 — ToDo 04 item 1 superseded
+
+The WS2812B string moved off the C2000 entirely in `bd48bfd`, and **lit for
+the first time**: eight solid green, all slots idle.
+
+ToDo 04's Timer 2 move, and the two later fixes in the same area (the LED ISR
+starving CPU2's I2C target; SCIA stranded by an unstrapped MODE strap), were
+each correct fixes to real defects — but none of them could ever have
+produced light. `LEDDriver_update()` sent raw colour bytes over a UART, and a
+WS2812B decodes pulse *widths*; a UART forces a start bit before every byte
+and holds each bit for a full bit time. No pixel ever lit from that core.
+
+The C2000 cannot drive one: GPIO29 has no SPI mux option and both usable SPI
+ports belong to the ADS131M08 pair. The ESP32 does it on SPI3/GPIO13 at
+2.5 MHz, four SPI bits per WS2812B bit, deriving colour from the I2C slot
+status it already polls. `BTS_LED_DRIVER_ENABLED` is now `false` in both arms
+and **CPU Timer 2 on CPU2 is free again**.
+
+See [`04.CPU2 Timer0 double booked for LED and ADS1119.md`](04.CPU2%20Timer0%20double%20booked%20for%20LED%20and%20ADS1119.md)
+for the full note, and `Docs/supervision-and-state-design.md` §2.5.1 for the
+current design.

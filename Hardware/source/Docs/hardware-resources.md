@@ -26,8 +26,9 @@ Four further problems, none previously known, were found while compiling these
 tables and are recorded in [§8](#8-known-conflicts-and-latent-bugs). Two are
 resource conflicts of exactly the kind this file exists to prevent — a
 trip-vector registration that silently collapses to one slot, and a CPU2 timer
-claimed twice. The trip-vector one has since been fixed; the timer is still
-masked by a build flag.
+claimed twice. Both have since been fixed; the timer conflict has additionally
+been dissolved, because the subsystem that was the second claimant no longer
+runs on this device at all.
 
 [§7](#7-cla1-allocation) covers CLA1, which is a third processor on this die
 and does not appear in any of the PIE, X-BAR or timer tables — its trigger
@@ -89,7 +90,6 @@ XINT3/XINT5 and `ISR1`/`ISR3` are at `bts_user_settings.h:521-525` and
 |---|---|---|---|---|---|
 | `INT_XINT1` | **1.4** | `ads1119Drdy1ISR` | `com_cpu2.c:1506` | `com_cpu2.c:1734` | ADS1119 #1 DRDY on GPIO42 (slots 1–4 cell temperature) |
 | `INT_XINT2` | **1.5** | `ads1119Drdy2ISR` | `com_cpu2.c:1507` | `com_cpu2.c:1746` | ADS1119 #2 DRDY on GPIO43 (slots 5–8 cell temperature) |
-| `INT_TIMER2` | **direct to CPU INT14** | `ledTimerISR` | `led_driver.c:55` | `led_driver.c:148` | WS2812B refresh at 80 Hz. **Production build only.** Moved off Timer 0, which the ADS1119 dwell reprograms — see §8.2 |
 | `INT_I2CA` | **8.1** | `i2cSlaveISR` | `com_cpu2.c:339` | `com_cpu2.c:2883` | I2C target framing (start/stop/AAS/NACK) |
 | `INT_I2CA_FIFO` | **8.2** | `i2cSlaveFifoISR` | `com_cpu2.c:340` | `com_cpu2.c:2976` | I2C target data bytes, and the watchdog reload on a host read |
 | `INT_SCIA_RX` | **9.1** | `uartRxISR` | `com_cpu2.c:1383` | `com_cpu2.c:3247` | AT console RX. Console build only (`BTS_CONSOLE_ENABLED`) |
@@ -109,6 +109,17 @@ bounded polled loops driven from `BTS_serviceADS1119()` /
 `BTS_serviceDeferredWork()` in CPU2's idle loop. `i2cTargetISR` and
 `i2cMasterISR` are declared at `com_cpu2.c:255-256` and **never defined or
 registered** — dead declarations, not an allocation.
+
+> **`INT_TIMER2` is unclaimed on CPU2, and `ledTimerISR` is registered in no
+> build.** It used to hold this table's only direct-INT14 row, driving the
+> WS2812B string at 80 Hz. That string now hangs off the ESP32 instead
+> (2026-10-02), and `BTS_LED_DRIVER_ENABLED` is `(false)` in **both** arms of
+> the `BTS_DEBUG_CONSOLE` switch (`bts_user_settings.h:83`, `:92`), so
+> `LEDDriver_init()` — the only caller of
+> `Interrupt_register(INT_TIMER2, &ledTimerISR)` (`led_driver.c:76`) — is the
+> no-op stub at `led_driver.c:213` everywhere. `ledTimerISR` still exists as a
+> stub body (`led_driver.c:216`), but nothing points a vector at it and CPU
+> Timer 2 on CPU2 is never started. See [§8.2](#82-cpu-timer-0-on-cpu2-was-double-booked).
 
 ---
 
@@ -138,7 +149,7 @@ spuriously.
 | `BTS_runISR_ch5_8()` (from `ISR3`) | `INT_XINT5` | **12** | `INTERRUPT_ACK_GROUP12` | `bts.h:862` |
 | `ads1119Drdy1ISR` | `INT_XINT1` | 1 | `INTERRUPT_ACK_GROUP1` | `com_cpu2.c:1741` |
 | `ads1119Drdy2ISR` | `INT_XINT2` | 1 | `INTERRUPT_ACK_GROUP1` | `com_cpu2.c:1749` |
-| `ledTimerISR` | `INT_TIMER2` | **none — direct INT14** | **must NOT ack** | `led_driver.c:151`, stub `:168` |
+| `ledTimerISR` *(stub — registered in no build)* | `INT_TIMER2`, if it ever were | **none — direct INT14** | **must NOT ack** | `led_driver.c:216` |
 | `i2cSlaveISR` | `INT_I2CA` | 8 | `INTERRUPT_ACK_GROUP8` | `com_cpu2.c:2968` |
 | `i2cSlaveFifoISR` | `INT_I2CA_FIFO` | 8 | `INTERRUPT_ACK_GROUP8` | `com_cpu2.c:3135` |
 | `canISR` | `INT_CANA0` | 9 | `INTERRUPT_ACK_GROUP9` | `com_cpu2.c:3187` |
@@ -156,14 +167,20 @@ group. `timerISR` correctly does not ack, and says why at `com_cpu2.c:2554`.
 
 **CPU Timer 0 is different** — it *is* a PIE interrupt at 1.7 and a handler
 registered on it does need `INTERRUPT_ACK_GROUP1`. Nothing registers one now:
-`ledTimerISR` moved to Timer 2 (§8.2) and the ADS1119 dwell runs Timer 0 with
-its interrupt disabled, reading only the counter.
+Timer 0 on CPU2 is the ADS1119 settle dwell's alone, run with its interrupt
+disabled (`CPUTimer_disableInterrupt(CPUTIMER0_BASE)` in `initADS1119()`) and
+only its counter read. **CPU Timer 2 on CPU2 is now free as well** — the LED
+driver that briefly held it is retired (§8.2).
 
-This rule is why the LED move was not a one-line base swap. `ledTimerISR` had
+The rule below is quoted from the LED move because the mechanism generalises,
+not because that driver still runs. `ledTimerISR` had
 `Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1)` in both its live body and its
 stub, correct for Timer 0 and wrong for Timer 2; carrying it across would have
 re-opened PIE group 1 — which carries the ADC interrupts — from a handler that
-never arrived through it. Both copies were deleted.
+never arrived through it. Both copies were deleted. The driver has since left
+the C2000 entirely, so what survives is the rule rather than the example:
+**moving a handler between timers changes its acknowledge obligation, and the
+compiler will not tell you.**
 
 ### What it looked like when it broke
 
@@ -775,8 +792,12 @@ anything failing outright.
 
 ### 8.2 CPU Timer 0 on CPU2 was double-booked
 
-**Status: FIXED.** It was latent while the console build shipped and live —
-LEDs dead — in any production build. Not previously known.
+**Status: FIXED, and since superseded — kept as a record.** It was latent
+while the console build shipped and live — LEDs dead — in any production
+build. Not previously known at the time. The LED driver has since left the
+C2000 altogether; see [the 2026-10-02 update](#update-2026-10-02--the-led-driver-left-the-c2000-and-none-of-this-could-ever-have-lit-the-string)
+at the end of this section, which is the part a reader debugging the LEDs
+today needs.
 
 Two subsystems claimed CPU2's Timer 0 with incompatible configurations:
 
@@ -792,25 +813,28 @@ the registered, enabled `ledTimerISR` never fired again.
 
 With `BTS_DEBUG_CONSOLE` `true` this was invisible — `BTS_LED_DRIVER_ENABLED`
 is then `false` and `LEDDriver_init()` is a no-op stub. In a production build
-the WS2812B string went dark moments after boot, having briefly worked. **A
-frozen LED showing "running" for a slot that has since tripped is actively
-misleading**, which is what made this worth fixing rather than documenting.
+the LED refresh tick stopped moments after boot. At the time that was read as
+the string going dark *having briefly worked* — it had not, and never did; see
+the 2026-10-02 update below. **A frozen LED showing "running" for a slot that
+has since tripped is actively misleading**, which is what made this worth
+fixing rather than documenting.
 
 The comment in `initADS1119()` showed the author knew the timer was shared
 ("CPU timer 0 is otherwise only started by the WS2812B driver, which is
 compiled out in a console build") — but the code below it was never guarded by
 that condition.
 
-**Fixed** by moving the LED dwell to **CPU Timer 2**, not by guarding the
-ADS1119 setup. The dwell genuinely needs a free-running counter in both build
-flavours, and Timer 2 is the only timer with no other claimant on this core.
+**Fixed** by moving the LED *tick* to **CPU Timer 2**, not by guarding the
+ADS1119 setup. The ADS1119 dwell genuinely needs a free-running counter on
+Timer 0 in both build flavours, and Timer 2 was the only timer with no other
+claimant on this core.
 
 Timer 2 is free **on CPU2 only**, and the distinction matters:
 
 | Core | Timer 0 | Timer 1 | Timer 2 |
 |---|---|---|---|
 | CPU1 | Task A (`TASKA_CPUTIMER_BASE`) | Task B, and borrowed by `BTS_HAL_measureSysclkKHz()` | Task C (`TASKC_CPUTIMER_BASE`), also borrowed by the clock measurement |
-| CPU2 | ADS1119 settle dwell | `timerISR` at 8 Hz | **WS2812B refresh at 80 Hz** ← was free |
+| CPU2 | ADS1119 settle dwell | `timerISR` at 8 Hz | **Free** — was the WS2812B refresh; see the update below |
 
 CPU2 runs neither the A/B/C task chain nor `BTS_HAL_setupDevice()`, so it
 never calls the clock measurement. **Do not make the same move on CPU1** —
@@ -821,28 +845,128 @@ and does not pass through the PIE, so `ledTimerISR` must **not** call
 `Interrupt_clearACKGroup()`. Both the live handler and its no-op stub had that
 call for Timer 0 and both lost it.
 
-### 8.2.1 SCIA is contended four ways, and a production unit loses its console
+#### Update 2026-10-02 — the LED driver left the C2000, and none of this could ever have lit the string
+
+**Everything above is still true of the code as it was, and the Timer 0 /
+ADS1119 facts are still true today.** What has changed is that the WS2812B
+string is no longer driven from this device at all, so the timer contention
+this section describes no longer exists in either direction:
+
+- `BTS_LED_DRIVER_ENABLED` is `(false)` in **both** arms of the
+  `BTS_DEBUG_CONSOLE` switch (`bts_user_settings.h:83`, `:92`).
+  `LEDDriver_init()`, `LEDDriver_update()` and `LEDDriver_due()` are the no-op
+  stubs at `led_driver.c:213-215` in every build.
+- `Interrupt_register(INT_TIMER2, &ledTimerISR)` (`led_driver.c:76`) sits
+  inside the compiled-out arm, so **Timer 2 on CPU2 is free again** and
+  `INT_TIMER2` is claimed by nothing.
+- `led_driver.c` and `led_driver.h` remain in the project and still compile.
+  The idle-loop call `if (LEDDriver_due()) { LEDDriver_update(); }` at the
+  bottom of `main()` in `com_cpu2.c` still exists and is now a no-op.
+- Timer 0 remains the ADS1119 dwell's alone — the four-line claim in
+  `initADS1119()` (`com_cpu2.c`, `CPUTimer_setPeriod`/`setPreScaler`/
+  `disableInterrupt`/`startTimer` on `CPUTIMER0_BASE`) is unchanged.
+- GPIO29 is still muxed to `GPIO_29_SCITXDA` unconditionally in
+  `BTS_HAL_setupCpu2Pins()` (`bts_hal.c:1394`) and is simply **idle** in a
+  production build.
+
+**And the part that matters most: fixing this timer bug could never have lit
+the string.** `LEDDriver_update()` clocked raw colour bytes out of SCIA at
+800 kbaud, but a WS2812B decodes pulse *widths* — 400 ns high is a 0, 800 ns
+high is a 1, in a 1250 ns slot — and a UART cannot produce them. It forces a
+LOW start bit before every byte and holds each data bit for a full bit time.
+The strip saw framing noise and latched nothing. **No pixel ever lit from this
+core**, in any build, at any point in the project's history.
+
+So the timer double-booking above was a real bug and worth fixing — as were
+the LED-ISR starvation of CPU2 and the SCIA stranding by an unstrapped MODE
+strap — but none of the three was ever the reason the LEDs were dark. Each one
+would have been uncovered only to reveal the next, with the UART problem
+waiting underneath all of them. This is the section's real lesson: a chain of
+genuine defects in a subsystem is not evidence that the subsystem can work.
+
+**It could not be fixed in place.** Driving a WS2812B needs a peripheral that
+emits a free-running bit pattern — on this device, SPI. GPIO29, the wire that
+physically exists, has **no SPI mux option** (its choices are GPIO, SCITXDA,
+EM1SDCKE, OUTPUTXBAR6, EQEP3B, SD2_C3), and both usable SPI ports (SPIA, SPIC)
+are held by the ADS131M08 pair (§1.1). The Output X-BAR has no ePWM source. An
+eCAP APWM reached through OUTPUTXBAR6 would have worked electrically but needs
+192 software duty updates per refresh — reintroducing exactly the ISR
+starvation that had just been fixed.
+
+The driver therefore moved to the **ESP32 proxy**, which has a free SPI host
+and a free pin: SPI3 (VSPI) MOSI on its GPIO13, four SPI bits per WS2812B bit
+at 2.5 MHz, 96 bytes per frame in one DMA transfer from a FreeRTOS task. That
+is off-device and so outside this file's scope; it is documented in
+[`esp32-btle-proxy/components/led_strip/include/led_strip.h`](../esp32-btle-proxy/components/led_strip/include/led_strip.h)
+and in
+[`supervision-and-state-design.md` §2.5.1](supervision-and-state-design.md#251-slot-indication--the-ws2812b-string).
+It lit on 2026-10-02, for the first time in the project.
+
+The move is not free, and two costs are worth stating plainly.
+
+**The colours are now one poll stale.** A C2000-resident driver read
+`registers[]` directly. The ESP32 driver colours from the snapshot its
+existing I2C poll fills at a 250 ms interval, so a slot changing state can
+take up to ~250 ms longer to reach the strip than it used to. For an
+indicator that is comfortably acceptable — but it means the LEDs must never
+be used to time anything, and a slot that trips and is read back within one
+poll window can legitimately show its previous colour.
+
+**And the strip now depends on the proxy**, which is the heavier of the two:
+
+> **One hazard moved rather than went away.** §8.2 called a frozen LED showing
+> "running" for a slot that has since tripped *actively misleading*, and that
+> is now the ESP32's failure mode: if the proxy is unplugged, crashes or is
+> held in reset it sends no frames, and the WS2812B latches hold their last
+> colour **indefinitely**. The driver's amber-unison link-down state covers
+> only the case where the ESP32 is alive and the I2C link is down — it cannot
+> cover the ESP32 itself being dead. The indicators are no longer evidence
+> about a slot unless something independently confirms the proxy is running.
+
+### 8.2.1 SCIA is contended two ways, and the production console is now a choice
 
 Not a defect - a consequence worth stating in one place, because it is why the
-ESP32 grew an AT console of its own.
+ESP32 grew an AT console of its own. **This section used to list four
+claimants. Two have since been retired**, and the conclusion it drew has been
+overtaken by that; the current list is short.
 
-| Claimant | Pins | Selected by |
-|---|---|---|
-| AT command console | GPIO28 RX, GPIO29 TX | `BTS_DEBUG_CONSOLE == true` |
-| WS2812B LED driver | GPIO29 TX only | `BTS_DEBUG_CONSOLE == false` |
-| Channel 1 GPIO trip | GPIO28 as a digital input | `BTS_DEBUG_CONSOLE == false` |
-| CPU1's SFRA GUI | the whole port | MODE strap 6 or 7, in an SFRA build |
+| Claimant | Pins | Selected by | State |
+|---|---|---|---|
+| CPU2's AT command console | GPIO28 RX, GPIO29 TX | `BTS_DEBUG_CONSOLE == true` (`bts_user_settings.h:48`) | Debug build only - **off today** |
+| CPU1's SFRA GUI | the whole port | MODE strap 6 or 7 **and** an SFRA build | Resolved at boot |
+| ~~WS2812B LED driver~~ | ~~GPIO29 TX~~ | — | **Retired** - moved to the ESP32, §8.2 |
+| ~~Channel 1 GPIO trip~~ | ~~GPIO28 as a digital input~~ | — | **Never enabled**, by standing instruction |
 
-The first three are resolved at build time by one switch. The fourth is
-resolved at **boot** by `SysCtl_selectCPUForPeripheral()`, which is a one-shot
-ownership write - CPU1 keeps SCIA only when the straps selected a tuning mode,
+The two retired rows are gone for different reasons. The LED driver left the
+device entirely on 2026-10-02 and `BTS_LED_DRIVER_ENABLED` is now `(false)` in
+both arms (`bts_user_settings.h:83`, `:92`). The channel-1 GPIO trip is
+`BTS_TRIP_GPIO_CH1_ENABLED (false)` in both arms as well (`:85`, `:93`) and is
+to stay that way - channel 1 keeps its CMPSS over-current trip in either mode,
+which is the comparator that actually protects the slot.
+
+The first row is resolved at build time by one switch. The second is resolved
+at **boot** by `SysCtl_selectCPUForPeripheral()` (`bts_cpu1.c:1382`), a
+one-shot ownership write - CPU1 keeps SCIA only when `btsSfraActive` latched,
+which needs `BTS_SFRA_ENABLED` **and** a strap of mode 6 or 7
+(`eModeSfraAds131Plant` / `eModeSfraAds131Closed`, `registers.h:1190-1191`);
 otherwise it hands the port to CPU2. That is precisely why SFRA selection has
 to ride on a strap latched at reset rather than on a host register: the
 ownership cannot be changed while the unit runs.
 
-**A production build therefore has no AT console.** The ESP32 proxy carries
-the same grammar on its own UART and reaches the registers over I2C - see
-[`at-command-specification.md`](at-command-specification.md).
+**A production build no longer loses its console for LED reasons.** That was
+the whole content of this section's original heading: GPIO29 had to carry
+either the console TX or the LED data line, and in production the LEDs took
+it. **That constraint is gone.** GPIO29 is still muxed to `GPIO_29_SCITXDA`
+(`bts_hal.c:1394`) and now sits idle, and nothing but the console wants it, so
+a production build could carry the C2000 AT console at no cost.
+
+It deliberately does not. The project ships `BTS_DEBUG_CONSOLE (false)` and
+uses the **ESP32's** console instead, which carries the same grammar on its
+own UART, is reachable without opening the enclosure, and reaches the
+registers over I2C - see
+[`at-command-specification.md`](at-command-specification.md). The point of
+recording the change here is that if the C2000 console is ever wanted back, it
+is now a free decision rather than a trade against the indicators.
 
 ### 8.3 The ADCB end-of-conversion flag was never cleared on the success path
 
@@ -1083,7 +1207,7 @@ session.
 | CPU1 global enable | `bts_hal.h:122-127` | `bts_hal.c:1998`; called `bts_cpu1.c:1028` |
 | CPU1 ISR bodies | `bts_hal.h:148-151` | `bts_cpu1.c:1162-1209`, `:2217`, `:2272` |
 | CPU1 ACK groups | — | `bts.h:811`, `:862`; `bts_hal.h:240`, `:255`; `bts_cpu1.c:1207`, `:2254`, `:2371` |
-| CPU2 interrupt registration | — | `com_cpu2.c:339-342`, `:1315`, `:1383`, `:1399`, `:1506-1507`; `led_driver.c:43` |
+| CPU2 interrupt registration | — | `com_cpu2.c:339-342`, `:1315`, `:1383`, `:1399`, `:1506-1507` (`led_driver.c:76` is compiled out — see §8.2) |
 | CPU2 global enable | — | `com_cpu2.c:3386-3387` |
 | ADC SOC / interrupt setup | — | `bts_hal.c:1680-1781` |
 | ADC SOC trigger and event prescale | `bts_hal.h:136` | `bts_hal.c:1818-1828`; `BTS_ADC_SOC_PRESCALE` at `bts_user_settings.h:931` |

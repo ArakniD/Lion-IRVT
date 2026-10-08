@@ -482,7 +482,19 @@ static void draw_slot_row(uint8_t slot)
      * not running, so nothing is drawn then. The fault and paused branches
      * below overdraw from x=40, which is why this sits at 34.
      */
-    if (st.bts_const_voltage || st.bts_const_current) {
+    if (st.bts_balancing || st.bts_soft_start) {
+        /*
+         * The pre-charge sequence outranks the CC/CV tag in this slot of the
+         * row: a slot that is balancing is not regulating a cell yet, so a
+         * CC/CV badge there would be meaningless.
+         *
+         * Yellow is the charge badge's colour, so these use the TEXT to
+         * disambiguate - "BAL" and "SS" cannot be mistaken for a direction.
+         */
+        band_text(34, y + 7, y, st.bts_balancing ? "BAL" : "SS", C_YELLOW, 1);
+    } else if (st.bts_ready) {
+        band_text(34, y + 7, y, "RDY", C_GREEN, 1);
+    } else if (st.bts_const_voltage || st.bts_const_current) {
         band_text(34, y + 7, y, st.bts_const_voltage ? "CV" : "CC",
                   st.bts_const_voltage ? C_CYAN : C_GREY, 1);
     }

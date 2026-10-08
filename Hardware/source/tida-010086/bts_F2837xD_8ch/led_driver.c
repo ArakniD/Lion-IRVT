@@ -17,9 +17,30 @@ static const uint16_t colorRed[3]   = COLOR_RED;
 static const uint16_t colorGreen[3] = COLOR_GREEN;
 static const uint16_t colorBlue[3]  = COLOR_BLUE;
 static const uint16_t colorWhite[3] = COLOR_WHITE;
+static const uint16_t colorYellow[3] = COLOR_YELLOW;
 
 // LED buffer (GRB order)
 static uint16_t ledBuffer[LED_BUFFER_SIZE];
+
+//
+// Set by the timer ISR, cleared by LEDDriver_due().
+//
+// THE TRANSFER USED TO HAPPEN IN THE ISR AND THAT WAS THE BUG. Clocking 24
+// bytes at 800 kbaud takes 300 us, and the WS2812B reset pulse adds another
+// 60 us of busy-wait. ledTimerISR is not declared HPI - unlike every other
+// ISR on this core - so it ran with interrupts disabled for the whole ~360 us,
+// 80 times a second.
+//
+// What that broke: CPU2's I2C target ISR fires on EVERY received byte
+// (SCI_FIFO_RX1) and was measured at 3-8 kHz while the ESP32 polls. A byte
+// arrives every 130-300 us, so each LED refresh masked one or two of them.
+// The ESP32 saw failed reads, its display cycled between "WAITING FOR BTS"
+// and live data, and CPU2's own 8 Hz heartbeat stretched to roughly a minute.
+//
+// Confirmed on hardware 2026-10-02 by stopping Timer 2 with the debugger:
+// the ESP32 link went solid immediately.
+//
+static volatile bool ledRefreshDue = false;
 
 // UART initialization for WS2812B
 void LEDDriver_init(void) {
@@ -105,6 +126,23 @@ void LEDDriver_update(void) {
                 (status & ((1UL << BTS_STATUS_WD_TRIPPED) |
                            (1UL << BTS_STATUS_RESTORED))) ? colorRed : colorBlue;
             color = ((tick % LED_PAUSE_PERIOD) < LED_PAUSE_ON) ? pauseColor : 0;
+        } else if (status & ((1UL << BTS_STATUS_BALANCING) |
+                             (1UL << BTS_STATUS_SOFT_START))) {
+            //
+            // Driving the rail, or starting into a freshly seated cell.
+            // Ranked below every fault - a slot that trips while balancing
+            // must still read as tripped - and above the direction states,
+            // which it precedes.
+            //
+            color = ((tick % LED_BALANCE_PERIOD) < LED_BALANCE_ON)
+                        ? colorYellow : 0;
+        } else if (status & (1UL << BTS_STATUS_READY)) {
+            //
+            // Rails matched: it is safe to seat a cell. Flashing, because
+            // solid green is idle.
+            //
+            color = ((tick % LED_READY_PERIOD) < LED_READY_ON)
+                        ? colorGreen : 0;
         } else if (status & ((1UL << BTS_STATUS_CHARGING) |
                              (1UL << BTS_STATUS_DISCHARGING))) {
             if (status & (1UL << BTS_STATUS_RUNNING)) {
@@ -139,7 +177,21 @@ void LEDDriver_update(void) {
     DEVICE_DELAY_US(60);
 }
 
+//
+// Returns true once per refresh interval.
+//
+bool LEDDriver_due(void) {
+    if (!ledRefreshDue) {
+        return false;
+    }
+    ledRefreshDue = false;
+    return true;
+}
+
 // Timer ISR for periodic LED updates
+//
+// Sets a flag and nothing else. The transfer itself is far too long to run
+// here - see the note on ledRefreshDue above.
 //
 // CPU Timer 2 is connected directly to CPU INT14, not through the PIE, so
 // there is no acknowledge group to clear - exactly as timerISR() documents
@@ -147,7 +199,7 @@ void LEDDriver_update(void) {
 // acknowledging a group this interrupt never came through.
 //
 __interrupt void ledTimerISR(void) {
-    LEDDriver_update();
+    ledRefreshDue = true;
     CPUTimer_clearOverflowFlag(CPUTIMER2_BASE);
 }
 
@@ -160,6 +212,7 @@ __interrupt void ledTimerISR(void) {
 //
 void LEDDriver_init(void) { }
 void LEDDriver_update(void) { }
+bool LEDDriver_due(void) { return false; }
 __interrupt void ledTimerISR(void) {
     //
     // Never registered in this build, but kept symmetrical with the live

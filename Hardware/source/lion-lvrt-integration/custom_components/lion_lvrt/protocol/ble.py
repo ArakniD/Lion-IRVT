@@ -101,6 +101,7 @@ UNIT_STATUS_V5_LEN: Final = struct.calcsize(UNIT_STATUS_V5_FMT)
 #   f bts_charge_mah  f bts_charge_mwh  f bts_charge_seconds
 #   f bts_discharge_mah  f bts_discharge_mwh  f bts_discharge_seconds
 #   B bts_const_voltage  B bts_const_current                    <- proto 6
+#   B bts_waiting  B bts_balancing  B bts_ready  B bts_soft_start <- proto 7
 #
 # The two regulation flags were appended at the END of the record, so every
 # offset above is unchanged and the 68-byte prefix still decodes exactly as
@@ -111,13 +112,17 @@ UNIT_STATUS_V5_LEN: Final = struct.calcsize(UNIT_STATUS_V5_FMT)
 # They read false on any firmware before the control law moved to CCCV -
 # status bits 6 and 7 existed from the start but the CC-only loop pinned
 # ctrlMode_logic to 0 and never set them.
-SLOT_STATUS_FMT: Final = "<BBBBffffffIIIBBBBffffffBB"
+SLOT_STATUS_FMT: Final = "<BBBBffffffIIIBBBBffffffBBBBBB"
 SLOT_STATUS_LEN: Final = struct.calcsize(SLOT_STATUS_FMT)
 
 #: The proto 3-5 record, before the regulation flags were appended. Kept so a
 #: unit on older firmware still decodes rather than being rejected outright.
 SLOT_STATUS_V3_FMT: Final = "<BBBBffffffIIIBBBBffffff"
 SLOT_STATUS_V3_LEN: Final = struct.calcsize(SLOT_STATUS_V3_FMT)
+
+#: The proto 6 record, before the pre-charge flags. Same reasoning.
+SLOT_STATUS_V6_FMT: Final = "<BBBBffffffIIIBBBBffffffBB"
+SLOT_STATUS_V6_LEN: Final = struct.calcsize(SLOT_STATUS_V6_FMT)
 
 #: The proto-2 prefix, for decoding a record from older firmware.
 SLOT_STATUS_V2_FMT: Final = "<BBBBffffffIII"
@@ -160,7 +165,8 @@ REGISTER_CMD_LEN: Final = struct.calcsize(REGISTER_CMD_FMT)
 # and ble_proto.h have drifted, which must fail loudly at import rather than
 # produce plausible-looking rubbish at runtime.
 assert UNIT_STATUS_LEN == 24, UNIT_STATUS_LEN
-assert SLOT_STATUS_LEN == 70, SLOT_STATUS_LEN
+assert SLOT_STATUS_LEN == 74, SLOT_STATUS_LEN
+assert SLOT_STATUS_V6_LEN == 70, SLOT_STATUS_V6_LEN
 assert SLOT_STATUS_V3_LEN == 68, SLOT_STATUS_V3_LEN
 assert SLOT_CONFIG_LEN == 80, SLOT_CONFIG_LEN
 assert SLOT_RESULT_LEN == 116, SLOT_RESULT_LEN
@@ -317,6 +323,13 @@ class SlotStatus:
     #: publishes the loop's state rather than the slot's intent.
     bts_const_voltage: bool = False
     bts_const_current: bool = False
+    #: Pre-charge balance. ``bts_waiting`` stays true through the sequence;
+    #: ``bts_ready`` means a cell can be seated right now and CLEARS if the
+    #: rail drifts, so it must be re-read rather than latched.
+    bts_waiting: bool = False
+    bts_balancing: bool = False
+    bts_ready: bool = False
+    bts_soft_start: bool = False
 
     @classmethod
     def decode(cls, data: bytes) -> "SlotStatus":
@@ -339,9 +352,16 @@ class SlotStatus:
         # the tail above so a proto 3-5 record - which stops at 68 bytes -
         # still yields everything it carries instead of being discarded.
         regulation: tuple = ()
-        if len(data) >= SLOT_STATUS_LEN:
+        if len(data) >= SLOT_STATUS_V6_LEN:
             regulation = struct.unpack(
-                "<BB", data[SLOT_STATUS_V3_LEN:SLOT_STATUS_LEN]
+                "<BB", data[SLOT_STATUS_V3_LEN:SLOT_STATUS_V6_LEN]
+            )
+
+        # Proto 7 appended the pre-charge sequence, again at the end.
+        precharge: tuple = ()
+        if len(data) >= SLOT_STATUS_LEN:
+            precharge = struct.unpack(
+                "<BBBB", data[SLOT_STATUS_V6_LEN:SLOT_STATUS_LEN]
             )
 
         return cls(
@@ -370,6 +390,10 @@ class SlotStatus:
             bts_discharge_seconds=tail[9] if tail else 0.0,
             bts_const_voltage=bool(regulation[0]) if regulation else False,
             bts_const_current=bool(regulation[1]) if regulation else False,
+            bts_waiting=bool(precharge[0]) if precharge else False,
+            bts_balancing=bool(precharge[1]) if precharge else False,
+            bts_ready=bool(precharge[2]) if precharge else False,
+            bts_soft_start=bool(precharge[3]) if precharge else False,
         )
 
     @property

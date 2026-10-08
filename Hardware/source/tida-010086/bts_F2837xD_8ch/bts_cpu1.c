@@ -44,6 +44,8 @@ static void updateInputVoltage(void);
 static void checkGroupIntegrity(void);
 static void publishStatusToCpu2(void);
 static void serviceTermination(void);
+static void servicePreChargeBalance(void);
+static void serviceDivergenceFault(void);
 
 //
 // Consecutive C1 passes each slot has satisfied its termination condition.
@@ -58,6 +60,20 @@ static void serviceTermination(void);
 // from before it was held.
 //
 static uint16_t termDwell[NUM_CHANNELS];
+
+//
+// Pre-charge balance supervisor state. All indexed by slot.
+//
+//   balanceDwell      consecutive passes the current condition has held, and
+//                     doubles as the BALANCING / SOFT_START elapsed counter
+//   softStartRetries  attempts used, against BTS_SOFT_START_MAX_RETRIES
+//   softStartHold     passes still to wait out after a trip, ~100 ms
+//
+static uint16_t balanceDwell[NUM_CHANNELS];
+static uint16_t softStartRetries[NUM_CHANNELS];
+static uint16_t softStartHold[NUM_CHANNELS];
+static uint16_t divergeDwell[NUM_CHANNELS];
+static uint16_t softStartElapsed[NUM_CHANNELS];
 
 //
 // How long a termination condition must hold. C1 is nominally 10 Hz but was
@@ -124,6 +140,28 @@ void B3(void);  //state B3
 void C1(void);  //state C1
 void C2(void);  //state C2
 void C3(void);  //state C3
+
+#ifdef _STANDALONE
+//
+// Bounded CPU2 boot - see tryBootCpu2(). Declared here because main() and
+// C3() both call it and it is defined further down.
+//
+// Per-attempt ceiling on waiting for CPU2's ROM. CPU2 reaches SYSTEM_READY
+// within microseconds of reset; by the time CPU1 gets here it has spent many
+// milliseconds in its own init, so a healthy CPU2 is already waiting and
+// this only ever bounds the failure case.
+//
+#define BTS_CPU2_BOOT_TIMEOUT_US    500000UL
+#define BTS_CPU2_BOOT_POLL_US          100UL
+
+#ifdef _FLASH
+#define BTS_CPU2_BOOT_MODE   C1C2_BROM_BOOTMODE_BOOT_FROM_FLASH
+#else
+#define BTS_CPU2_BOOT_MODE   C1C2_BROM_BOOTMODE_BOOT_FROM_RAM
+#endif
+
+static bool tryBootCpu2(uint32_t timeoutUs);
+#endif
 
 // Global unit state
 volatile UnitState unitState = eInputOK;
@@ -287,7 +325,113 @@ static void slotStop(uint16_t ch)
     status[ch].wdTripped = 0;
     status[ch].restored  = 0;
 
+    //
+    // THE DIRECTION BITS ARE CLEARED HERE. They were not, and a stopped slot
+    // kept whichever direction it last ran. Two things went wrong as a
+    // result: the LED driver tests CHARGING|DISCHARGING above its FINISHED
+    // branch, so a slot that had ever run could never show the finished
+    // colour and showed idle-green through the wrong path; and a host
+    // reading the status word saw a direction on a slot doing nothing.
+    //
+    // A pause is different and must NOT clear these - slotPause() leaves
+    // them deliberately, because a resume has to know which way to go.
+    //
+    status[ch].charging    = 0;
+    status[ch].discharging = 0;
+
+    //
+    // Leaving the pre-charge sequence too. A stop is an operator saying
+    // "stand down", so the slot must not keep driving its rail; re-arming is
+    // an explicit WAITING command.
+    //
+    status[ch].waiting   = 0;
+    status[ch].balancing = 0;
+    status[ch].ready     = 0;
+    status[ch].softStart = 0;
+
+    btsSlotPreCharging[ch] = 0U;
+
     termDwell[ch] = 0U;
+    balanceDwell[ch] = 0U;
+    softStartRetries[ch] = 0U;
+}
+
+//
+// ==================== Pre-charge balance lifecycle ====================
+//
+// Arms a slot to watch for a cell approaching its contacts. The converter
+// stays off - WAITING only watches.
+//
+static void slotWait(uint16_t ch)
+{
+    BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
+    BTS_userInputs[ch].enable_logic = 0;
+
+    status[ch].running   = 0;
+    status[ch].stopped   = 0;
+    status[ch].finished  = 0;
+    status[ch].paused    = 0;
+    status[ch].wdTripped = 0;
+    status[ch].restored  = 0;
+
+    status[ch].waiting   = 1;
+    status[ch].balancing = 0;
+    status[ch].ready     = 0;
+    status[ch].softStart = 0;
+
+    btsSlotPreCharging[ch] = 0U;
+    termDwell[ch] = 0U;
+    balanceDwell[ch] = 0U;
+    softStartRetries[ch] = 0U;
+}
+
+//
+// Begin driving the output capacitors toward the ADS reading.
+//
+// enable_logic goes to 1 because the converter genuinely runs here - which is
+// also what arms the trip system for this slot, and that is wanted: balancing
+// drives real current into real capacitance and every protection should be
+// live, exactly as it is for a running slot.
+//
+static void slotBalance(uint16_t ch)
+{
+    status[ch].waiting   = 1;
+    status[ch].balancing = 1;
+    status[ch].ready     = 0;
+    status[ch].softStart = 0;
+
+    //
+    // Hand the control ISR the balancing duty path BEFORE enabling the
+    // stage, so the first pass after enable_logic goes high is already a
+    // balance step and never a stale control-loop output.
+    //
+    btsSlotPreCharging[ch] = 1U;
+    BTS_userInputs[ch].enable_logic = 1;
+
+    balanceDwell[ch] = 0U;
+}
+
+//
+// Rails matched. The converter is parked - not driving, but still armed.
+//
+// This is NOT a latch. An unloaded output capacitor drifts, so the supervisor
+// re-checks every pass and drops back to BALANCING if the differential
+// re-opens while the operator is still seating the cell.
+//
+static void slotReady(uint16_t ch)
+{
+    BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
+    BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
+    BTS_userInputs[ch].enable_logic = 0;
+
+    status[ch].waiting   = 1;
+    status[ch].balancing = 0;
+    status[ch].ready     = 1;
+    status[ch].softStart = 0;
+
+    btsSlotPreCharging[ch] = 0U;
+    balanceDwell[ch] = 0U;
 }
 
 //
@@ -318,7 +462,24 @@ static void slotFinish(uint16_t ch)
     status[ch].wdTripped = 0;
     status[ch].restored  = 0;
 
+    //
+    // A completed test keeps its direction bit, unlike a stop: a host wants
+    // to know which way the run that just ended was going.
+    //
+    // The pre-charge state is dropped, though. The cell that just finished is
+    // still in the holder, so the slot is not waiting for anything; the
+    // supervisor re-arms WAITING once it sees that cell removed.
+    //
+    status[ch].waiting   = 0;
+    status[ch].balancing = 0;
+    status[ch].ready     = 0;
+    status[ch].softStart = 0;
+
+    btsSlotPreCharging[ch] = 0U;
+
     termDwell[ch] = 0U;
+    balanceDwell[ch] = 0U;
+    softStartRetries[ch] = 0U;
 }
 
 //
@@ -371,6 +532,17 @@ static void applyRestoredSlotStates(void)
 
         slotStop(ch);
         status[ch].finished = ((f & BTS_STATE_F_END) != 0UL) ? 1U : 0U;
+
+        //
+        // Re-arm a slot that was armed when power went away. Only the WAITING
+        // bit is restored - the supervisor works out within a few passes
+        // whether a cell is present and where in the sequence the slot
+        // belongs, from readings that are current rather than remembered.
+        //
+        if ((f & BTS_STATE_F_WAITING) != 0UL) {
+            status[ch].waiting = 1U;
+            status[ch].stopped = 0U;
+        }
 
         if ((f & BTS_STATE_F_RUNNING) != 0UL) {
             status[ch].charging    = ((f & BTS_STATE_F_CHARGING) != 0UL) ? 1U : 0U;
@@ -1046,7 +1218,27 @@ void main(void)
     // means "highest enabled slot", but in a tuning mode there is only one
     // slot under test, so the same three pins name it directly.
     //
-    btsSfraActive = BTS_MODE_IS_SFRA((uint16_t)startup_mode) ? 1U : 0U;
+    //
+    // THE BUILD GETS A VETO, not just the strap.
+    //
+    // btsSfraActive gates whether CPU1 keeps SCIA for the SFRA GUI. In a
+    // build with no SFRA library compiled in there is nothing to keep it
+    // FOR - and keeping it strands the port: CPU1 never calls
+    // SysCtl_selectCPUForPeripheral(), so CPU2's LED driver writes to a
+    // peripheral it does not own and every SCIA register reads back zero.
+    //
+    // That is not hypothetical. Observed on hardware 2026-10-02 with the LED
+    // string connected and dark: the MODE straps were open, pull-ups made
+    // them read 0b111, truth_table[7] decoded that to mode 7
+    // (eModeSfraAds131Closed), btsSfraActive latched to 1, and SCIA was held
+    // by a core with no SFRA code in it. Pin muxing and GPIO ownership were
+    // both correct, which is what made it hard to see.
+    //
+    // BTS_SFRA_ENABLED is a compile-time constant, so in a production build
+    // this whole expression folds to 0 and the strap cannot strand the port.
+    //
+    btsSfraActive = (BTS_SFRA_ENABLED == true) &&
+                    BTS_MODE_IS_SFRA((uint16_t)startup_mode) ? 1U : 0U;
     btsSfraSlot   = (uint16_t)startup_enable & 0x7U;
 
     BTS_initSlotGrouping((uint16_t)startup_mode, (uint16_t)startup_enable);
@@ -1101,7 +1293,26 @@ void main(void)
     //
     BTS_seedSlotTuningRegisters();
     BTS_initController();
-    BTS_applySlotTuning();
+
+    //
+    // DELIBERATELY NOT calling BTS_applySlotTuning() here.
+    //
+    // registers[] lives in CPU2TOCPU1RAM and is populated by CPU2, which at
+    // this point in CPU1's boot has not run yet - the block still reads all
+    // zeros. BTS_initController() has just installed valid coefficients from
+    // the compile-time BTS_DCL_* constants, and applying a zeroed register
+    // block over the top would replace them with a biquad that outputs a
+    // constant zero, leaving no slot able to regulate.
+    //
+    // CPU2 seeds the defaults, loads any stored tuning over them, and then
+    // raises BTS_IPC_FLAG_CAL_RELOAD. The apply happens there, by which time
+    // the registers hold real values. A host write to any tuning register
+    // re-applies as well.
+    //
+    // Found on hardware 2026-10-02: the controllers read 0.0 at runtime
+    // while registers[] held the correct values, because this call ran
+    // before CPU2 had written them.
+    //
 
     //
     // Configure DCL and SFRA libraries
@@ -1213,11 +1424,15 @@ void main(void)
 
     //
     // GPIO29 is CPU2's in both modes: console TX when debugging, WS2812B LED
-    // output in production. GPIO28 is CPU2's console RX only in a debug
-    // build - in production it stays with CPU1 as channel 1's trip input.
+    // output in production.
+    //
+    // GPIO28 goes to CPU2 only when it is the console RX. Keyed on the
+    // console rather than on BTS_TRIP_GPIO_CH1_ENABLED, which is now always
+    // false - testing the trip macro would have handed GPIO28 to CPU2 in
+    // every build, including production where nothing on CPU2 uses it.
     //
     GPIO_setControllerCore(29, GPIO_CORE_CPU2);
-#if (BTS_TRIP_GPIO_CH1_ENABLED == false)
+#if (BTS_CONSOLE_ENABLED == true)
     GPIO_setControllerCore(28, GPIO_CORE_CPU2);
 #endif
 
@@ -1242,22 +1457,22 @@ void main(void)
     //
     // Release CPU2.
     //
-    // Only do this in a standalone (no-debugger) build. When running under
-    // CCS the debugger loads and starts CPU2 itself, and Device_bootCPU2()
-    // would block forever in its do/while waiting for the boot ROM to report
-    // C2_BOOTROM_BOOTSTS_SYSTEM_READY - leaving CPU1 stalled here and CPU2
-    // parked in boot ROM around 0x3FE00A.
+    // Standalone builds only. Under CCS the debugger loads and starts CPU2
+    // itself.
+    //
+    // This used to be a plain Device_bootCPU2() call, which spins with no
+    // timeout until CPU2's boot ROM reports ready - so a CPU2 that never got
+    // there stalled CPU1 here, before its background loop, with no control
+    // tasks, no supervision and no trip arming. tryBootCpu2() makes one
+    // bounded attempt; if CPU2 is not ready, CPU1 carries on and C3 retries.
+    // See the note above tryBootCpu2().
     //
     // This mirrors TI's own project configurations, where _STANDALONE is a
     // separate build config from plain _FLASH (see the C2000Ware dual-core
     // examples, e.g. led_ex1_blinky.projectspec).
     //
 #ifdef _STANDALONE
-#ifdef _FLASH
-    Device_bootCPU2(C1C2_BROM_BOOTMODE_BOOT_FROM_FLASH);
-#else
-    Device_bootCPU2(C1C2_BROM_BOOTMODE_BOOT_FROM_RAM);
-#endif
+    (void)tryBootCpu2(BTS_CPU2_BOOT_TIMEOUT_US);
 #endif
 
     //
@@ -1399,6 +1614,10 @@ static void publishStatusToCpu2(void)
         bitset |= (status[ch].calVoltageValid & 0x1) << BTS_STATUS_CAL_V_VALID;
         bitset |= (status[ch].calCurrentValid & 0x1) << BTS_STATUS_CAL_I_VALID;
         bitset |= (status[ch].paused & 0x1) << BTS_STATUS_PAUSED;
+        bitset |= (status[ch].waiting & 0x1) << BTS_STATUS_WAITING;
+        bitset |= (status[ch].balancing & 0x1) << BTS_STATUS_BALANCING;
+        bitset |= (status[ch].ready & 0x1) << BTS_STATUS_READY;
+        bitset |= (status[ch].softStart & 0x1) << BTS_STATUS_SOFT_START;
         bitset |= (status[ch].wdTripped & 0x1) << BTS_STATUS_WD_TRIPPED;
         bitset |= (status[ch].restored & 0x1) << BTS_STATUS_RESTORED;
         cpu1Status.statusBits[ch] = bitset;
@@ -1497,6 +1716,268 @@ void updateStatusRegisters(void)
     publishStatusToCpu2();
 }
 
+
+//
+// ============================================================================
+// CPU2 boot, bounded and non-blocking
+// ============================================================================
+//
+// driverlib's Device_bootCPU2() spins with NO timeout until CPU2's boot ROM
+// reports C2_BOOTROM_BOOTSTS_SYSTEM_READY. If that never happens CPU1 hangs
+// right there - before its background loop starts, so the control tasks, the
+// slot supervision and the trip arming all never run. A dead comms core must
+// not be allowed to take the control core down with it.
+//
+// This does the same handshake as Device_bootCPU2() but never waits longer
+// than BTS_CPU2_BOOT_TIMEOUT_US per attempt. If CPU2's ROM is not ready yet,
+// CPU1 carries on into its background loop and retries from the C3 task
+// (~6.7 Hz) until it gets through. Every step here matches Device_bootCPU2()
+// in device/device.c exactly - only the waits differ - so the two cannot
+// disagree about the protocol.
+//
+// WHAT THIS DOES NOT FIX: a cold power-up with the XDS100 attached. If the
+// probe holds TRSTn high at reset, CPU1's own boot ROM takes the emulation
+// path (SelectMode_Boot.c), finds the EMU key at 0x0D00 cleared by the
+// power-on RAM init, and parks in WAIT_BOOT. This code never runs at all in
+// that case - it is decided in ROM. Unplug the probe for a standalone boot,
+// or let CCS start the cores.
+//
+// Only the FLASH and RAM boot modes are used here, and neither needs the pin
+// muxing Device_bootCPU2() does for the peripheral bootloaders, so that part
+// is not reproduced.
+//
+#if defined(_STANDALONE)
+
+typedef enum {
+    eCpu2BootPending  = 0,   // not yet commanded, or a command was lost
+    eCpu2BootSent     = 1,   // command issued, waiting for the ROM's ACK
+    eCpu2BootAlready  = 2,   // CPU2 was already booted (e.g. by CCS)
+    eCpu2BootAcked    = 3,   // ROM acknowledged and branched to flash
+} BTS_cpu2BootState;
+
+static BTS_cpu2BootState cpu2BootState = eCpu2BootPending;
+static uint32_t          cpu2BootAttempts = 0UL;
+
+//
+// C3 passes to wait for the ROM's ACK before treating a sent command as lost
+// and sending it again. C3 runs at ~6.7 Hz, so 10 passes is ~1.5 s - orders of
+// magnitude longer than the ROM takes to service the command.
+//
+#define BTS_CPU2_ACK_WAIT_PASSES   10U
+static uint16_t          cpu2AckWait = 0U;
+
+//
+// True once CPU2's ROM has acknowledged a boot command.
+//
+static bool cpu2AlreadyBooted(void)
+{
+    uint32_t sts = HWREG(IPC_BASE + IPC_O_BOOTSTS);
+
+    return ((sts & 0x0000000FUL) == C2_BOOTROM_BOOTSTS_C2TOC1_BOOT_CMD_ACK) &&
+           ((sts & 0x80000000UL) != 0UL);
+}
+
+//
+// One bounded attempt. Returns true once CPU2 has been commanded (or was
+// already running), false if its ROM was not ready inside the timeout.
+//
+static bool tryBootCpu2(uint32_t timeoutUs)
+{
+    uint32_t waited = 0UL;
+
+    if ((cpu2BootState == eCpu2BootAcked) ||
+        (cpu2BootState == eCpu2BootAlready)) {
+        return true;
+    }
+
+    //
+    // A command has gone out: confirm it actually landed.
+    //
+    // Sending the command is not the same as CPU2 booting. CPU2's ROM handles
+    // it inside its IPC interrupt, and only reports C2TOC1_BOOT_CMD_ACK once
+    // it has resolved the flash entry and is about to branch there. Observed
+    // 2026-10-08 with the debugger attached: the ROM consumed the command
+    // flag (IPCFLG back to 0) but BOOTSTS went back to SYSTEM_READY rather
+    // than ACK, and CPU2 stayed parked in ROM with I2CA never configured.
+    // This state machine used to record Sent and stop there, so that boot was
+    // lost for good. Now a command that is not acknowledged in time is sent
+    // again.
+    //
+    if (cpu2BootState == eCpu2BootSent) {
+        if (cpu2AlreadyBooted()) {
+            cpu2BootState = eCpu2BootAcked;
+            return true;
+        }
+        if (++cpu2AckWait < BTS_CPU2_ACK_WAIT_PASSES) {
+            return true;
+        }
+        //
+        // No ACK. Fall through and resend - but only once the ROM is back at
+        // SYSTEM_READY, which the wait below checks. Anything else means the
+        // ROM is still busy with the last command and must be left alone.
+        //
+        cpu2AckWait   = 0U;
+        cpu2BootState = eCpu2BootPending;
+    }
+
+    cpu2BootAttempts++;
+
+    //
+    // Already booted - by CCS, or by a previous attempt that this state
+    // somehow missed. Sending a second boot command would be refused by
+    // the ROM anyway; record it and stop.
+    //
+    if (cpu2AlreadyBooted()) {
+        cpu2BootState = eCpu2BootAlready;
+        return true;
+    }
+
+    //
+    // Wait for CPU2's ROM to be ready to accept a command. This is the loop
+    // Device_bootCPU2() runs with no limit.
+    //
+    //
+    // The low nibble must be exactly SYSTEM_READY. Masking with it, as
+    // Device_bootCPU2() does, also passes on 3 (ACK) - harmless there, but
+    // here it would send a second command into a ROM that has just branched.
+    //
+    while ((HWREG(IPC_BASE + IPC_O_BOOTSTS) & 0x0000000FUL) !=
+           C2_BOOTROM_BOOTSTS_SYSTEM_READY) {
+        if (waited >= timeoutUs) {
+            return false;
+        }
+        DEVICE_DELAY_US(BTS_CPU2_BOOT_POLL_US);
+        waited += BTS_CPU2_BOOT_POLL_US;
+    }
+
+    //
+    // The ROM takes the command through IPC flags 0 and 31. Both must be
+    // clear. Flag 0 doubles as BTS_IPC_FLAG_REG_WRITE, but nothing on CPU2
+    // can raise it before CPU2 is running, so it is clear here in practice.
+    //
+    while (((HWREG(IPC_BASE + IPC_O_FLG) & IPC_FLG_IPC0)  != 0UL) ||
+           ((HWREG(IPC_BASE + IPC_O_FLG) & IPC_FLG_IPC31) != 0UL)) {
+        if (waited >= timeoutUs) {
+            return false;
+        }
+        DEVICE_DELAY_US(BTS_CPU2_BOOT_POLL_US);
+        waited += BTS_CPU2_BOOT_POLL_US;
+    }
+
+    HWREG(IPC_BASE + IPC_O_BOOTMODE) = BTS_CPU2_BOOT_MODE;
+    HWREG(IPC_BASE + IPC_O_SENDCOM)  = BROM_IPC_EXECUTE_BOOTMODE_CMD;
+    HWREG(IPC_BASE + IPC_O_SET)      = 0x80000001UL;
+
+    cpu2BootState = eCpu2BootSent;
+    return true;
+}
+
+#endif  // _STANDALONE
+
+
+//
+// Seeds the converter's duty before the gate drive is enabled.
+//
+// WHY THIS EXISTS: without it a slot starts every run from 0% duty.
+//
+// For a CHARGE that is harmless - the output is the cell, the energy flows
+// into it, and starting at zero duty means starting at zero current and
+// ramping up. That is why a 1 A charge ran for the life of the project with
+// nothing to show a problem.
+//
+// For a DISCHARGE into anything that holds the node up - a bench supply, or
+// a cell - 0% is the WORST case, not the safe one. This is a synchronous
+// buck: in discharge, with current below the reverse-current threshold,
+// BTS_ctrlDirection() drives dutyH and dutyL from the same dutySet_pu
+// (bts.h:588), so a high side at ~0% means the low side is effectively on
+// across a node something else is holding at Vout. The whole of Vout then
+// sits across the inductor in the direction that drives current INTO the
+// slot.
+//
+// Measured on hardware 2026-10-02: slot 1 at 3.492 V from a bench supply,
+// 14.41 V input, IMAX 0.1 A. Required duty Vout/Vin = 24.2%; actual 0%. The
+// CMPSS low comparator latched its -9.5 A one-shot (COMPSTS bit 9,
+// TZOSTFLG = 0x0040 DCAEVT1) the instant the slot enabled, while the
+// measured current was 8 mA. The trip was correct and the firmware was not.
+//
+// WHAT IS SEEDED. A buck's steady-state duty is Vout/Vin, so that is the
+// feed-forward term. It is not enough to write it to dutySet_pu alone: the
+// CC controller is a biquad that integrates, and it would start from its own
+// state and drag the duty back. So the biquad's state is preloaded too.
+//
+// The preload is exact rather than approximate, and the arithmetic matters:
+//
+//   DCL_runDF22_C4 computes  uk = ek*b0 + x1
+//                            x1 = ek*b1 + x2 - uk*a1
+//                            x2 = ek*b2      - uk*a2
+//
+// At t = 0 no current is flowing yet, so the current error ek is ~0 and
+// uk reduces to x1. Setting x1 = D makes the very first control effort the
+// feed-forward duty. For the SECOND pass to hold it as well, x2 must satisfy
+// both x1 = x2 - D*a1 and x2 = -D*a2, which is consistent only when
+// 1 + a1 + a2 == 0 - the condition for a pole at z = 1.
+//
+// The shipped CC coefficients have exactly that: a1 = -1.96058023,
+// a2 = +0.96058023, sum with 1 is 0.0 to the last bit. The controller IS an
+// integrator, so x1 = D with x2 = -D*a2 sits the loop at duty D with zero
+// error and no step on any subsequent pass.
+//
+// If a future retune breaks that condition the seed still removes the
+// inrush - x1 = D is what the first edge uses - and the loop converges from
+// a sane duty rather than from zero. It degrades, it does not become unsafe.
+//
+// Vsense_V is used rather than CellVoltage_V because Vsense_V is the
+// ADS131M08, which is the converter's own regulated node and is separately
+// calibrated. CellVoltage_V is the 12-bit internal ADC.
+//
+static void BTS_seedConverterDuty(uint16_t ch)
+{
+    float32_t vin  = registers[BTS_REG_IDX(eInputVoltage)];
+    float32_t vout = BTS_measValues[ch].Vsense_V;
+    float32_t duty;
+
+    //
+    // No input, or a node that is not holding any voltage, means there is
+    // nothing to feed forward from. Leaving the duty at zero is correct in
+    // that case: with no output voltage there is no reverse-current path to
+    // guard against, which is the ordinary empty-slot start.
+    //
+    if ((vin <= (float32_t)0.0) || (vout <= (float32_t)0.0)) {
+        BTS_userInputs[ch].dutyRef_pu = (float32_t)0.0;
+        return;
+    }
+
+    duty = vout / vin;
+
+    //
+    // Clamped to the same band the control effort is clamped to, so the seed
+    // can never ask for a duty the loop would immediately reject.
+    //
+    if (duty > BTS_DUTY_SET_MAX_PU) {
+        duty = BTS_DUTY_SET_MAX_PU;
+    }
+    if (duty < BTS_DUTY_SET_MIN_PU) {
+        duty = BTS_DUTY_SET_MIN_PU;
+    }
+
+    BTS_userInputs[ch].dutyRef_pu = duty;
+
+    //
+    // The biquad is NOT preloaded here, and the first version of this
+    // function was wrong to try.
+    //
+    // BTS_tripEpwm() zeroes ctrl_cc->x1 and x2 on every control pass while
+    // tripFlag is set, and tripFlag is set for the whole time a slot is idle.
+    // At 100 kHz a preload written here is erased thousands of times over
+    // before the gate drive enables. Confirmed on hardware 2026-10-02: the
+    // duty reached dutySetRef_pu correctly at 0.2395, x1 read 0.0, and the
+    // slot tripped exactly as it had before.
+    //
+    // dutyRef_pu propagates to dutySetRef_pu through BTS_updateReference(),
+    // and the ISR applies it at the trip-release edge instead.
+    //
+}
+
 void modeCallback(float value, uint16_t channel)
 {
     uint32_t mode = (uint32_t)value;
@@ -1523,6 +2004,43 @@ void modeCallback(float value, uint16_t channel)
         // against eChargeRestrictV / eDischargeRestrictV below. The 10 Hz
         // half lives in C1().
         //
+        //
+        // Arm the pre-charge sequence. Reachable from STOPPED or END only:
+        // a running slot is already past this, and a paused one resumes
+        // rather than re-arming.
+        //
+        // The stored-calibration requirement was REMOVED on 2026-10-02 at the
+        // operator's direction: the shipped per-channel defaults are
+        // pre-calibrated and correct for this hardware, so a slot with no
+        // F-RAM record still has a meaningful differential between its two
+        // sense paths. A forced calibration step will be reintroduced later.
+        //
+        // The original reasoning is kept because it still describes the real
+        // risk: this sequence drives the power stage from the difference
+        // between the two sense paths, so if the defaults are ever wrong for
+        // a board, this is the path that will act on it. It is safe here
+        // because both paths were verified against an external reference on
+        // slot 1 - the ADS131M08 read 3.48 V and the internal ADC 3.53 V
+        // against an applied 3.492 V.
+        //
+        if (mode & BTS_MODE_WAITING) {
+            if (status[channel].running || status[channel].paused) {
+                return;
+            }
+
+            {
+                uint16_t m;
+                for (m = 0; m < NUM_CHANNELS; m++) {
+                    if ((btsSlotLeader[m] == channel) &&
+                        (btsSlotEnabled[m] != 0U)) {
+                        slotWait(m);
+                    }
+                }
+            }
+            updateStatusRegisters();
+            return;
+        }
+
         if (mode & BTS_MODE_CALIBRATE) {
             registers[BTS_REG_IDX(eCalSlot)] = (float32_t)channel;
             calHandleCommand((uint16_t)eCalCmdEnter, (float32_t)0.0);
@@ -1634,6 +2152,14 @@ void modeCallback(float value, uint16_t channel)
             BTS_userInputs[channel].iref_A           = registers[regBase + BTS_SET_I_MAX] * groupShare;
             BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + BTS_SET_I_MIN] * groupShare;
             BTS_userInputs[channel].direction_logic  = status[channel].charging;
+
+            //
+            // Seed the duty BEFORE enable_logic goes high - the next control
+            // ISR acts on enable_logic, so anything set after it is already
+            // a pass late and the first PWM edge has gone out at 0%.
+            //
+            BTS_seedConverterDuty(channel);
+
             BTS_userInputs[channel].enable_logic     = 1;
 
             //
@@ -1671,6 +2197,17 @@ void modeCallback(float value, uint16_t channel)
                 status[m].paused      = status[channel].paused;
                 status[m].wdTripped   = status[channel].wdTripped;
                 status[m].restored    = status[channel].restored;
+
+                //
+                // The pre-charge state travels too. The members' outputs are
+                // paralleled onto one physical rail, so they balance and soft
+                // start as one converter - a host must not see the leader
+                // balancing while its members read idle.
+                //
+                status[m].waiting     = status[channel].waiting;
+                status[m].balancing   = status[channel].balancing;
+                status[m].ready       = status[channel].ready;
+                status[m].softStart   = status[channel].softStart;
 
                 //
                 // The leader's iref_A is ALREADY its per-slot share, so this
@@ -2087,8 +2624,15 @@ void A3(void)
 void B1(void)
 {
     //
-    // Toggle on-board LED to indicate program execution
+    // Pre-charge balance and the two-path divergence check.
     //
+    // Here rather than in C1 because both need a timebase the C chain cannot
+    // offer: the brief's 100 ms soft-start retry, and a divergence fault
+    // prompt enough to matter while a cell is being seated. B1 was empty and
+    // runs three times faster than any single C task.
+    //
+    servicePreChargeBalance();
+    serviceDivergenceFault();
 
     //
     // Execute task B2 the next time CpuTimer1 decrements to 0
@@ -2247,7 +2791,14 @@ void C1(void)
     for (uint16_t ch = 0; ch < NUM_CHANNELS; ch++) {
         if (BTS_measValues[ch].CellVoltage_V < BTS_REVERSE_POLARITY_V) {
             status[ch].reversePolarity = 1;
-            if (status[ch].running) {
+            //
+            // A balancing or soft-starting slot is driving the stage just as
+            // a running one is, so it is stopped on the same evidence. It
+            // does not carry `running`, which is why the test cannot be
+            // slotIsRunning() alone.
+            //
+            if (status[ch].running || status[ch].balancing ||
+                status[ch].softStart) {
                 slotStop(ch);
             }
         } else {
@@ -2392,6 +2943,16 @@ void C3(void)
     //
     BTS_HAL_pollClockHealth();
 
+#ifdef _STANDALONE
+    //
+    // Drive the CPU2 boot to completion: retry a command main() could not
+    // send, and resend one the ROM never acknowledged. Zero timeout - this
+    // runs in the background task chain and must not stall it. A no-op once
+    // CPU2 has acknowledged.
+    //
+    (void)tryBootCpu2(0UL);
+#endif
+
     //
     // Execute task C1 the next time CpuTimer2 decrements to 0
     //
@@ -2497,6 +3058,323 @@ static void serviceTermination(void)
         }
 
         updateStatusRegisters();
+    }
+}
+
+//
+// ==================== Pre-charge balance supervisor ====================
+//
+// Runs in B1 rather than C1. The brief asks for a 100 ms trip retry and a
+// prompt divergence fault, and B1 is both empty and three times faster than
+// the C chain. (The C chain is no longer the 0.69 Hz it was measured at in
+// September - a latent missed-clock detection was keeping the PLL off full
+// speed, and it now runs above nominal - but B1 is still the better home for
+// a 100 ms timebase.)
+//
+// THE SHUNT PLACEMENT IS WHAT MAKES THIS DECIDABLE. The output capacitors sit
+// after the current sense resistor, so the shunt only reads current the
+// switching FETs produce - never charge moving between a cell and the rail
+// through the contacts. So:
+//
+//   voltages match + current zero      rail is balanced, no cell yet
+//   voltages match + current non-zero  a cell is bridging the contacts
+//
+// Without that, "balanced successfully" and "cell inserted" would be the same
+// reading and the sequence could not be sequenced at all.
+//
+// GROUPED MODES: only the leader is supervised. The members' outputs are
+// physically paralleled onto one rail, so balancing the leader balances all
+// of them - and followers have no control loop of their own to run.
+//
+static void servicePreChargeBalance(void)
+{
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        float32_t vAds;
+        float32_t vInt;
+        float32_t iAds;
+        float32_t tol;
+        uint16_t  cellPresent;
+        uint16_t  matched;
+        uint16_t  loaded;
+
+        //
+        // Disabled slots and followers never run the sequence. A follower is
+        // driven by its leader's duty and cannot balance independently.
+        //
+        if ((btsSlotEnabled[ch] == 0U) || (btsSlotIsLeader[ch] == 0U)) {
+            continue;
+        }
+
+        //
+        // Calibration owns the slot outright. Entering it cancels an armed
+        // sequence - we are deliberately bringing up a controlled external
+        // source and must not also be driving the rail.
+        //
+        if (calSlotIsCalibrating(ch)) {
+            if (status[ch].waiting || status[ch].balancing ||
+                status[ch].ready || status[ch].softStart) {
+                slotStop(ch);
+                updateStatusRegisters();
+            }
+            continue;
+        }
+
+        vAds = BTS_measValues[ch].Vsense_V;
+        vInt = BTS_measValues[ch].CellVoltage_V;
+        iAds = fabsf(BTS_measValues[ch].Isense_A);
+
+        cellPresent = (vAds > BTS_INSERT_DETECT_V) ? 1U : 0U;
+
+        //
+        // Tolerance is a fraction of the ADS reading with an absolute floor,
+        // so a near-zero reading does not demand a match tighter than the
+        // 12-bit converter can resolve.
+        //
+        tol = vAds * BTS_BALANCE_TOL_FRAC;
+        if (tol < BTS_BALANCE_TOL_MIN_V) {
+            tol = BTS_BALANCE_TOL_MIN_V;
+        }
+        matched = (fabsf(vInt - vAds) <= tol) ? 1U : 0U;
+        loaded  = (iAds > BTS_BALANCE_ZERO_I_A) ? 1U : 0U;
+
+        //
+        // A slot that has finished its test re-arms once the cell is taken
+        // out, so the next cell is met by an armed slot without an operator
+        // having to command anything.
+        //
+        if (status[ch].finished && !cellPresent) {
+            slotWait(ch);
+            updateStatusRegisters();
+            continue;
+        }
+
+        //
+        // Nothing below applies unless the slot is in the sequence.
+        //
+        if (!status[ch].waiting) {
+            continue;
+        }
+
+        //
+        // The cell went away, at any point in the sequence. Stand the
+        // converter down and re-arm - this is also how a fault is cleared,
+        // per the brief: pull the cell, the slot goes back to waiting.
+        //
+        if (!cellPresent) {
+            if (status[ch].balancing || status[ch].ready ||
+                status[ch].softStart) {
+                slotWait(ch);
+                updateStatusRegisters();
+            }
+            continue;
+        }
+
+        //
+        // ---- SOFT_START ----
+        //
+        if (status[ch].softStart) {
+            //
+            // Holding off after a trip. The converter is already down; wait
+            // out the ~100 ms and try again.
+            //
+            if (softStartHold[ch] > 0U) {
+                softStartHold[ch]--;
+                if (softStartHold[ch] == 0U) {
+                    if (softStartRetries[ch] >= BTS_SOFT_START_MAX_RETRIES) {
+                        //
+                        // Out of attempts. Fault, and leave it faulted until
+                        // the cell is removed.
+                        //
+                        slotStop(ch);
+                        status[ch].waiting = 1;
+                        status[ch].overCurrentTrip = 1;
+                        updateStatusRegisters();
+                    } else {
+                        softStartRetries[ch]++;
+                        BTS_userInputs[ch].enable_logic = 1;
+                        balanceDwell[ch] = 0U;
+                    }
+                }
+                continue;
+            }
+
+            //
+            // A trip during soft start: drop the converter and schedule a
+            // retry rather than failing outright. Inrush into a pre-biased
+            // cell is exactly what soft start exists to survive.
+            //
+            if (BTS_ctrlLoopVariables[ch].tripFlag != 0U) {
+                BTS_userInputs[ch].enable_logic = 0;
+                softStartHold[ch] = BTS_SOFT_START_RETRY_PASSES;
+                continue;
+            }
+
+            //
+            // Done when the average current is no longer negative - the
+            // inductor current is positive across the whole cycle, so the
+            // synchronous rectifier can be engaged without the cell driving
+            // current backwards through it.
+            //
+            if (BTS_measValues[ch].Isense_A >= (float32_t)0.0) {
+                if (++balanceDwell[ch] >= BTS_BALANCE_DWELL_PASSES) {
+                    status[ch].waiting   = 0;
+                    status[ch].softStart = 0;
+                    status[ch].running   = 1;
+                    status[ch].stopped   = 0;
+                    balanceDwell[ch] = 0U;
+                    softStartRetries[ch] = 0U;
+                    updateStatusRegisters();
+                }
+            } else {
+                balanceDwell[ch] = 0U;
+
+                //
+                // Not converging. Give it a bounded time, then treat it as a
+                // failed attempt and retry - the same path a trip takes.
+                //
+                if (++softStartElapsed[ch] > BTS_SOFT_START_TIMEOUT_PASSES) {
+                    BTS_userInputs[ch].enable_logic = 0;
+                    softStartElapsed[ch] = 0U;
+                    softStartHold[ch] = BTS_SOFT_START_RETRY_PASSES;
+                }
+            }
+            continue;
+        }
+
+        //
+        // ---- READY ----
+        //
+        if (status[ch].ready) {
+            //
+            // A load appearing on a matched rail is the insertion: the shunt
+            // cannot see cell-to-rail charge transfer, so any current here is
+            // the converter meeting a cell that is now connected.
+            //
+            if (loaded) {
+                if (++balanceDwell[ch] >= BTS_BALANCE_DWELL_PASSES) {
+                    status[ch].ready     = 0;
+                    status[ch].softStart = 1;
+                    //
+                    // Out of the balancing duty path: from here the control
+                    // loop runs, in diode emulation, into a connected cell.
+                    //
+                    btsSlotPreCharging[ch] = 0U;
+                    BTS_userInputs[ch].enable_logic = 1;
+                    balanceDwell[ch] = 0U;
+                    softStartRetries[ch] = 0U;
+                    softStartHold[ch] = 0U;
+                    updateStatusRegisters();
+                }
+                continue;
+            }
+
+            //
+            // READY is re-verified, not latched: an unloaded output capacitor
+            // drifts, and the operator may take a while to seat the cell.
+            //
+            if (!matched) {
+                slotBalance(ch);
+                updateStatusRegisters();
+            } else {
+                balanceDwell[ch] = 0U;
+            }
+            continue;
+        }
+
+        //
+        // ---- BALANCING ----
+        //
+        if (status[ch].balancing) {
+            if (++balanceDwell[ch] > BTS_BALANCE_TIMEOUT_PASSES) {
+                //
+                // Could not reach the target. Stand down and fault rather
+                // than drive the rail indefinitely.
+                //
+                slotStop(ch);
+                status[ch].waiting = 1;
+                updateStatusRegisters();
+                continue;
+            }
+
+            //
+            // Balanced only when the voltages agree AND nothing is drawing -
+            // a matched pair with current flowing means a cell is already
+            // connected, which is a different state.
+            //
+            if (matched && !loaded) {
+                slotReady(ch);
+                updateStatusRegisters();
+            }
+            continue;
+        }
+
+        //
+        // ---- WAITING ----
+        //
+        // A cell is approaching. If the rail already matches there is nothing
+        // to do; otherwise drive it.
+        //
+        if (matched) {
+            slotReady(ch);
+        } else {
+            slotBalance(ch);
+        }
+        updateStatusRegisters();
+    }
+}
+
+//
+// Faults a RUNNING slot whose two sense paths have diverged.
+//
+// A rapid rise on the converter rail that the ADS path does not see means the
+// cell is no longer bridging the contacts - a cell pulled mid-test, or a
+// contact that has opened - and the converter is now driving into its own
+// output capacitor with the loop still asking for current.
+//
+static void serviceDivergenceFault(void)
+{
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        float32_t vAds;
+        float32_t vInt;
+        float32_t limit;
+
+        if ((slotIsRunning(ch) == 0U) || calSlotIsCalibrating(ch)) {
+            continue;
+        }
+
+        vAds = BTS_measValues[ch].Vsense_V;
+        vInt = BTS_measValues[ch].CellVoltage_V;
+
+        //
+        // Referenced to the ADS path, which is the one that still reads the
+        // cell. A floor keeps a near-zero reading from making any difference
+        // look like 20%.
+        //
+        limit = vAds * BTS_DIVERGE_FAULT_FRAC;
+        if (limit < BTS_BALANCE_TOL_MIN_V) {
+            limit = BTS_BALANCE_TOL_MIN_V;
+        }
+
+        if (fabsf(vInt - vAds) > limit) {
+            if (++divergeDwell[ch] >= BTS_BALANCE_DWELL_PASSES) {
+                uint16_t m;
+
+                for (m = 0; m < NUM_CHANNELS; m++) {
+                    if ((btsSlotLeader[m] == ch) && (btsSlotEnabled[m] != 0U)) {
+                        slotStop(m);
+                        status[m].groupDisconnect = 1;
+                    }
+                }
+                divergeDwell[ch] = 0U;
+                updateStatusRegisters();
+            }
+        } else {
+            divergeDwell[ch] = 0U;
+        }
     }
 }
 

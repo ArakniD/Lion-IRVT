@@ -74,6 +74,14 @@ typedef struct {
      */
     bool     const_voltage;
     bool     const_current;
+    /*
+     * Pre-charge balance. `waiting` stays true through the whole sequence,
+     * so it answers "is this slot armed"; the other three say where in it.
+     */
+    bool     waiting;
+    bool     balancing;
+    bool     ready;
+    bool     soft_start;
     bool     valid;            /* false until the first good read */
 } bts_channel_state_t;
 
@@ -116,7 +124,7 @@ typedef struct {
 } bts_unit_status_t;
 
 /*
- * Calibration window, registers 1200-1252.
+ * Calibration window, registers 1008-1064 - 15 registers.
  *
  * Only refreshed while the unit reports calibration active; the fields hold
  * their last values otherwise, and `active` is what tells them apart. The

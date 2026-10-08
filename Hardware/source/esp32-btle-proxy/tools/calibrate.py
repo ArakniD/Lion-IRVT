@@ -21,6 +21,14 @@ never left driving current.
 The DMM current reading is entered as a MAGNITUDE. The firmware applies the
 discharge sign itself; passing a signed value inverts that slot's current
 calibration.
+
+REGISTER MAP
+------------
+Written against register map v2.1 - 280 registers, top byte address 1116 -
+as defined by components/bts_link/include/bts_regs.h and, authoritatively, by
+the C2000's registers.h. See Docs/api-specification.md section 2.8 for the
+current layout; the address tables in Docs/calibration-design.md predate the
+2026-09-22 settings compression and are flagged as stale there.
 """
 
 from __future__ import annotations
@@ -60,9 +68,18 @@ SLOT_SELECT = uuid(0x0004)
 SLOT_STATUS = uuid(0x000A)
 CAL_CONTROL = uuid(0x000B)
 CAL_STATUS = uuid(0x000C)
+REGISTER_ACCESS = uuid(0x000D)
 
 # ble_cal_cmd_t   { u8 opcode; u8 slot; u16 rsvd; f32 arg; }
 CAL_CMD_FMT = "<BBHf"
+# ble_register_cmd_t { u16 addr; u8 write; u8 count; f32 value; }
+#
+# `addr` is the BYTE address as it appears on the I2C bus; `value` is a native
+# little-endian float, NOT the C2000's big-endian wire format - the ESP32
+# converts inside bts_regs.h. `count` is reserved and must be 1, so a block
+# read is one transaction per register.
+REG_CMD_FMT = "<HBBf"
+REG_CMD_LEN = struct.calcsize(REG_CMD_FMT)
 # ble_cal_status_t, from ble_proto.h - field order is authoritative:
 #   u8 slot; u8 active; u8 v_tick; u8 i_tick; u32 status_bits; u32 result; f32 x9
 CAL_STATUS_FMT = "<BBBBII" + "f" * 9
@@ -130,15 +147,45 @@ BTS_STATUS_CALIBRATING = 12
 BTS_STATUS_CAL_V_VALID = 13
 BTS_STATUS_CAL_I_VALID = 14
 
-# Register map v2: the calibration block sits inside each slot's settings
-# block, at BTS_SET_BASE + ch * BTS_SET_STRIDE + BTS_SET_CAL_FIRST.
-REG_CAL_BASE = 384 + 44
-REG_CAL_STRIDE = 96
+#
+# Register map v2.1 - byte addresses, mirroring bts_regs.h.
+#
+# The calibration block sits inside each slot's settings block, at
+# BTS_SET_BASE + ch * BTS_SET_STRIDE + BTS_SET_CAL_FIRST. On the C2000 the
+# same twelve registers are BTS_CAL_BASE(ch) = BTS_SET_BASE(ch) + 6U, which is
+# register INDEX arithmetic - 6 registers is the 24 bytes below.
+#
+# These carried the v1 numbers (384 + 44, stride 96) until the 2026-09-22
+# settings compression dropped the stride from 24 registers to 18. Both reads
+# succeeded and returned plausible floats, so the only symptom was a
+# before/after gain table quoting another slot's calibration.
+#
+REG_CAL_BASE = 384 + 24         # 408, slot 1's F28V_Gain
+REG_CAL_STRIDE = 72             # BTS_SET_STRIDE, 18 registers
 CAL_FIELDS = [
     "F28V_Gain", "F28V_Offset", "F28I_Gain", "F28I_Offset",
     "IoutGain_pu", "IoutOffset_pu", "IoutGain_A", "IoutOffset_A",
     "VoutGain_pu", "VoutOffset_pu", "VoutGain_V", "VoutOffset_V",
 ]
+CAL_FIELD_COUNT = len(CAL_FIELDS)
+
+#
+# The unit-wide calibration control window, BTS_REG_CAL_SLOT upwards. Written
+# by this script only through characteristic 000d; the firmware polls the
+# whole 15-register burst from 1008 while a calibration is active.
+#
+REG_CAL_SLOT = 1008
+REG_CAL_COMMAND = 1012
+REG_CAL_ARGUMENT = 1016
+REG_CAL_STATUS = 1020
+REG_CAL_RESULT = 1024
+REG_WATCHDOG_REMAINING_S = 1028
+REG_CAL_TELEMETRY_FIRST = 1032  # ads_v_pu .. temp_c, nine floats to 1064
+
+# BTS_TOTAL_REGISTERS, and the top byte address it implies. The slot tuning
+# block (DCL biquad coefficients) occupies 1068-1116 above the unit block.
+TOTAL_REGISTERS = 280
+TOP_REGISTER_ADDR = (TOTAL_REGISTERS - 1) * 4   # 1116
 
 # Capture windows, design doc section 5.1 / 6.6.
 PU_LOW_MAX = 0.2
@@ -342,6 +389,10 @@ class Transport:
         """Persisted gains for `slot`, or None when no register path exists."""
         return None
 
+    async def read_register(self, addr: int) -> Optional[float]:
+        """One register by byte address, or None when unreachable."""
+        return None
+
 
 class BleTransport(Transport):
     """bleak, reusing the connect pattern from ble_verify.py."""
@@ -350,6 +401,7 @@ class BleTransport(Transport):
         self.address = address
         self.http_host = http_host
         self._client: Any = None
+        self._has_registers = False
 
     async def connect(self) -> None:
         try:
@@ -383,7 +435,12 @@ class BleTransport(Transport):
                     f"characteristic {needed} missing - this firmware predates "
                     "BLE_PROTO_VERSION 2 and has no calibration interface"
                 )
-        print(f"connected, mtu={self._client.mtu_size}")
+        # 000d arrived in BLE_PROTO_VERSION 4. It is optional here: without it
+        # the gain read-back falls back to HTTP, and without that too the
+        # before/after table simply has no "before" column.
+        self._has_registers = REGISTER_ACCESS.lower() in uuids
+        print(f"connected, mtu={self._client.mtu_size}"
+              f"{'' if self._has_registers else '  (no register characteristic)'}")
 
     async def close(self) -> None:
         if self._client is not None:
@@ -408,27 +465,70 @@ class BleTransport(Transport):
             raise CalibrationError("slot status record too short to decode")
         return struct.unpack(SLOT_FMT, raw[:SLOT_LEN])[12]
 
-    async def read_cal_block(self, slot: int) -> Optional[dict[str, float]]:
-        """Persisted gains via GET /api/registers, when an HTTP host is known.
+    async def read_register(self, addr: int) -> Optional[float]:
+        """One register over characteristic 000d.
 
-        There is no GATT characteristic for the calibration block, so without
-        an HTTP host the before/after table has no "before" column.
+        A read writes the command with `write` = 0 and reads the reply back
+        from the SAME characteristic, which carries the register's value after
+        the operation.
         """
-        if not self.http_host:
+        if not self._has_registers:
             return None
-        import urllib.request
-
-        addr = REG_CAL_BASE + slot * REG_CAL_STRIDE
-        url = f"http://{self.http_host}/api/registers?addr={addr}&count=12"
+        if addr % 4 or not 0 <= addr <= TOP_REGISTER_ADDR:
+            raise CalibrationError(f"register address {addr} is not a valid "
+                                   f"4-byte-aligned address in 0..{TOP_REGISTER_ADDR}")
         try:
-            with urllib.request.urlopen(url, timeout=5.0) as resp:
-                doc = json.loads(resp.read().decode("utf-8"))
+            await self._client.write_gatt_char(
+                REGISTER_ACCESS, struct.pack(REG_CMD_FMT, addr, 0, 1, 0.0),
+                response=True)
+            raw = await self._client.read_gatt_char(REGISTER_ACCESS)
         except Exception as exc:
-            print(f"  (register read-back failed: {exc})")
+            print(f"  (register {addr} read failed: {exc})")
             return None
-        if not doc.get("ok") or len(doc.get("values", [])) < 12:
+        if len(raw) < REG_CMD_LEN:
             return None
-        return dict(zip(CAL_FIELDS, (float(v) for v in doc["values"][:12])))
+        got_addr, _write, _count, value = struct.unpack(REG_CMD_FMT, raw[:REG_CMD_LEN])
+        if got_addr != addr:
+            print(f"  (register read-back addressed {got_addr}, expected {addr})")
+            return None
+        return float(value)
+
+    async def read_cal_block(self, slot: int) -> Optional[dict[str, float]]:
+        """Persisted gains for `slot`, over BLE if possible, else HTTP.
+
+        Characteristic 000d (BLE_PROTO_VERSION 4) reads one register per
+        transaction, so the twelve-register block costs twelve round trips -
+        acceptable twice per slot. HTTP fetches the block in one GET and is
+        preferred when a host is configured; without either path the
+        before/after table has no "before" column.
+        """
+        addr = REG_CAL_BASE + slot * REG_CAL_STRIDE
+
+        if self.http_host:
+            import urllib.request
+
+            url = (f"http://{self.http_host}/api/registers"
+                   f"?addr={addr}&count={CAL_FIELD_COUNT}")
+            try:
+                with urllib.request.urlopen(url, timeout=5.0) as resp:
+                    doc = json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:
+                print(f"  (register read-back over HTTP failed: {exc})")
+            else:
+                vals = doc.get("values", [])
+                if doc.get("ok") and len(vals) >= CAL_FIELD_COUNT:
+                    return dict(zip(CAL_FIELDS,
+                                    (float(v) for v in vals[:CAL_FIELD_COUNT])))
+
+        if not self._has_registers:
+            return None
+        out: dict[str, float] = {}
+        for i, name in enumerate(CAL_FIELDS):
+            value = await self.read_register(addr + i * 4)
+            if value is None:
+                return None
+            out[name] = value
+        return out
 
 
 class SimBench:
@@ -687,7 +787,10 @@ def configure(cfg: Config, path: Path, force: bool) -> Config:
     cfg.dmm_host = ask("DMM IP address", cfg.dmm_host)
     cfg.dmm_port = int(ask("DMM SCPI port", str(cfg.dmm_port)) or 5025)
     cfg.ble_address = ask("BLE address (blank to scan for BTS-Tester)", cfg.ble_address)
-    cfg.http_host = ask("Tester HTTP host, optional, for the gain read-back",
+    # Optional. The gain read-back works over BLE characteristic 000d alone,
+    # one register per transaction; an HTTP host fetches the twelve-register
+    # block in a single GET instead.
+    cfg.http_host = ask("Tester HTTP host, optional, to speed the gain read-back",
                         cfg.http_host)
     cfg.save(path)
     print(f"  saved to {path}")

@@ -10,11 +10,11 @@ a calibration.
 
 | File | What it is |
 |---|---|
-| [`api-specification.md`](api-specification.md) | Part 1 the HTTP API; Part 2 the **complete I2C register map** — 267 registers in three regions, verified against `registers.h`. The authority for any address |
+| [`api-specification.md`](api-specification.md) | Part 1 the HTTP API; Part 2 the **complete I2C register map** — 280 registers in four regions, verified against `registers.h`. The authority for any address |
 | [`ble-specification.md`](ble-specification.md) | The GATT service: 12 characteristics, packed record layouts, notify behaviour, protocol versioning |
 | [`data-flow.md`](data-flow.md) | How measurements, commands, settings and calibration move between CPU1, CPU2, the ESP32 and a host. Diagrams, the measured rates, the CLA telemetry filter, and the dead paths |
 | [`supervision-and-state-design.md`](supervision-and-state-design.md) | The design contract for the PAUSED state, the host watchdog and F-RAM state persistence |
-| [`calibration-design.md`](calibration-design.md) | The calibration mathematics, opcodes and state machine. **Its register addresses are stale** — use `api-specification.md` for those |
+| [`calibration-design.md`](calibration-design.md) | The calibration mathematics, opcodes and state machine. A design document — for any address, `api-specification.md` §2.8 is the authority |
 | [`calibration-flow.md`](calibration-flow.md) | The calibration procedure and state machine as diagrams |
 | [`hardware-resources.md`](hardware-resources.md) | PIE, ACK groups, XINT, X-BAR, ADC base and CLA1 allocation across both cores |
 
@@ -22,13 +22,27 @@ a calibration.
 
 ## Read this first
 
-> ### Hardware over-current protection is currently DISABLED
+> ### The hardware over-current trips have never fired on a board
 >
-> All eight hardware trips are switched off in this firmware build
-> (`BTS_TRIP_HW_CH1..8_ENABLED (false)`, `bts_user_settings.h:113-120`). The
-> only over-current protection left is a software check that runs once per
-> control pass — fast enough for a gradual overload, **not** fast enough for a
-> genuine short.
+> All eight are **enabled** in this build (`BTS_TRIP_HW_CH1..8_ENABLED (true)`,
+> [`bts_user_settings.h`](../tida-010086/bts_F2837xD_8ch/bts_user_settings.h)),
+> and they are **armed only while a slot is running** — `serviceTripArming()`
+> in `bts_cpu1.c` arms the comparators once a slot is commanded to run and
+> disarms when the last one stops. Arming at boot is not possible: an unpowered
+> sense chain reads as −10 A and would latch a trip on every slot before the
+> board did anything.
+>
+> So a calibrating slot is covered from the moment it starts driving current —
+> with one exception worth knowing: a group is **all-or-nothing**. If the
+> ENABLE strap masks off any member of the group you are calibrating, the whole
+> group is left unrouted and none of it has a hardware trip, even while
+> running. In an ungrouped build (MODE 0) each slot is its own group and the
+> exception does not arise.
+>
+> The caution is therefore not "there is no trip". It is this: **the trips were
+> enabled by a compile-verified change and no board has yet been seen to
+> trip.** The levels (±9.5 A hardware, above the 8 A software trip) have not
+> been measured against a real over-current.
 >
 > Three consequences, all of which matter during calibration because
 > calibration deliberately drives real current:
@@ -36,10 +50,12 @@ a calibration.
 > 1. **Do not run calibration unattended.** Stay at the bench with a hand near
 >    the supply's output switch.
 > 2. **Set the bench supply's own current limit before you start.** 3 A is a
->    sensible backstop for the 2.5 A the procedure draws. The supply's limit is
->    your fast protection, because the unit's is not armed.
-> 3. Consider enabling the hardware trip for the slot you are about to
->    calibrate, if the trip links on that slot are wired.
+>    sensible backstop for the 2.5 A the procedure draws. Treat it as your
+>    fast protection until the unit's own trip has been seen to work.
+> 3. **An untested trip can fail the other way too.** If a sense chain does not
+>    behave as documented, a slot may latch a trip the instant it starts rather
+>    than failing quietly. A slot that trips immediately on every start is this,
+>    not a wiring fault at the terminals.
 
 > ### Enter the DMM current as a MAGNITUDE
 >
@@ -150,6 +166,10 @@ everything before a calibration session.
 I2C write through the proxy, so the traffic does reach the watchdog. But the
 thing that keeps it fed reliably is the proxy's own 250 ms I2C poll — **leave
 the ESP32 powered and connected** for the whole session.
+
+That same poll is what lights the slot LEDs. The proxy owns the strip, so
+unplugging the ESP32 mid-session does not just stop the watchdog being fed —
+it stops the indicators telling you anything. See the troubleshooting table.
 
 ---
 
@@ -326,6 +346,11 @@ shows only that slot:
   `HI set`, `I0 set`, `I1 set`. They clear when you exit or clear.
 - **The slot's LED flashes white** while it is calibrating. A fault colour
   out-ranks it — if the LED shows a trip, the trip is what matters.
+- **The LEDs come from the ESP32 proxy, not from the unit.** The proxy reads
+  each slot's state over its 250 ms I2C poll and drives the strip itself, so a
+  colour can lag the slot it describes by up to about a quarter of a second.
+  It also means the strip has two failure modes of its own — all eight amber,
+  and frozen — both in the troubleshooting table below.
 
 The encoder does nothing during calibration. Press and long-press only write
 to the log; the procedure is driven over BLE or HTTP.
@@ -350,6 +375,8 @@ to the log; the procedure is driven over BLE or HTTP.
 | DMM reads 0 A in the current phase | The lead is in the volts jack. | Move it to the amps jack. |
 | Another slot paused itself partway through the session | The host watchdog. Nothing talked to the unit for 30 s, so every *running* slot paused. The slot under calibration is unaffected. | Expected. Check the ESP32 is powered and its I2C link is up (`GET /api/i2c_diag`), then resume or stop the slot. |
 | A slot shows `restored` after you power-cycled the unit | The F-RAM state block. It was mid-run when the unit went down, and came back paused with its counters rather than resuming into a cell that may have been changed. | Working as designed. Stop it before calibrating; resume it only if you know the same cell is still in the slot. |
+| All eight LEDs flashing amber together | The ESP32 proxy cannot reach the unit over I2C. The proxy itself is alive — it is still driving the strip — but it has nothing current to show. Amber is used for nothing else, so this is always the link, never a slot condition. | Check the I2C wiring between the proxy and the unit, and `GET /api/i2c_diag`. Everything the proxy reports — display, HTTP, BLE — is stale until it clears. |
+| The LEDs are frozen on a colour and never change | The ESP32 is dead, unplugged or held in reset. It drives the strip, and a WS2812B holds its last colour indefinitely once the frames stop — so you are looking at whatever was true when the proxy stopped. **Do not trust them.** A slot showing green may have tripped since. | Confirm it: the display, HTTP and BLE all come from the same ESP32, so they will be gone too. Power-cycle the proxy, then read the slot state back before touching anything. |
 | The AT console prints `WARNING: host watchdog DISABLED` repeatedly | **Known bug.** The message is spurious — supervision is armed. | Ignore it. Confirm with `AT+WD?`, which should answer `+WD=30.00`. |
 | The AT console answers only garbage | **Build skew**, not a hardware fault. The console is served by **CPU2**, and `SCI_setConfig()` derives its divisor from `DEVICE_LSPCLK_FREQ`. Editing the clock config and rebuilding only CPU1 leaves CPU2's divisor built for the old clock. | Rebuild and reload **both** cores, then connect at **115200 8N1**. |
 | The AT console says nothing at all to `AT` | **By design.** `uartRxISR()` matches only `"AT+"`; a bare `AT` is dropped with no `OK` and no `ERROR`. | Probe with a real command, e.g. `AT+InputVoltage?`. |
@@ -375,14 +402,18 @@ Verify the result independently before you trust the unit:
 3. Power-cycle the unit and confirm the values and the green ticks survive.
 4. Deliberately provoke an over-current during a calibration and confirm the
    slot still trips and exits. Do this once on a new unit — it is the check
-   that the safety path is real.
+   that the safety path is real, and as of this writing **no board has been
+   seen to trip**, so on an early unit this is not a formality. Put a scope on
+   the slot's PWM and start low.
 
 ---
 
 ## Safety summary
 
-- **Hardware over-current trips are disabled.** The bench supply's current
-  limit is your fast backstop. Set it. Stay at the bench.
+- **The hardware over-current trips are enabled but unproven.** All eight are
+  armed while a slot runs, at ±9.5 A, above the 8 A software trip. No board has
+  been seen to trip. Keep the bench supply's current limit set and stay at the
+  bench until one has.
 - **The host watchdog is not over-current protection.** It pauses running
   slots 30 s after the host goes quiet — a supervision timeout measured in
   seconds, not a fast trip. It does not make unattended high-current testing

@@ -151,12 +151,20 @@
 #define BTS_TUNING_HEADER_MASK 0xFFFF0000UL
 
 //
-// Polling bound for the blocking I2C helpers. At 160 MHz this is a few
-// hundred microseconds - long enough for a 400 kHz transfer to complete,
-// short enough that a DRDY ISR talking to an absent device does not stall
-// the console. (Was 1000000, i.e. milliseconds per failed attempt.)
+// Polling bound for the blocking I2C helpers.
 //
-#define BTS_I2C_TIMEOUT_ITERATIONS 20000UL
+// Every wait that uses this covers at most one phase - a byte, or START plus
+// an address and two bytes - never a whole record. At 100 kHz one byte is
+// 90 us, so the longest phase is ~270 us. 80000 iterations is several
+// milliseconds at 180 MHz: roughly 10x the longest phase, so slow edges on
+// the 10k pull-ups can never trip it, while a target that is genuinely absent
+// still fails in milliseconds rather than stalling the console.
+//
+// Was 20000, sized when this bus ran at 400 kHz. At 100 kHz that left a
+// margin of only a few phases - too thin for a poll-count bound whose real
+// duration depends on how fast the loop body happens to be.
+//
+#define BTS_I2C_TIMEOUT_ITERATIONS 80000UL
 
 //
 // Idle-loop passes the host bus may sit busy, with no address match,
@@ -212,7 +220,12 @@
 // a real gain/offset pair is established by the calibration procedure and
 // stored in EEPROM.
 //
-#define DEFAULT_F28V_GAIN            1.0f
+//
+// ~2.412:1 divider on the cell-voltage sense, measured on hardware
+// 2026-10-02 (3.492 V cell -> 1.4478 V at the ADC pin). Unity here
+// reported the pin voltage as if it were the cell voltage.
+//
+#define DEFAULT_F28V_GAIN            2.4121f
 #define DEFAULT_F28V_OFFSET          0.0f
 /* Must track BTS_F28I_GAIN_DEFAULT - see the derivation there. */
 #define DEFAULT_F28I_GAIN            9.66f
@@ -319,9 +332,53 @@ __interrupt void ads1119Drdy2ISR(void);
 // Background tasks, driven from the idle loop in main().
 //
 void BTS_serviceADS1119(void);
+
+//
+// Quiet-converter watchdog, in 8 Hz CPU Timer 1 ticks (timerISR()).
+//
+// The ADS1119 runs continuous conversion at 20 SPS, so DRDY falls every
+// 50 ms. adsLastSeenTick[] is stamped each time a sample is published; if a
+// converter that is meant to be running has published nothing for
+// ADS1119_QUIET_TICKS, it is serviced as though DRDY had fired.
+//
+// Why this exists: the whole temperature path hangs off one falling edge per
+// conversion, and nothing else ever starts a read. Any edge that is lost -
+// missed while the PIE group was blocked, eaten by a debugger halt, or simply
+// never delivered - left the state machine in eAdsIdle forever, and every slot
+// reported exactly 0.00 C, the register's power-up value. That was observed on
+// 2026-10-08 after a cold flash boot. A real conversion can never read 0.00:
+// the amplifier holds the input above ground, so the floor is 18.32 C.
+//
+// One second (8 ticks) is twenty conversion periods: far outside anything a
+// healthy converter does, and short enough that a hang shows as one stale
+// reading rather than none at all.
+//
+#define ADS1119_QUIET_TICKS        8U
+//
+// Back-off before re-arming a converter that was disabled after
+// ADS1119_MAX_CONSECUTIVE_FAILURES aborts: 10 s. A genuinely absent part costs
+// one short probe every 10 s; a part that failed transiently (bus glitch,
+// debugger halt mid-frame) comes back by itself.
+//
+#define ADS1119_REARM_TICKS        80U
+static volatile uint32_t     adsTick = 0U;             // 8 Hz, from timerISR()
+static uint32_t              adsLastSeenTick[2] = {0U, 0U};
+static uint32_t              adsDisabledTick[2] = {0U, 0U};
+static bool                  adsArmed[2] = {false, false};
+
+//
+// Diagnostics, readable over JTAG. Kept separate from adsFailCount[], which
+// the state machine resets on every good sample.
+//
+volatile uint16_t BTS_dbgAdsQuietKicks = 0U;   // reads started by the watchdog
+volatile uint16_t BTS_dbgAdsRearms     = 0U;   // disabled converters re-armed
+volatile uint16_t BTS_dbgAdsBusRecoverFails = 0U;
+
+static void ads1119ArmDrdy(uint16_t unit);
 void BTS_serviceDeferredWork(void);
 bool saveSlotTuning(void);
 static bool loadSlotTuning(void);
+static void seedSlotTuningDefaults(void);
 
 //
 // Set when a host writes any slot-tuning register; cleared once the record
@@ -453,7 +510,20 @@ void initI2C_Master(void)
     SysCtl_delay(100U);
     HWREGH(I2CB_BASE + I2C_O_MDR) = 0U;
 
-    I2C_initController(I2CB_BASE, DEVICE_SYSCLK_FREQ, 400000, I2C_DUTYCYCLE_50);
+    //
+    // 100 kHz, not 400 kHz. The bus has only 10k pull-ups, and the rise time
+    // of an RC pull-up is 0.8473 * R * C: 424 ns at a near-ideal 50 pF and
+    // 847 ns at 100 pF. Fast mode allows 300 ns, so at 400 kHz this bus was
+    // out of spec at any realistic capacitance - edges arriving late enough
+    // to be sampled wrong, which looks like a NACK, an arbitration loss, or a
+    // frame that never finishes. Standard mode allows 1000 ns, which 10k
+    // meets up to ~118 pF.
+    //
+    // Nothing on this bus needs the bandwidth. The longest transfer is a
+    // 162-byte calibration record, ~15 ms at 100 kHz, and it happens once
+    // at boot. Running at 400 kHz would need ~2.2k pull-ups.
+    //
+    I2C_initController(I2CB_BASE, DEVICE_SYSCLK_FREQ, 100000, I2C_DUTYCYCLE_50);
     I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
     I2C_setBitCount(I2CB_BASE, I2C_BITCOUNT_8);
 
@@ -608,6 +678,188 @@ static bool i2cRecoverBus(void)
     return freed;
 }
 
+//
+//=============================================================================
+// I2CB bus-owner tracking
+//=============================================================================
+//
+// WHY THIS EXISTS. I2CB carries three devices driven by two incompatible
+// styles - blocking F-RAM helpers and a non-blocking ADS1119 state machine -
+// and when it wedges, everything on it goes quiet at once with nothing to
+// say who did it. On 2026-10-08 the controller was found with BB latched,
+// I2CSAR = 0x50 and I2CCNT = 66: a slot-state F-RAM write abandoned four
+// bytes in. Reconstructing that took a debugger and an afternoon. This
+// records it as it happens.
+//
+// Every transfer is bracketed: i2cbBegin() when it takes the bus,
+// i2cbStep() as it advances, i2cbEnd() when it lets go. Read over JTAG:
+//
+//   i2cbOwner      who holds the bus RIGHT NOW. NONE when idle. If the bus
+//                  is busy and this says NONE, nothing in firmware owns it -
+//                  a target is holding the wire, or a stop never landed.
+//   i2cbLast       the most recent transfer, start to finish.
+//   i2cbFaultSnap  frozen the FIRST time a transfer fails or the bus is
+//                  found stuck. Never overwritten, so the original culprit
+//                  survives the recovery and everything after it. Clear
+//                  i2cbFaultSnap.valid by hand to arm it again.
+//   i2cbHist[]     the last I2CB_HIST_LEN transfers; i2cbHistHead is the
+//                  next slot to be written, so the oldest is at Head.
+//
+// Cost: a few stores per transfer, and ~420 words of RAM.
+//
+typedef enum {
+    eI2cbOwnNone      = 0,
+    eI2cbOwnFramRead  = 1,    // i2cReadBlock  (F-RAM)
+    eI2cbOwnFramWrite = 2,    // i2cWriteBlock (F-RAM)
+    eI2cbOwnAdsCmd    = 3,    // ads1119Write  (start-up, blocking)
+    eI2cbOwnAdsRead   = 4,    // ads1119ReadAfterCommand (start-up, blocking)
+    eI2cbOwnAdsData   = 5,    // state machine: RDATA
+    eI2cbOwnAdsMux    = 6,    // state machine: mux WREG
+    eI2cbOwnAdsStart  = 7,    // state machine: START/SYNC
+    eI2cbOwnRecovery  = 8,    // i2cMasterWaitBusFree() reset / bit-bang
+} BTS_i2cbOwner;
+
+typedef enum {
+    eI2cbEndOpen      = 0,    // still in flight (or abandoned without an end)
+    eI2cbEndOk        = 1,
+    eI2cbEndBusBusy   = 2,    // could not start: bus never came free
+    eI2cbEndNack      = 3,    // target did not acknowledge
+    eI2cbEndTimeout   = 4,    // a phase never completed
+    eI2cbEndStopStuck = 5,    // stop requested but never reached the wire
+} BTS_i2cbEnd;
+
+typedef struct {
+    uint16_t owner;           // BTS_i2cbOwner
+    uint16_t devAddr;         // 7-bit target
+    uint16_t memAddr;         // F-RAM word address, or ADS command byte
+    uint16_t count;           // bytes requested
+    uint16_t done;            // bytes actually moved before it ended
+    uint16_t step;            // last step reached, owner-specific
+    uint16_t end;             // BTS_i2cbEnd
+    uint16_t str;             // I2CSTR at the end
+    uint16_t mdr;             // I2CMDR at the end
+    uint16_t cnt;             // I2CCNT at the end
+    uint32_t seq;             // monotonic transfer number
+} BTS_i2cbTrace;
+
+#define I2CB_HIST_LEN  16U
+
+volatile uint16_t      i2cbOwner = eI2cbOwnNone;
+volatile BTS_i2cbTrace i2cbLast;
+volatile BTS_i2cbTrace i2cbFaultSnap;
+volatile uint16_t      i2cbFaultSnapValid = 0U;
+volatile BTS_i2cbTrace i2cbHist[I2CB_HIST_LEN];
+volatile uint16_t      i2cbHistHead = 0U;
+static   uint32_t      i2cbSeq = 0UL;
+
+//
+// Per-outcome tallies, so a pattern shows without reading the ring.
+//
+volatile uint32_t BTS_dbgI2cbEnds[6] = {0UL, 0UL, 0UL, 0UL, 0UL, 0UL};
+
+//
+// Owner of the last transfer at the moment the bus was found stuck and had to
+// be forced free. The single most useful value when the bus wedges.
+//
+volatile uint16_t BTS_dbgI2cbStuckOwner = 0U;
+
+static void i2cbBegin(uint16_t owner, uint16_t devAddr,
+                      uint16_t memAddr, uint16_t count)
+{
+    i2cbOwner        = owner;
+    i2cbLast.owner   = owner;
+    i2cbLast.devAddr = devAddr;
+    i2cbLast.memAddr = memAddr;
+    i2cbLast.count   = count;
+    i2cbLast.done    = 0U;
+    i2cbLast.step    = 0U;
+    i2cbLast.end     = eI2cbEndOpen;
+    i2cbLast.str     = 0U;
+    i2cbLast.mdr     = 0U;
+    i2cbLast.cnt     = 0U;
+    i2cbLast.seq     = ++i2cbSeq;
+}
+
+static inline void i2cbStep(uint16_t step, uint16_t done)
+{
+    i2cbLast.step = step;
+    i2cbLast.done = done;
+}
+
+static void i2cbEnd(uint16_t end)
+{
+    uint16_t h;
+
+    i2cbLast.end = end;
+    i2cbLast.str = HWREGH(I2CB_BASE + I2C_O_STR);
+    i2cbLast.mdr = HWREGH(I2CB_BASE + I2C_O_MDR);
+    i2cbLast.cnt = HWREGH(I2CB_BASE + I2C_O_CNT);
+
+    if (end < 6U) {
+        BTS_dbgI2cbEnds[end]++;
+    }
+
+    h = i2cbHistHead;
+    i2cbHist[h] = i2cbLast;
+    i2cbHistHead = (uint16_t)((h + 1U) % I2CB_HIST_LEN);
+
+    //
+    // First failure only. A recovery that follows - and every transfer after
+    // it - must not erase the evidence of what started the trouble.
+    //
+    if ((end != eI2cbEndOk) && (i2cbFaultSnapValid == 0U)) {
+        i2cbFaultSnap      = i2cbLast;
+        i2cbFaultSnapValid = 1U;
+    }
+
+    i2cbOwner = eI2cbOwnNone;
+}
+
+//
+// Ends a frame properly, whatever state it is in.
+//
+// Requests the stop if one is not already armed, waits for it to actually
+// reach the wire, and resets the module if it never does - so the bus is
+// never handed on with BB latched. Every F-RAM exit, good or bad, goes
+// through here.
+//
+// The previous failure paths called I2C_sendStopCondition() and returned at
+// once. BB stays set until the stop is physically seen on the bus, so the
+// next caller found the bus busy, and its own setTargetAddress() was then
+// silently ignored by the module - one failed F-RAM access made the next one
+// fail too, and so on. That is what made a single bad transfer look like a
+// permanently dead F-RAM.
+//
+static void i2cbEndFrame(uint16_t end)
+{
+    uint32_t guard = 0;
+
+    if ((HWREGH(I2CB_BASE + I2C_O_MDR) & I2C_MDR_STP) == 0U) {
+        I2C_sendStopCondition(I2CB_BASE);
+    }
+
+    while (I2C_isBusBusy(I2CB_BASE)) {
+        if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
+            //
+            // The stop never landed. Record THAT before the reset changes
+            // the registers, then reset through nIRS - the documented way to
+            // clear a latched BB without disturbing the clock configuration.
+            //
+            i2cbEnd((end == eI2cbEndOk) ? eI2cbEndStopStuck : end);
+            I2C_disableModule(I2CB_BASE);
+            SysCtl_delay(100U);
+            I2C_enableModule(I2CB_BASE);
+            I2C_clearStatus(I2CB_BASE,
+                            I2C_STS_NO_ACK | I2C_STS_ARB_LOST |
+                            I2C_STS_REG_ACCESS_RDY | I2C_STS_STOP_CONDITION);
+            return;
+        }
+    }
+
+    I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK | I2C_STS_STOP_CONDITION);
+    i2cbEnd(end);
+}
+
 static bool i2cMasterWaitBusFree(void)
 {
     //
@@ -617,6 +869,20 @@ static bool i2cMasterWaitBusFree(void)
     uint32_t guard = 0;
     while (I2C_isBusBusy(I2CB_BASE)) {
         if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
+            //
+            // The bus is stuck. Freeze the evidence FIRST: i2cbLast is the
+            // transfer that left it this way, and the reset below is about to
+            // overwrite the registers it was holding. Then mark the recovery
+            // itself as a transfer so it shows up in the history.
+            //
+            if (i2cbFaultSnapValid == 0U) {
+                i2cbFaultSnap      = i2cbLast;
+                i2cbFaultSnap.str  = HWREGH(I2CB_BASE + I2C_O_STR);
+                i2cbFaultSnap.mdr  = HWREGH(I2CB_BASE + I2C_O_MDR);
+                i2cbFaultSnap.cnt  = HWREGH(I2CB_BASE + I2C_O_CNT);
+                i2cbFaultSnapValid = 1U;
+            }
+            BTS_dbgI2cbStuckOwner = i2cbLast.owner;
             //
             // BB latches until a stop is actually seen on the wire. A
             // transfer that ended without one - a read whose stop was
@@ -652,6 +918,7 @@ static bool i2cMasterWaitBusFree(void)
     }
     return true;
 }
+
 
 //
 // Waits for a requested stop condition to actually appear on the bus.
@@ -692,41 +959,91 @@ static bool i2cWriteBlock(uint16_t devAddr, uint16_t memAddr,
                           const uint16_t *bytes, uint16_t count)
 {
     uint16_t i;
+    uint32_t guard;
+
+    i2cbBegin(eI2cbOwnFramWrite, devAddr, memAddr, count);
 
     if (!i2cMasterWaitBusFree()) {
+        i2cbEnd(eI2cbEndBusBusy);
         return false;
     }
 
+    //
+    // The FM24V10 writes as fast as the bus can clock: no page buffer, no
+    // write-cycle time, no polling for completion. A write is one frame -
+    // S ADDR W, two address bytes, the data, P - and it is committed by the
+    // time the stop is on the wire.
+    //
+    // STP is armed WITH the start, in one write to I2CMDR, so the module
+    // ends the frame itself the moment the byte count reaches zero. It used
+    // to be set only after the last byte had been queued; the module reaches
+    // CNT = 0 and then waits for STP with SCL held low, so anything that
+    // delayed that final write held the whole bus. Arming it up front is
+    // safe because the module honours the count first - the same pattern
+    // ads1119Write() uses for the same reason.
+    //
     I2C_setTargetAddress(I2CB_BASE, devAddr);
-    I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
-    I2C_setDataCount(I2CB_BASE, count + 2U);
-
+    HWREGH(I2CB_BASE + I2C_O_CNT) = count + 2U;
     I2C_putData(I2CB_BASE, (memAddr >> 8) & 0xFFU);
+
+    HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                    I2C_MDR_STP  | I2C_MDR_MST |
+                                    I2C_MDR_TRX  | I2C_MDR_IRS;
+    i2cbStep(1U, 0U);
+
+    //
+    // Second address byte. Wait for the first to be taken, and check the
+    // ADDRESS was acknowledged before pushing anything else: an absent or
+    // unresponsive F-RAM then fails in one byte-time, not a full timeout for
+    // every byte of the record.
+    //
+    guard = 0;
+    while ((I2C_getStatus(I2CB_BASE) & I2C_STS_TX_DATA_RDY) == 0U) {
+        if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
+            i2cbEndFrame(eI2cbEndNack);
+            return false;
+        }
+        if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
+            i2cbEndFrame(eI2cbEndTimeout);
+            return false;
+        }
+    }
     I2C_putData(I2CB_BASE, memAddr & 0xFFU);
-    I2C_sendStartCondition(I2CB_BASE);
+    i2cbStep(2U, 0U);
 
     for (i = 0; i < count; i++) {
-        uint32_t guard = 0;
+        guard = 0;
         while ((I2C_getStatus(I2CB_BASE) & I2C_STS_TX_DATA_RDY) == 0U) {
+            if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
+                i2cbEndFrame(eI2cbEndNack);
+                return false;
+            }
             if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
-                I2C_sendStopCondition(I2CB_BASE);
+                i2cbEndFrame(eI2cbEndTimeout);
                 return false;
             }
         }
         I2C_putData(I2CB_BASE, bytes[i] & 0xFFU);
-    }
-
-    I2C_sendStopCondition(I2CB_BASE);
-
-    if (!i2cMasterWaitReady()) {
-        return false;
+        i2cbStep(3U, i + 1U);
     }
 
     //
-    // ARDY only says the module finished its own work; the stop still
-    // has to land before the bus belongs to anyone else.
+    // The stop is already armed; wait for the module to finish and for the
+    // stop to reach the wire. A NACK on the final byte still surfaces here.
     //
-    i2cMasterWaitStopComplete();
+    guard = 0;
+    while ((I2C_getStatus(I2CB_BASE) & I2C_STS_STOP_CONDITION) == 0U) {
+        if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
+            i2cbEndFrame(eI2cbEndNack);
+            return false;
+        }
+        if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
+            i2cbEndFrame(eI2cbEndTimeout);
+            return false;
+        }
+    }
+
+    i2cbEndFrame(eI2cbEndOk);
     return true;
 }
 
@@ -739,45 +1056,88 @@ static bool i2cReadBlock(uint16_t devAddr, uint16_t memAddr,
 {
     uint16_t i;
 
+    i2cbBegin(eI2cbOwnFramRead, devAddr, memAddr, count);
+
     if (!i2cMasterWaitBusFree()) {
+        i2cbEnd(eI2cbEndBusBusy);
         return false;
     }
 
-    // Phase 1: write the memory address, no stop (repeated start follows).
+    //
+    // Phase 1: write the memory address, NO STOP - a repeated start follows.
+    //
+    // I2CMDR is written outright, never read-modify-written. I2C_setConfig()
+    // and I2C_sendStartCondition() both OR into the register and preserve
+    // STP, so a stop left armed by any earlier transfer rode straight into
+    // this phase. The module then emitted S ADDR P and stopped: the F-RAM
+    // never received the memory address, and the read failed with
+    // I2CMDR = 0x4E20 (STP set) and I2CCNT = 2 (neither address byte sent).
+    // Caught by the I2CB trace on 2026-10-08 - identical on EVERY boot read,
+    // which is why calibration never loaded even though every save worked:
+    // the write path already set I2CMDR in one write.
+    //
     I2C_setTargetAddress(I2CB_BASE, devAddr);
-    I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_SEND_MODE);
-    I2C_setDataCount(I2CB_BASE, 2U);
+    HWREGH(I2CB_BASE + I2C_O_CNT) = 2U;
     I2C_putData(I2CB_BASE, (memAddr >> 8) & 0xFFU);
+    HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                    I2C_MDR_MST  | I2C_MDR_TRX |
+                                    I2C_MDR_IRS;
+    i2cbStep(1U, 0U);
+
+    //
+    // Second address byte once the first has been taken. I2CB has no FIFO
+    // enabled, so I2CDXR holds one byte at a time.
+    //
+    {
+        uint32_t guard = 0;
+        while ((I2C_getStatus(I2CB_BASE) & I2C_STS_TX_DATA_RDY) == 0U) {
+            if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
+                i2cbEndFrame(eI2cbEndNack);
+                return false;
+            }
+            if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
+                i2cbEndFrame(eI2cbEndTimeout);
+                return false;
+            }
+        }
+    }
     I2C_putData(I2CB_BASE, memAddr & 0xFFU);
-    I2C_sendStartCondition(I2CB_BASE);
 
     if (!i2cMasterWaitReady()) {
-        I2C_sendStopCondition(I2CB_BASE);
+        //
+        // i2cMasterWaitReady() clears NO_ACK before returning, so the two
+        // causes are told apart by what is left: a NACK leaves no ARDY.
+        //
+        i2cbEndFrame(eI2cbEndNack);
         return false;
     }
 
-    // Phase 2: repeated start, read count bytes.
-    I2C_setConfig(I2CB_BASE, I2C_CONTROLLER_RECEIVE_MODE);
-    I2C_setDataCount(I2CB_BASE, count);
-    I2C_sendStartCondition(I2CB_BASE);
+    //
+    // Phase 2: repeated start into a read, stop ARMED UP FRONT so the module
+    // ends the frame itself when the count runs out - written outright for
+    // the same reason as phase 1.
+    //
+    HWREGH(I2CB_BASE + I2C_O_CNT) = count;
+    HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
+                                    I2C_MDR_STP  | I2C_MDR_MST |
+                                    I2C_MDR_IRS;
+    i2cbStep(2U, 0U);
 
     for (i = 0; i < count; i++) {
         uint32_t guard = 0;
         while ((I2C_getStatus(I2CB_BASE) & I2C_STS_RX_DATA_RDY) == 0U) {
             if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
-                I2C_sendStopCondition(I2CB_BASE);
+                i2cbEndFrame(eI2cbEndTimeout);
                 return false;
             }
             if (I2C_getStatus(I2CB_BASE) & I2C_STS_NO_ACK) {
-                I2C_clearStatus(I2CB_BASE, I2C_STS_NO_ACK);
-                I2C_sendStopCondition(I2CB_BASE);
+                i2cbEndFrame(eI2cbEndNack);
                 return false;
             }
         }
         bytes[i] = I2C_getData(I2CB_BASE) & 0xFFU;
+        i2cbStep(3U, i + 1U);
     }
-
-    I2C_sendStopCondition(I2CB_BASE);
 
     //
     // Let the stop reach the wire before handing the bus on. Returning
@@ -785,8 +1145,51 @@ static bool i2cReadBlock(uint16_t devAddr, uint16_t memAddr,
     // whose setTargetAddress() is then ignored - which is how a
     // perfectly healthy device ends up looking absent.
     //
-    i2cMasterWaitStopComplete();
+    i2cbEndFrame(eI2cbEndOk);
     return true;
+}
+
+//
+// Boot-time F-RAM read, with retry.
+//
+// WHY. The first I2CB transfer after reset used to fail. The bus trace
+// (i2cbFaultSnap) caught it on 2026-10-08: seq 1, a read of 0x0000 - the
+// channel 0 calibration - NACKed on the device address before either memory
+// address byte was sent. Every later access in the same boot succeeded,
+// including all eight slot-state writes. So the part is present and healthy;
+// the first access just lands before the bus or the F-RAM is ready.
+//
+// It mattered because loadCalibration() treats a failed read as "no stored
+// calibration" and installs compiled defaults without saying so - a slot
+// that had been calibrated came up uncalibrated, on every boot.
+//
+// The FM24V10 needs up to 250 us after power reaches VDD before its first
+// access, and the bus has only just been brought up by initI2C_Master(). A
+// handful of attempts a millisecond apart covers both comfortably.
+//
+// Only a read that NEVER succeeds falls through to defaults. That case is a
+// real absent or wedged F-RAM, and the caller still handles it as before.
+//
+#define FRAM_BOOT_READ_ATTEMPTS   8U
+#define FRAM_BOOT_READ_RETRY_US   1000U
+
+volatile uint16_t BTS_dbgFramBootRetries = 0U;   // extra attempts needed
+volatile uint16_t BTS_dbgFramBootFails   = 0U;   // reads that never succeeded
+
+static bool framReadBoot(uint16_t memAddr, uint16_t *bytes, uint16_t count)
+{
+    uint16_t attempt;
+
+    for (attempt = 0U; attempt < FRAM_BOOT_READ_ATTEMPTS; attempt++) {
+        if (i2cReadBlock(EEPROM_I2C_ADDR, memAddr, bytes, count)) {
+            return true;
+        }
+        BTS_dbgFramBootRetries++;
+        DEVICE_DELAY_US(FRAM_BOOT_READ_RETRY_US);
+    }
+
+    BTS_dbgFramBootFails++;
+    return false;
 }
 
 //
@@ -808,8 +1211,8 @@ static bool i2cReadBlock(uint16_t devAddr, uint16_t memAddr,
 // Used for the bare commands (RESET, START/SYNC, POWERDOWN) and for WREG,
 // which is the same frame with one payload byte appended.
 //
-static bool ads1119Write(uint16_t devAddr, uint16_t cmd,
-                         const uint16_t *data)
+static bool ads1119WriteRaw(uint16_t devAddr, uint16_t cmd,
+                            const uint16_t *data)
 {
     uint16_t count = (data != 0) ? 2U : 1U;
     uint32_t guard;
@@ -883,6 +1286,36 @@ static bool ads1119Write(uint16_t devAddr, uint16_t cmd,
 //
 // Sends a bare single-byte command (RESET, START/SYNC, POWERDOWN).
 //
+static bool ads1119ReadAfterCommandRaw(uint16_t devAddr, uint16_t cmd,
+                                    uint16_t *bytes, uint16_t count);
+
+//
+// Tracked entry points. The bodies are ads1119WriteRaw() and
+// ads1119ReadAfterCommandRaw(); these record the transfer around them so
+// every exit - including the early ones - lands in the I2CB trace.
+//
+static bool ads1119Write(uint16_t devAddr, uint16_t cmd,
+                         const uint16_t *data)
+{
+    bool ok;
+
+    i2cbBegin(eI2cbOwnAdsCmd, devAddr, cmd, (data != 0) ? 2U : 1U);
+    ok = ads1119WriteRaw(devAddr, cmd, data);
+    i2cbEnd(ok ? eI2cbEndOk : eI2cbEndTimeout);
+    return ok;
+}
+
+static bool ads1119ReadAfterCommand(uint16_t devAddr, uint16_t cmd,
+                                    uint16_t *bytes, uint16_t count)
+{
+    bool ok;
+
+    i2cbBegin(eI2cbOwnAdsRead, devAddr, cmd, 0U);
+    ok = ads1119ReadAfterCommandRaw(devAddr, cmd, bytes, count);
+    i2cbEnd(ok ? eI2cbEndOk : eI2cbEndTimeout);
+    return ok;
+}
+
 static bool ads1119Command(uint16_t devAddr, uint16_t cmd)
 {
     return ads1119Write(devAddr, cmd, 0);
@@ -907,7 +1340,7 @@ static bool ads1119WriteConfig(uint16_t devAddr, uint16_t cfg)
 //
 // Used by RREG (configuration or status) and RDATA.
 //
-static bool ads1119ReadAfterCommand(uint16_t devAddr, uint16_t cmd,
+static bool ads1119ReadAfterCommandRaw(uint16_t devAddr, uint16_t cmd,
                                     uint16_t *bytes, uint16_t count)
 {
     uint16_t i;
@@ -1038,7 +1471,7 @@ bool readEEPROM(uint16_t channel, BTS_channelCalibration* data)
     uint16_t bytes[CAL_EEPROM_BYTES];
     uint16_t eepromAddr = CAL_FRAM_BASE + channel * CAL_FRAM_STRIDE_BYTES;
 
-    if (!i2cReadBlock(EEPROM_I2C_ADDR, eepromAddr, bytes, CAL_EEPROM_BYTES)) {
+    if (!framReadBoot(eepromAddr, bytes, CAL_EEPROM_BYTES)) {
         return false;
     }
     bytesToCalibration(bytes, data);
@@ -1102,7 +1535,20 @@ static bool validateCalibration(const BTS_channelCalibration* cal, uint16_t chan
     if (cal->MaxCellTemp < -40.0f || cal->MaxCellTemp > 100.0f) {
         return false;
     }
-    if (cal->F28V_Gain < 0.5f || cal->F28V_Gain > 2.0f || cal->F28V_Offset < -1.0f || cal->F28V_Offset > 1.0f) {
+    //
+    // The voltage gain band is 2.0..3.0 because the on-chip cell-voltage
+    // sense sits behind a ~2.412:1 resistive divider: the ADC sees
+    // 1.4478 V for a 3.492 V cell, and the gain is what undoes that.
+    //
+    // It used to be 0.5..2.0, which could not express 2.412 AT ALL. The
+    // default of 1.0 sat inside that band and looked valid, so nothing
+    // complained - and every host read the voltage AT THE PIN while calling
+    // it a cell voltage. Measured on hardware 2026-10-02: a 3.492 V cell
+    // reported as 1.45 V. A discharge cut-off of 2.5 V compares against that
+    // number, so the slot reads as already below its floor while the cell is
+    // still full.
+    //
+    if (cal->F28V_Gain < 2.0f || cal->F28V_Gain > 3.0f || cal->F28V_Offset < -1.0f || cal->F28V_Offset > 1.0f) {
         return false;
     }
     //
@@ -1274,7 +1720,7 @@ void loadCalibration(void)
     //
     // Global charge/discharge voltage thresholds.
     //
-    if (i2cReadBlock(EEPROM_I2C_ADDR, EEPROM_GLOBAL_V_ADDR, voltageBytes, 16U)) {
+    if (framReadBoot(EEPROM_GLOBAL_V_ADDR, voltageBytes, 16U)) {
         float32_t voltages[4];
         uint16_t *dst = (uint16_t *)voltages;
         uint16_t i;
@@ -1304,6 +1750,21 @@ void loadCalibration(void)
     // CPU1 applies both this and the calibration above when it sees the
     // single CAL_RELOAD flag raised after this function returns.
     //
+    //
+    // Seed the compile-time defaults FIRST, then let the stored record
+    // overwrite them if there is one.
+    //
+    // THIS HAS TO HAPPEN ON CPU2. registers[] lives in CPU2TOCPU1RAM, which
+    // the F2837xD makes writable only by CPU2 - CPU1's writes to it are
+    // silently discarded by the hardware. BTS_seedSlotTuningRegisters() on
+    // CPU1 therefore never took effect, and every DCL coefficient
+    // initialised to zero. A biquad with all-zero coefficients produces a
+    // constant zero output, so no slot could regulate at all.
+    //
+    // Found on hardware 2026-10-02: AT+CVB0? read 0.00 where the shipped
+    // default is 8.0377, and BTS_ctrl_cv[0].b0 was 0.0 on the live target.
+    //
+    seedSlotTuningDefaults();
     (void)loadSlotTuning();
 
     //
@@ -1470,6 +1931,34 @@ bool saveSlotTuning(void)
 // the shipped tuning rather than on zeros - a zeroed biquad outputs a
 // constant zero and no slot would regulate at all.
 //
+//
+// Writes the compile-time BTS_DCL_* constants into the tuning registers.
+//
+// The mirror of BTS_seedSlotTuningRegisters() on CPU1, which cannot work
+// because CPU1 may not write CPU2TOCPU1RAM. CPU1 keeps its copy for the
+// clamp check in BTS_applySlotTuning(), which only READS registers[].
+//
+static void seedSlotTuningDefaults(void)
+{
+    uint16_t base = BTS_REG_IDX(BTS_TUNING_BASE_ADDR);
+
+    registers[base + BTS_TUNE_CC_B0] = BTS_DCL_CC_B0;
+    registers[base + BTS_TUNE_CC_B1] = BTS_DCL_CC_B1;
+    registers[base + BTS_TUNE_CC_B2] = BTS_DCL_CC_B2;
+    registers[base + BTS_TUNE_CC_A1] = BTS_DCL_CC_A1;
+    registers[base + BTS_TUNE_CC_A2] = BTS_DCL_CC_A2;
+
+    registers[base + BTS_TUNE_CV_Z0] = BTS_DCL_CV_Z0;
+    registers[base + BTS_TUNE_CV_Z1] = BTS_DCL_CV_Z1;
+    registers[base + BTS_TUNE_CV_P1] = BTS_DCL_CV_P1;
+
+    registers[base + BTS_TUNE_CV_B0] = BTS_DCL_CV_B0;
+    registers[base + BTS_TUNE_CV_B1] = BTS_DCL_CV_B1;
+    registers[base + BTS_TUNE_CV_B2] = BTS_DCL_CV_B2;
+    registers[base + BTS_TUNE_CV_A1] = BTS_DCL_CV_A1;
+    registers[base + BTS_TUNE_CV_A2] = BTS_DCL_CV_A2;
+}
+
 static bool loadSlotTuning(void)
 {
     uint16_t bytes[TUNING_TOTAL_WORDS * 2U];
@@ -1478,7 +1967,7 @@ static bool loadSlotTuning(void)
     uint32_t stored;
     uint16_t i;
 
-    if (!i2cReadBlock(EEPROM_I2C_ADDR, TUNING_FRAM_ADDR, bytes,
+    if (!framReadBoot(TUNING_FRAM_ADDR, bytes,
                       TUNING_TOTAL_WORDS * 2U)) {
         return false;
     }
@@ -1615,7 +2104,7 @@ static bool readSlotState(uint16_t channel, BTS_slotRuntimeState *st)
     uint16_t addr = STATE_FRAM_BASE + channel * STATE_FRAM_STRIDE;
     uint16_t i;
 
-    if (!i2cReadBlock(EEPROM_I2C_ADDR, addr, bytes, STATE_EEPROM_BYTES)) {
+    if (!framReadBoot(addr, bytes, STATE_EEPROM_BYTES)) {
         return false;
     }
     for (i = 0; i < (uint16_t)sizeof(BTS_slotRuntimeState); i++) {
@@ -1665,6 +2154,14 @@ static bool saveSlotState(uint16_t channel)
     }
     if ((bits & (1UL << BTS_STATUS_END)) != 0UL) {
         flags |= BTS_STATE_F_END;
+    }
+    //
+    // An armed slot comes back armed. Only WAITING is carried; the rest of
+    // the pre-charge sequence is re-derived from the live sense readings
+    // within a few supervisor passes of boot.
+    //
+    if ((bits & (1UL << BTS_STATUS_WAITING)) != 0UL) {
+        flags |= BTS_STATE_F_WAITING;
     }
 
     st.header           = BTS_STATE_MAKE_HEADER(channel);
@@ -2090,19 +2587,26 @@ void initADS1119(void)
 #endif
 
     //
-    // Now the bus is idle, accept DRDY. Clear anything the PIE latched while
-    // the converters were being configured, otherwise a stale edge fires the
-    // ISR immediately and it contends with this still-unfinished init.
+    // Now the bus is idle, accept DRDY.
     //
-    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
-
+    // ads1119ArmDrdy() clears each channel's stale PIE flag and acknowledges
+    // group 1 before enabling. Acknowledging alone, as this used to, leaves a
+    // flag that latched during the configuration writes above in place, and
+    // it fires the ISR into this still-unfinished init the moment the enable
+    // lands.
+    //
+    // A converter that failed its start-up check is not armed here, but it is
+    // no longer abandoned: the back-off in ads1119Supervise() retries it.
+    //
     if (ok1) {
-        GPIO_enableInterrupt(GPIO_INT_XINT1);
-        Interrupt_enable(INT_XINT1);
+        ads1119ArmDrdy(0U);
+    } else {
+        adsDisabledTick[0] = adsTick;
     }
     if (ok2) {
-        GPIO_enableInterrupt(GPIO_INT_XINT2);
-        Interrupt_enable(INT_XINT2);
+        ads1119ArmDrdy(1U);
+    } else {
+        adsDisabledTick[1] = adsTick;
     }
 }
 
@@ -2275,6 +2779,7 @@ static uint16_t              adsBusBusyPasses[2] = {0U, 0U};
 // stall was detected HERE, on the path that had no recovery at all before.
 //
 volatile uint16_t BTS_dbgAdsBusStalls = 0U;
+
 static uint32_t              adsDwellStart[2] = {0U, 0U};
 static uint16_t              adsSampleCh[2] = {0U, 0U};
 
@@ -2283,14 +2788,19 @@ static uint16_t              adsSampleCh[2] = {0U, 0U};
 // abandoned. The idle loop calls in continuously, so this is a generous
 // ceiling that only trips on genuinely stuck hardware.
 //
-#define ADS1119_PHASE_MAX_POLLS  2000UL
+//
+// Raised from 2000 with the move to 100 kHz: a phase now takes four times as
+// many service calls to complete, and a bound that fires on a healthy but
+// slow transfer aborts a good frame and counts a failure that never happened.
+//
+#define ADS1119_PHASE_MAX_POLLS  8000UL
 
 //
 // Poll bound for the one byte handed over inside the WREG frame. A byte
-// at 400 kHz is about 22 us, so this is generous while staying far
+// at 100 kHz is about 90 us, so this is generous while staying far
 // below the 55 ms interface timeout of the part.
 //
-#define ADS1119_WREG_BYTE_TIMEOUT  20000UL
+#define ADS1119_WREG_BYTE_TIMEOUT  80000UL
 
 //
 // Service calls to dwell on a channel after switching the mux. The idle
@@ -2347,6 +2857,13 @@ static void ads1119Abort(uint16_t unit)
     // with nothing in the status register to say why. Reset the module
     // through nIRS if the stop does not complete promptly.
     //
+    //
+    // Record the failed frame before the stop and reset change the registers.
+    //
+    if (i2cbOwner != eI2cbOwnNone) {
+        i2cbEnd(eI2cbEndTimeout);
+    }
+
     I2C_sendStopCondition(I2CB_BASE);
 
     while (I2C_isBusBusy(I2CB_BASE)) {
@@ -2375,6 +2892,8 @@ static void ads1119Abort(uint16_t unit)
             //
             GPIO_disableInterrupt((unit == 0U) ? GPIO_INT_XINT1
                                                : GPIO_INT_XINT2);
+            adsArmed[unit]        = false;
+            adsDisabledTick[unit] = adsTick;
         }
     }
 }
@@ -2436,7 +2955,16 @@ static void ads1119Service(uint16_t unit)
             if (++adsBusBusyPasses[unit] > ADS1119_BUS_STALL_PASSES) {
                 adsBusBusyPasses[unit] = 0U;
                 BTS_dbgAdsBusStalls++;
-                (void)i2cMasterWaitBusFree();
+                //
+                // The result matters. A recovery that fails leaves the bus
+                // wedged, and the next attempt is another 2000 passes away;
+                // count it so a hardware fault (a target holding SDA, a
+                // missing pull-up) is visible rather than looking like a
+                // converter that merely went quiet.
+                //
+                if (!i2cMasterWaitBusFree()) {
+                    BTS_dbgAdsBusRecoverFails++;
+                }
             }
             return;
         }
@@ -2458,6 +2986,7 @@ static void ads1119Service(uint16_t unit)
         HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_STT |
                                         I2C_MDR_MST  | I2C_MDR_TRX |
                                         I2C_MDR_IRS;
+        i2cbBegin(eI2cbOwnAdsData, devAddr, ADS1119_CMD_RDATA, 2U);
         adsState[unit] = eAdsReadCmd;
         return;
 
@@ -2518,6 +3047,7 @@ static void ads1119Service(uint16_t unit)
             float    mV  = ((float)raw * ADS1119_VREF_MV) / ADS1119_FULL_SCALE;
 
             adsFailCount[unit] = 0U;
+            adsLastSeenTick[unit] = adsTick;
 
             //
             // The first result after a mux change belongs to the old
@@ -2533,6 +3063,7 @@ static void ads1119Service(uint16_t unit)
             // drops any conversion left over from the previous input, so
             // whatever arrives now genuinely belongs to this channel.
             //
+            i2cbEnd(eI2cbEndOk);
             publishCellTemp(ADS1119_SLOT_FOR_AIN(channel) +
                                 (unit * ADS1119_CHANNELS_PER_DEV),
                             mVToTemperature(mV), true);
@@ -2575,7 +3106,7 @@ static void ads1119Service(uint16_t unit)
         // wait for I2CDXR to drain in between, rather than being split
         // across service calls where an interrupt could open a gap.
         //
-        // The wait is for one byte at 400 kHz, roughly 22 us. That is long
+        // The wait is for one byte at 100 kHz, roughly 90 us. That is long
         // by ISR standards but trivial next to the 50 ms budget, and it is
         // the only way to keep the frame contiguous without a transmit FIFO.
         //
@@ -2615,6 +3146,7 @@ static void ads1119Service(uint16_t unit)
         // effect, and every channel keeps sampling AIN0 while the code
         // believes it is cycling.
         //
+        i2cbBegin(eI2cbOwnAdsMux, devAddr, ADS1119_CMD_WREG, 2U);
         adsState[unit] = eAdsMuxDone;
         return;
 
@@ -2634,6 +3166,7 @@ static void ads1119Service(uint16_t unit)
 
         adsGuard[unit] = 0U;
 
+        i2cbEnd(eI2cbEndOk);
         adsState[unit] = eAdsStart;
         return;
 
@@ -2670,6 +3203,7 @@ static void ads1119Service(uint16_t unit)
         // time, so without waiting here the next read would start on top
         // of this one.
         //
+        i2cbBegin(eI2cbOwnAdsStart, devAddr, ADS1119_CMD_START, 1U);
         adsState[unit] = eAdsStartDone;
         return;
 
@@ -2697,6 +3231,7 @@ static void ads1119Service(uint16_t unit)
         // than a smear of the previous channel.
         //
         adsDwellStart[unit] = CPUTimer_getTimerCount(CPUTIMER0_BASE);
+        i2cbEnd(eI2cbEndOk);
         adsState[unit]  = eAdsSettle;
         return;
 
@@ -2854,10 +3389,76 @@ static void i2cbFramRelease(void)
 // Drives both converters. Called from the idle loop; performs at most one
 // step per converter per call and never waits on the bus.
 //
+//
+// Re-arms a converter's DRDY interrupt.
+//
+// Order matters, and it is the sequence the TRM gives for enabling a PIE
+// source that may have latched while masked: disable at the source, clear
+// any flag the PIE is already holding for this channel, acknowledge the
+// group, then enable. Without the clear, a flag latched before the enable
+// fires the ISR immediately; without the acknowledge, a group left latched
+// by an earlier interrupt blocks this one entirely.
+//
+static void ads1119ArmDrdy(uint16_t unit)
+{
+    GPIO_ExternalIntNum xint = (unit == 0U) ? GPIO_INT_XINT1 : GPIO_INT_XINT2;
+    uint32_t            irq  = (unit == 0U) ? INT_XINT1      : INT_XINT2;
+    uint16_t            bit  = (unit == 0U) ? 0x0008U        : 0x0010U;  // INTx4 / INTx5
+
+    GPIO_disableInterrupt(xint);
+    Interrupt_disable(irq);
+
+    EALLOW;
+    HWREGH(PIECTRL_BASE + PIE_O_IFR1) &= (uint16_t)~bit;
+    EDIS;
+    Interrupt_clearACKGroup(INTERRUPT_ACK_GROUP1);
+
+    adsPending[unit]      = 0U;
+    adsLastSeenTick[unit] = adsTick;
+    adsArmed[unit]        = true;
+
+    GPIO_enableInterrupt(xint);
+    Interrupt_enable(irq);
+}
+
+//
+// Supervises one converter, then advances its state machine.
+//
+static void ads1119Supervise(uint16_t unit)
+{
+    uint32_t now = adsTick;
+
+    if (adsArmed[unit]) {
+        //
+        // Quiet-converter watchdog: see ADS1119_QUIET_TICKS. Only from
+        // eAdsIdle - any other state is a transfer in flight that must be
+        // left to finish or abort on its own guard.
+        //
+        if ((adsState[unit] == eAdsIdle) && (adsPending[unit] == 0U) &&
+            ((uint32_t)(now - adsLastSeenTick[unit]) > ADS1119_QUIET_TICKS)) {
+            adsLastSeenTick[unit] = now;   // one kick per quiet interval
+            adsPending[unit]      = 1U;
+            BTS_dbgAdsQuietKicks++;
+        }
+    } else if ((adsFailCount[unit] >= ADS1119_MAX_CONSECUTIVE_FAILURES) &&
+               ((uint32_t)(now - adsDisabledTick[unit]) > ADS1119_REARM_TICKS)) {
+        //
+        // Disabled after repeated failures. Re-arm after the back-off and
+        // let the state machine decide again - a converter that is truly
+        // gone will be disabled again within a few frames.
+        //
+        adsFailCount[unit] = 0U;
+        BTS_dbgAdsRearms++;
+        ads1119ArmDrdy(unit);
+    }
+
+    ads1119Service(unit);
+}
+
 void BTS_serviceADS1119(void)
 {
-    ads1119Service(0U);
-    ads1119Service(1U);
+    ads1119Supervise(0U);
+    ads1119Supervise(1U);
 }
 
 //
@@ -3001,10 +3602,18 @@ static void mirrorCpu1Status(void)
         //
         {
             static uint32_t lastSavedBits[NUM_CHANNELS];
+            //
+            // WAITING is included so an armed slot survives a power cycle.
+            // The other three pre-charge bits are deliberately absent: they
+            // change every few passes while a rail is being driven, and
+            // writing F-RAM on each one would be constant wear for state the
+            // supervisor re-derives at boot anyway.
+            //
             uint32_t stateBits = statusBits[ch] &
                 ((1UL << BTS_STATUS_RUNNING)  | (1UL << BTS_STATUS_STOPPED) |
                  (1UL << BTS_STATUS_CHARGING) | (1UL << BTS_STATUS_DISCHARGING) |
-                 (1UL << BTS_STATUS_PAUSED)   | (1UL << BTS_STATUS_END));
+                 (1UL << BTS_STATUS_PAUSED)   | (1UL << BTS_STATUS_END) |
+                 (1UL << BTS_STATUS_WAITING));
 
             if (stateBits != lastSavedBits[ch]) {
                 lastSavedBits[ch] = stateBits;
@@ -3255,6 +3864,7 @@ __interrupt void timerISR(void)
     mirrorCpu1Status();
     hostWatchdogTick();
     heartbeatTick();
+    adsTick++;          // ADS1119 quiet-converter watchdog timebase
 
     //
     // One slot marked per tick: eight slots spread across the 6 s window.
@@ -4210,6 +4820,15 @@ void main(void)
         //
         BTS_serviceADS1119();
         BTS_serviceDeferredWork();
+
+        //
+        // The WS2812B refresh. Here rather than in the timer ISR because it
+        // blocks for ~360 us - long enough to mask the I2C target interrupts
+        // that serve the ESP32 at several kHz. See led_driver.c.
+        //
+        if (LEDDriver_due()) {
+            LEDDriver_update();
+        }
     }
 }
 

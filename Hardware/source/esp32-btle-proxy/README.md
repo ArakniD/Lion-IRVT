@@ -18,6 +18,9 @@ a GATT service (for a Web Bluetooth UI) and a JSON HTTP API.
 | Flash | 4 MB |
 | Programming port | COM6 (Silicon Labs CP210x) |
 | BTS link | I2C master, SDA = GPIO21, SCL = GPIO22, 100 kHz |
+| Status panel | ST7789 on SPI2/HSPI, MOSI = GPIO23, SCK = GPIO18, DC = GPIO16, RST = GPIO17, BL = GPIO4 |
+| Slot LEDs | 8x WS2812B on SPI3/VSPI, DIN = GPIO13 |
+| Encoder | A = GPIO15, B = GPIO27, switch = GPIO2 |
 | BTS address | `0x50` |
 | Unit envelope | 0–5 V and ±10 A per channel, 8 channels |
 
@@ -51,23 +54,32 @@ the same environment itself.
 
 ---
 
-## Register map v2 and the host watchdog
+## Register map v2.1 and the host watchdog
 
 The BTS register map was reorganised in v2, and **every address moved**. Both
 the C2000 and this firmware must be flashed together - there is no
-compatibility window. The authoritative contract is
-`Docs/supervision-and-state-design.md`; `components/bts_link/include/bts_regs.h`
-is the mirror this project builds against.
+compatibility window. For any individual address the authority is
+`Docs/api-specification.md` §2.8;
+`components/bts_link/include/bts_regs.h` is the mirror this project builds
+against.
 
-Three regions replace the nine scattered blocks of v1:
+Four regions replace the nine scattered blocks of v1:
 
 | Region | Base | Stride | Regs/slot | Range |
 |---|---|---|---|---|
 | runtime (RO) | 0 | 48 B | 12 | 0 – 383 |
-| settings (RW) | 384 | 96 B | 24 | 384 – 1151 |
-| unit | 1152 | — | — | 1152 – 1252 |
+| settings (RW) | 384 | 72 B | 18 | 384 – 959 |
+| unit (mixed) | 960 | — | 27 total | 960 – 1064 |
+| slot tuning (RW) | 1068 | — | 13 total | 1068 – 1116 |
 
-**314 registers, top address 1252.** A slot's whole live state - status, both
+**280 registers, top address 1116.** The settings stride was 24 registers
+until the 2026-09-22 compression merged the charge and discharge limit pairs,
+which pulled the unit base down from 1152 to 960; the slot tuning block - the
+DCL biquad coefficients, one set for the whole unit - was appended above it
+afterwards. Anything still quoting 1152, 1252 or a 24-register stride predates
+that change.
+
+A slot's whole live state - status, both
 measurement paths, temperature and six counters - is one contiguous burst,
 which took the poll cycle from **33 I2C transactions to 9** (8 slots + the
 unit block; 10 while calibration is active). `eChX_MinVoltage`/`MaxVoltage`
@@ -283,6 +295,65 @@ a site can retune a cutoff without a firmware build.
 
 ---
 
+## Slot indicators
+
+Eight WS2812B pixels, one per BTS slot, are driven from this firmware —
+`components/led_strip/`, one `SPI3_HOST` transfer every 25 ms from a FreeRTOS
+task at priority 4. Colour comes from `bts_link_get_snapshot()`, so the
+indicators ride on the poll that was already running and there is nothing to
+feed them.
+
+**This used to be the C2000's job, and it never lit a single pixel.**
+`LEDDriver_update()` clocked raw colour bytes out of SCIA at 800 kbaud, but a
+WS2812B decodes pulse *widths* — 400 ns high is a 0, 800 ns high is a 1, each
+inside a 1250 ns slot — and a UART cannot produce them: it forces a low start
+bit before every byte and holds each data bit for a full bit time, so the strip
+saw framing noise and latched nothing. Fixing it in place needed a peripheral
+that emits a free-running bit pattern, which on that device means SPI — and
+GPIO29, the wire that physically exists, has no SPI mux option, while both
+usable SPI ports are held by the ADS131M08 pair. The full account, including
+the per-slot colour priority chain, is in
+[`Docs/supervision-and-state-design.md` §2.5.1](../Docs/supervision-and-state-design.md#251-slot-indication--the-ws2812b-string).
+
+**SPI3 and not SPI2.** The ST7789 panel holds SPI2, which *is* HSPI: it sits on
+GPIO23/GPIO18 — VSPI's IO_MUX default pads — but reaches them through the GPIO
+matrix, so SPI3 was the genuinely free host. Sharing one would let an LED frame
+stall a panel repaint and vice versa.
+
+**Four SPI bits per WS2812B bit at 2.5 MHz** (80 MHz / 32, so one SPI bit is
+400 ns): `1000` is a 0, `1100` is a 1, landing both symbols on the part's exact
+nominal widths with a 1600 ns slot well inside the 650–1850 ns it tolerates.
+Two WS2812B bits pack into one SPI byte, so the whole eight-LED frame is 96
+bytes in a single 307 us DMA transfer, and MOSI rests low afterwards — which
+covers the 50 us reset latch for free. The rate is a deliberate departure from
+the commonly-cited **3.333 MHz**, where the same `1100` symbol gives
+T1H = 600 ns, *below* the 650 ns minimum for a logic 1. That works on some
+strips and fails on others, which on a safety indicator is the worst failure
+mode available.
+
+**The encoder's B channel moved from GPIO13 to GPIO27** to free the MOSI pin.
+GPIO14 was the other candidate and was rejected: it is MTMS, and with A already
+on MTDO (GPIO15) a second JTAG pin on one encoder would make the box awkward to
+debug later. GPIO27 carries no strapping or JTAG role.
+
+### What it costs
+
+**Indication lags by up to one poll.** Colour derives from the 250 ms I2C
+snapshot rather than from the unit's registers directly, so a state change can
+take ~250 ms longer to reach the strip than a C2000-resident driver would have
+needed. Against an operator's reaction time that is nothing; it is recorded
+because it is a real difference.
+
+**The strip now depends on this firmware being alive.** If the ESP32 is
+unplugged, crashes, or is held in reset it sends no frames at all — and a
+WS2812B latch holds its last colour **indefinitely**, leaving a pixel that
+still shows a slot running when it has since tripped. All eight flashing
+amber in unison covers the case where this firmware is running but cannot
+reach the unit; by construction it cannot cover this firmware being dead.
+Treat the strip as an indicator, never as evidence that a slot is safe.
+
+---
+
 ## BLE interface
 
 One primary service, `e5f10001-9a4c-4b7d-8f2e-1c3a5b7d9f01`. Every
@@ -301,18 +372,28 @@ characteristic shares the base with a 16-bit discriminator in bytes 2–3.
 | `000a` | read, notify | `ble_slot_status_t` |
 | `000b` | write | `ble_cal_cmd_t` |
 | `000c` | read, notify | `ble_cal_status_t` |
+| `000d` | read, write | `ble_register_cmd_t` - raw register access |
 
 All records are packed little-endian, which is what `DataView` with
 `littleEndian=true` reads — note this is the *opposite* of the BTS I2C wire
 format; nothing past `bts_link` sees the C2000's byte order.
 
-`ble_proto.h` is the contract. `BLE_PROTO_VERSION` is **3**, published in the
+`ble_proto.h` is the contract. `BLE_PROTO_VERSION` is **7**, published in the
 unit-status record so a client can refuse to decode a firmware it does not
-understand rather than silently misreading a struct. Proto 3 **appends** to
-`ble_unit_status_t` (the watchdog timeout, 24 B total) and to
-`ble_slot_status_t` (the four pause flags and the six counters, 68 B total);
-no characteristic was renumbered, because the discriminators are the client's
-contract. `tools/ble_verify.py` decodes both and checks the version first.
+understand rather than silently misreading a struct. The interface is
+**append-only**: a newer version adds characteristics and appends fields, so
+every offset an older client decodes stays put and no characteristic is ever
+renumbered - the discriminators are the client's contract.
+
+| Version | What it added |
+|---|---|
+| 3 | The watchdog timeout on `ble_unit_status_t` (24 B), and the pause flags and six counters on `ble_slot_status_t` |
+| 4 | Characteristic `000d`, raw register access - this is what lets a BLE client reach the C2000 mode register, and so charge and discharge, at all |
+| 6 | The two CC/CV regulation flags at the end of the slot record (70 B) |
+| 7 | The four pre-charge balance flags - waiting, balancing, ready, soft start (74 B) |
+
+`tools/ble_verify.py` decodes every readable characteristic, checks the
+version first, and fails rather than misreading a shorter record.
 
 The slot-status notification carries its slot number, so one subscription
 covers all eight. Notifications fire on every state change, and once a second

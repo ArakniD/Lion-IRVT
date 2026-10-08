@@ -125,7 +125,7 @@ shared. Only the persisted validity flags cross, as `calValidFlags[8]`.
 | `CPU1TOCPU2RAM` | 508 words (`0x1FC`) | **516 words** (`0x204`) |
 
 `CPU2TOCPU1RAM` is the binding constraint on any new shared register: each
-costs two words, and v2's 315 registers account for 630 of the 790 used.
+costs two words, and v2.1's 280 registers account for 560 of the 790 used.
 Overflow is a link-time failure, not a runtime one, so the cost of getting it
 wrong is a rebuild — but **check the map** rather than guessing.
 
@@ -477,19 +477,27 @@ transfers at once.
 
 ## 5. Register map strides — v2
 
-The register file is indexed by `byte address / 4`. Under **map v2** the
-nine scattered blocks collapsed into **three regions**, each with a fixed,
-generous per-slot stride so a future field does not move everything again:
+The register file is indexed by `byte address / 4`. Under **map v2.1** the
+nine scattered blocks collapsed into **four regions**, each per-slot region
+with a fixed stride so a future field does not move everything again:
 
 | Region | Base | Regs/slot | Stride | Access | Helper |
 |---|---|---|---|---|---|
 | Runtime | 0 | **12** | 48 B | all RO | `BTS_RT_BASE(ch)` |
-| Settings | 384 | **24** | 96 B | mostly RW | `BTS_SET_BASE(ch)` |
-| Unit | 1152 | 27 total | — | mixed | direct |
+| Settings | 384 | **18** | 72 B | mostly RW | `BTS_SET_BASE(ch)` |
+| Unit | 960 | 27 total | — | mixed | direct |
+| Slot tuning | 1068 | 13 total | — | RW | `BTS_TUNING_BASE_ADDR` |
 
-`TOTAL_REGISTERS` = **315**, top byte address **1256**. Runtime ch7 ends at
-383, immediately before the settings base; settings ch7 ends at 1151,
-immediately before the unit base.
+`TOTAL_REGISTERS` = **280**, top byte address **1116**. Runtime ch7 ends at
+383, immediately before the settings base; settings ch7 ends at 959,
+immediately before the unit base; the unit block ends at 1064 and the tuning
+block sits above it.
+
+The settings stride was 24 registers (96 B) with a unit base of 1152 until the
+2026-09-22 compression merged the charge and discharge limit pairs. The slot
+tuning block — the DCL biquad coefficients, **one set for the whole unit**,
+written once by the system builder — was appended afterwards, which is why
+the map does not end at 1064.
 
 Sub-blocks within a slot, as offsets from their region's base — these are
 what the named macros resolve to:

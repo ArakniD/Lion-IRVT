@@ -7,17 +7,69 @@ serial port. Tooling is written once and pointed at either.
 
 ## 1. Why there are two consoles
 
-The C2000's console lives on **SCIA**, and SCIA is contended four ways:
+The C2000's console lives on **SCIA**, and SCIA is contended. It used to be
+contended four ways; two of those claimants are now gone.
 
-| Claimant | Needs |
-|---|---|
-| AT console | GPIO28 RX + GPIO29 TX |
-| WS2812B LED driver | GPIO29 TX |
-| Channel 1 GPIO trip | GPIO28 as a digital input |
-| CPU1's SFRA GUI | the whole port |
+| Claimant | Needs | Selected by |
+|---|---|---|
+| CPU2's AT console | GPIO28 RX + GPIO29 TX | `BTS_DEBUG_CONSOLE == true` |
+| CPU1's SFRA GUI | the whole port | MODE strap 6 or 7 in a tuning build, at boot |
 
-`BTS_DEBUG_CONSOLE` picks between them at build time, and a **production unit
-gives SCIA to the LEDs** — so a shipped unit has no AT console at all.
+**The WS2812B LED driver is no longer a claimant.** It wanted GPIO29 as a TX
+line, and it never worked: it clocked raw colour bytes out of SCIA at
+800 kbaud, but a WS2812B decodes pulse *widths* — 400 ns high is a 0, 800 ns
+high is a 1, in a 1250 ns slot — and a UART cannot produce them. It forces a
+low start bit before every byte and holds each data bit for a full bit time,
+so the strip saw framing noise and latched nothing. **No pixel ever lit from
+the C2000.** Nor could it be fixed there: driving a WS2812B needs a peripheral
+that emits a free-running bit pattern, which means SPI, and GPIO29 — the wire
+that physically exists — has no SPI mux option at all. The string moved to the
+ESP32, which drives it from SPI3 MOSI on its GPIO13; see
+[`led_strip.h`](../esp32-btle-proxy/components/led_strip/include/led_strip.h)
+and
+[`supervision-and-state-design.md` §2.5.1](supervision-and-state-design.md#251-slot-indication--the-ws2812b-string).
+
+**Channel 1's GPIO trip is no longer a claimant either.**
+`BTS_TRIP_GPIO_CH1_ENABLED` is `(false)` in both arms of the switch in
+[`bts_user_settings.h`](../tida-010086/bts_F2837xD_8ch/bts_user_settings.h).
+Channel 1 keeps its CMPSS over-current trip in every build — the hardware
+comparator that responds in nanoseconds — and the GPIO path was only ever a
+second, slower one.
+
+Of the two claimants that remain, the console is a build-time switch. SFRA is
+resolved at **boot**, by a one-shot `SysCtl_selectCPUForPeripheral()` write
+([`bts_cpu1.c:1382`](../tida-010086/bts_F2837xD_8ch/bts_cpu1.c)): CPU1 keeps
+SCIA only when a tuning build was strapped to a tuning mode, and otherwise
+hands the port to CPU2. Ownership cannot be changed once the unit is running,
+which is why the selection rides on a strap latched at reset rather than on a
+host register.
+
+### The pin conflict is gone; the choice of console is not
+
+**A production unit no longer has to give up its AT console.** The reason it
+lost one was that the LED string needed GPIO29. That constraint has gone.
+GPIO29 is still muxed to `GPIO_29_SCITXDA` unconditionally in
+`BTS_HAL_setupCpu2Pins()`
+([`bts_hal.c:1394`](../tida-010086/bts_F2837xD_8ch/bts_hal.c)) and now simply
+sits idle, so a production build could carry the C2000 console at no cost.
+
+It deliberately does not — `BTS_DEBUG_CONSOLE` is `(false)`, and the ESP32
+proxy remains the primary console by choice. **The proxy was never only a
+workaround for the pin conflict**, and every reason for it that does not
+depend on the LEDs still holds:
+
+- the two grammars are held identical by `check_at_parity.py` (§4), so
+  reaching for the proxy gives nothing up;
+- the proxy is already in the box for BLE, HTTP and the display;
+- it is reachable without opening the enclosure;
+- a shipped unit has a console **without a rebuild** — getting the C2000's
+  back means flipping a `#define` and reflashing both cores.
+
+What changed is only that the *hard* constraint forcing the choice is gone. If
+the C2000 console is ever wanted back, that is now a free decision rather than
+a trade against the slot indicators.
+
+### The two consoles side by side
 
 The ESP32 proxy carries the same interface on its own UART and reaches the
 registers over I2C instead of directly. Nothing is taken back from the unit.
@@ -26,7 +78,8 @@ registers over I2C instead of directly. Nothing is taken back from the unit.
 |---|---|---|
 | Port | SCIA, GPIO28/29 | UART0 |
 | Baud | 115200 8N1 | 115200 8N1 |
-| Available in a production build | **no** | yes |
+| Available in a production build | **not as built** — a build switch, no longer a pin conflict | yes |
+| Needs a rebuild to appear | yes | no |
 | Reaches registers | directly | over I2C |
 | Source | `com_cpu2.c`, `uartRxISR()` | `components/at_console/at_console.c` |
 

@@ -39,13 +39,19 @@ records the known disagreements, including a live one in the ESP32 mirror.
 
 Nine facts that invalidate the obvious guess. Each is confirmed in source.
 
-0. **The register map is v2, and every v1 address is wrong.** Three regions
-   — runtime (base 0, stride 48 B, RO), settings (base 384, stride 96 B),
-   unit (1152–1256) — replacing v1's nine scattered blocks. **315 registers,
-   top address 1256.** A slot's live data is now one contiguous 12-register
-   burst, which took the ESP32 poll cycle from 33 transactions to 9. There is
-   no compatibility window: the C2000 and any host flash together. Complete
-   map: `Docs/api-specification.md` §2.8.
+0. **The register map is v2.1, and every v1 address is wrong.** Four regions
+   — runtime (base 0, stride 48 B, RO), settings (base 384, stride 72 B),
+   unit (960–1064) and slot tuning (1068–1116) — replacing v1's nine
+   scattered blocks. **280 registers, top address 1116.** A slot's live data
+   is now one contiguous 12-register burst, which took the ESP32 poll cycle
+   from 33 transactions to 9. There is no compatibility window: the C2000 and
+   any host flash together. Complete map: `Docs/api-specification.md` §2.8.
+
+   The 2026-09-22 compression merged the charge and discharge limit pairs,
+   taking the settings stride from 24 registers to 18 and pulling the unit
+   base from 1152 to 960; the tuning block was appended afterwards. **Any
+   address in this document quoting 1152, 1224 or 1256 predates that and is
+   wrong** — `registers.h` is authoritative.
 
 1. **`eChX_CellVoltage` / `eChX_CellCurrent` are the 12-bit internal ADC**,
    not the 16-bit ADS131M08 — the opposite of what the naming suggests. The
@@ -163,8 +169,8 @@ flags cross, as `calValidFlags[8]`, because CPU1 needs them for the display
 ticks after a power cycle.
 
 **`CPU2TOCPU1RAM` is the binding constraint on any new shared register.** The
-v2 map's 315 registers cost 630 words on their own. Current occupancy, read
-from the map files after the v2 build:
+v2.1 map's 280 registers cost 560 words on their own. Current occupancy,
+read from the map files after the v2.1 build:
 
 | Block | Used | Free |
 |---|---|---|
@@ -297,9 +303,9 @@ same timestep as its set's mAh and mWh.
 
 ### Host watchdog
 
-A 30 s supervision timeout (`eHostWatchdog_s`, 1196, RW; **0 disables**). On
+A 30 s supervision timeout (`eHostWatchdog_s`, 1004, RW; **0 disables**). On
 expiry every slot that is `CHARGING` or `DISCHARGING` pauses with
-`WD_TRIPPED` set. The live countdown is `eWatchdogRemaining_s` (1220, RO),
+`WD_TRIPPED` set. The live countdown is `eWatchdogRemaining_s` (1028, RO),
 which reads 0 both when fired **and** when disabled — read the timeout beside
 it to tell them apart.
 
@@ -415,20 +421,30 @@ GPIO28/29 do, and the two roles are mutually exclusive:
 | `true` (current) | SCIRXDA | SCITXDA | **SCIA, see the baud warning** | off | off |
 | `false` | ch1 trip in | WS2812B TX | **none** | on | on |
 
-> ### The console's real baud rate is ~7267, not 115200
+> ### The console works at 115200 — the ~7267 advice is withdrawn
 >
-> **Open-issue, root cause not established.** `BTS_CONSOLE_BAUDRATE` is
-> `115200` and `SCI_setConfig()` computes BRR = 42 from
-> `DEVICE_LSPCLK_FREQ` — which by the arithmetic should give about
-> 145 kbaud, already not 115200. In practice the console only works when the
-> host connects at **approximately 7267 baud**; at 115200 every received byte
-> is framing garbage (observed 254, 248, 254, 245 … where `A`, `T`, `+` were
-> sent).
+> **Resolved.** An earlier revision of this document said to connect at
+> ~7267 baud. That was wrong. The console runs at the configured
+> **115200 8N1**.
 >
-> The working rate implies the real LSPCLK is far lower than
-> `DEVICE_LSPCLK_FREQ` claims. This has **not** been confirmed: reading
-> `ClkCfgRegs` over JTAG returned all zeros, a known artefact on this part
-> when the registers are read while the core is running. **Halt the core
+> What looked like a wrong baud rate was **build skew**. The console is served
+> by CPU2, `SCI_setConfig()` derives BRR from `DEVICE_LSPCLK_FREQ`, and the
+> clock configuration was repeatedly edited with only CPU1 rebuilt and
+> reloaded — so CPU2 kept a divisor built for the previous clock and the
+> apparent baud moved every time. Every "independent" measurement of the clock
+> came back through that same console and shared the confound.
+>
+> The clock was never wrong: SYSCLK measures **179.7 MHz** against a
+> configured 180 MHz, LSPCLK is 45 MHz, and the driver programs BRR = 47 for
+> 117188 baud — 1.7 % off 115200 and inside UART tolerance.
+>
+> **Rebuild and reload BOTH cores after any clock change.** A bare `AT` with
+> no reply is separate and by design: `uartRxISR()` matches only `"AT+"`.
+> Probe with `AT+InputVoltage?`.
+>
+> The original guidance below is retained only as a record of the false trail.
+> Reading `ClkCfgRegs` over JTAG returned all zeros, a known artefact on this
+> part when the registers are read while the core is running. **Halt the core
 > before judging the PLL**, and do not change the baud constant until the
 > clock tree has been read properly — the same LSPCLK feeds SPI and the LED
 > driver's 800 kbaud timing.
@@ -494,7 +510,8 @@ physical stimulus at the same instant. `CAL_CMD_COMPUTE_SAVE` runs the
 two-point maths, validates against gain windows, and hands the result to CPU2,
 which writes the F-RAM **from the idle loop, never from an ISR**. Progress is
 a bitfield in `eCalStatus`, failures a code in `eCalResult`, and live
-telemetry streams through the window at 1224-1256.
+telemetry streams through the window at 1032-1064 — the top of the
+15-register calibration window that starts at `eCalSlot` (1008).
 
 Safety properties that must survive any edit: trips stay armed; the
 fixed-current setpoint is clamped to 0.8 pu (≈8 A); the input-voltage
@@ -520,10 +537,14 @@ build coupling**.
 
 > ### They have drifted before — check the mirror when either changes
 >
-> In the v2 reorder `bts_regs.h` lost `eWatchdogRemaining_s` (1220), which put
-> every calibration telemetry address in it 4 bytes low: telemetry at
-> 1220–1252 against the C2000's 1224–1256, `BTS_TOTAL_REGISTERS` 314 against
-> 315, and `BTS_CAL_WINDOW_COUNT` 14 against a 15-register window.
+> In the v2 reorder `bts_regs.h` lost `eWatchdogRemaining_s` (then 1220),
+> which put every calibration telemetry address in it 4 bytes low: telemetry
+> at 1220–1252 against the C2000's 1224–1256, `BTS_TOTAL_REGISTERS` 314
+> against 315, and `BTS_CAL_WINDOW_COUNT` 14 against a 15-register window.
+>
+> Those are **v1 addresses, left as they were at the time** — the same
+> registers are 1028 and 1032–1064 today. A record of what happened stops
+> being evidence if it is renumbered after the fact.
 >
 > `poll_cal_window()` would have misdecoded every telemetry value during a
 > bench calibration, shifted by one register — and **only** during one, since
@@ -643,7 +664,9 @@ time rather than the BTS's fixed 150 ms step.
 
 - **Never insert a register mid-map.** Hosts hard-code byte addresses; every
   addition goes into the spare space its region already carries, or above the
-  current top (1256). Adding one means updating, together: the enum, the
+  current top (1116) — but **there is no spare register left in any region**
+  since the 2026-09-22 compression, so a per-slot field now means a stride
+  change. Adding one means updating, together: the enum, the
   `NUM_*` count, `TOTAL_REGISTERS`, `regConfig[]`, `uartRegConfig[]` (both are
   sized `TOTAL_REGISTERS` and must stay index-aligned), the ESP32
   `bts_regs.h` mirror, and `Docs/api-specification.md`.

@@ -736,6 +736,10 @@ static void fill_status_locked(uint8_t slot, const bts_snapshot_t *snap,
     out->bts_ended             = ch->ended;
     out->bts_const_voltage     = ch->const_voltage;
     out->bts_const_current     = ch->const_current;
+    out->bts_waiting           = ch->waiting;
+    out->bts_balancing         = ch->balancing;
+    out->bts_ready             = ch->ready;
+    out->bts_soft_start        = ch->soft_start;
     out->bts_charge_mah        = ch->charge_mah;
     out->bts_charge_mwh        = ch->charge_mwh;
     out->bts_charge_seconds    = ch->charge_seconds;

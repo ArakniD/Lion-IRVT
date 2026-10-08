@@ -24,18 +24,24 @@
 
 //
 //=============================================================================
-// Register map v2
+// Register map v2.1
 //=============================================================================
 //
-// Three regions with fixed, generous per-slot strides, so a future field does
-// not shift every address again:
+// Four regions with fixed per-slot strides, so a future field does not shift
+// every address again:
 //
 //   runtime   base    0, stride 12 regs (48 B), all RO  - one host burst/slot
-//   settings  base  384, stride 24 regs (96 B)          - one host burst/slot
-//   unit      base 1152
+//   settings  base  384, stride 18 regs (72 B)          - one host burst/slot
+//   unit      base  960, 27 regs                        - 960 to 1064
+//   tuning    base 1068, 13 regs, unit-wide RW          - 1068 to 1116
 //
 // Runtime ch7 ends at 383, immediately before the settings base; settings ch7
-// ends at 1151, immediately before the unit base. Top address is 1256.
+// ends at 959, immediately before the unit base. Top address is 1116.
+//
+// The settings stride was 24 regs (96 B) with a unit base of 1152 until the
+// 2026-09-22 compression merged the charge/discharge limit pairs. Anything
+// still quoting those numbers - or a 1224-1256 telemetry window, or a top of
+// 1256 - predates it. The enum below is authoritative.
 //
 #define BTS_RT_REGS_PER_CH          (12U)
 #define BTS_SET_REGS_PER_CH         (18U)
@@ -382,7 +388,12 @@ typedef enum {
     eCh7_VoutOffset_V = 956,
     //
     // Unit block, base 960. eWatchdogRemaining_s is the live
-    // countdown; calibration telemetry follows at 1224-1256.
+    // countdown; calibration telemetry follows at 1032-1064.
+    //
+    // The 15 registers from eCalSlot (1008) to eCalTemp_C (1064) are the
+    // calibration window the ESP32 reads as one burst. eWatchdogRemaining_s
+    // sits INSIDE it, between eCalResult and the telemetry - a reader that
+    // skips it takes every telemetry float one register low.
     //
     eChargeDisableV = 960,
     eChargeRestrictV = 964,
@@ -448,7 +459,8 @@ typedef enum {
 
 //
 // Sub-blocks within a slot's settings region. The calibration group is 12
-// registers at offset 11; BTS_cpu1Status sizes an array with that count.
+// registers at offset 6 (see BTS_CAL_BASE); BTS_cpu1Status sizes an array
+// with that count. It was offset 11 before the 2026-09-22 compression.
 //
 #define BTS_CAL_REGS_PER_CH         (12U)
 #define BTS_TEMP_REGS_PER_CH        (2U)
@@ -500,6 +512,15 @@ typedef struct {
     uint32_t discharging;
     uint32_t constVoltage;
     uint32_t constCurrent;
+    //
+    // Pre-charge balance (ToDo 08). waiting is the armed state and stays set
+    // through balancing and ready, so one test covers "in the pre-charge
+    // sequence"; the other three say where in it.
+    //
+    uint32_t waiting;
+    uint32_t balancing;
+    uint32_t ready;
+    uint32_t softStart;
     //
     // Grouping state. Packed into bits 8-11 of the published status word.
     // The word is carried to the host as a float32, whose 24-bit significand
@@ -556,9 +577,38 @@ typedef struct {
 //
 // END is an ALIAS for FINISHED (bit 2), not a new bit: that bit was declared
 // from the start and never written, so it is driven now with the END meaning
-// rather than duplicated at bit 16. Bit 16 is therefore free.
+// rather than duplicated at bit 16. Bit 16 was left free here and has since
+// been taken by BTS_STATUS_WAITING below.
 //
 #define BTS_STATUS_PAUSED            15U
+//
+// ==================== Pre-charge balance (ToDo 08) ====================
+//
+// The sequence a slot runs between STOPPED and RUNNING so a cell can be
+// seated onto a rail that already matches it:
+//
+//   WAITING    armed, watching the ADS path for a cell approaching the
+//              contacts. The converter is off.
+//   BALANCING  driving the output capacitors to match the ADS reading. The
+//              cell is NOT yet connected to the rail.
+//   READY      rails matched. Re-verified continuously, because an unloaded
+//              capacitor drifts - this bit CLEARS and returns to BALANCING if
+//              the differential re-opens while the operator is seating it.
+//   SOFT_START diode-emulation (DCM) start into the now-connected cell, with
+//              the synchronous rectifier held off so current cannot flow
+//              backwards out of the cell.
+//
+// MONITORING from the original brief is deliberately absent: an armed slot is
+// by definition watching, so it would never be observably distinct from
+// WAITING, and status bits are nearly exhausted.
+//
+// Bit 16 is used here because it was the one free low bit; the rest continue
+// above 18. The ceiling is bit 23 - see the note below.
+//
+#define BTS_STATUS_WAITING           16U
+#define BTS_STATUS_BALANCING         19U
+#define BTS_STATUS_READY             20U
+#define BTS_STATUS_SOFT_START        21U
 #define BTS_STATUS_END               BTS_STATUS_FINISHED
 #define BTS_STATUS_WD_TRIPPED        17U  /* paused by the host watchdog   */
 #define BTS_STATUS_RESTORED          18U  /* paused by a FRAM boot restore */
@@ -572,6 +622,12 @@ typedef struct {
 #define BTS_MODE_CALIBRATE           0x04U
 #define BTS_MODE_PAUSE               0x08U
 #define BTS_MODE_RESUME              0x10U
+//
+// Arms the pre-charge sequence. Only reachable from STOPPED or END - a
+// stopped slot never auto-arms, which is what keeps a slot that an operator
+// deliberately stopped from driving its rail on its own.
+//
+#define BTS_MODE_WAITING             0x20U
 
 // Bitfield for eTripStatus register
 typedef struct {
@@ -689,6 +745,17 @@ typedef struct _BTS_slotRuntimeState
 #define BTS_STATE_F_RUNNING    0x00000001UL
 #define BTS_STATE_F_CHARGING   0x00000002UL
 #define BTS_STATE_F_END        0x00000004UL
+//
+// Armed for pre-charge balance. Persisted so a slot an operator armed is
+// still armed after a power cycle - otherwise a rack that lost power would
+// come back with every slot disarmed and no indication of it.
+//
+// Only WAITING survives. BALANCING, READY and SOFT_START are transient states
+// the supervisor re-derives within a few passes of boot from the live sense
+// readings, so persisting them would restore a stale position in a sequence
+// whose inputs have moved on.
+//
+#define BTS_STATE_F_WAITING    0x00000008UL
 
 //
 //=============================================================================
@@ -869,8 +936,14 @@ typedef struct {
     uint32_t restoreFlags;   // 3 bits per slot: BTS_STATE_F_* << (ch * 3)
 } BTS_supervision;
 
-#define BTS_STATE_FLAGS_SHIFT(ch)  ((uint16_t)(ch) * 3U)
-#define BTS_STATE_FLAGS_MASK       0x7UL
+//
+// FOUR bits per slot, not three. Widened for BTS_STATE_F_WAITING.
+//
+// 8 slots x 4 bits is exactly 32, so restoreFlags is now completely full -
+// a fifth per-slot flag needs a wider carrier, not another bit.
+//
+#define BTS_STATE_FLAGS_SHIFT(ch)  ((uint16_t)(ch) * 4U)
+#define BTS_STATE_FLAGS_MASK       0xFUL
 
 // CPU2 -> CPU1 single register mailbox. Lives in CPU2TOCPU1RAM.
 typedef struct {
@@ -1012,6 +1085,13 @@ typedef struct
     float32_t dutyH_pu;
     float32_t dutyL_pu;
 
+    //
+    // Set while the converter is held off, cleared when the biquad has been
+    // seeded on the release edge. See BTS_tripEpwm() for why the seed cannot
+    // be written from the task level.
+    //
+    uint16_t seedPending;
+
     uint16_t ctrlMode_logic;
     uint16_t direction_logic;
 
@@ -1032,15 +1112,23 @@ typedef struct
 //   runtime   12 regs/slot  eCh0_Status  .. eCh7_DischargeRuntime_s  (RO)
 //   settings  18 regs/slot  eCh0_Mode    .. eCh7_VoutOffset_V
 //   unit      27 regs total eChargeDisableV .. eCalTemp_C
+//   tuning    13 regs total eDCL_CC_B0      .. eDCL_CV_A2   (unit-wide, RW)
+//
+// The tuning block has no per-slot stride and is indexed by
+// BTS_TUNING_BASE_ADDR rather than through a BASE(ch) macro.
 //
 #define BTS_REG_IDX(addr)           ((uint16_t)((addr) / 4U))
 
 #define BTS_RT_BASE(ch)     (BTS_REG_IDX(eCh0_Status) + (ch) * BTS_RT_REGS_PER_CH)
 #define BTS_SET_BASE(ch)    (BTS_REG_IDX(eCh0_Mode)   + (ch) * BTS_SET_REGS_PER_CH)
 
-// The 12 calibration registers sit at settings offset 11 and keep their
-// internal BTS_CAL_* order, so saveCalibration()/loadCalibration() index
-// through this exactly as before.
+// The 12 calibration registers sit at settings offset 6 - the compression
+// moved them down from 11 - and keep their internal BTS_CAL_* order, so
+// saveCalibration()/loadCalibration() index through this exactly as before.
+//
+// NOTE: this is REGISTER-INDEX arithmetic. The ESP32 mirror's BTS_SET_CAL_FIRST
+// expresses the same offset in BYTES (24). The two files use the same names
+// for different units - do not copy a line between them.
 #define BTS_CAL_BASE(ch)    (BTS_SET_BASE(ch) + 6U)
 #define BTS_TEMP_BASE(ch)   (BTS_SET_BASE(ch) + 5U)
 
