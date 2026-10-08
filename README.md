@@ -18,8 +18,10 @@ host controller.
 | Supervision | **ESP32** (LOLIN32 v1.0.0) | I2C master. Owns the test sequence and cell limits, integrates mAh/mWh, records results, and exposes BLE GATT, a JSON HTTP API and an ST7789 LCD with a rotary encoder. |
 
 The current ESP32 firmware talks BLE and HTTP directly. **Home Assistant
-support is now a custom component**, `Hardware/source/lion-lvrt-integration/`,
-which speaks BLE, HTTP or CAN from the HA side — the tester itself carries no
+support is now a custom component**, in its own repository
+[ha-lion-irvt](https://github.com/ArakniD/ha-lion-irvt) and checked out here as
+the submodule `Hardware/source/lion-lvrt-integration/`. It speaks BLE, HTTP or
+CAN from the HA side — the tester itself carries no
 MQTT or native-API client, and does not need one. The superseded ESPHome
 `esp32-controller/` variant was the only firmware that ever reported to HA
 directly.
@@ -114,7 +116,7 @@ Inside `Hardware/source/`:
 | `esp32-btle-proxy/` | **Current** ESP32 host firmware (ESP-IDF). |
 | `esp32-controller/` | Superseded ESPHome-based controller (2025), which reported to Home Assistant. |
 | `esp32-bridge/` | Superseded Arduino WiFi bridge (2024). |
-| `lion-lvrt-integration/` | **Home Assistant custom component**, plus a firmware-accurate simulator and its pytest suite. Speaks BLE, HTTP or CAN. |
+| `lion-lvrt-integration/` | **Home Assistant custom component** — a git **submodule**, [ha-lion-irvt](https://github.com/ArakniD/ha-lion-irvt). Plus a firmware-accurate simulator and its pytest suite. Speaks BLE, HTTP or CAN. |
 | `Docs/` | The authoritative interface and calibration specifications. Start here. |
 | `references/` | Datasheets and manuals used while writing the firmware: F2837xD TRM, controlCARD guide, ADS131M08, ADS1119, the LOLIN32 schematic, and the XTIDA-010086E3 schematic PDF. |
 | `.claude/` | Agent skills and project notes. |
@@ -153,6 +155,15 @@ barcode-scanner work, not as a starting point.
 ---
 
 ## Building
+
+Clone with the submodule, or the Home Assistant integration directory is
+empty:
+
+```bash
+git clone --recurse-submodules https://github.com/ArakniD/Lion-IRVT.git
+# or, in an existing clone:
+git submodule update --init
+```
 
 ### C2000 firmware
 
@@ -357,7 +368,17 @@ Two things belong here rather than only in the procedure:
 
 ## Home Assistant
 
-`Hardware/source/lion-lvrt-integration/` is a custom component: eight slot
+The integration lives in its own repository,
+[ha-lion-irvt](https://github.com/ArakniD/ha-lion-irvt), so it can be installed
+through HACS without the firmware. It is checked out here as the submodule
+`Hardware/source/lion-lvrt-integration/`, at the same path as before, so its
+test suite finds the firmware's C headers beside it and checks every wire
+layout against them.
+
+To change it: commit inside the submodule and push to ha-lion-irvt, then commit
+the new submodule pointer here.
+
+It is a custom component: eight slot
 devices plus a unit device, with mode selects, start/stop/pause/resume buttons,
 measurements, status binary sensors, configuration numbers and the BTS's own
 per-direction counters. Services cover slot configuration, serial assignment,

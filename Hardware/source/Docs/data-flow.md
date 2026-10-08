@@ -819,5 +819,6 @@ all. Fixed-point removed the failure mode rather than narrowing it.
 
 **This is a breaking wire change.** The two layouts are not distinguishable
 on the wire, so a host must be updated together with the firmware. The
-in-tree decoder (`lion-lvrt-integration/.../protocol/can.py`) and its
-simulator were updated with it.
+decoder in the Home Assistant integration
+(`lion-lvrt-integration/.../protocol/can.py`, now the ha-lion-irvt submodule)
+and its simulator were updated with it.

@@ -62,6 +62,8 @@
  * integration at lion-lvrt-integration/.../protocol/registers.py. It is
  * current as of v2.1, but it is a separate file with no build coupling to
  * either this one or registers.h, so a map change means editing all three.
+ * That directory is a git submodule (ha-lion-irvt), so its edit is a commit
+ * in that repo plus a pointer update here.
  *
  * The strides are deliberately larger than the fields in use, so adding a
  * field later does not move every slot again.

@@ -1,0 +1,4 @@
+[submodule "Hardware/source/lion-lvrt-integration"]
+	path = Hardware/source/lion-lvrt-integration
+	url = https://github.com/ArakniD/ha-lion-irvt.git
+	branch = main
