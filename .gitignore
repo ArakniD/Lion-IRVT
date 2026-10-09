@@ -19,3 +19,6 @@ Hardware/schematics/TIDA-010086/Project Outputs/*
 # CMake build output (ESP-IDF and other CMake projects)
 build/
 cmake-build-*/
+Hardware/source/.claude/settings.local.json
+ti-ccstudio-migrate-to-ti/
+ti-ccstudio-test-migration/
