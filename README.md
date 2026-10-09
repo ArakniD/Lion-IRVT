@@ -17,6 +17,65 @@ host controller.
 | Communication | F28379D **CPU2** | I2C target register file for the host, I2C controller for F-RAM and the ADS1119 temperature converters, UART AT console (debug build), CAN telemetry, calibration and slot-state persistence. |
 | Supervision | **ESP32** (LOLIN32 v1.0.0) | I2C controller. Owns the test sequence and cell limits, integrates mAh/mWh, records results, drives the eight WS2812B slot LEDs, and exposes BLE GATT, a JSON HTTP API with a setup page, WiFi firmware update, and an ST7789 LCD with a rotary encoder. |
 
+## Configuring the unit — MODE and ENABLE switches
+
+Two 8-way DIP switches on the board set how the unit runs. **MODE** decides
+how the eight slots are grouped; **ENABLE** decides how many slots are in
+use. Both are read **once, at power-on** — change a switch, then power-cycle.
+**Turn on exactly one switch on each.** DIP *n* selects setting *n* − 1.
+
+**MODE — slot grouping**
+
+| MODE DIP | `eSlotMode` | Name | Slot groups | Voltage loop from | What it is for |
+|---|---|---|---|---|---|
+| **1** | **0** | Independent | 8 groups of 1 | ADS131M08 | **Normal use.** Eight separate cells, each with its own test |
+| 2 | 1 | Pairs | 1+2, 3+4, 5+6, 7+8 | ADS131M08 | One cell on two slots in parallel, up to twice the current |
+| 3 | 2 | Quads | 1–4, 5–8 | ADS131M08 | One cell on four slots, up to four times the current |
+| 4 *(or none)* | 3 | Octet | 1–8 | ADS131M08 | One cell on all eight slots |
+| 5 | 4 | Independent, internal ADC | 8 groups of 1 | C2000 12-bit ADC | As MODE DIP 1, with the voltage loop closed on the on-chip ADC |
+| 6 | 5 | Pairs, internal ADC | as MODE DIP 2 | C2000 12-bit ADC | As MODE DIP 2, internal ADC |
+| 7 | 6 | Loop tuning — plant | one slot | — | Bench only. SFRA sweep of the converter with its loop open |
+| 8 | 7 | Loop tuning — closed loop | one slot | — | Bench only. SFRA sweep of the closed current loop |
+
+In a group the slots are wired in parallel onto one cell. **Command the lowest
+slot in the group only** — the others follow it. The group's current limit is
+the **total**, shared across its slots; voltage limits apply as written.
+
+**ENABLE — slots in use**
+
+| ENABLE DIP | `eSlotEnable` | Slots enabled | Slots off |
+|---|---|---|---|
+| 1 | 0 | 1 | 2–8 |
+| 2 | 1 | 1–2 | 3–8 |
+| 3 | 2 | 1–3 | 4–8 |
+| 4 *(or none)* | 3 | 1–4 | 5–8 |
+| 5 | 4 | 1–5 | 6–8 |
+| 6 | 5 | 1–6 | 7–8 |
+| 7 | 6 | 1–7 | 8 |
+| **8** | **7** | **all eight** | — |
+
+**Typical settings**
+
+| To run | MODE DIP | ENABLE DIP |
+|---|---|---|
+| Eight cells, one per slot | 1 | 8 |
+| One cell on slot 1 only (bench bring-up) | 1 | 1 |
+| Four cells, two slots each | 2 | 8 |
+| Two cells, four slots each | 3 | 8 |
+| One cell on all eight slots | 4 | 8 |
+
+> **No switch on reads as DIP 4**, which is MODE 3 / ENABLE 3: one group of
+> eight with only slots 1–4 enabled — a combination that cannot run. Always
+> set both straps. And **the straps must agree**: a group that ENABLE cuts
+> short has its hardware over-current trips disabled. Pairs need an even
+> number of slots enabled; quads, four or eight; the octet, all eight.
+
+Check what the unit actually latched in `slot_mode` and `slots_enabled`
+(`GET /api/status`), or `AT+SMD?` / `AT+SEN?` on the ESP32's console, rather
+than trusting the switch positions. Every detail — group semantics, the
+loop-tuning modes, the switch wiring and decode — is in
+[`hardware-resources.md` §11](Hardware/source/Docs/hardware-resources.md#11-mode-and-enable-straps).
+
 ## Status — 2026-10-08
 
 What has run on hardware, as opposed to what compiles. One slot - slot 1 -
@@ -440,15 +499,9 @@ Check a setting against what the unit reports (`slot_mode` and
 `slots_enabled` in `GET /api/status`, or `AT+SMD?` and `AT+SEN?` on the
 ESP32's console) rather than trusting the switch position.
 
-- **MODE** sets the grouping: 0 = eight independent slots, 1 = pairs,
-  2 = quads, 3 = all eight as one group; 4 and 5 are 0 and 1 with the voltage
-  loop on the C2000's internal ADC; 6 and 7 run an SFRA loop sweep on one
-  slot instead of a test.
-- **ENABLE** is the index of the **highest enabled slot**: 0 enables slot 1
-  alone, 7 enables all eight.
-
-So **all slots, independent** is MODE DIP 1 and ENABLE DIP 8. **Slot 1
-alone** is MODE DIP 1 and ENABLE DIP 1.
+What each setting does is in
+[Configuring the unit](#configuring-the-unit--mode-and-enable-switches), at
+the top of this file.
 
 ### Which comparator watches which slot
 
@@ -627,6 +680,7 @@ decision or a gap.
 | ~~The over-current indication never clears~~ | **Fixed 2026-10-09** (build only, no hardware yet). `eTripStatus` and status bit 3 clear when the slot is handed back — clearing the fault on the ESP32 (it sends the unit a new clear-fault mode command, `0x40`), a fresh start, a `WAITING` re-arm, or removing the cell. Deliberately **not** on a stop: the ESP32 sends a stop as its first reaction to a trip, and clearing there would wipe the fault before anyone saw it. |
 | ~~The comparator that trips a slot watched a different slot's current, on slots 2, 3, 5, 7 and 8~~ | **Fixed 2026-10-09, and the routing read back from the board.** Each comparator's input pins are fixed by the device, and the board routes each slot's sense nets for layout, so slot *n* is not watched by `CMPSSn`: slot 2 is `CMPSS3`, slot 3 `CMPSS2`, slot 5 `CMPSS7`, slot 7 `CMPSS8` and slot 8 `CMPSS5`. The firmware assumed `CMPSSn`, so slots 2 and 3 tripped on each other's current and 5, 7 and 8 in a ring — in the ungrouped and pair modes; quads and the octet were unaffected. Each slot is now bound to the comparator on its own current pin (`BTS_TRP_CMPSS_CH1..8`), and on the board slot 2's trip now reads `CMPSS3`. No trip has been forced. See [Which comparator watches which slot](#which-comparator-watches-which-slot). |
 | ~~The MODE and ENABLE straps read 0 after a power cycle, whatever the switches said~~ | **Fixed 2026-10-09, and verified on the board.** The decode table was an initialised array, and this project links with `--ram_model`, so only a debugger load ever wrote it: after a standalone boot from flash it held zeros, and every switch position decoded to MODE 0 / ENABLE 0. It is `const` now, in flash. The table itself was also corrected against the schematic, so each DIP switch selects the setting printed beside it (see [Straps](#straps)). The value reaches the ESP32 correctly: the unit latched MODE 3 / ENABLE 2 and `AT+SMD?` / `AT+SEN?` returned the same. |
+| ~~The slot temperatures stall~~ | **Fixed 2026-10-10, and verified on the board.** About 1.5 % of I2CB frames to the ADS1119s timed out: a new frame was started the moment the bus went free, before the module had cleared the previous frame's stop bit, and the start was lost. Each loss counted as a converter failure and was retried, so readings arrived late and in bursts, and a converter could go quiet for seconds. Every frame now waits for the stop to finish completely. On the board: 4523 good frames to 1 timeout, no converter failures. See [`hardware-resources.md` §10.6](Hardware/source/Docs/hardware-resources.md#106-a-new-frame-must-wait-for-stp-not-just-for-the-bus). |
 | ~~The GPIO trip inputs were configured on every slot~~ | **Fixed 2026-10-09.** They are not fitted on this board, and now have their own switches, `BTS_TRIP_GPIO_CH1..8_ENABLED`, all `false`. Until then the pin setup and X-BAR routing were gated on the CMPSS switches, so enabling the comparators also configured seven unwired inputs and put channel 6's on `INPUT14`, which slots 5–8 need. Only the CMPSS comparators trip now. |
 | ~~The ESP32 panics when the BTS stops answering~~ | **Fixed.** A failed `i2c_master_probe()` in ESP-IDF v6.1 leaves a dangling operation list behind, and the next transfer crashed on it. The proxy no longer scans the bus while the link is down, and resets the bus after any failed transfer. |
 | ~~A spurious `WARNING: host watchdog DISABLED` on the AT console~~ | **Gone.** The warning and its flag were removed on 2026-09-22 (`8070d2e`); nothing prints it any more. |
@@ -654,7 +708,7 @@ decision or a gap.
 | **A calibration commit does not mark a slot calibrated.** | `eCalibrationMode = 2` saves the current gains to F-RAM but keeps whatever validity flags the slot already had, so committing a slot's factory gains still leaves its calibration ticks (`CAL_V_VALID`/`CAL_I_VALID`) clear. The runtime calibration's `CAL_CMD_COMPUTE_SAVE` sets them. |
 | **The global voltage thresholds persist only through a calibration commit.** | `eChargeDisableV` … `eDischargeDisableV` (960–972) take effect when written, but are saved to F-RAM only by `eCalibrationMode = 2`. Write them, then commit, or they revert at the next boot. |
 | **The ESP32's AT console can repeat its last reply.** | Seen once on 2026-10-08: about 17,000 copies of one reply to a single command, with the proxy otherwise healthy. Not yet investigated. It does not affect the C2000, but it will confuse any tool parsing the ESP32's console. |
-| **A cell temperature of 18.32 °C is not a measurement.** | `BTS_NTC_POLY_C0` is 18.323 and the Horner evaluation returns exactly C0 for a zero input, so 18.32–18.90 °C means an **open input** — an empty slot. Measured: empty slots read 18.9 °C. |
+| **A cell temperature of 18.32 °C is not a measurement.** | `BTS_NTC_POLY_C0` is 18.323 and the Horner evaluation returns exactly C0 for a zero input, so 18.32–18.90 °C means an **open input** — an empty slot. Measured 2026-10-10 with only slot 1's thermistor fitted: slots 2–7 read 18.89 °C (an ADS1119 code of about 260) and slot 8 reads 18.32 °C (code 0). |
 | **`bts_regs.h` is a hand-maintained mirror of `registers.h` with no build coupling.** | Adding a register means editing both, and they have drifted twice. Worse, the two files use the **same identifiers for different things**: `BTS_STATUS_*` and `BTS_CAL_ST_*` are bit *positions* on the C2000 and bit *masks* on the ESP32; the `BTS_RT_*`, `BTS_SET_*` and `BTS_CAL_*` offsets are register *indices* on one side and *byte* offsets on the other; and `BTS_RT_BASE` / `BTS_SET_BASE` are function-like macros returning an index on the C2000 and bare byte-address constants on the ESP32. `BTS_RT_STATUS` is `0` in both files, while `BTS_RT_CELL_VOLTAGE` is `1` on the C2000 and `4` on the ESP32. Copying a line between the files compiles and is wrong. |
 | **There is no spare register left in any region.** | The 2026-09-22 compression spent the settings region's slack. A new per-slot field now means another stride change, which moves every address below it and breaks every host — the thing the generous strides were chosen to avoid. `CPU2TOCPU1RAM` is no longer the binding constraint (304 of 1024 words free); the map layout is. |
 | **Every slot must be recalibrated, and the saved state was invalidated too.** | Both F-RAM headers were bumped: the calibration image `0xA5CC` → `0xA5CD` for the `calFlags`/`crc32` revision and the fixed 128-byte stride, and the slot-state record `0x5A5E` → `0x5A5F` for the 64-byte layout. The calibration change also fixed a collision in which channel 4's block overwrote the global voltage thresholds — which consequently had *never* persisted. The state change fixed a 20-word record running 8 bytes into the next slot's header, so that only slot 7 could ever validate. |

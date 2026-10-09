@@ -818,6 +818,30 @@ static void i2cbEnd(uint16_t end)
 //
 // Ends a frame properly, whatever state it is in.
 //
+// True while I2CB cannot take a new frame: the bus is busy, OR the previous
+// frame's STP is still set.
+//
+// The second half is not redundant. The module drops BB when the stop is
+// seen on the wire but clears STP only after SCD - a few cycles later. A
+// frame started in that gap is mangled: the module takes the new STT, emits
+// the start and the address, then never moves another byte, and the frame
+// times out with I2CSTR SCD|XSMT|NACKSNT and I2CMDR still FREE|STT|TRX|IRS
+// (0x6220). The TRM says so outright (SPRUHM8K, I2CMDR.STP): "the user must
+// wait until this bit is clear before initiating a new message." TI's own
+// i2c_ex2_eeprom does the same check.
+//
+// Measured on hardware 2026-10-10, before this check existed: 1.4 % of
+// ADS1119 frames (38 of 2480) timed out exactly this way, each one counted
+// as a converter failure and retried, and one boot-time F-RAM read of the
+// tuning record needed a retry for the same reason.
+//
+static inline bool i2cbNotReady(void)
+{
+    return I2C_isBusBusy(I2CB_BASE) ||
+           ((HWREGH(I2CB_BASE + I2C_O_MDR) & I2C_MDR_STP) != 0U);
+}
+
+//
 // Requests the stop if one is not already armed, waits for it to actually
 // reach the wire, and resets the module if it never does - so the bus is
 // never handed on with BB latched. Every F-RAM exit, good or bad, goes
@@ -838,7 +862,11 @@ static void i2cbEndFrame(uint16_t end)
         I2C_sendStopCondition(I2CB_BASE);
     }
 
-    while (I2C_isBusBusy(I2CB_BASE)) {
+    //
+    // Until the stop has fully completed - STP cleared, not just the bus
+    // free - so the caller after this one cannot start in the gap.
+    //
+    while (i2cbNotReady()) {
         if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
             //
             // The stop never landed. Record THAT before the reset changes
@@ -846,9 +874,9 @@ static void i2cbEndFrame(uint16_t end)
             // clear a latched BB without disturbing the clock configuration.
             //
             i2cbEnd((end == eI2cbEndOk) ? eI2cbEndStopStuck : end);
-            I2C_disableModule(I2CB_BASE);
+            HWREGH(I2CB_BASE + I2C_O_MDR) = 0U;          // drops STP too
             SysCtl_delay(100U);
-            I2C_enableModule(I2CB_BASE);
+            HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_IRS;
             I2C_clearStatus(I2CB_BASE,
                             I2C_STS_NO_ACK | I2C_STS_ARB_LOST |
                             I2C_STS_REG_ACCESS_RDY | I2C_STS_STOP_CONDITION);
@@ -867,7 +895,7 @@ static bool i2cMasterWaitBusFree(void)
     // an absent or wedged device on the bus must not stall the CPU forever.
     //
     uint32_t guard = 0;
-    while (I2C_isBusBusy(I2CB_BASE)) {
+    while (i2cbNotReady()) {
         if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
             //
             // The bus is stuck. Freeze the evidence FIRST: i2cbLast is the
@@ -897,14 +925,20 @@ static bool i2cMasterWaitBusFree(void)
             // configuration survives, so only the enable has to be
             // re-asserted.
             //
-            I2C_disableModule(I2CB_BASE);
+            // I2CMDR is written outright rather than through
+            // I2C_disableModule()/I2C_enableModule(), which only toggle IRS
+            // and so carry a stale STP straight through the reset - the
+            // module would come back still owing the bus a stop, and
+            // i2cbNotReady() would keep reporting it busy.
+            //
+            HWREGH(I2CB_BASE + I2C_O_MDR) = 0U;
             SysCtl_delay(100U);
-            I2C_enableModule(I2CB_BASE);
+            HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_IRS;
             I2C_clearStatus(I2CB_BASE,
                             I2C_STS_NO_ACK | I2C_STS_ARB_LOST |
                             I2C_STS_REG_ACCESS_RDY | I2C_STS_STOP_CONDITION);
 
-            if (!I2C_isBusBusy(I2CB_BASE)) {
+            if (!i2cbNotReady()) {
                 return true;
             }
 
@@ -913,7 +947,7 @@ static bool i2cMasterWaitBusFree(void)
             // problem, a target is holding the wire. Clock it free.
             //
             (void)i2cRecoverBus();
-            return !I2C_isBusBusy(I2CB_BASE);
+            return !i2cbNotReady();
         }
     }
     return true;
@@ -930,7 +964,7 @@ static bool i2cMasterWaitBusFree(void)
 static void i2cMasterWaitStopComplete(void)
 {
     uint32_t guard = 0;
-    while (I2C_isBusBusy(I2CB_BASE)) {
+    while (i2cbNotReady()) {
         if (++guard > BTS_I2C_TIMEOUT_ITERATIONS) {
             return;
         }
@@ -2866,11 +2900,17 @@ static void ads1119Abort(uint16_t unit)
 
     I2C_sendStopCondition(I2CB_BASE);
 
-    while (I2C_isBusBusy(I2CB_BASE)) {
+    //
+    // Until the stop has fully completed (see i2cbNotReady()), and if it
+    // never does, reset with I2CMDR written outright: toggling IRS alone
+    // leaves the STP just requested above in place, and the next frame
+    // would then start into the very gap this wait exists to close.
+    //
+    while (i2cbNotReady()) {
         if (++guard > ADS1119_PHASE_MAX_POLLS) {
-            I2C_disableModule(I2CB_BASE);
+            HWREGH(I2CB_BASE + I2C_O_MDR) = 0U;
             SysCtl_delay(100U);
-            I2C_enableModule(I2CB_BASE);
+            HWREGH(I2CB_BASE + I2C_O_MDR) = I2C_MDR_FREE | I2C_MDR_IRS;
             break;
         }
     }
@@ -2937,7 +2977,13 @@ static void ads1119Service(uint16_t unit)
             return;
         }
 
-        if (I2C_isBusBusy(I2CB_BASE)) {
+        //
+        // i2cbNotReady(), not just I2C_isBusBusy(): the stop that ended the
+        // last frame drops BB a few cycles before the module clears STP, and
+        // a frame started in that gap times out. That was 1.4 % of every
+        // read here - see i2cbNotReady().
+        //
+        if (i2cbNotReady()) {
             //
             // Busy is normal for a few passes while another transfer on this
             // bus finishes. Permanently busy is not, and it used to be
@@ -3083,10 +3129,10 @@ static void ads1119Service(uint16_t unit)
 
     case eAdsSetMux:
         //
-        // The read armed its own stop, so wait for the bus to clear before
-        // starting the configuration frame.
+        // The read armed its own stop, so wait for it to finish - bus free
+        // AND STP cleared - before starting the configuration frame.
         //
-        if (I2C_isBusBusy(I2CB_BASE)) {
+        if (i2cbNotReady()) {
             if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
                 ads1119Abort(unit);
             }
@@ -3151,7 +3197,11 @@ static void ads1119Service(uint16_t unit)
         return;
 
     case eAdsMuxDone:
-        if (I2C_isBusBusy(I2CB_BASE)) {
+        //
+        // Done means the stop has fully completed - STP cleared as well as
+        // the bus free - so whatever starts next cannot land in the gap.
+        //
+        if (i2cbNotReady()) {
             if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
                 ads1119Abort(unit);
             }
@@ -3181,7 +3231,7 @@ static void ads1119Service(uint16_t unit)
         // start it converting again, and the channel would read zero
         // forever with no error anywhere to show why.
         //
-        if (I2C_isBusBusy(I2CB_BASE)) {
+        if (i2cbNotReady()) {
             if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
                 ads1119Abort(unit);
             }
@@ -3208,7 +3258,11 @@ static void ads1119Service(uint16_t unit)
         return;
 
     case eAdsStartDone:
-        if (I2C_isBusBusy(I2CB_BASE)) {
+        //
+        // Wait for the stop to complete fully (see eAdsMuxDone): the next
+        // state is eAdsSettle, which hands the bus to the F-RAM.
+        //
+        if (i2cbNotReady()) {
             if (++adsGuard[unit] > ADS1119_PHASE_MAX_POLLS) {
                 ads1119Abort(unit);
             }
@@ -3369,7 +3423,7 @@ static bool i2cbFramAcquire(void)
     // recover by itself rather than needing a power cycle. It is safe to
     // spin here because this is the idle loop and nothing is in flight.
     //
-    if (I2C_isBusBusy(I2CB_BASE)) {
+    if (i2cbNotReady()) {
         if (!i2cMasterWaitBusFree()) {
             i2cbFramBusy = 0U;
             return false;

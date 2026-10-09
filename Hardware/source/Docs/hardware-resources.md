@@ -33,6 +33,10 @@ runs on this device at all.
 [§10](#10-i2c-buses) covers the two I2C buses: why both run slowly on this
 board's 10 kΩ pull-ups, and the latches that made the F-RAM fail at boot.
 
+[§11](#11-mode-and-enable-straps) covers the **MODE and ENABLE DIP switches**:
+what each setting does, which combinations make sense, and how the switches
+are decoded.
+
 [§7](#7-cla1-allocation) covers CLA1, which is a third processor on this die
 and does not appear in any of the PIE, X-BAR or timer tables — its trigger
 never reaches a PIE channel and its code and data live in RAM blocks the C28x
@@ -1403,21 +1407,161 @@ anyway (`ADS1119_QUIET_TICKS`), and one disabled after repeated failures is
 re-armed after **10 s** (`ADS1119_REARM_TICKS`).
 
 **18.32–18.9 °C is an open input**, not a temperature — the amplifier floor
-for an empty slot.
+for an empty slot. Measured 2026-10-10 with one thermistor fitted (slot 1,
+taped to the ESP32's heat shield, 36.4 °C): slots 2–7 read ADS1119 codes
+around 260 (20 mV, 18.89 °C) and slot 8 reads 0 (18.32 °C). Both are "nothing
+plugged in".
 
-### 10.6 Rules
+### 10.6 A new frame must wait for STP, not just for the bus
+
+**Found 2026-10-10.** About **1.5 % of every I2CB frame timed out**, and they
+all failed the same way: the module emitted the start and the address, then
+moved no further bytes. At the end of each one I2CSTR held `SCD | XSMT |
+NACKSNT` (0x2420) and I2CMDR still held the frame's own start word, `FREE |
+STT | TRX | IRS` (0x6220).
+
+The cause is a gap between two bits that look as if they move together. When
+a frame's stop reaches the wire, the module drops **BB** at once but clears
+**STP** only after it has set **SCD**, a few cycles later. Every frame start
+here waited for `!BB` alone, so a frame started inside that gap — most often
+the next ADS1119 phase, which follows its predecessor immediately — wrote its
+start word while the module was still finishing the last stop, and the start
+was lost. The TRM states the rule (SPRUHM8K, I2CMDR.STP): *"the user must wait
+until this bit is clear before initiating a new message"*, and TI's
+`i2c_ex2_eeprom` example does exactly that.
+
+What it cost: each lost frame counted as an ADS1119 failure and was retried,
+so readings still arrived but late and in bursts, and at that rate the
+quiet-converter watchdog and the 8-failure disable were both close enough to
+trip that a converter could go quiet for seconds at a time. One boot-time
+F-RAM read (the tuning record at 0x0700) needed a retry for the same reason.
+
+**Fixed:** `i2cbNotReady()` in `com_cpu2.c` is BB **or** STP. Every frame
+start waits on it — the ADS1119 state machine's idle, mux and start states,
+`i2cMasterWaitBusFree()` for the blocking F-RAM and start-up helpers, and the
+F-RAM's bus acquire — and so does every "frame finished" wait, so the bus is
+never handed on mid-stop. The module resets in the recovery paths now write
+I2CMDR outright instead of toggling IRS, because an IRS toggle carries a
+stale STP straight through the reset.
+
+| | Good frames | Timed out | Converter failures | Quiet kicks |
+|---|---|---|---|---|
+| Before (~4 min) | 2480 | 38 (1.5 %) | climbing to the disable threshold | 73 |
+| After (~3 min) | 4523 | 1 (0.02 %) | 0 | 0 |
+
+The one remaining timeout ended differently — `BB | SCD | XRDY` with STP
+still set, the stop not yet out — and it recovered on its own. It is rare
+enough to leave alone, but its signature is recorded here in case it ever
+rises.
+
+### 10.7 Rules
 
 1. **Do not raise either bus above 100 kHz** without stiffer pull-ups.
 2. **Do not halt CPU2 mid-transfer** (§9 rule 5) — the I2CA target wedges
    with SCL low, and its recovery runs on the core you halted.
 3. **Write `I2CMDR` whole.** Never build a start on a read-modify-write of it.
 4. **The F-RAM never takes I2CB while a converter is mid-frame.**
+5. **Start a frame only when `i2cbNotReady()` is false** — bus free *and*
+   STP clear (§10.6). `I2C_isBusBusy()` alone is not enough.
+6. **Reset the module by writing I2CMDR outright**, not with
+   `I2C_disableModule()`/`I2C_enableModule()`: those toggle IRS only and keep
+   STP.
 
 ---
 
 ## 11. MODE and ENABLE straps
 
-Two 8-way DIP switches, each read through an SN74HC148 8:3 priority encoder:
+Two 8-way DIP switches set how the unit runs: **MODE** groups the slots and
+picks the control loop's voltage sensor, **ENABLE** says how many slots are
+fitted. Both are read **once, at power-on** — change a switch, then
+power-cycle. Turn on **one switch per strap**. DIP *n* selects setting *n* − 1.
+
+### 11.1 MODE — slot grouping
+
+| MODE DIP | `eSlotMode` | Name | Slot groups | Voltage loop from | What it is for |
+|---|---|---|---|---|---|
+| **1** | **0** | Independent | 8 groups of 1 | ADS131M08 | **Normal use.** Eight separate cells, each with its own test |
+| 2 | 1 | Pairs | 1+2, 3+4, 5+6, 7+8 | ADS131M08 | One cell on two slots in parallel, up to twice the current |
+| 3 | 2 | Quads | 1–4, 5–8 | ADS131M08 | One cell on four slots, up to four times the current |
+| 4 *(or none)* | 3 | Octet | 1–8 | ADS131M08 | One cell on all eight slots |
+| 5 | 4 | Independent, internal ADC | 8 groups of 1 | C2000 12-bit ADC | As MODE DIP 1, with the voltage loop closed on the on-chip ADC |
+| 6 | 5 | Pairs, internal ADC | as MODE DIP 2 | C2000 12-bit ADC | As MODE DIP 2, internal ADC |
+| 7 | 6 | Loop tuning — plant | one slot | — | Bench only. SFRA sweep of the converter with its loop open |
+| 8 | 7 | Loop tuning — closed loop | one slot | — | Bench only. SFRA sweep of the closed current loop |
+
+In a group, **only the leader — the lowest-numbered slot — is commanded**; a
+host addresses it alone and the other members follow its duty cycle.
+`modeCallback()` refuses a mode write to a follower. Grouped slots are wired in
+parallel onto one cell, so:
+
+- **Voltage limits** apply to the group as written — every member sits at the
+  same voltage.
+- **Current limits are the group total**, divided by the number of *enabled*
+  members. Pairs set to 6 A run 3 A per slot.
+- **Charge counters stay per slot.** A group's delivered mAh is the sum of its
+  members'.
+- **The members switch out of phase** — 180° apart in a pair, 90° in a quad,
+  45° in the octet — to cut ripple.
+- **One over-current stops the whole group**, in hardware, in the same
+  switching cycle ([§5.3](#53-grouped-trips-one-x-bar-output-per-group)). A
+  member whose voltage strays more than 10 % (at least 0.2 V) from the
+  leader's for five consecutive passes also stops the group, as
+  `groupDisconnect`.
+
+Full group semantics: [§5.5](#55-group-semantics-what-the-leader-owns).
+
+**Voltage sensor.** In MODE DIP 1–4 the voltage loop uses the ADS131M08, the
+16-bit external converter. MODE DIP 5–6 close it on the C2000's 12-bit
+internal ADC instead (`btsSlotUsesIntAdc[]`). The **current** loop, the
+software over-current trip and the charge counters use the ADS131M08 in every
+mode.
+
+**Loop tuning (MODE DIP 7, 8)** runs an SFRA frequency sweep on one slot
+instead of a test, with the AT console's serial port handed to TI's SFRA GUI.
+The slot under test is set by the ENABLE strap — ENABLE DIP *n* tunes slot
+*n* — and nothing else runs. The sweep needs a tuning build (`cpu1_sfra`,
+which defines `BTS_SFRA_BUILD`). **In a production build these two modes run
+no sweep:** the unit treats every slot as a group of one, and the console
+keeps its port. Don't strap them in normal use.
+
+### 11.2 ENABLE — fitted slots
+
+| ENABLE DIP | `eSlotEnable` | Slots enabled | Slots off |
+|---|---|---|---|
+| 1 | 0 | 1 | 2–8 |
+| 2 | 1 | 1–2 | 3–8 |
+| 3 | 2 | 1–3 | 4–8 |
+| 4 *(or none)* | 3 | 1–4 | 5–8 |
+| 5 | 4 | 1–5 | 6–8 |
+| 6 | 5 | 1–6 | 7–8 |
+| 7 | 6 | 1–7 | 8 |
+| **8** | **7** | **all eight** | — |
+
+ENABLE is the **highest** enabled slot, not a bitmask: slots are always
+enabled from slot 1 upward. A disabled slot never switches, rejects every
+command, and shows `SLOT_DISABLED` in its status word. Disable slots that have
+no power stage or sense chain fitted — an unpowered sense chain reads −10 A.
+
+**A group is only usable if every member is enabled.** If ENABLE cuts a group
+short, the whole group's hardware trips are left unrouted
+([§5.3](#53-grouped-trips-one-x-bar-output-per-group)) — so match the two
+straps: pairs need an even count of slots, quads four or eight, the octet all
+eight.
+
+### 11.3 Common settings
+
+| To run | MODE DIP | ENABLE DIP |
+|---|---|---|
+| Eight cells, one per slot | 1 | 8 |
+| One cell on slot 1 only (bench bring-up) | 1 | 1 |
+| Four cells, two slots each | 2 | 8 |
+| Two cells, four slots each | 3 | 8 |
+| One cell on all eight slots | 4 | 8 |
+| Tune slot 3's current loop (tuning build) | 8 | 3 |
+
+### 11.4 How the switches are read
+
+Each strap is an 8-way DIP switch read through an SN74HC148 8:3 priority encoder:
 S4 → U26 for ENABLE, S5 → U27 for MODE (schematic XTIDA-010086E3 sheet 13).
 Every encoder input has a 10 kΩ pull-up and a switch to ground, so an ON
 switch drives its input low. EI is tied low; **GS and EO are not connected**.
