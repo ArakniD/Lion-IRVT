@@ -17,6 +17,7 @@ a calibration.
 | [`calibration-design.md`](calibration-design.md) | The calibration mathematics, opcodes and state machine. A design document — for any address, `api-specification.md` §2.8 is the authority |
 | [`calibration-flow.md`](calibration-flow.md) | The calibration procedure and state machine as diagrams |
 | [`hardware-resources.md`](hardware-resources.md) | PIE, ACK groups, XINT, X-BAR, ADC base and CLA1 allocation across both cores |
+| [`esp32-hardware-connections.md`](esp32-hardware-connections.md) | ESP32 proxy pin usage: the ST7789 LCD, rotary encoder, WS2812B slot LEDs and I2C link, by header pin and GPIO |
 
 ---
 

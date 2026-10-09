@@ -1,36 +1,34 @@
 /*
  * input.h
  *
- * Rotary encoder with a push switch.
+ * Rotary encoder with a push switch, plus the separate KEY0 button.
  *
  * WIRING
  * ------
- *   A    GPIO15      quadrature channel A
- *   B    GPIO27      quadrature channel B
- *   SW   GPIO2       push switch to ground, internal pull-up
+ *   A     GPIO32      quadrature channel A
+ *   B     GPIO27      quadrature channel B
+ *   SW    GPIO33      push switch to ground, internal pull-up
+ *   KEY0  GPIO34      extra button to ground, pulled up on the LCD board
  *
  * A NOTE ON THESE PINS
  * --------------------
- * All three are ESP32 strapping or JTAG pins, and two of them matter at
- * boot:
+ * None of these is a strapping or JTAG pin, so nothing here can change how
+ * the chip boots, whatever the encoder or the buttons are doing at reset.
  *
- *   GPIO15 (MTDO) is read at reset. Held LOW it silences the ROM bootloader
- *          log; it has an internal pull-up and idles high, so an encoder
- *          detent resting on A-low at power-up only costs the boot banner.
- *   GPIO2  is a strapping pin for download mode: it must NOT be high while
- *          GPIO0 is low. The switch here is to GROUND with a pull-up, so it
- *          reads high when idle - which is fine for a normal boot, but if
- *          you ever enter download mode by hand, do not hold the encoder
- *          button down at the same time.
- *   GPIO27 has no boot role and is unconditionally safe.
+ * A and SW used to be on GPIO15 and GPIO2, both strapping pins: GPIO15 (MTDO)
+ * silences the ROM boot log if held low at reset, and GPIO2 must not be high
+ * while GPIO0 is low or download mode fails. They moved to GPIO32 and GPIO33
+ * to take the encoder out of the boot path altogether. B was on GPIO13 until
+ * the WS2812B driver claimed that pin for SPI3 MOSI (see led_strip.h), and
+ * went to GPIO27. GPIO14 would also have worked, but it is MTMS: a JTAG pin on
+ * the encoder would make the board awkward to debug over JTAG.
  *
- * B was on GPIO13 until the WS2812B driver claimed that pin for SPI3 MOSI
- * (see led_strip.h). GPIO14 would also have worked electrically, but it is
- * MTMS: with A already on MTDO, putting a second JTAG pin on the encoder
- * would make the board awkward to debug over JTAG. GPIO27 has neither role.
+ * GPIO34 is input only and has NO internal pull-up or pull-down. That is fine
+ * for KEY0, which the LCD board pulls up to 3V3, but it means the driver must
+ * not ask for one: the pull configuration is simply ignored on that pad, and
+ * a board without the external pull-up would read a floating input.
  *
- * None of this affects normal running, and the pins are otherwise free on
- * the LOLIN32. See the pin table in README.md.
+ * See the pin table in README.md and Docs/esp32-hardware-connections.md.
  *
  * DECODING
  * --------
@@ -64,6 +62,7 @@ typedef enum {
     INPUT_EVENT_ROTATE_CCW,
     INPUT_EVENT_PRESS,        /* released before the long-press threshold */
     INPUT_EVENT_LONG_PRESS,   /* fires once, while still held             */
+    INPUT_EVENT_KEY0_PRESS,   /* KEY0 pressed; fires on the debounced edge */
 } input_event_type_t;
 
 typedef struct {
@@ -78,6 +77,13 @@ typedef struct {
     int      switch_gpio;
     /* True when the switch shorts to ground and needs an internal pull-up. */
     bool     switch_active_low;
+    /*
+     * KEY0 button, active low. Negative disables it. There is no internal
+     * pull to configure: the intended pin is input only, see above.
+     * Note that an omitted designated initialiser is 0, which is GPIO0 and
+     * not "disabled" - set this to -1 explicitly if there is no KEY0.
+     */
+    int      key0_gpio;
     uint32_t long_press_ms;      /* 0 => 800 */
     /* Swap if the encoder counts backwards relative to the UI. */
     bool     invert_direction;
@@ -96,7 +102,7 @@ bool input_wait_event(input_event_t *out, uint32_t timeout_ms);
 /* Current switch state, for a UI that wants to show the hold in progress. */
 bool input_switch_is_down(void);
 
-/* Logs A/B/SW levels and the raw PCNT count. See input.c for how to read it. */
+/* Logs A/B/SW/KEY0 levels and the raw PCNT count. See input.c for how to read it. */
 void input_log_pin_state(const char *when);
 
 #ifdef __cplusplus

@@ -55,26 +55,34 @@ static const char *TAG = "main";
  * ST7789 status display on SPI2 (HSPI), using the hardware MOSI/SCK pads so
  * the SPI peripheral drives them through the IO_MUX rather than the GPIO
  * matrix. None of these collide with the BTS I2C pins or the console UART.
+ *
+ * CS is a real GPIO: this module has no tie to ground. GPIO19 has no strapping
+ * role, and an external 10k pull-up to 3V3 holds the panel deselected from
+ * reset until the driver takes the pin.
  */
 #define LCD_MOSI_GPIO       23
 #define LCD_SCLK_GPIO       18
+#define LCD_CS_GPIO         19
 #define LCD_RESET_GPIO      17
 #define LCD_DC_GPIO         16
 #define LCD_BACKLIGHT_GPIO  4
 
 /*
- * Rotary encoder with push switch. See input.h for the strapping-pin
- * caveats on GPIO15 and GPIO2 - neither affects normal running.
+ * Rotary encoder with push switch, and the extra KEY0 button. None of these
+ * is a strapping or JTAG pin; see input.h.
  *
- * B moved off GPIO13 when the WS2812B driver took that pin for SPI3 MOSI.
- * GPIO27 has no strapping or JTAG role, so it is a straight swap. GPIO14
- * was the other candidate and was not used: it is MTMS, and with A already
- * on MTDO a second JTAG pin on the same encoder would make the box awkward
- * to debug over JTAG later.
+ * A and the switch were on GPIO15 and GPIO2, both strapping pins, and moved
+ * to GPIO32 and GPIO33. B moved off GPIO13 earlier, when the WS2812B driver
+ * took that pin for SPI3 MOSI. GPIO14 was not used for B: it is MTMS, and a
+ * JTAG pin on the encoder would make the box awkward to debug over JTAG later.
+ *
+ * KEY0 is on GPIO34, which is input only with no internal pull. The LCD board
+ * pulls KEY0 up to 3V3, so it needs none.
  */
-#define ENC_A_GPIO          15
+#define ENC_A_GPIO          32
 #define ENC_B_GPIO          27
-#define ENC_SW_GPIO         2
+#define ENC_SW_GPIO         33
+#define KEY0_GPIO           34
 
 /*
  * WS2812B slot indicators, one per slot, on SPI3 (VSPI) MOSI.
@@ -176,6 +184,7 @@ void app_main(void)
     const display_config_t lcd_cfg = {
         .mosi_gpio      = LCD_MOSI_GPIO,
         .sclk_gpio      = LCD_SCLK_GPIO,
+        .cs_gpio        = LCD_CS_GPIO,
         .reset_gpio     = LCD_RESET_GPIO,
         .dc_gpio        = LCD_DC_GPIO,
         .backlight_gpio = LCD_BACKLIGHT_GPIO,
@@ -207,6 +216,7 @@ void app_main(void)
         .encoder_b_gpio    = ENC_B_GPIO,
         .switch_gpio       = ENC_SW_GPIO,
         .switch_active_low = true,      /* switch to GND, internal pull-up */
+        .key0_gpio         = KEY0_GPIO, /* to GND, board pull-up to 3V3    */
         .long_press_ms     = 800,
         .invert_direction  = false,
         .trace             = true,

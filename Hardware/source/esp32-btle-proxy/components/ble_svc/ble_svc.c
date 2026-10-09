@@ -739,20 +739,48 @@ static void notify_task(void *arg)
             continue;
         }
 
+        /*
+         * One trailing notification after a slot stops, so a client sees the
+         * run end. Without it the last record a client holds is the final
+         * "running" one, with no later update to say it stopped.
+         */
+        static bool s_slot_was_live[SLOT_COUNT];
+
         for (uint8_t slot = 0; slot < SLOT_COUNT; slot++) {
             slot_status_t st;
             test_engine_get_status(slot, &st);
+
+            bool engine_live;
             switch (st.state) {
             case SLOT_STATE_IDLE:
             case SLOT_STATE_COMPLETE:
             case SLOT_STATE_FAULT:
             case SLOT_STATE_ABORTED:
-                continue;
+                engine_live = false;
+                break;
             default:
                 /* BTS_PAUSED is included: a client watching a held run needs
                  * to see it appear without re-reading every characteristic. */
+                engine_live = true;
                 break;
             }
+
+            /*
+             * The engine's state is not the whole story. A mode written
+             * straight to the BTS - the register characteristic, the CAN bus
+             * or the AT console - runs the converter without the engine ever
+             * leaving IDLE, so gating on the engine alone left a manually
+             * started slot silent: no voltage, current or mode updates at all.
+             * The BTS's own status word is what says whether it is running.
+             */
+            const bool bts_live = (st.status_bits & BTS_STATUS_RUNNING) != 0 ||
+                                  st.bts_paused;
+            const bool live = engine_live || bts_live;
+
+            if (!live && !s_slot_was_live[slot]) {
+                continue;
+            }
+            s_slot_was_live[slot] = live;
             notify_slot(slot, &st);
         }
 
