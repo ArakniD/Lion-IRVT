@@ -207,6 +207,15 @@ esp_err_t bts_link_pause_channel(uint8_t channel);
 esp_err_t bts_link_resume_channel(uint8_t channel);
 
 /*
+ * Clears the unit's latched fault indicators on a channel - the over-current
+ * bit and its eTripStatus pair, and group-disconnect. Ignored on a channel
+ * that is driving. Send it when an operator clears a fault: the unit keeps
+ * the indicators otherwise, and check_safety() refuses a slot that still
+ * shows a trip.
+ */
+esp_err_t bts_link_clear_fault_channel(uint8_t channel);
+
+/*
  * Writes the ten settings-block limit registers for a channel.
  *
  * The caller is expected to have clamped these to the unit envelope already

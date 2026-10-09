@@ -1037,6 +1037,15 @@ esp_err_t test_engine_clear_fault(uint8_t slot)
     if (c->state == SLOT_STATE_FAULT || c->state == SLOT_STATE_ABORTED) {
         c->fault = SLOT_FAULT_NONE;
         enter_state(slot, SLOT_STATE_IDLE);
+        /*
+         * Clear the unit's indication too. It latches the over-current and
+         * group-disconnect bits until told otherwise, and check_safety()
+         * refuses to run a slot whose trip bit is still set - so without
+         * this, a tripped slot could never be started again. Best effort:
+         * an unreachable unit leaves the bit set, and the next start then
+         * faults again with the same reason, which is the honest outcome.
+         */
+        (void)bts_link_clear_fault_channel(slot);
     }
     xSemaphoreGive(s_lock);
     return ESP_OK;

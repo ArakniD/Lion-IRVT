@@ -259,34 +259,41 @@ last select register; the next register is `INPUTSELECTLOCK`. There is no
 | `INPUT11` | eCAP5 | Channel 3 GPIO trip | GPIO27 | `bts_hal.c:1242` | Compiled out |
 | `INPUT12` | eCAP6 | Channel 4 GPIO trip | GPIO34 | `bts_hal.c:1245` | Compiled out |
 | `INPUT13` | XINT4 | Channel 5 GPIO trip | GPIO39 | `bts_hal.c:1248` | Compiled out |
-| `INPUT14` | XINT5 | **SPI ADC2 DRDY (CPU1)** *and* **channel 6 GPIO trip** | GPIO49 / GPIO44 | `bts_hal.c:455` / `bts_hal.c:1251` | **DOUBLE-BOOKED** |
+| `INPUT14` | XINT5 | **SPI ADC2 DRDY (CPU1)** *and* channel 6 GPIO trip | GPIO49 / GPIO44 | `bts_hal.c:455` / `bts_hal.c:1251` | Double-booked, but the trip is **compiled out** |
 | *(`INPUT15`)* | — | Channel 7 GPIO trip | GPIO45 | `bts_hal.c:1254` | **Does not exist** — call rejected |
 | *(`INPUT16`)* | — | Channel 8 GPIO trip | GPIO46 | `bts_hal.c:1257` | **Does not exist** — call rejected |
 
 **Free inputs: `INPUT1`, `INPUT2`, `INPUT3`, `INPUT7`, `INPUT8`.**
 
-> ### `INPUT14` is double-booked
+> ### `INPUT14` is double-booked — latent again since 2026-10-09
 >
 > XINT5 (CPU1's SPI ADC2 DRDY, GPIO49) and the channel-6 GPIO trip (GPIO44)
 > both target `INPUT14`. Only one can win.
 >
-> **This is live now.** `BTS_TRIP_HW_CH1..8_ENABLED` are all `(true)`, so
-> `BTS_HAL_setupTripSystem()` writes `INPUT14` ← GPIO44. Acquisition wins
-> anyway, by running later: `BTS_HAL_setupTripSystem()` runs inside
-> `BTS_HAL_setupDevice()`, and `BTS_HAL_setupExAdcGpio_Adc2()` re-points
-> `INPUT14` at GPIO49 afterwards in `main()`. **Slots 5–8 acquire correctly,
-> and channel 6's GPIO trip is silently not routed.**
+> **The GPIO trips are compiled out now.** They have their own switches,
+> `BTS_TRIP_GPIO_CH1..8_ENABLED`, all `(false)`, because no external trip
+> line is fitted on this board. Until 2026-10-09 the GPIO pin setup and X-BAR
+> routing were gated only on `BTS_TRIP_HW_CHn_ENABLED` — the CMPSS switch — so
+> enabling the comparators also wrote `INPUT14` ← GPIO44. Acquisition won by
+> running later, so slots 5–8 still read, but only by ordering. Verified in
+> the build: `BTS_HAL_setupTripSystem()` now calls `BTS_HAL_setupInputXBAR()`
+> twice (the ADS1119 DRDYs, `INPUT4`/`INPUT5`), where it used to call it nine
+> times plus seven GPIO pin setups.
 >
-> Channel 6 is not left unprotected: its CMPSS comparator reaches the trip
-> zone through the ePWM X-BAR and Digital Compare, which never touch the
-> Input X-BAR. Only the external GPIO trip line is lost — and channels 7 and
-> 8 never had one (below). Moving the channel-6 trip to `INPUT7` or `INPUT8`
-> fixes it, as would moving XINT5's DRDY to XINT4/`INPUT13` and relocating the
-> channel-5 trip.
+> Before fitting the channel-6 line on a later board: move it to `INPUT7` or
+> `INPUT8`, or move XINT5's DRDY to XINT4/`INPUT13` and relocate the channel-5
+> trip. Channel 6's comparator trip is unaffected either way: it reaches the
+> trip zone through the ePWM X-BAR and Digital Compare, which never touch the
+> Input X-BAR.
 >
-> **Do not reorder those two calls.** If the trip setup ever ran last, it
-> would take `INPUT14` from acquisition and slots 5–8 would stop reading —
-> Defect 1 again, in the other direction.
+> **Channel 6 is being debugged at the bench (2026-10-09):** its trip input is
+> suspected of not being properly connected. The comparator is CMPSS6, whose
+> positive input `CMPIN6P` is `ADCINC2` (TRM SPRUHM8K, Figure 10-1) — the pin
+> the firmware also samples as slot 6's current (ADCC SOC2), on the
+> schematic's `IoutS6` net, through 0-ohm link R253 to `J5` pin 90. With the
+> GPIO trips compiled out, that net is the only trip input channel 6 has.
+> Slot 6 is one of the three slots whose comparator was already right, so the
+> 2026-10-09 remap (§5.0) does not change it.
 
 > ### Channels 7 and 8 have no Input X-BAR path at all
 >
@@ -351,20 +358,104 @@ ePWM trip zones through the separate **ePWM X-BAR** at `EPWMXBAR_BASE`
 at once, OR-ing them onto that one output** — which is what makes a grouped
 trip possible with no software in the path. `CMPSSn` occupies mux `(n-1)*2`.
 
-| Slot | CMPSS | ePWM X-BAR trip | Mux |
-|---|---|---|---|
-| 1 | `CMPSS1` | `XBAR_TRIP4` | `MUX00` |
-| 2 | `CMPSS2` | `XBAR_TRIP5` | `MUX02` |
-| 3 | `CMPSS3` | `XBAR_TRIP7` | `MUX04` |
-| 4 | `CMPSS4` | `XBAR_TRIP8` | `MUX06` |
-| 5 | `CMPSS5` | `XBAR_TRIP9` | `MUX08` |
-| 6 | `CMPSS6` | `XBAR_TRIP10` | `MUX10` |
-| 7 | `CMPSS7` | `XBAR_TRIP11` | `MUX12` |
-| 8 | `CMPSS8` | `XBAR_TRIP12` | `MUX14` |
+> **Slot *n* is not watched by `CMPSSn`.** Each comparator's input pins are
+> fixed by the device, and the board routes each slot's sense nets to
+> whichever ADC pins suited the layout. So the comparator for a slot is the
+> one that owns the pin its current lands on — a different number for slots
+> 2, 3, 5, 7 and 8. Until 2026-10-09 the firmware used `CMPSSn` for slot *n*,
+> which was right for slots 1, 4 and 6 only.
 
-The tables live at the top of `BTS_HAL_setupTripRouting()`'s block in
-`bts_hal.c`; the routing itself is built there, and the trip zones are
-configured in `BTS_HAL_setupEPWMTripZone()`.
+| Slot | ePWM | Comparator | ePWM X-BAR trip | Mux | DC input |
+|---|---|---|---|---|---|
+| 1 | `EPWM1` | **`CMPSS1`** | `XBAR_TRIP4` | `MUX00` | `TRIPIN4` |
+| 2 | `EPWM2` | **`CMPSS3`** | `XBAR_TRIP5` | `MUX04` | `TRIPIN5` |
+| 3 | `EPWM3` | **`CMPSS2`** | `XBAR_TRIP7` | `MUX02` | `TRIPIN7` |
+| 4 | `EPWM4` | **`CMPSS4`** | `XBAR_TRIP8` | `MUX06` | `TRIPIN8` |
+| 5 | `EPWM5` | **`CMPSS7`** | `XBAR_TRIP9` | `MUX12` | `TRIPIN9` |
+| 6 | `EPWM6` | **`CMPSS6`** | `XBAR_TRIP10` | `MUX10` | `TRIPIN10` |
+| 7 | `EPWM7` | **`CMPSS8`** | `XBAR_TRIP11` | `MUX14` | `TRIPIN11` |
+| 8 | `EPWM8` | **`CMPSS5`** | `XBAR_TRIP12` | `MUX08` | `TRIPIN12` |
+
+The trip output and the Digital Compare input belong to the **slot**; the mux
+belongs to the **comparator**. `btsSlotCmpss[]` in `bts_hal.c` joins the two,
+from `BTS_TRP_CMPSS_CH1..8` in `bts_user_settings.h` — which fails the build
+unless every slot has a comparator of its own. The routing is built in
+`BTS_HAL_setupTripRouting()`, and the trip zones are configured in
+`BTS_HAL_setupEPWMTripZone()`.
+
+**Read back from the board, 2026-10-09** (MODE 0, ENABLE 1, both cores
+loaded): `TRIP4MUXENABLE` = `0x0001` (`MUX00`, `CMPSS1`) and
+`TRIP5MUXENABLE` = `0x0010` (`MUX04`, `CMPSS3`), each selecting
+`CTRIPH_OR_L` (`TRIP5MUX0TO15CFG` = `0x0100`); ePWM2's `DCTRIPSEL` = 4,
+which is `TRIPIN5`. Slots 3–8 were strap-disabled and left unrouted, as
+designed. So slot 2 is watched by its own current for the first time. No
+trip was forced, so the comparator has still not been seen to fire on a real
+over-current.
+
+At the same moment every slot's current sense read 1694–1717 counts on the
+internal ADC — about 1.25 V, zero current — **including the six
+strap-disabled slots**, and no comparator's live output was asserted. So on
+this board a disabled slot's sense chain is powered and reads 0 A, not the
+−10 A that §5.3 and §5.4 assume for an unpowered chain. That case still
+applies before the supply is up, which is what deferred arming is for.
+
+### 5.0 Which comparator watches which slot
+
+Both sense nets of every slot, from the schematic to the comparator. Sources:
+schematic **XTIDA-010086E3 sheet 13**, "Control card pin mapping_28379" (the
+net, its 0-ohm link and its `J5` pin); the device datasheet **SPRS880 Table
+4-1**, which names each analog pin's comparator input (the same as TRM
+SPRUHM8K Figure 10-1); and the firmware's own ADC SOCs in
+`BTS_HAL_setupADC()` and `bts_cla.cla`, which already sampled these pins.
+
+| Slot | Current net | Link | `J5` | Device pin | Comparator input | ADC SOC | Voltage net | Link | `J5` | Device pin | Comparator input | ADC SOC | Comparator |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | `IoutS1` | R249 | 106 | `ADCINA2` | `CMPIN1P` | ADCA SOC3 | `VoutS1` | R250 | 104 | `ADCINA3` | `CMPIN1N` | ADCA SOC0 | **CMPSS1** |
+| 2 | `IoutS2` | R251 | 103 | `ADCINB2` | `CMPIN3P` | ADCB SOC3 | `VoutS2` | R252 | 101 | `ADCINB3` | `CMPIN3N` | ADCB SOC0 | **CMPSS3** |
+| 3 | `IoutS3` | R43 | 100 | `ADCINA4` | `CMPIN2P` | ADCA SOC4 | `VoutS3` | R47 | 98 | `ADCINA5` | `CMPIN2N` | ADCA SOC1 | **CMPSS2** |
+| 4 | `IoutS4` | R49 | 96 | `ADCIN14` | `CMPIN4P` | ADCA SOC5 | `VoutS4` | R51 | 94 | `ADCIN15` | `CMPIN4N` | ADCA SOC2 | **CMPSS4** |
+| 5 | `IoutS5` | R52 | 93 | `ADCIND0` | `CMPIN7P` | ADCD SOC2 | `VoutS5` | R53 | 91 | `ADCIND1` | `CMPIN7N` | ADCD SOC0 | **CMPSS7** |
+| 6 | `IoutS6` | R253 | 90 | `ADCINC2` | `CMPIN6P` | ADCC SOC2 | `VoutS6` | R254 | 88 | `ADCINC3` | `CMPIN6N` | ADCC SOC0 | **CMPSS6** |
+| 7 | `IoutS7` | R255 | 87 | `ADCIND2` | `CMPIN8P` | ADCD SOC3 | `VoutS7` | R256 | 85 | `ADCIND3` | `CMPIN8N` | ADCD SOC1 | **CMPSS8** |
+| 8 | `IoutS8` | R54 | 84 | `ADCINC4` | `CMPIN5P` | ADCC SOC3 | `VoutS8` | R55 | 82 | `ADCINC5` | `CMPIN5N` | ADCC SOC1 | **CMPSS5** |
+
+The same table the other way round, for anyone starting from a comparator:
+
+| Comparator | Watches | Positive input | Negative input (not used) |
+|---|---|---|---|
+| CMPSS1 | slot 1 | `ADCINA2`, `IoutS1` | `ADCINA3`, `VoutS1` |
+| CMPSS2 | **slot 3** | `ADCINA4`, `IoutS3` | `ADCINA5`, `VoutS3` |
+| CMPSS3 | **slot 2** | `ADCINB2`, `IoutS2` | `ADCINB3`, `VoutS2` |
+| CMPSS4 | slot 4 | `ADCIN14`, `IoutS4` | `ADCIN15`, `VoutS4` |
+| CMPSS5 | **slot 8** | `ADCINC4`, `IoutS8` | `ADCINC5`, `VoutS8` |
+| CMPSS6 | slot 6 | `ADCINC2`, `IoutS6` | `ADCINC3`, `VoutS6` |
+| CMPSS7 | **slot 5** | `ADCIND0`, `IoutS5` | `ADCIND1`, `VoutS5` |
+| CMPSS8 | **slot 7** | `ADCIND2`, `IoutS7` | `ADCIND3`, `VoutS7` |
+
+Three things the table settles:
+
+- **The voltage net lands on the same comparator's negative pin**, on every
+  slot. Nothing reads it there: both the high and the low comparator take
+  their negative input from the internal DAC (`CMPSS_INSRC_DAC`), which is
+  what sets the ±9.5 A threshold. Switching either to `CMPSS_INSRC_PIN` would
+  compare a slot's current against its own voltage.
+- **`J5` is the controlCARD socket.** TI's controlCARD pinout numbers the same
+  pins 121 − *n* (`J5` 106 is its pin 15, `ADC-A2`), so check which numbering
+  a drawing uses before probing.
+- **The board, not the device, fixes this table.** A layout that moves a sense
+  net changes the comparator for that slot, the ADC SOC that samples it and
+  `BTS_TRP_CMPSS_CHn` together.
+
+**What the old binding did.** It paired slot *n* with `CMPSSn`:
+
+| Grouping (MODE) | Effect of the old binding |
+|---|---|
+| Ungrouped (0, 4) | An over-current on slot 2 stopped slot 3 instead, and the reverse; slots 5, 7 and 8 did the same in a ring (5 stopped 7, 7 stopped 8, 8 stopped 5). The faulted slot kept switching until its software trip caught it, and with the other slot masked by the ENABLE strap nothing stopped in hardware at all |
+| Pairs (1, 5) | The first pair's output was `CMPSS1` \| `CMPSS2`, which is slot 1 \| slot **3**; the third was slot 8 \| slot 6, the fourth slot 5 \| slot 7 |
+| Quads, octet (2, 3) | **Unaffected.** Each group's OR covered the same set of comparators either way |
+
+The software trip (±8 A, each slot's own ADS131M08 current) was never
+affected and remains the first line; only the ±9.5 A backstop was mis-aimed.
 
 > `XBAR_TRIP6` is skipped: `INPUT6` feeds ePWM TRIP6 directly, and `INPUT6` is
 > XINT3's input (CPU1's SPI ADC1 DRDY). Do not route a CMPSS to TRIP6.
@@ -438,12 +529,18 @@ group **one** trip output carrying the OR of that group's comparators, and
 points every ePWM in the group at it — so all of them trip in the same
 switching cycle, in hardware:
 
-```
-ungrouped   TRIP4 = CMPSS1            -> ePWM1
-pairs       TRIP4 = CMPSS1 | CMPSS2   -> ePWM1, ePWM2
-quads       TRIP4 = CMPSS1..CMPSS4    -> ePWM1..ePWM4
-octet       TRIP4 = CMPSS1..CMPSS8    -> ePWM1..ePWM8
-```
+Each member contributes **its own** comparator, from the table in §5.0:
+
+| Grouping | Trip output | OR of | Trips |
+|---|---|---|---|
+| ungrouped | `TRIP4`, `TRIP5`, `TRIP7` … `TRIP12` | one comparator each: `CMPSS1`, `CMPSS3`, `CMPSS2`, `CMPSS4`, `CMPSS7`, `CMPSS6`, `CMPSS8`, `CMPSS5` | that slot's ePWM |
+| pairs | `TRIP4` | `CMPSS1` \| `CMPSS3` | ePWM1, ePWM2 |
+| | `TRIP7` | `CMPSS2` \| `CMPSS4` | ePWM3, ePWM4 |
+| | `TRIP9` | `CMPSS7` \| `CMPSS6` | ePWM5, ePWM6 |
+| | `TRIP11` | `CMPSS8` \| `CMPSS5` | ePWM7, ePWM8 |
+| quads | `TRIP4` | `CMPSS1`–`CMPSS4` | ePWM1 – ePWM4 |
+| | `TRIP9` | `CMPSS5`–`CMPSS8` | ePWM5 – ePWM8 |
+| octet | `TRIP4` | all eight | ePWM1 – ePWM8 |
 
 The group leader's `TRIPn` is the one used, matching `BTS_GROUP_LEADER()`.
 
@@ -1338,6 +1435,7 @@ for an empty slot.
 | CLA1 init: LS4/LS5, `MVECT`, `MIER`, trigger | — | `bts_cpu1.c:843-910`; called `:929` |
 | CLA1 memory placement | — | `2837xD_RAM_lnk_cpu1.cmd` (`Cla1Prog`, `CLADataLS5`, `.scratchpad`) |
 | Trip zone signals and interrupt masking | `bts_user_settings.h:113-120` | `bts_hal.c:1437-1490` |
+| Slot → comparator binding | `BTS_TRP_CMPSS_CH1..8`, `bts_user_settings.h` | `btsSlotCmpss[]` in `BTS_HAL_setupTripRouting()`, `bts_hal.c` |
 | PIE group numbers | `driverlib/f2837xd/driverlib/inc/hw_ints.h` | — |
 | XINT → X-BAR input mapping | `driverlib/f2837xd/driverlib/gpio.c:127-147` | — |
 | X-BAR input → peripheral mapping | `driverlib/f2837xd/driverlib/xbar.h:199-215` | — |

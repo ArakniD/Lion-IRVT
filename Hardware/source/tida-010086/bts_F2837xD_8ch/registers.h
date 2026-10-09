@@ -628,6 +628,15 @@ typedef struct {
 // deliberately stopped from driving its rail on its own.
 //
 #define BTS_MODE_WAITING             0x20U
+//
+// Acknowledges a fault: clears the latched fault indicators - over-current
+// (status bit 3 and eTripStatus) and group-disconnect - on a slot that is not
+// driving. An edge command, like pause and resume. Added 2026-10-09 so a host
+// can clear the indication when it leaves its own fault state; until then it
+// cleared only on a fresh start, which a host that refuses to start a
+// tripped slot never reaches.
+//
+#define BTS_MODE_CLEAR_FAULT         0x40U
 
 // Bitfield for eTripStatus register
 typedef struct {

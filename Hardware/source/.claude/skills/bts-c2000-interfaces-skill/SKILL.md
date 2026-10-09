@@ -95,6 +95,15 @@ Nine facts that invalidate the obvious guess. Each is confirmed in source.
    the OR of the group's comparators, so a trip stops every member in the
    same switching cycle. Details: `Docs/hardware-resources.md` §5.
 
+   **Slot *n* is not watched by `CMPSSn`.** Each comparator's input pins are
+   fixed by the device and the board routes the sense nets for layout: slots
+   1–8 use CMPSS 1, 3, 2, 4, 7, 6, 8, 5. `BTS_TRP_CMPSS_CH1..8`
+   (`bts_user_settings.h`) holds the binding and fails the build unless it
+   is one-to-one; `btsSlotCmpss[]` applies it. Index the mux tables by the
+   **comparator** and the trip/DC tables by the **slot** — mixing the two is
+   how slots 2, 3, 5, 7 and 8 were tripped by another slot's current until
+   2026-10-09. Full pin table: `Docs/hardware-resources.md` §5.0.
+
 6. **The Input X-BAR is device-global, not per-core.** Each core has its own
    PIE vector, but `GPIO_setInterruptPin()` writes the **single shared Input
    X-BAR**. Both cores used to claim XINT1/XINT2, so CPU2's `initADS1119()`
@@ -178,7 +187,7 @@ read from the map files after the v2.1 build:
 
 | Block | Used | Free |
 |---|---|---|
-| `CPU2TOCPU1RAM` | 790 words (`0x316`) | **234 words** (`0x0EA`) |
+| `CPU2TOCPU1RAM` | 720 words (`0x2D0`) | **304 words** (`0x130`) |
 | `CPU1TOCPU2RAM` | 508 words (`0x1FC`) | 516 words (`0x204`) |
 
 Overflow is a link-time failure (`#10099-D ... section
@@ -207,7 +216,8 @@ temperature window and trip protection.
 
 - `eChX_Mode` (settings offset 0) encodes run + direction + calibration entry
   + pause/resume. Bit 0 = run, bit 1 = **charge** (clear = discharge), bit 2 =
-  enter calibration, bit 3 = **pause**, bit 4 = **resume**. Note the
+  enter calibration, bit 3 = **pause**, bit 4 = **resume**, bit 5 =
+  **waiting** (arm pre-charge), bit 6 = **clear fault**. Note the
   asymmetry: `0x00` is stop and `0x01` is *start a discharge*, one bit apart.
   Bits 3 and 4 are **edge commands** — acted on at the write, not retained,
   handled before the run/stop decode.
@@ -590,7 +600,7 @@ you came for.
 | 0 | `RUNNING` | yes — **stays set while PAUSED** |
 | 1 | `STOPPED` | yes |
 | 2 | `FINISHED` / `END` | yes — set by `serviceTermination()` |
-| 3 | `OVERCURRENT_TRIP` | yes — **latches, never cleared** until power-cycle |
+| 3 | `OVERCURRENT_TRIP` | yes — latches until clear-fault (0x40), restart, re-arm or cell removal; **not** on stop |
 | 4 | `CHARGING` | yes |
 | 5 | `DISCHARGING` | yes |
 | 6 | `CONST_VOLTAGE` | yes, while running; 0 when stopped |
@@ -630,14 +640,19 @@ brought to life.
 | Status bit 2 (`FINISHED` / `END`) | **Driven, and asserted by the C2000's termination** |
 | `eChX_SettingsSpare` | Reserved by design. RO, reads 0.0, one per slot at settings offset 23 — the place to put a future per-slot setting without moving anything |
 | `iref_cuttout_A` | The charge termination current, read by `serviceTermination()` |
-| `eTripStatus` (988) | **Live, but never cleared.** See below |
+| `eTripStatus` (988) | **Live**; cleared on restart. See below |
 
-`eTripStatus` is mirrored from `cpu1Status.tripStatus`, which only
-`epwmTripISR` writes. With all eight hardware trips enabled, a CMPSS trip
-sets the channel's bit — and nothing ever clears it, nor
-`status[].overCurrentTrip` (bit 3). Read a set bit as "has tripped since
-boot". The software trip path forces the outputs low through the same trip
-zone without going near this ISR, so it sets neither.
+`eTripStatus` is mirrored from `cpu1Status.tripStatus`. `epwmTripISR` sets a
+channel's bit on a CMPSS trip, and `slotClearOverCurrent()` clears it, with
+`status[].overCurrentTrip` (bit 3), when the slot is handed back: an
+explicit `BTS_MODE_CLEAR_FAULT` (0x40, which the ESP32 sends when its own
+fault is cleared), a fresh start, a `BTS_MODE_WAITING` re-arm, or the cell
+being removed. **Never on a
+stop** — the ESP32 engine stops a slot as its first reaction to a trip, and
+clearing there would wipe the fault before anyone saw it. The software trip
+path forces the outputs low through the same trip zone without going near
+this ISR, so it sets neither. The GPIO bit is never set: no GPIO trip is
+fitted (`BTS_TRIP_GPIO_CHn_ENABLED`, all false).
 
 The ESP32 still integrates charge and energy itself (`coulomb_counter.c`) and
 reports the BTS figures beside its own, because it samples on real elapsed
@@ -680,7 +695,7 @@ time rather than the BTS's fixed 150 ms step.
   them is the single most common bug in this codebase and produces silent
   cross-channel corruption rather than an error.
 - **A new CPU1-visible register costs `CPU2TOCPU1RAM`** — two words each,
-  234 words free. Check the map.
+  304 words free. Check the map.
 - **If CPU1 needs to act on a register write, add it to the decode.**
   `BTS_HandleRegisterWrite()` decodes the settings region (the mode register
   and the calibration group) and `eCalCommand`. Everything else — including

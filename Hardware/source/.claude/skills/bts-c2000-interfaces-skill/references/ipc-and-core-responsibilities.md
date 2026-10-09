@@ -630,11 +630,10 @@ XINT1/`INPUT4` and XINT2/`INPUT5`. Set in `bts_user_settings.h`
 group moved from 1.4/1.5 to 12.1/12.3 — which is why the ACK group had to move
 with it.
 
-> **`INPUT14` is double-booked** between XINT5 and the channel-6 GPIO trip,
-> and with all eight hardware trips enabled that is live. Acquisition wins
-> because `BTS_HAL_setupExAdcGpio_Adc2()` writes `INPUT14` after the trip
-> setup, so slots 5–8 read and channel 6's GPIO trip is silently unrouted.
-> Do not reorder those calls. Free inputs: `INPUT1`, `2`, `3`, `7`, `8` — and note
+> **`INPUT14` is double-booked** between XINT5 and the channel-6 GPIO trip.
+> The GPIO trips are compiled out (`BTS_TRIP_GPIO_CHn_ENABLED`, all false —
+> not fitted on this board), so XINT5 owns it. Move one of them before ever
+> fitting the channel-6 line. Free inputs: `INPUT1`, `2`, `3`, `7`, `8` — and note
 > `INPUT1`/`INPUT2` are ePWM TZ1/TZ2, sitting at their GPIO0 reset default.
 > Channels 7 and 8 have **no** X-BAR path at all: their trips target
 > `INPUT15`/`INPUT16`, which do not exist. Full picture:
@@ -657,6 +656,12 @@ authoritative over both; keep all three current.
 > `EPWM_TZ_FLAG_DCAEVT1` as well as `OST`. They arm on a slot's first run,
 > not at boot. The register-level notes below on TZFLG versus TZOSTFLG still
 > hold.
+>
+> **The ePWM identifies the slot; the comparator number does not.** Slot *n*
+> is watched by CMPSS 1, 3, 2, 4, 7, 6, 8, 5 for slots 1–8, not `CMPSSn` —
+> see `BTS_TRP_CMPSS_CH1..8` and `Docs/hardware-resources.md` §5.0. A trip
+> found by scanning ePWM*n*'s flags is slot *n*'s; never map it back through
+> a comparator index.
 
 driverlib has **no** `Interrupt_getVectorNumber()` — there is no
 `Interrupt_get*` API at all. A shared trip handler must identify the source

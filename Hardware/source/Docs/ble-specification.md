@@ -193,13 +193,15 @@ bit (ch*2 + 1) GPIO group trip on channel ch
 bits 16-31     reserved, zero
 ```
 
-> **Set by real trips, and never cleared.** All eight hardware trips are
-> enabled, so a CMPSS over-current sets the channel's bit in
-> `epwmTripISR()`. Nothing clears it again: the word only accumulates, so a
-> set bit means **"has tripped since the unit booted"**, not "is tripped
-> now". A power cycle clears it. The GPIO bit (`ch*2 + 1`) is never set, as no
-> GPIO trip reaches the one-shot zone. The software over-current check
-> (`BTS_tripEpwm()`) forces the trip zone itself and does not set these bits.
+> **Set by real trips; cleared when the slot is handed back.** A CMPSS
+> over-current sets the channel's bit in `epwmTripISR()`. It stays set until
+> the fault is cleared (`BLE_CMD_CLEAR_FAULT`, which sends the unit mode
+> `0x40`), or the slot is started again, re-armed for a cell, or emptied —
+> **a stop does not clear it**, because the ESP32 sends a stop as its first
+> reaction to a trip. Before 2026-10-09 nothing cleared it. The GPIO bit (`ch*2 + 1`) is
+> never set: the GPIO trip inputs are not fitted on this board. The software
+> over-current check (`BTS_tripEpwm()`) forces the trip zone itself and does
+> not set these bits.
 
 #### 3.1.3 `stats_live`
 
@@ -234,7 +236,7 @@ slot-select.
 |---|---|---|
 | 1 | `BLE_CMD_START` | `test_engine_start(slot)` |
 | 2 | `BLE_CMD_ABORT` | `test_engine_abort(slot)` |
-| 3 | `BLE_CMD_CLEAR_FAULT` | `test_engine_clear_fault(slot)` |
+| 3 | `BLE_CMD_CLEAR_FAULT` | `test_engine_clear_fault(slot)` — also clears the unit's trip indication (mode `0x40`) |
 | 4 | `BLE_CMD_ABORT_ALL` | `test_engine_abort_all()` |
 | 5 | `BLE_CMD_PAUSE` | `test_engine_pause(slot)` — **new in proto 3** |
 | 6 | `BLE_CMD_RESUME` | `test_engine_resume(slot)` — **new in proto 3** |
@@ -500,7 +502,7 @@ carried through unchanged. Authoritative table:
 | 0 | `RUNNING` | Slot is executing a charge or discharge. **Stays set while paused** | yes |
 | 1 | `STOPPED` | Slot is not running | yes |
 | 2 | `FINISHED` / `END` | Test finished normally | **yes** — set by the C2000's termination |
-| 3 | `OVERCURRENT` | An over-current trip latched | **yes, never cleared** — see below |
+| 3 | `OVERCURRENT` | An over-current trip latched | yes — cleared on restart, see below |
 | 4 | `CHARGING` | Mode bit 1 set at the last start | yes |
 | 5 | `DISCHARGING` | Mode bit 1 clear at the last start | yes |
 | 6 | `CONST_VOLTAGE` | Loop is in CV regulation | yes, while running |
@@ -534,8 +536,8 @@ bytes exist so a thin client does not have to carry a bit table.
 
 Three of these need more than their names:
 
-- **Bit 3 (`OVERCURRENT`) latches and never clears**, like `trip_status` —
-  see §3.1.2. Read it as "has tripped since boot".
+- **Bit 3 (`OVERCURRENT`) latches until the slot is handed back**, like
+  `trip_status` — see §3.1.2.
 - **Bits 6 and 7 track the loop.** The build is CC-CV, so they follow the CV
   loop taking over from CC. Both are 0 while the slot is not running.
 - **Bit 2 is set by the C2000's own termination**: a discharge ends at

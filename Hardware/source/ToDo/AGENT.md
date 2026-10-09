@@ -81,11 +81,19 @@ Not ToDo items, recorded here for the same reason:
 
 Open, found while documenting:
 
-- `eTripStatus` and status bit 3 are now set by real trips but **never
-  cleared** - a slot reads over-current until power-cycled.
-- With all hardware trips enabled, channel 6's GPIO trip loses `INPUT14` to
-  slot 5-8 acquisition (acquisition is configured later, so it wins).
-  Channel 6 keeps its CMPSS trip.
+- ~~`eTripStatus` and status bit 3 never clear~~ - fixed 2026-10-09: they
+  clear on a fresh start, a WAITING re-arm, or cell removal; not on a stop.
+- ~~Channel 6's GPIO trip loses `INPUT14`~~ - moot 2026-10-09: the GPIO
+  trips have their own switches, all false (not fitted on this board).
+  Channel 6's trip input is being debugged at the bench - see
+  `Docs/hardware-resources.md` section 4.
+- ~~Slots 2, 3, 5, 7 and 8 were tripped by another slot's comparator~~ -
+  fixed 2026-10-09: each slot is bound to the comparator on its own current
+  pin (`BTS_TRP_CMPSS_CH1..8`: CMPSS 1, 3, 2, 4, 7, 6, 8, 5). ToDo 02 had
+  specified the groups as CMPSSn for slot n, which the device's fixed
+  comparator pins and this board's routing do not allow. Read back on the
+  board: slot 2's trip now carries CMPSS3. Not yet seen to fire on a real
+  over-current. See `Docs/hardware-resources.md` section 5.0.
 - A calibration commit (`CALM=2`) does not set a slot's calibration-valid
   flags.
 - The ESP32's AT console once repeated its last reply ~17,000 times.

@@ -81,8 +81,6 @@
 
     // GPIO29 is the console TX, so the LED string cannot have it.
     #define BTS_LED_DRIVER_ENABLED    (false)
-
-    #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #else
     //
     // Production: no console. GPIO29 is left muxed to SCITXDA and idle -
@@ -90,21 +88,47 @@
     //
     #define BTS_CONSOLE_ENABLED       (false)
     #define BTS_LED_DRIVER_ENABLED    (false)
-    #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #endif
 
-//
-// CHANNEL 1'S GPIO TRIP INPUT IS NEVER ENABLED, in either build.
-//
-// It is not useful: channel 1 keeps its CMPSS over-current trip in both
-// modes, which is the hardware comparator that actually protects the slot and
-// responds in nanoseconds. The separate GPIO trip was a second, slower path
-// on a pin that is contended with the console RX, and nothing depends on it.
-//
-// Hard-coded false above rather than left as a build option so the two
-// branches cannot drift, and so GPIO28 stays a plain input in every build.
-
 #define BTS_ENABLE_DETECT_CODE (false)
+
+//
+//=============================================================================
+// External GPIO trip inputs (per slot) - NOT FITTED ON THIS BOARD
+//=============================================================================
+//
+// The board has no external trip line wired to any slot, so every one of
+// these is false and stays false. The only hardware trip is each slot's CMPSS
+// over-current comparator - BTS_TRIP_HW_CHn_ENABLED below.
+//
+// These were not separate switches until 2026-10-09. The GPIO pin setup and
+// the Input X-BAR routing were compiled in for every slot whose
+// BTS_TRIP_HW_CHn_ENABLED was true, so enabling the comparators also
+// configured eight GPIO trip inputs that go nowhere - and one of them,
+// channel 6's INPUT14 <- GPIO44, collides with CPU1's slot 5-8 acquisition
+// DRDY (XINT5, INPUT14 <- GPIO49). Acquisition happened to be configured
+// later and won, so nothing broke, but only by ordering.
+//
+// A later board revision may fit the lines. Before setting any of these true:
+//
+//   * The one-shot inputs read TZ1/TZ2 (Input X-BAR INPUT1/INPUT2), not the
+//     INPUT9..INPUT14 the routing in BTS_HAL_setupTripSystem() uses. A GPIO
+//     trip has to reach the trip zone through Digital Compare (DCBH, say),
+//     as the comparators do - see BTS_HAL_setupEPWMTripZone().
+//   * Channel 6's INPUT14 must move first: INPUT7 and INPUT8 are free.
+//   * Channels 7 and 8 have no input at all - INPUT15/16 do not exist.
+//   * Channel 1's pin, GPIO28, is the debug console RX.
+//
+// Each still requires that slot's BTS_TRIP_HW_CHn_ENABLED as well.
+//
+#define BTS_TRIP_GPIO_CH1_ENABLED (false)
+#define BTS_TRIP_GPIO_CH2_ENABLED (false)
+#define BTS_TRIP_GPIO_CH3_ENABLED (false)
+#define BTS_TRIP_GPIO_CH4_ENABLED (false)
+#define BTS_TRIP_GPIO_CH5_ENABLED (false)
+#define BTS_TRIP_GPIO_CH6_ENABLED (false)
+#define BTS_TRIP_GPIO_CH7_ENABLED (false)
+#define BTS_TRIP_GPIO_CH8_ENABLED (false)
 
 //
 //=============================================================================
@@ -115,9 +139,10 @@
 // latches the PWM low within a switching cycle. Enabled here; the routing is
 // built by BTS_HAL_setupTripRouting() and armed by BTS_HAL_armTripZones().
 //
-// The GPIO trip inputs (OSHT2) remain masked - those links are not wired on
-// this board, and the Input X-BAR path they need has the defaulting problem
-// described below.
+// THESE ENABLE THE COMPARATOR TRIPS ONLY. The external GPIO trip inputs are
+// not fitted on this board and have their own switches, all false - see
+// BTS_TRIP_GPIO_CHn_ENABLED above. The one-shot inputs they would arrive on
+// (OSHT1/OSHT2) stay masked either way.
 //
 // HOW THE COMPARATOR REACHES THE TRIP ZONE, because the obvious route does
 // not work. The one-shot inputs OSHT1/OSHT2 read TZ1/TZ2, which are hardwired
@@ -679,15 +704,64 @@
 #define BTS_TRP_PIN_GPIO_CH8            46U
 
 
- // Map: A2->COMP1A, B2->COMP2B, A4->COMP3A, IN14->COMP4A, D0->COMP5D, C2->COMP6C, D2->COMP7D, C4->COMP8C
-#define BTS_TRP_PIN_CONFIG_COMP_CH1 ADC_CH_ADCIN2
-#define BTS_TRP_PIN_CONFIG_COMP_CH2 ADC_CH_ADCIN2
-#define BTS_TRP_PIN_CONFIG_COMP_CH3 ADC_CH_ADCIN4
-#define BTS_TRP_PIN_CONFIG_COMP_CH4 ADC_CH_ADCIN14
-#define BTS_TRP_PIN_CONFIG_COMP_CH5 ADC_CH_ADCIN0
-#define BTS_TRP_PIN_CONFIG_COMP_CH6 ADC_CH_ADCIN2
-#define BTS_TRP_PIN_CONFIG_COMP_CH7 ADC_CH_ADCIN2
-#define BTS_TRP_PIN_CONFIG_COMP_CH8 ADC_CH_ADCIN4
+//
+//=============================================================================
+// Over-current comparator per slot - NOT CMPSSn for slot n
+//=============================================================================
+//
+// Each CMPSS has a fixed pair of input pins (datasheet SPRS880 Table 4-1, TRM
+// SPRUHM8K Figure 10-1), and this board routes each slot's sense nets to
+// whichever ADC pins suited the layout. So the comparator that can watch a
+// slot is the one that owns the pin its current-sense net IoutSn lands on -
+// and for slots 2, 3, 5, 7 and 8 that is a different number:
+//
+//   slot  ePWM   IoutSn  J5   device pin  comparator input  CMPSS   X-BAR mux
+//    1    ePWM1  IoutS1  106  ADCINA2     CMPIN1P           CMPSS1  MUX00
+//    2    ePWM2  IoutS2  103  ADCINB2     CMPIN3P           CMPSS3  MUX04
+//    3    ePWM3  IoutS3  100  ADCINA4     CMPIN2P           CMPSS2  MUX02
+//    4    ePWM4  IoutS4   96  ADCIN14     CMPIN4P           CMPSS4  MUX06
+//    5    ePWM5  IoutS5   93  ADCIND0     CMPIN7P           CMPSS7  MUX12
+//    6    ePWM6  IoutS6   90  ADCINC2     CMPIN6P           CMPSS6  MUX10
+//    7    ePWM7  IoutS7   87  ADCIND2     CMPIN8P           CMPSS8  MUX14
+//    8    ePWM8  IoutS8   84  ADCINC4     CMPIN5P           CMPSS5  MUX08
+//
+// IoutSn to J5 pin to device pin is schematic XTIDA-010086E3 sheet 13. J5 is
+// the controlCARD socket; TI's controlCARD pinout numbers the same pin
+// 121 - n. These are also the pins the ADC samples as each slot's current
+// (BTS_HAL_setupADC() and bts_cla.cla), so a board that moves one changes
+// both places.
+//
+// Each slot's voltage-sense net VoutSn lands on the SAME comparator's
+// negative pin (VoutS2 on ADCINB3 = CMPIN3N, and so on). Nothing reads it
+// there: the high and the low comparator both take their negative input
+// from the internal DAC (CMPSS_INSRC_DAC, BTS_HAL_setupCMPSS()).
+//
+// Until 2026-10-09 the routing used CMPSSn for slot n - right for slots 1, 4
+// and 6 only. Applied by btsSlotCmpss[] in bts_hal.c. The full per-slot map,
+// with both sense nets, their links and ADC channels, is in
+// Docs/hardware-resources.md section 5.
+//
+#define BTS_TRP_CMPSS_CH1               (1U)
+#define BTS_TRP_CMPSS_CH2               (3U)
+#define BTS_TRP_CMPSS_CH3               (2U)
+#define BTS_TRP_CMPSS_CH4               (4U)
+#define BTS_TRP_CMPSS_CH5               (7U)
+#define BTS_TRP_CMPSS_CH6               (6U)
+#define BTS_TRP_CMPSS_CH7               (8U)
+#define BTS_TRP_CMPSS_CH8               (5U)
+
+//
+// Eight slots, eight comparators, one each. A repeated entry would leave a
+// slot watched by another slot's current, so anything but a one-to-one
+// assignment of CMPSS1..8 fails the build. This checks only that the table
+// IS one; whether it matches the board is the schematic's question.
+//
+#if (((1U << (BTS_TRP_CMPSS_CH1 - 1U)) | (1U << (BTS_TRP_CMPSS_CH2 - 1U)) | \
+      (1U << (BTS_TRP_CMPSS_CH3 - 1U)) | (1U << (BTS_TRP_CMPSS_CH4 - 1U)) | \
+      (1U << (BTS_TRP_CMPSS_CH5 - 1U)) | (1U << (BTS_TRP_CMPSS_CH6 - 1U)) | \
+      (1U << (BTS_TRP_CMPSS_CH7 - 1U)) | (1U << (BTS_TRP_CMPSS_CH8 - 1U))) != 0xFFU)
+#error "BTS_TRP_CMPSS_CH1..8 must give each slot its own comparator, CMPSS1..8"
+#endif
 
 
 #define BTS_DRV_EPWM_HR_ENABLED           true

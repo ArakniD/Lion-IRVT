@@ -310,8 +310,56 @@ static void slotResume(uint16_t ch)
 }
 
 //
+// Clears a slot's over-current indication: status bit 3 and its two bits in
+// eTripStatus. Neither ever cleared before, so one trip left the slot showing
+// a fault until the unit was power-cycled, even after it ran cleanly again.
+//
+// Called only where an operator hands the slot back - a fresh start,
+// re-arming the pre-charge sequence, removing the cell, or an explicit
+// BTS_MODE_CLEAR_FAULT - because by then the fault has been seen and the
+// slot is being used again. NEVER from the trip path, never on a timer, and
+// deliberately NOT on a stop: the ESP32 engine writes a stop as its first
+// reaction to a trip (fail() -> bts_link_stop_channel()), so clearing there
+// would wipe the fault about a second after it happened, and before
+// anything on the bench had shown it.
+//
+// The hardware latch is already gone by then. epwmTripISR() clears the trip
+// zone's flags as it handles the trip, and BTS_HAL_armTripZones() clears
+// DCAEVT1 again before re-enabling it. So this only brings the reported
+// state into line with the hardware, and it cannot release a trip.
+//
+// A trip that recurs sets everything again: the comparator is re-armed, and
+// the ISR sets the bits afresh on the next over-current. And if the
+// comparator is STILL asserted when the slot is re-armed, the ISR fires at
+// once and the slot stops with the bits set - a persistent fault cannot be
+// cleared by restarting into it.
+//
+static void slotClearOverCurrent(uint16_t ch)
+{
+    const uint32_t mask = 3UL << (ch * 2U);   // cmpss and gpio bits, as in epwmTripISR()
+    bool           wasDisabled;
+
+    status[ch].overCurrentTrip = 0;
+
+    //
+    // epwmTripISR() read-modify-writes the same word, and it can preempt any
+    // task. Keep it out across the clear, or a trip on another channel could
+    // write back a copy taken before this channel's bits came off.
+    //
+    wasDisabled = Interrupt_disableGlobal();
+    cpu1Status.tripStatus &= ~mask;
+    if (!wasDisabled) {
+        Interrupt_enableGlobal();
+    }
+}
+
+//
 // Full stop. Clears the pause and END indications too, so a host that stops a
 // paused slot gets a clean STOPPED rather than a mixture.
+//
+// It does NOT clear the over-current indication: a trip ends in a stop -
+// epwmTripISR() calls this, and the ESP32 sends one straight after - and the
+// fault has to outlive both. See slotClearOverCurrent().
 //
 static void slotStop(uint16_t ch)
 {
@@ -2023,6 +2071,41 @@ void modeCallback(float value, uint16_t channel)
         // slot 1 - the ADS131M08 read 3.48 V and the internal ADC 3.53 V
         // against an applied 3.492 V.
         //
+        //
+        // Fault acknowledgement. An edge command, handled first and not
+        // retained, like pause and resume.
+        //
+        // Clears the latched fault indicators once a host has seen them: the
+        // over-current indication and the group-disconnect bit. Reverse
+        // polarity is not latched - C1() re-measures it every pass - so it
+        // is left alone. Carried across the group, as every command is.
+        //
+        // A member that is driving is skipped. A trip stops the slot, so a
+        // driving slot has nothing to acknowledge.
+        //
+        // WHY THIS EXISTS. The ESP32 test engine will not start a slot whose
+        // trip bit is set - its safety check runs before the slot is ever
+        // powered - while the indication otherwise clears only on a fresh
+        // start. So a tripped slot could never be run through the engine
+        // again. The engine sends this when an operator clears its fault.
+        //
+        if (mode & BTS_MODE_CLEAR_FAULT) {
+            uint16_t m;
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if ((btsSlotLeader[m] != channel) || (btsSlotEnabled[m] == 0U)) {
+                    continue;
+                }
+                if (status[m].running || status[m].balancing ||
+                    status[m].softStart) {
+                    continue;
+                }
+                slotClearOverCurrent(m);
+                status[m].groupDisconnect = 0;
+            }
+            updateStatusRegisters();
+            return;
+        }
+
         if (mode & BTS_MODE_WAITING) {
             if (status[channel].running || status[channel].paused) {
                 return;
@@ -2033,6 +2116,11 @@ void modeCallback(float value, uint16_t channel)
                 for (m = 0; m < NUM_CHANNELS; m++) {
                     if ((btsSlotLeader[m] == channel) &&
                         (btsSlotEnabled[m] != 0U)) {
+                        //
+                        // Re-arming is the operator taking the slot back,
+                        // so a past over-current comes off here.
+                        //
+                        slotClearOverCurrent(m);
                         slotWait(m);
                     }
                 }
@@ -2231,10 +2319,17 @@ void modeCallback(float value, uint16_t channel)
                     status[m].groupDisconnect = 0;
                     status[m].finished = 0;
                     accResetDirection(m, status[m].charging);
+                    //
+                    // A fresh start hands the slot back, so a past
+                    // over-current comes off here - see
+                    // slotClearOverCurrent() for why a stop does not.
+                    //
+                    slotClearOverCurrent(m);
                 }
             }
             if (status[channel].running) {
                 status[channel].groupDisconnect = 0;
+                slotClearOverCurrent(channel);
             }
         }
 
@@ -3162,9 +3257,15 @@ static void servicePreChargeBalance(void)
         // converter down and re-arm - this is also how a fault is cleared,
         // per the brief: pull the cell, the slot goes back to waiting.
         //
+        // The soft-start fault below parks the slot with only `waiting` set
+        // and the over-current bit up, so it has to be included here - and
+        // the bit has to come off. Before this, removing the cell re-armed
+        // nothing for that case and the fault indication never cleared.
+        //
         if (!cellPresent) {
             if (status[ch].balancing || status[ch].ready ||
-                status[ch].softStart) {
+                status[ch].softStart || status[ch].overCurrentTrip) {
+                slotClearOverCurrent(ch);
                 slotWait(ch);
                 updateStatusRegisters();
             }

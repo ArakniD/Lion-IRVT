@@ -159,7 +159,7 @@ Query parameters: none.
 | `unit.online` | bool | The last I2C poll cycle to the BTS completed |
 | `unit.unit_state` | 0–4 | See §1.3.1 |
 | `unit.input_voltage_v` | float, 3 dp | DC input bus, register 1176 |
-| `unit.trip_status` | uint32 | Two bits per channel. Set by a hardware trip and **never cleared** — see §2.7 |
+| `unit.trip_status` | uint32 | Two bits per channel. Set by a hardware trip; cleared when the slot is restarted — see §2.7 |
 | `unit.consecutive_errors` | uint32 | Failed poll cycles in a row; 0 when healthy |
 | `unit.watchdog_timeout_s` | float, 0 dp | The unit's configured host-watchdog timeout, register 1196. **0 = disabled** |
 | `unit.watchdog_enabled` | bool | `watchdog_timeout_s > 0`. Convenience only, derived from the field above |
@@ -388,7 +388,7 @@ No body. All five return `{"ok":true}` on success.
 |---|---|---|
 | `/start` | `test_engine_start(n)` | Mode write with RUN + direction. Zeroes the starting direction's counter set |
 | `/abort` | `test_engine_abort(n)` | Mode write of `0x00`. Zeroes nothing |
-| `/clear` | `test_engine_clear_fault(n)` | Clears the proxy's own fault latch |
+| `/clear` | `test_engine_clear_fault(n)` | Clears the proxy's own fault latch, and sends the unit `BTS_MODE_CLEAR_FAULT` so its trip indication clears too |
 | `/pause` | `test_engine_pause(n)` | Mode bit 3. Converter reference to zero, direction remembered, **counters frozen and kept** |
 | `/resume` | `test_engine_resume(n)` | Mode bit 4. Resumes the held direction, **zeroes nothing**, clears `WD_TRIPPED` and `RESTORED` |
 
@@ -1234,7 +1234,7 @@ from the map**, and the accumulators are live.
 | `eChX_ChargeRuntime_s`, `eChX_DischargeRuntime_s` | **Live.** New in v2, on the same timestep as the mAh/mWh |
 | Status bit 2 (`FINISHED` / `END`) | **Now driven, and asserted by the C2000's own termination.** See §2.7 |
 | `eChX_SettingsSpare` | **Deleted 2026-09-22** with the settings compression. There is no spare register left in the settings region; a new per-slot setting now needs another stride change |
-| `eTripStatus` | **Live since the hardware trips were enabled**, but never cleared. See §2.7 |
+| `eTripStatus` | **Live** since the hardware trips were enabled; cleared on restart. See §2.7 |
 
 The accumulators remain **RO**, so a host still cannot zero them on demand.
 The BTS zeroes a direction's set itself when that direction starts — see
@@ -1259,7 +1259,7 @@ to the host as a `float32`.
 | 0 | `RUNNING` | Slot is executing a charge or discharge. **Stays set while PAUSED** — a pause is a held run | yes |
 | 1 | `STOPPED` | Slot is not running | yes |
 | 2 | `FINISHED` / `END` | Test finished normally. Converter off, counters hold final values | **yes** — set by the C2000's termination |
-| 3 | `OVERCURRENT` | An over-current trip latched | **yes, and never cleared** — see below |
+| 3 | `OVERCURRENT` | An over-current trip latched | yes — cleared on restart, see below |
 | 4 | `CHARGING` | Mode bit 1 was set at the last start | yes |
 | 5 | `DISCHARGING` | Mode bit 1 was clear at the last start | yes |
 | 6 | `CONST_VOLTAGE` | Loop is in CV regulation | yes, while running |
@@ -1318,8 +1318,8 @@ cell may have been swapped while it was off. Both clear on resume
 
 Three of these bits need more than their names:
 
-- **Bit 3 (`OVERCURRENT`) latches and never clears** — see `eTripStatus`
-  below. It is also set when a soft start runs out of retries.
+- **Bit 3 (`OVERCURRENT`) latches until the slot is handed back** — see
+  `eTripStatus` below. It is also set when a soft start runs out of retries.
 - **Bits 6 and 7 track the loop.** The build is CC-CV
   (`BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_CCCV`), so `ctrlMode_logic` follows
   the CV loop taking over from CC. Both bits are **0 while the slot is not
@@ -1352,18 +1352,31 @@ bit (ch*2 + 1) GPIO group trip on channel ch
 bits 16-31     reserved
 ```
 
-> **Set by real trips since 2026-10-08, and never cleared.** All eight
-> hardware trips are enabled (`BTS_TRIP_HW_CH1..8_ENABLED (true)`), so
-> `epwmTripISR()` runs on a CMPSS trip and sets the channel's bit. It latched
-> on hardware during the deadband investigation, as `TZOSTFLG` 0x0040
-> (DCAEVT1) on channel 1.
+> **Set by real trips since 2026-10-08.** All eight CMPSS comparator trips
+> are enabled (`BTS_TRIP_HW_CH1..8_ENABLED (true)`), so `epwmTripISR()` runs
+> on a comparator trip and sets the channel's bit. It latched on hardware
+> during the deadband investigation, as `TZOSTFLG` 0x0040 (DCAEVT1) on
+> channel 1.
 >
-> **Nothing clears these bits.** `epwmTripISR()` only ORs into
-> `cpu1Status.tripStatus`, and status bit 3 (`status[].overCurrentTrip`) is
-> likewise never reset — so a slot that tripped once reports over-current
-> until the unit is power-cycled, even after it runs normally again. Read a
-> set bit as **"has tripped since boot"**, not "is tripped now". The GPIO bit
-> (`ch*2 + 1`) is never set: no GPIO trip is routed to the one-shot zone.
+> **When it clears (since 2026-10-09).** A slot's two bits here, and its
+> status bit 3, stay set after the trip so the fault is seen. They clear when
+> the slot is handed back: an explicit **clear-fault** command (mode `0x40`),
+> a fresh start (the mode register with run set), re-arming the pre-charge
+> wait (`BTS_MODE_WAITING`), or removing the cell from the slot. The ESP32
+> sends `0x40` when its own fault is cleared (`POST /api/slot/<n>/clear`,
+> `BLE_CMD_CLEAR_FAULT`) — without it the engine could never start a tripped
+> slot again, because its safety check refuses a slot whose trip bit is set. **A stop does not clear them** — the ESP32 engine sends a
+> stop as its first reaction to a trip, and clearing there would wipe the
+> fault about a second after it happened. A trip that recurs sets them
+> again; restarting into a fault that is still present trips at once.
+>
+> Before 2026-10-09 nothing cleared them, and one trip left a slot reading
+> over-current until power-cycle. The hardware latch is not affected by any
+> of this: `epwmTripISR()` clears the trip zone as it handles the trip, and
+> the arm clears it again before re-enabling.
+>
+> The GPIO bit (`ch*2 + 1`) is never set: the external GPIO trip inputs are
+> not fitted on this board (`BTS_TRIP_GPIO_CHn_ENABLED`, all false).
 >
 > The **software** over-current check (`BTS_tripEpwm()`) still runs every
 > control pass as the first line, at ±8 A against the hardware's ±9.5 A. It
@@ -1381,6 +1394,8 @@ The only register that causes an action rather than storing a value.
 | 2 | `0x04` | Enter calibration |
 | 3 | `0x08` | **PAUSE** — hold a running slot. Edge command |
 | 4 | `0x10` | **RESUME** — release a paused slot. Edge command |
+| 5 | `0x20` | **WAITING** — arm the pre-charge sequence. From STOPPED or END only |
+| 6 | `0x40` | **CLEAR FAULT** — clear the latched over-current and group-disconnect indicators. Edge command, ignored on a driving slot |
 
 | Value | Effect |
 |---|---|
@@ -1390,6 +1405,7 @@ The only register that causes an action rather than storing a value.
 | `0x04` | Enter calibration on this channel |
 | `0x08` | Pause this channel |
 | `0x10` | Resume this channel |
+| `0x40` | Clear this channel's latched fault indicators |
 
 > **Bits 3 and 4 are edge commands.** They are acted on at the write and
 > **not retained**, so a host never has to clear them afterwards and there is
@@ -1641,7 +1657,7 @@ block at risk.
 | 976 | `eCalibrationMode` | **RW** | command | Writing exactly `2.0f` triggers a deferred F-RAM save of the whole calibration image. **No acknowledgement**, and the register is never cleared. Decoded with no tolerance — `1.9999f` does nothing |
 | 980 | `eUnitState` | RO | enum | `UnitState`, 0–4. See §1.3.1 |
 | 984 | `eInputVoltage` | RO | V | DC input bus voltage |
-| 988 | `eTripStatus` | RO | bitfield | Two bits per channel. Set by a hardware trip and **never cleared** — see §2.7 |
+| 988 | `eTripStatus` | RO | bitfield | Two bits per channel. Set by a hardware trip; cleared on restart — see §2.7 |
 | 992 | `eSlotMode` | RO | 0–7 | `BTS_SlotMode`. Low two bits = group size, bit 2 selects the converter |
 | 996 | `eSlotEnable` | RO | 0–7 | Index of the **highest enabled** slot: 0 enables slot 1 alone, 7 enables all eight |
 | 1000 | `eGroupSize` | RO | 1/2/4/8 | Slots per group, `1 << (mode & 3)` |

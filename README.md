@@ -213,8 +213,8 @@ same address in both, and `CPU2TOCPU1RAM` must not overflow. There are
 `supervision`, `canData`, `cpu1Status`, `startup_mode` and `startup_enable`.
 
 The current tree builds clean on both cores, all eight symbols resolve
-identically in the two map files, and `CPU2TOCPU1RAM` has **330 words free of
-1024** after the settings compression. `CPU1TOCPU2RAM` has 516 free.
+identically in the two map files, and `CPU2TOCPU1RAM` has **304 words free of
+1024** (`0x2D0` used). `CPU1TOCPU2RAM` has 516 free.
 
 > **Both cores now have their own complete flash bank, and this was wrong
 > before.** On the F2837xD each CPU has its *own* full bank, both mapped at the
@@ -418,7 +418,14 @@ What protects each bus from a stuck transfer:
 ### Straps
 
 MODE and ENABLE are DIP switches read once at power-on, through an SN74HC148
-priority encoder. **All switches off reads as 0.**
+priority encoder. **All switches off reads as 0.** Turn on **one switch at a
+time**: with more than one on, the encoder reports only the highest-priority
+input. The switches are not wired to the encoder in order, so
+`truth_table[]` in `bts_hal.c` maps them back — since 2026-10-09 it reverses
+the top four encoder inputs (I4→7, I5→6, I6→5, I7→4) and leaves I0–I3 as
+they were. Check a setting against what the unit reports (`slot_mode` and
+`slots_enabled` in `GET /api/status`) rather than trusting the switch
+position.
 
 - **MODE** sets the grouping: 0 = eight independent slots, 1 = pairs,
   2 = quads, 3 = all eight as one group; 4 and 5 are 0 and 1 with the voltage
@@ -429,6 +436,29 @@ priority encoder. **All switches off reads as 0.**
 
 So **all slots, independent** is MODE = 0, ENABLE = 7. All switches off gives
 MODE 0, ENABLE 0 — slot 1 only.
+
+### Which comparator watches which slot
+
+Each slot's hardware over-current trip (±9.5 A) is a CMPSS comparator on the
+pin its current-sense net reaches. The device fixes each comparator's pins and
+the board routes the sense nets for layout, so **slot *n* is not `CMPSSn`**:
+
+| Slot | Current sense | Device pin | Comparator | Voltage sense | Device pin |
+|---|---|---|---|---|---|
+| 1 | `IoutS1` | `ADCINA2` | **CMPSS1** | `VoutS1` | `ADCINA3` |
+| 2 | `IoutS2` | `ADCINB2` | **CMPSS3** | `VoutS2` | `ADCINB3` |
+| 3 | `IoutS3` | `ADCINA4` | **CMPSS2** | `VoutS3` | `ADCINA5` |
+| 4 | `IoutS4` | `ADCIN14` | **CMPSS4** | `VoutS4` | `ADCIN15` |
+| 5 | `IoutS5` | `ADCIND0` | **CMPSS7** | `VoutS5` | `ADCIND1` |
+| 6 | `IoutS6` | `ADCINC2` | **CMPSS6** | `VoutS6` | `ADCINC3` |
+| 7 | `IoutS7` | `ADCIND2` | **CMPSS8** | `VoutS7` | `ADCIND3` |
+| 8 | `IoutS8` | `ADCINC4` | **CMPSS5** | `VoutS8` | `ADCINC5` |
+
+The voltage pin is the same comparator's negative input and is not used by
+it: both comparators compare against their internal DAC. The binding is
+`BTS_TRP_CMPSS_CH1..8` in `bts_user_settings.h`. The full table, with each
+net's 0-ohm link, `J5` pin, comparator input and ADC SOC, is in
+[`hardware-resources.md` §5.0](Hardware/source/Docs/hardware-resources.md#50-which-comparator-watches-which-slot).
 
 ---
 
@@ -581,6 +611,9 @@ decision or a gap.
 | ~~The unit never boots without the debugger~~ | **Fixed.** `_STANDALONE` is defined beside `_FLASH`, so CPU1 starts CPU2, with a bounded wait and a resend if CPU2's boot ROM does not acknowledge. A cold power-up with the XDS100 **attached** still cannot boot: a powered probe holds TRSTn high and the boot ROM ignores the boot switch. Unplug it. |
 | ~~F-RAM reads fail at every boot~~ | **Fixed.** A stop bit left armed in `I2CMDR` by an earlier transfer rode into the read's address phase, so calibration and slot state silently fell back to defaults on every boot. `I2CMDR` is now written outright, and boot reads retry up to 8 times. 0 read failures since. |
 | ~~Temperatures read 0.00 °C after a cold boot~~ | **Fixed.** A lost DRDY edge left the ADS1119 state machine idle forever. A converter quiet for 1 s is now read anyway, and one disabled after repeated failures is re-armed after 10 s. This also retires the old "the ADS1119 state machine stalls after a JTAG load" entry. |
+| ~~The over-current indication never clears~~ | **Fixed 2026-10-09** (build only, no hardware yet). `eTripStatus` and status bit 3 clear when the slot is handed back — clearing the fault on the ESP32 (it sends the unit a new clear-fault mode command, `0x40`), a fresh start, a `WAITING` re-arm, or removing the cell. Deliberately **not** on a stop: the ESP32 sends a stop as its first reaction to a trip, and clearing there would wipe the fault before anyone saw it. |
+| ~~The comparator that trips a slot watched a different slot's current, on slots 2, 3, 5, 7 and 8~~ | **Fixed 2026-10-09, and the routing read back from the board.** Each comparator's input pins are fixed by the device, and the board routes each slot's sense nets for layout, so slot *n* is not watched by `CMPSSn`: slot 2 is `CMPSS3`, slot 3 `CMPSS2`, slot 5 `CMPSS7`, slot 7 `CMPSS8` and slot 8 `CMPSS5`. The firmware assumed `CMPSSn`, so slots 2 and 3 tripped on each other's current and 5, 7 and 8 in a ring — in the ungrouped and pair modes; quads and the octet were unaffected. Each slot is now bound to the comparator on its own current pin (`BTS_TRP_CMPSS_CH1..8`), and on the board slot 2's trip now reads `CMPSS3`. No trip has been forced. See [Which comparator watches which slot](#which-comparator-watches-which-slot). |
+| ~~The GPIO trip inputs were configured on every slot~~ | **Fixed 2026-10-09.** They are not fitted on this board, and now have their own switches, `BTS_TRIP_GPIO_CH1..8_ENABLED`, all `false`. Until then the pin setup and X-BAR routing were gated on the CMPSS switches, so enabling the comparators also configured seven unwired inputs and put channel 6's on `INPUT14`, which slots 5–8 need. Only the CMPSS comparators trip now. |
 | ~~The ESP32 panics when the BTS stops answering~~ | **Fixed.** A failed `i2c_master_probe()` in ESP-IDF v6.1 leaves a dangling operation list behind, and the next transfer crashed on it. The proxy no longer scans the bus while the link is down, and resets the bus after any failed transfer. |
 | ~~A spurious `WARNING: host watchdog DISABLED` on the AT console~~ | **Gone.** The warning and its flag were removed on 2026-09-22 (`8070d2e`); nothing prints it any more. |
 | ~~The AT console's baud rate is wrong, and the cause is unknown~~ | **Resolved — the console works at 115200.** It was never a hardware fault. The console is served by **CPU2**, whose `SCI_setConfig()` derives BRR from `DEVICE_LSPCLK_FREQ`; the clock config was edited repeatedly with only CPU1 rebuilt, so CPU2 kept a divisor built for the previous clock and the apparent baud moved every time. Every "independent" clock measurement came through that same console and shared the confound. SYSCLK measures **179.7 MHz** against a configured 180 MHz. A bare `AT` producing no reply is separate and **by design** — `uartRxISR()` matches only `"AT+"`. |
@@ -601,15 +634,14 @@ decision or a gap.
 
 | | |
 |---|---|
-| **The over-current indication never clears.** | `eTripStatus` (988) and status bit 3 are now set by real trips — but nothing clears them. `epwmTripISR()` only ORs bits into `cpu1Status.tripStatus`, and no path resets `status[].overCurrentTrip`, so after one trip a slot reports over-current until the unit is power-cycled, even once it is running normally again. Read a set bit as "has tripped since boot", not "is tripped now". |
-| **Channel 6's GPIO trip has no X-BAR input.** | Enabling the hardware trips made the `INPUT14` double-booking live: the channel-6 GPIO trip (GPIO44) and CPU1's slot 5–8 acquisition DRDY (XINT5, GPIO49) both select `INPUT14`. Acquisition is configured last, so it wins and slots 5–8 still read — but channel 6's GPIO trip is not routed. Channel 6 keeps its CMPSS comparator trip, which is the one that protects the slot. Channels 7 and 8 have no GPIO-trip input at all (`INPUT15`/`16` do not exist). See `Docs/hardware-resources.md` §4. |
+| **Channel 6's trip input is under bench investigation.** | Suspected of not being properly connected (2026-10-09). Channel 6 has one trip input on this board: comparator CMPSS6, whose positive input `CMPIN6P` is `ADCINC2` — the same pin the firmware samples as slot 6's current, on the schematic's `IoutS6` net (0-ohm link R253, `J5` pin 90). The GPIO trip inputs are not fitted, so nothing else can trip it. Slot 6's comparator was already right, so the comparator fix above does not change it. See `Docs/hardware-resources.md` §4. |
 | **The internal-ADC current reads ~60 mA high at low current.** | Slot 1 at a 100 mA setpoint: ADS131M08 0.10 A, internal ADC 0.16 A; they agree to 2 % at 1 A. A zero offset that the two-point calibration will remove. The control loop and the counters use the ADS131M08, so regulation is unaffected. |
 | **A calibration commit does not mark a slot calibrated.** | `eCalibrationMode = 2` saves the current gains to F-RAM but keeps whatever validity flags the slot already had, so committing a slot's factory gains still leaves its calibration ticks (`CAL_V_VALID`/`CAL_I_VALID`) clear. The runtime calibration's `CAL_CMD_COMPUTE_SAVE` sets them. |
 | **The global voltage thresholds persist only through a calibration commit.** | `eChargeDisableV` … `eDischargeDisableV` (960–972) take effect when written, but are saved to F-RAM only by `eCalibrationMode = 2`. Write them, then commit, or they revert at the next boot. |
 | **The ESP32's AT console can repeat its last reply.** | Seen once on 2026-10-08: about 17,000 copies of one reply to a single command, with the proxy otherwise healthy. Not yet investigated. It does not affect the C2000, but it will confuse any tool parsing the ESP32's console. |
 | **A cell temperature of 18.32 °C is not a measurement.** | `BTS_NTC_POLY_C0` is 18.323 and the Horner evaluation returns exactly C0 for a zero input, so 18.32–18.90 °C means an **open input** — an empty slot. Measured: empty slots read 18.9 °C. |
 | **`bts_regs.h` is a hand-maintained mirror of `registers.h` with no build coupling.** | Adding a register means editing both, and they have drifted twice. Worse, the two files use the **same identifiers for different things**: `BTS_STATUS_*` and `BTS_CAL_ST_*` are bit *positions* on the C2000 and bit *masks* on the ESP32; the `BTS_RT_*`, `BTS_SET_*` and `BTS_CAL_*` offsets are register *indices* on one side and *byte* offsets on the other; and `BTS_RT_BASE` / `BTS_SET_BASE` are function-like macros returning an index on the C2000 and bare byte-address constants on the ESP32. `BTS_RT_STATUS` is `0` in both files, while `BTS_RT_CELL_VOLTAGE` is `1` on the C2000 and `4` on the ESP32. Copying a line between the files compiles and is wrong. |
-| **There is no spare register left in any region.** | The 2026-09-22 compression spent the settings region's slack. A new per-slot field now means another stride change, which moves every address below it and breaks every host — the thing the generous strides were chosen to avoid. `CPU2TOCPU1RAM` is no longer the binding constraint (330 of 1024 words free); the map layout is. |
+| **There is no spare register left in any region.** | The 2026-09-22 compression spent the settings region's slack. A new per-slot field now means another stride change, which moves every address below it and breaks every host — the thing the generous strides were chosen to avoid. `CPU2TOCPU1RAM` is no longer the binding constraint (304 of 1024 words free); the map layout is. |
 | **Every slot must be recalibrated, and the saved state was invalidated too.** | Both F-RAM headers were bumped: the calibration image `0xA5CC` → `0xA5CD` for the `calFlags`/`crc32` revision and the fixed 128-byte stride, and the slot-state record `0x5A5E` → `0x5A5F` for the 64-byte layout. The calibration change also fixed a collision in which channel 4's block overwrote the global voltage thresholds — which consequently had *never* persisted. The state change fixed a 20-word record running 8 bytes into the next slot's header, so that only slot 7 could ever validate. |
 | **The C2000 and the ESP32 must be flashed together.** | The 2026-09-22 compression moved every settings and unit address. A mismatched pair reads plausible-looking garbage rather than failing loudly, because every address in this map is a valid float somewhere else in it. |
 | **No mDNS.** | Nothing in the firmware registers a `.local` name. Use the IP address the device logs on connect (`idf.py monitor`). |

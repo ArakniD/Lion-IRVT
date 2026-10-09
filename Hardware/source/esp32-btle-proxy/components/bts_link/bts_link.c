@@ -204,6 +204,11 @@ esp_err_t bts_link_resume_channel(uint8_t channel)
     return bts_link_set_mode(channel, BTS_MODE_RESUME);
 }
 
+esp_err_t bts_link_clear_fault_channel(uint8_t channel)
+{
+    return bts_link_set_mode(channel, BTS_MODE_CLEAR_FAULT);
+}
+
 esp_err_t bts_link_stop_all(void)
 {
     esp_err_t first_err = ESP_OK;

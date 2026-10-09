@@ -329,6 +329,12 @@ typedef enum {
 #define BTS_MODE_RESUME             0x10u
 /* Arms the pre-charge sequence. Only accepted from STOPPED or END. */
 #define BTS_MODE_WAITING            0x20u
+/*
+ * Edge command: acknowledges a fault, clearing the latched over-current
+ * (status bit 3, eTripStatus) and group-disconnect indicators on a slot that
+ * is not driving. A firmware older than 2026-10-09 ignores it.
+ */
+#define BTS_MODE_CLEAR_FAULT        0x40u
 #define BTS_MODE_RUN_DISCHARGE      (BTS_MODE_RUN)
 #define BTS_MODE_RUN_CHARGE         (BTS_MODE_RUN | BTS_MODE_CHARGE)
 
