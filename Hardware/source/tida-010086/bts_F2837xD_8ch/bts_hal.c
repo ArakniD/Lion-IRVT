@@ -509,22 +509,59 @@ void BTS_HAL_setupDevice(void)
 extern volatile uint32_t startup_mode;
 extern volatile uint32_t startup_enable;
 
-/* SN74HC148DR
- * This is attached to the three inputs, so its a single select
- * based on parity really - and the dip-switch was wired
- * [4-1] = [1-4]
- * [5-8] = [5-8]
- * meaning slightly out-of-order. Only one switch to be engaged
- * at a time to ensure correct decoding, otherwise mayhem! */
-uint8_t truth_table[8] = {
-  4, // 0 Input 4=L
-  5, // 1 Input 5=L
-  6, // 2 Input 6=L
-  7, // 3 Input 7=L
-  3, // 4 Input 3=L
-  2, // 5 Input 2=L
-  1, // 6 Input 1=L
-  0  // 7 Input 0=L or ALL OFF
+//
+// MODE and ENABLE strap decode: SN74HC148 code -> setting.
+//
+// Each strap is an 8-way DIP switch into an SN74HC148 priority encoder (S4 ->
+// U26 for ENABLE, S5 -> U27 for MODE; schematic XTIDA-010086E3 sheet 13).
+// Every encoder input has a 10k pull-up and a switch to ground, so an ON
+// switch drives its input LOW. EI is tied low and GS is not connected. The
+// three outputs A0..A2 arrive on GPIO57..59 (ENABLE) and GPIO54..56 (MODE),
+// and that 3-bit code, A2 A1 A0, is the index here.
+//
+// The switches are not wired to the encoder in order: DIP 1-4 reach inputs
+// 3-0, reversed, and DIP 5-8 reach inputs 4-7. With the 148's inverted
+// outputs that gives:
+//
+//   DIP on   input   A2 A1 A0   index   setting
+//     1        3      H  L  L      4       0
+//     2        2      H  L  H      5       1
+//     3        1      H  H  L      6       2
+//     4        0      H  H  H      7       3
+//     5        4      L  H  H      3       4
+//     6        5      L  H  L      2       5
+//     7        6      L  L  H      1       6
+//     8        7      L  L  L      0       7
+//    none      -      H  H  H      7       3   <- the same code as DIP 4
+//
+// so each DIP switch selects the setting printed beside it, counting from 0.
+//
+// ALL SWITCHES OFF READS AS DIP 4. With no input low the 148 outputs H H H,
+// which is exactly what input 0 - DIP 4 - produces, and only GS could tell
+// them apart. So an unstrapped board decodes to setting 3 on both straps:
+// MODE 3 (all eight slots as one group) and ENABLE 3 (slots 1-4). That is a
+// partial group, so its hardware trips are left unrouted and it cannot run a
+// sensible test. Strap the board.
+//
+// ONE SWITCH AT A TIME. With two on, the 148 reports only the
+// higher-numbered input, and nothing here can tell.
+//
+// static const, NOT a plain array, and this is what broke a standalone boot.
+// The project links with --ram_model: .data is initialised only by the
+// debugger's program load, never by a boot from flash. As an initialised
+// array in .data, this table held its values after a CCS load and zeros
+// after a power cycle - so every switch position decoded to 0, MODE 0 /
+// ENABLE 0, whatever the switches said. const puts it in flash.
+//
+static const uint16_t truth_table[8] = {
+    7U,     // 0  L L L  DIP 8
+    6U,     // 1  L L H  DIP 7
+    5U,     // 2  L H L  DIP 6
+    4U,     // 3  L H H  DIP 5
+    0U,     // 4  H L L  DIP 1
+    1U,     // 5  H L H  DIP 2
+    2U,     // 6  H H L  DIP 3
+    3U,     // 7  H H H  DIP 4, or all switches off
 };
 
 
@@ -552,13 +589,13 @@ void BTS_HAL_setupGPIO(void)
     GPIO_setPadConfig(BTS_EN_GPIO_PIN_1, GPIO_PIN_TYPE_STD);
     GPIO_setPadConfig(BTS_EN_GPIO_PIN_2, GPIO_PIN_TYPE_STD);
 
-    // startup_enable
+    // startup_enable - A0..A2 of U26, decoded by truth_table[] above
     startup_enable  = (GPIO_readPin(BTS_EN_GPIO_PIN_0) ? 1 : 0) << 0;
     startup_enable |= (GPIO_readPin(BTS_EN_GPIO_PIN_1) ? 1 : 0) << 1;
     startup_enable |= (GPIO_readPin(BTS_EN_GPIO_PIN_2) ? 1 : 0) << 2;
     startup_enable = truth_table[startup_enable];
 
-    // startup_mode
+    // startup_mode - A0..A2 of U27, decoded the same way
     startup_mode  = (GPIO_readPin(BTS_MODE_GPIO_PIN_0) ? 1 : 0) << 0;
     startup_mode |= (GPIO_readPin(BTS_MODE_GPIO_PIN_1) ? 1 : 0) << 1;
     startup_mode |= (GPIO_readPin(BTS_MODE_GPIO_PIN_2) ? 1 : 0) << 2;

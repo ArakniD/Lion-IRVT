@@ -906,14 +906,18 @@ by a command mid-sweep. It is a runtime branch rather than the `#if` it used
 to be, so one tuning binary serves both sweeps - otherwise a system builder
 would have to reflash between measuring the plant and checking the result.
 
-**Mode 0 was NOT taken for SFRA, despite the original spec.** The MODE and
-ENABLE straps are pulled high, so an unstrapped board reads `0b111`, which
-the SN74HC148 truth table maps to **mode 0**. Mode 0 is therefore both a real
-mode and the unstrapped default - putting slot tuning there would have sent
-every unstrapped unit into a calibration sweep at power-on, with no slot
-running and the AT console replaced by the SFRA serial port. The tuning modes
-sit at the far end of the table instead, where they require a deliberate
-strap.
+**Mode 0 was NOT taken for SFRA, despite the original spec.** At the time
+the SN74HC148 truth table mapped an unstrapped board to **mode 0**, so mode 0
+was both a real mode and the unstrapped default - putting slot tuning there
+would have sent every unstrapped unit into a calibration sweep at power-on,
+with no slot running and the AT console replaced by the SFRA serial port. The
+tuning modes sit at the far end of the table instead, where they require a
+deliberate strap.
+
+> **Since 2026-10-09 an unstrapped board decodes to mode 3, not 0.** The table
+> was corrected against the schematic so each DIP switch selects its own
+> number, and "no switch on" is the encoder code for DIP 4. The SFRA modes
+> still need a deliberate strap. See `hardware-resources.md` §11.
 
 **The slot under test comes from the ENABLE straps.** ENABLE normally names
 the highest enabled slot; in a tuning mode there is only one slot under test,

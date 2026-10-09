@@ -418,14 +418,27 @@ What protects each bus from a stuck transfer:
 ### Straps
 
 MODE and ENABLE are DIP switches read once at power-on, through an SN74HC148
-priority encoder. **All switches off reads as 0.** Turn on **one switch at a
-time**: with more than one on, the encoder reports only the highest-priority
-input. The switches are not wired to the encoder in order, so
-`truth_table[]` in `bts_hal.c` maps them back — since 2026-10-09 it reverses
-the top four encoder inputs (I4→7, I5→6, I6→5, I7→4) and leaves I0–I3 as
-they were. Check a setting against what the unit reports (`slot_mode` and
-`slots_enabled` in `GET /api/status`) rather than trusting the switch
-position.
+priority encoder. **DIP switch *n* selects setting *n* − 1**: DIP 1 is 0, DIP 8
+is 7. Turn on **one switch at a time** — with more than one on, the encoder
+reports only one of them.
+
+**All switches off reads the same as DIP 4, which is setting 3.** The encoder
+outputs the same code for "no switch on" as for its input 0, which is where
+DIP 4 is wired, and the board does not bring out the GS pin that would tell
+them apart. So an unstrapped board comes up in MODE 3 (one group of eight)
+with ENABLE 3 (slots 1–4) — a part-populated group that cannot run a test.
+Always set both straps.
+
+| DIP switch on | 1 | 2 | 3 | 4 or none | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| **Setting** | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+The switches are not wired to the encoder in order — DIP 1–4 reach its inputs
+3–0, DIP 5–8 its inputs 4–7 — and `truth_table[]` in `bts_hal.c` maps them
+back. The full derivation is in [`hardware-resources.md` §11](Hardware/source/Docs/hardware-resources.md#11-mode-and-enable-straps).
+Check a setting against what the unit reports (`slot_mode` and
+`slots_enabled` in `GET /api/status`, or `AT+SMD?` and `AT+SEN?` on the
+ESP32's console) rather than trusting the switch position.
 
 - **MODE** sets the grouping: 0 = eight independent slots, 1 = pairs,
   2 = quads, 3 = all eight as one group; 4 and 5 are 0 and 1 with the voltage
@@ -434,8 +447,8 @@ position.
 - **ENABLE** is the index of the **highest enabled slot**: 0 enables slot 1
   alone, 7 enables all eight.
 
-So **all slots, independent** is MODE = 0, ENABLE = 7. All switches off gives
-MODE 0, ENABLE 0 — slot 1 only.
+So **all slots, independent** is MODE DIP 1 and ENABLE DIP 8. **Slot 1
+alone** is MODE DIP 1 and ENABLE DIP 1.
 
 ### Which comparator watches which slot
 
@@ -613,6 +626,7 @@ decision or a gap.
 | ~~Temperatures read 0.00 °C after a cold boot~~ | **Fixed.** A lost DRDY edge left the ADS1119 state machine idle forever. A converter quiet for 1 s is now read anyway, and one disabled after repeated failures is re-armed after 10 s. This also retires the old "the ADS1119 state machine stalls after a JTAG load" entry. |
 | ~~The over-current indication never clears~~ | **Fixed 2026-10-09** (build only, no hardware yet). `eTripStatus` and status bit 3 clear when the slot is handed back — clearing the fault on the ESP32 (it sends the unit a new clear-fault mode command, `0x40`), a fresh start, a `WAITING` re-arm, or removing the cell. Deliberately **not** on a stop: the ESP32 sends a stop as its first reaction to a trip, and clearing there would wipe the fault before anyone saw it. |
 | ~~The comparator that trips a slot watched a different slot's current, on slots 2, 3, 5, 7 and 8~~ | **Fixed 2026-10-09, and the routing read back from the board.** Each comparator's input pins are fixed by the device, and the board routes each slot's sense nets for layout, so slot *n* is not watched by `CMPSSn`: slot 2 is `CMPSS3`, slot 3 `CMPSS2`, slot 5 `CMPSS7`, slot 7 `CMPSS8` and slot 8 `CMPSS5`. The firmware assumed `CMPSSn`, so slots 2 and 3 tripped on each other's current and 5, 7 and 8 in a ring — in the ungrouped and pair modes; quads and the octet were unaffected. Each slot is now bound to the comparator on its own current pin (`BTS_TRP_CMPSS_CH1..8`), and on the board slot 2's trip now reads `CMPSS3`. No trip has been forced. See [Which comparator watches which slot](#which-comparator-watches-which-slot). |
+| ~~The MODE and ENABLE straps read 0 after a power cycle, whatever the switches said~~ | **Fixed 2026-10-09, and verified on the board.** The decode table was an initialised array, and this project links with `--ram_model`, so only a debugger load ever wrote it: after a standalone boot from flash it held zeros, and every switch position decoded to MODE 0 / ENABLE 0. It is `const` now, in flash. The table itself was also corrected against the schematic, so each DIP switch selects the setting printed beside it (see [Straps](#straps)). The value reaches the ESP32 correctly: the unit latched MODE 3 / ENABLE 2 and `AT+SMD?` / `AT+SEN?` returned the same. |
 | ~~The GPIO trip inputs were configured on every slot~~ | **Fixed 2026-10-09.** They are not fitted on this board, and now have their own switches, `BTS_TRIP_GPIO_CH1..8_ENABLED`, all `false`. Until then the pin setup and X-BAR routing were gated on the CMPSS switches, so enabling the comparators also configured seven unwired inputs and put channel 6's on `INPUT14`, which slots 5–8 need. Only the CMPSS comparators trip now. |
 | ~~The ESP32 panics when the BTS stops answering~~ | **Fixed.** A failed `i2c_master_probe()` in ESP-IDF v6.1 leaves a dangling operation list behind, and the next transfer crashed on it. The proxy no longer scans the bus while the link is down, and resets the bus after any failed transfer. |
 | ~~A spurious `WARNING: host watchdog DISABLED` on the AT console~~ | **Gone.** The warning and its flag were removed on 2026-09-22 (`8070d2e`); nothing prints it any more. |
@@ -634,6 +648,7 @@ decision or a gap.
 
 | | |
 |---|---|
+| **The ENABLE strap does not read ENABLE DIP 8.** | With ENABLE DIP 8 on (2026-10-09), the encoder lines read `A2 A1 A0` = `1 1 0`, the code for DIP 3, where DIP 8 is `0 0 0`; the unit therefore runs slots 1–3. None of the three lines is pulled low, and A0 (GPIO57) is floating. A hardware fault between the switch and the C2000, not the firmware — check U26's supply and EI, its pins 9/7/6, and `J5` pins 15/13/11 across R276/R283/R281. See `Docs/hardware-resources.md` §11. |
 | **Channel 6's trip input is under bench investigation.** | Suspected of not being properly connected (2026-10-09). Channel 6 has one trip input on this board: comparator CMPSS6, whose positive input `CMPIN6P` is `ADCINC2` — the same pin the firmware samples as slot 6's current, on the schematic's `IoutS6` net (0-ohm link R253, `J5` pin 90). The GPIO trip inputs are not fitted, so nothing else can trip it. Slot 6's comparator was already right, so the comparator fix above does not change it. See `Docs/hardware-resources.md` §4. |
 | **The internal-ADC current reads ~60 mA high at low current.** | Slot 1 at a 100 mA setpoint: ADS131M08 0.10 A, internal ADC 0.16 A; they agree to 2 % at 1 A. A zero offset that the two-point calibration will remove. The control loop and the counters use the ADS131M08, so regulation is unaffected. |
 | **A calibration commit does not mark a slot calibrated.** | `eCalibrationMode = 2` saves the current gains to F-RAM but keeps whatever validity flags the slot already had, so committing a slot's factory gains still leaves its calibration ticks (`CAL_V_VALID`/`CAL_I_VALID`) clear. The runtime calibration's `CAL_CMD_COMPUTE_SAVE` sets them. |

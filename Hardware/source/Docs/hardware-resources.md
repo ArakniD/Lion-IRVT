@@ -1415,7 +1415,84 @@ for an empty slot.
 
 ---
 
-## 11. Source index
+## 11. MODE and ENABLE straps
+
+Two 8-way DIP switches, each read through an SN74HC148 8:3 priority encoder:
+S4 → U26 for ENABLE, S5 → U27 for MODE (schematic XTIDA-010086E3 sheet 13).
+Every encoder input has a 10 kΩ pull-up and a switch to ground, so an ON
+switch drives its input low. EI is tied low; **GS and EO are not connected**.
+The encoder's A0–A2 reach the controlCARD through 0-ohm links:
+
+| Strap | A0 | A1 | A2 | Links | `J5` pins |
+|---|---|---|---|---|---|
+| ENABLE | GPIO57 | GPIO58 | GPIO59 | R276, R283, R281 | 15, 13, 11 |
+| MODE | GPIO54 | GPIO55 | GPIO56 | R257, R270, R278 | 21, 19, 17 |
+
+CPU1 samples them once, in `BTS_HAL_setupGPIO()`, and decodes the 3-bit code
+`A2 A1 A0` through `truth_table[]`.
+
+The switches are not wired to the encoder in order. DIP 1–4 reach its inputs
+3–0, reversed; DIP 5–8 reach inputs 4–7. With the 148's inverted outputs:
+
+| DIP on | Encoder input | A2 A1 A0 | Index | Setting |
+|---|---|---|---|---|
+| 1 | 3 | H L L | 4 | 0 |
+| 2 | 2 | H L H | 5 | 1 |
+| 3 | 1 | H H L | 6 | 2 |
+| 4 | 0 | H H H | 7 | 3 |
+| 5 | 4 | L H H | 3 | 4 |
+| 6 | 5 | L H L | 2 | 5 |
+| 7 | 6 | L L H | 1 | 6 |
+| 8 | 7 | L L L | 0 | 7 |
+| **none** | — | **H H H** | **7** | **3** |
+
+**No switch on is indistinguishable from DIP 4.** With every input high the
+148 outputs `H H H`, which is exactly what input 0 produces; only GS separates
+the two, and GS goes nowhere. An unstrapped board therefore decodes to setting
+3 on both straps — MODE 3, one group of eight, with ENABLE 3, slots 1–4. That
+is a part-populated group, so its trips stay unrouted (§5.3) and it cannot run
+a sensible test. This was a choice (2026-10-09): every switch selects the
+number printed beside it, at the cost of a useful unstrapped default.
+
+**One switch at a time.** With two on, the 148 reports only the
+higher-numbered input, and nothing downstream can tell.
+
+> **The table must be `const`.** The project links with `--ram_model`, which
+> initialises `.data` only during a debugger load — a boot from flash never
+> writes it. `truth_table[]` was an initialised array in `.data` until
+> 2026-10-09, so it held its values after a CCS load and **zeros after a power
+> cycle**, and every switch position then decoded to 0: MODE 0, ENABLE 0. That
+> is why the unit reported slot 1 only with ENABLE DIP 8 on. It is
+> `static const` now and links into flash (`.const:truth_table`).
+>
+> The same trap applies to every other initialised variable on either core.
+> On 2026-10-09 the rest were all rewritten at boot before use —
+> `btsSlotLeader[]`, `btsSlotIsLeader[]`, `btsSlotEnabled[]` and
+> `btsGroupMembers[]` by `BTS_initSlotGrouping()`, `btsTripRoute[]` by
+> `BTS_HAL_setupTripRouting()`, and the DCL coefficients by
+> `BTS_initController()` — or unused (`ePWM[]`, `BTS_ctrl_ch1..8`). **A new
+> initialised variable that relies on its initialiser is wrong in a
+> standalone boot**: make it `const`, or assign it at runtime.
+
+**Read back, 2026-10-09**, both cores loaded, with ENABLE DIP 8 reported on:
+GPIO54–56 (MODE A0–A2) read `1, 1, 1` — index 7, setting 3: no MODE switch
+on, or DIP 4. GPIO57–59 (ENABLE A0–A2) read `0, 1, 1` — index 6, setting 2,
+which is the code for DIP **3**. DIP 8 would read `0, 0, 0`. CPU1 latched
+MODE 3 / ENABLE 2, and `AT+SMD?` / `AT+SEN?` on the ESP32 returned 3 and 2:
+the path from CPU1 through CPU2 and I2C to the ESP32 carries the value
+faithfully.
+
+> **Open: the ENABLE encoder's outputs do not match the switch.** With the
+> C2000's internal pull-ups switched on for a moment, all three ENABLE lines
+> read high — none is being driven low, as DIP 8 requires — and GPIO57 (A0)
+> went from 0 to 1, which a driven output would not do: the A0 line is
+> floating. Check, with ENABLE DIP 8 on: U26 pin 16 at 3.3 V and pin 5 (EI)
+> at 0 V; U26 pins 9, 7, 6 (A0, A1, A2) all low; and the same at `J5` pins
+> 15, 13, 11, across R276, R283 and R281.
+
+---
+
+## 12. Source index
 
 | Resource | Declared in | Applied in |
 |---|---|---|
@@ -1436,6 +1513,7 @@ for an empty slot.
 | CLA1 memory placement | — | `2837xD_RAM_lnk_cpu1.cmd` (`Cla1Prog`, `CLADataLS5`, `.scratchpad`) |
 | Trip zone signals and interrupt masking | `bts_user_settings.h:113-120` | `bts_hal.c:1437-1490` |
 | Slot → comparator binding | `BTS_TRP_CMPSS_CH1..8`, `bts_user_settings.h` | `btsSlotCmpss[]` in `BTS_HAL_setupTripRouting()`, `bts_hal.c` |
+| MODE / ENABLE strap pins and decode | `BTS_MODE_GPIO_PIN_*`, `BTS_EN_GPIO_PIN_*`, `bts_user_settings.h` | `truth_table[]` and `BTS_HAL_setupGPIO()`, `bts_hal.c` |
 | PIE group numbers | `driverlib/f2837xd/driverlib/inc/hw_ints.h` | — |
 | XINT → X-BAR input mapping | `driverlib/f2837xd/driverlib/gpio.c:127-147` | — |
 | X-BAR input → peripheral mapping | `driverlib/f2837xd/driverlib/xbar.h:199-215` | — |

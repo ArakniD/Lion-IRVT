@@ -94,6 +94,16 @@ Open, found while documenting:
   comparator pins and this board's routing do not allow. Read back on the
   board: slot 2's trip now carries CMPSS3. Not yet seen to fire on a real
   over-current. See `Docs/hardware-resources.md` section 5.0.
+- ~~The MODE and ENABLE straps decoded to 0 after every power cycle~~ -
+  fixed 2026-10-09: `truth_table[]` was in `.data`, which `--ram_model`
+  initialises only on a debugger load, so a standalone boot read zeros. Now
+  `static const`, in flash, and re-derived from the schematic so DIP n
+  selects setting n-1. No switch on reads as DIP 4 (setting 3). Verified on
+  the board and through the ESP32. See `Docs/hardware-resources.md`
+  section 11.
+- The ENABLE strap does not read DIP 8 (2026-10-09): the encoder lines show
+  DIP 3's code, none is pulled low, and A0 (GPIO57) floats. Hardware -
+  check U26 and R276/R283/R281. `Docs/hardware-resources.md` section 11.
 - A calibration commit (`CALM=2`) does not set a slot's calibration-valid
   flags.
 - The ESP32's AT console once repeated its last reply ~17,000 times.
