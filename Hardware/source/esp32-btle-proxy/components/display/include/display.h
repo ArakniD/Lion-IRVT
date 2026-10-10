@@ -10,10 +10,13 @@
  *
  *   MOSI  GPIO23      hardware VSPID
  *   SCK   GPIO18      hardware VSPICLK
+ *   CS    GPIO19      active low, external 10k pull-up to 3V3
  *   RES   GPIO17
  *   DC    GPIO16
  *   BLK   GPIO4       backlight, active high
- *   CS    not used    the panel is the only device on this bus
+ *
+ * The module has no tie from CS to ground, so CS is driven. The pull-up holds
+ * the panel deselected from reset until display_init() takes the pin.
  *
  * GPIO21/22 stay with the BTS I2C link and GPIO1/3 with the console UART;
  * none of the display pins collide with either.
@@ -44,6 +47,7 @@ extern "C" {
 typedef struct {
     int mosi_gpio;
     int sclk_gpio;
+    int cs_gpio;            /* -1 if CS is tied low on the module */
     int reset_gpio;
     int dc_gpio;
     int backlight_gpio;

@@ -847,6 +847,27 @@ shutdown, but it sets `finished` and leaves `stopped` clear, so a host can
 tell a charge that reached its termination current from one an operator
 halted. END persists until the slot is started again.
 
+#### Verified on hardware, 2026-10-08
+
+**Discharge termination works.** Slot 1 discharging at 1 A from an external
+supply, `V_MIN` 0.5 V; the supply was wound down to 0 V and the slot ended in
+END (`FINISHED` + `DISCHARGING`, status 36) - not STOPPED, and not a trip.
+
+Two observations from the same session, both the rule working as written:
+
+- **The cutoff bites at start-up if the source collapses.** A 100 mA discharge
+  against a bench supply in current limit ended at once in END, reading
+  exactly 0.50 V. The supply folded back as the converter began to draw;
+  raising its limit let the same run proceed. The only guard is the 0.17 s
+  dwell - there is no start-up hold-off - so a source that sags on load for
+  longer than that ends the run.
+- **A 1 A discharge into a 3.46 V supply ran 206 s** without ending early.
+
+**Charge termination is NOT yet verified.** The charge test was into a short,
+which never reaches CV, so the `I_MIN`-in-CV branch has not run on hardware.
+Neither has the CV loop itself: these coefficients have still never
+regulated a voltage on a real cell.
+
 ### 2.7 MODE strap - slot grouping and slot tuning
 
 | MODE | Meaning | Group size | Voltage loop |
@@ -885,14 +906,18 @@ by a command mid-sweep. It is a runtime branch rather than the `#if` it used
 to be, so one tuning binary serves both sweeps - otherwise a system builder
 would have to reflash between measuring the plant and checking the result.
 
-**Mode 0 was NOT taken for SFRA, despite the original spec.** The MODE and
-ENABLE straps are pulled high, so an unstrapped board reads `0b111`, which
-the SN74HC148 truth table maps to **mode 0**. Mode 0 is therefore both a real
-mode and the unstrapped default - putting slot tuning there would have sent
-every unstrapped unit into a calibration sweep at power-on, with no slot
-running and the AT console replaced by the SFRA serial port. The tuning modes
-sit at the far end of the table instead, where they require a deliberate
-strap.
+**Mode 0 was NOT taken for SFRA, despite the original spec.** At the time
+the SN74HC148 truth table mapped an unstrapped board to **mode 0**, so mode 0
+was both a real mode and the unstrapped default - putting slot tuning there
+would have sent every unstrapped unit into a calibration sweep at power-on,
+with no slot running and the AT console replaced by the SFRA serial port. The
+tuning modes sit at the far end of the table instead, where they require a
+deliberate strap.
+
+> **Since 2026-10-09 an unstrapped board decodes to mode 3, not 0.** The table
+> was corrected against the schematic so each DIP switch selects its own
+> number, and "no switch on" is the encoder code for DIP 4. The SFRA modes
+> still need a deliberate strap. See `hardware-resources.md` §11.
 
 **The slot under test comes from the ENABLE straps.** ENABLE normally names
 the highest enabled slot; in a tuning mode there is only one slot under test,
@@ -1234,5 +1259,5 @@ Build and load both cores plus the ESP32, then:
 
 Bench preconditions that otherwise waste time: input supply above
 `eChargeDisableV` or nothing starts; a latched `TZOSTFLG` cannot be cleared
-while its source is asserted; and with hardware trips disabled, do not leave
-high-current tests unattended.
+while its source is asserted; and with the hardware trip level still untested
+against a real over-current, do not leave high-current tests unattended.

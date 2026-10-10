@@ -53,13 +53,15 @@ flowchart LR
     end
 
     subgraph CPU1 ["F28379D CPU1 — control core"]
-        ADS["ADS131M08<br/>SPI, 16-bit WORD mode"]
+        ADS["ADS131M08 ×2<br/>CLKIN 8.18 MHz, OSR 128<br/>31.96 kSPS, 16-bit WORD mode"]
+        COND["BTS_conditionCtrlInputs()<br/>CC: 4-sample rolling mean<br/>CV: 100 Hz IIR"]
         INT["On-chip ADC<br/>12-bit @ 2.5 V ref<br/>17 SOCs @ 99.67 kSPS"]
         CLA["CLA1 task 1<br/>two IIRs per channel<br/>20 Hz + fast<br/>runs on EVERY sweep"]
         PROT["Reverse polarity check<br/>+ group supervision"]
         LOOP["DCL control loop<br/>HRPWM, per slot"]
         ACC["mAh / mWh / seconds<br/>integrated per direction"]
-        DEAD["Isense_A / Vsense_V<br/>engineering values"]
+        SENSE["Isense_A / Vsense_V<br/>32-sample mean, at C1()"]
+        VIN["updateInputVoltage()<br/>16× oversample + IIR"]
         PUB["cpu1Status<br/>seqlock, CPU1TOCPU2RAM"]
     end
 
@@ -84,9 +86,14 @@ flowchart LR
     SHUNT --> INT
     NTC --> ADS1119
 
-    ADS -->|"ioutSense_pu<br/>raw per-unit"| LOOP
-    ADS -->|"16-bit sums"| ACC
-    ADS -.->|"computed at 10 Hz,<br/>NEVER READ"| DEAD
+    SHUNT -->|"ADCINB0 ÷ A0 ref"| VIN
+    ADS -->|"every DRDY"| COND
+    COND -->|"ioutSense_pu / voutSense_pu"| LOOP
+    ADS -->|"raw sample:<br/>trip + direction guard"| LOOP
+    ADS -->|"32-deep ring"| SENSE
+    SENSE --> ACC
+    SENSE -->|"senseVoltage / senseCurrent"| PUB
+    VIN -->|"inputVoltage"| PUB
     INT -->|"ADCA INT2 at SOC6,<br/>every sweep"| CLA
     CLA -->|"fast IIR<br/>CellVoltage_V / CellCurrent_I"| PROT
     CLA -->|"20 Hz IIR<br/>CellVoltageFilt_V<br/>CellCurrentFilt_I"| PUB
@@ -103,23 +110,26 @@ flowchart LR
     ENGINE --> HTTPH
     ENGINE --> LCD
 
-    style DEAD stroke-dasharray: 5 5
     style PROT stroke-dasharray: 5 5
 ```
 
 ### What the diagram is telling you
 
-**The 16-bit converter's engineering values are dead.**
-`BTS_monitor_Iout_Vout()` computes `Isense_A` and `Vsense_V` at 10 Hz and
-nothing reads them — not `cpu1Status`, not `canData`, not `registers[]`. The
-ADS131M08 still matters, because its *raw per-unit* value is what closes the
-control loop and what the accumulators integrate. But what a host sees in
-`eChX_CellVoltage` and `eChX_CellCurrent` is the **12-bit on-chip ADC**. The
-register naming suggests the opposite.
+**Each converter has more than one consumer, and they want different
+filtering.** The ADS131M08 feeds the control loops on every sample through a
+light filter, and feeds the reported `Isense_A` / `Vsense_V` through a
+separate 32-sample ring. The internal ADC feeds protection through a fast IIR
+and telemetry through a 20 Hz IIR. The per-stage rates, sample counts and
+corner frequencies are in
+[the ADS131M08 section](#the-ads131m08-from-clkin-to-every-consumer) and the
+[CLA section](#the-internal-adc-is-filtered-by-the-cla-for-telemetry-and-protection)
+below.
 
-**`eChX_SenseVoltage` and `eChX_SenseCurrent` exist in the map and are
-published**, so the runtime burst is self-consistent — but they come from the
-same internal path, not from the dead ADS engineering values.
+**The register naming points the wrong way.** `eChX_CellVoltage` /
+`eChX_CellCurrent` are the **12-bit on-chip ADC** (CLA, 20 Hz).
+`eChX_SenseVoltage` / `eChX_SenseCurrent` are the **ADS131M08**
+`Vsense_V` / `Isense_A` — the converter the loops regulate against and the
+accumulators integrate.
 
 **The thermistor inputs are wired in reverse.** On both converters the highest
 AIN carries the lowest slot: `AIN3 → slot 1`. `ADS1119_SLOT_FOR_AIN()` inverts
@@ -129,6 +139,144 @@ it at the publish call. A console `ChN` is a **slot**, not an AIN.
 18.323 and the Horner evaluation returns exactly C0 for a zero input, so that
 value means an open input. `publishCellTemp()` is called unconditionally, so
 an all-zero transfer publishes the floor as if it were valid.
+
+### The ADS131M08, from CLKIN to every consumer
+
+The 16-bit path, end to end. One converter serves slots 1–4 and another serves
+slots 5–8. They are identical apart from the pins, ISR and ePWM involved. Each
+slot uses one channel pair: even channel = current, odd channel = voltage.
+
+```mermaid
+flowchart LR
+    subgraph CLK ["Clock — C2000 generated"]
+        PWM["EPWM11A → ADC1 CLKIN<br/>EPWM12A → ADC2 CLKIN<br/>TBPRD 10 @ 90 MHz<br/><b>8.1818 MHz</b>"]
+    end
+
+    subgraph ADC ["ADS131M08"]
+        MOD["ΔΣ modulator<br/>fMOD = CLKIN/2 = 4.09 MHz"]
+        SINC["sinc3, OSR 128<br/><b>fDATA 31.96 kSPS</b><br/>-3 dB ≈ 8.37 kHz"]
+    end
+
+    subgraph FRAME ["Acquisition — every DRDY (31.29 µs)"]
+        DRDY["DRDY falling edge<br/>XINT3 / XINT5 → ISR1 / ISR3"]
+        SPI["SPIA / SPIB @ 11.25 MHz<br/>10-word frame ≈ 14.2 µs<br/>RX FIFO → ISR2 / ISR4"]
+        RAW["BTS_ADC1 / BTS_ADC2<br/>.channel0 … .channel7<br/>sign-extended 16-bit"]
+    end
+
+    subgraph CTRL ["Control branch — every sample"]
+        CCAVG["CC: rolling mean<br/><b>N = 4</b> (125 µs)<br/><b>-3 dB ≈ 3.54 kHz</b>, null 8 kHz<br/>ctrlI_ring / ctrlI_sum"]
+        CVIIR["CV: single-pole IIR<br/>alpha 0.019467<br/><b>fc 100 Hz</b>, tau 1.59 ms<br/>ctrlV_filt"]
+        PU["ioutSense_pu<br/>voutSense_pu"]
+        DCLCV["CV DF22 @ 31.96 kHz<br/>(designed for 31.25 kHz)"]
+        DCLCC["CC DF22 @ 31.96 kHz<br/>(designed for 31.25 kHz)"]
+        HR["HRPWM duty<br/>EPWM1–8 @ 99.67 kHz"]
+        TRIP["BTS_tripEpwm() ±8 A<br/>BTS_ctrlDirection()<br/><b>raw, unfiltered</b>"]
+    end
+
+    subgraph TEL ["Telemetry branch"]
+        RING["Isense_24b / Vsense_24b<br/><b>32-deep ring</b> = 1.0 ms<br/>box -3 dB ≈ 442 Hz"]
+        MON["BTS_monitor_Iout_Vout()<br/>in C1(): mean of 32,<br/>× gain + offset"]
+        SV["<b>Isense_A / Vsense_V</b><br/>refreshed per C1 pass"]
+    end
+
+    subgraph OUT ["Destinations"]
+        STAT["cpu1Status.senseVoltage / senseCurrent<br/>→ eChX_SenseVoltage / SenseCurrent<br/>→ ESP32 / BLE / HTTP"]
+        ACCN["accIntegrateSlot() — mAh / mWh"]
+        TERM["serviceTermination()<br/>I ≤ I_MIN in CV, V ≤ V_MIN"]
+        BAL["Balancing / pre-charge match"]
+        CALT["calTelemetry[2..3]<br/>(calibration window)"]
+    end
+
+    PWM --> MOD --> SINC --> DRDY --> SPI --> RAW
+    RAW --> CCAVG --> PU
+    RAW --> CVIIR --> PU
+    PU --> DCLCV --> DCLCC --> HR
+    RAW --> TRIP
+    RAW --> RING --> MON --> SV
+    SV --> STAT
+    SV --> ACCN
+    SV --> TERM
+    SV --> BAL
+    SV --> CALT
+```
+
+| Stage | Records | Rate | Corner / response | Writes |
+|---|---|---|---|---|
+| CLKIN from EPWM11A / EPWM12A | — | 8.1818 MHz (90 MHz / 11) | 50 % duty (toggle at ZERO and CMPA) | ADS131M08 CLKIN pin |
+| sinc3 decimator, OSR 128, HR mode | 128 modulator samples | **31.96 kSPS** | -3 dB ≈ 0.262·fDATA = **8.37 kHz** | DRDY + SPI frame |
+| SPI frame read (ISR2 / ISR4) | 10 words | 31.96 kHz | — | `BTS_ADC1/2.channelN` |
+| `BTS_conditionCtrlInputs()` — current | **4**, rolling | 31.96 kHz | **-3 dB 3.54 kHz**, first null 8.0 kHz, delay 47 µs | `ctrlI_sum >> 2` → `ioutSense_pu` |
+| `BTS_conditionCtrlInputs()` — voltage | IIR (≈ 1/alpha = 51 samples) | 31.96 kHz | **fc 100 Hz**, alpha 0.019467 | `ctrlV_filt` → `voutSense_pu` |
+| CC / CV DCL DF22 | 2nd order | 31.96 kHz | coefficients designed for 31.25 kHz | HRPWM CMPA |
+| Trip and direction guard | 1 (raw) | 31.96 kHz | unfiltered (sinc3 only) | trip latch, `BTS_ctrlDirection()` |
+| `BTS_storeValuesAds()` ring | **32** | 31.96 kHz fill | box -3 dB **442 Hz**, null 999 Hz | `Isense_24b[]` / `Vsense_24b[]` |
+| `BTS_monitor_Iout_Vout()` | 32-sample mean | once per `C1()` pass | 1.0 ms snapshot (see below) | `Isense_A` / `Vsense_V` |
+| `publishStatusToCpu2()` → `mirrorCpu1Status()` | — | C1 / 8 Hz | — | `eChX_SenseVoltage` / `eChX_SenseCurrent` |
+| ESP32 poll | — | 4 Hz | — | BLE (1 Hz notify), HTTP, LCD |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PWM as EPWM11A / 12A (8.18 MHz)
+    participant ADS as ADS131M08
+    participant ISR as ISR1 / ISR3 (DRDY, 31.96 kHz)
+    participant SPI as ISR2 / ISR4 (SPI FIFO)
+    participant CTL as BTS_runSlot()
+    participant C1 as C1() (Task C, 1 in 3)
+    participant CPU2 as CPU2 timerISR (8 Hz)
+    participant ESP as ESP32 (250 ms poll)
+
+    PWM->>ADS: CLKIN, continuous
+    loop every 31.29 µs
+        ADS->>ISR: DRDY falling edge
+        ISR->>SPI: send TX frame (10 words, 14.2 µs)
+        SPI-->>ISR: channel0..7 latched (previous frame)
+        ISR->>ISR: BTS_storeValuesAds() into 32-deep ring
+        ISR->>CTL: raw I, raw V
+        CTL->>CTL: I into 4-sample rolling mean (3.54 kHz)
+        CTL->>CTL: V into IIR alpha 0.019467 (100 Hz)
+        CTL->>CTL: raw I to trip / direction guard
+        CTL->>CTL: CV DF22, CC DF22, HRPWM duty
+    end
+    loop every C1 pass
+        C1->>C1: mean of 32 into Isense_A / Vsense_V
+        C1->>C1: accumulators, termination, balancing
+        C1->>CPU2: cpu1Status.senseVoltage / senseCurrent (seqlock)
+    end
+    loop 8 Hz
+        CPU2->>CPU2: mirrorCpu1Status() into registers[]
+    end
+    loop 250 ms
+        ESP->>CPU2: I2C burst read of eChX_Sense*
+    end
+```
+
+**The loops run on every sample, and only their inputs are filtered.** The
+DCL biquads still execute at fDATA, so the sample period they were designed
+for is kept. The CC input is lightly smoothed (3.54 kHz), which keeps the
+inner loop responsive. The CV input is filtered about 35× harder (100 Hz),
+which keeps the outer loop well below the inner one. The trip and the
+reverse-current guard bypass both filters and see the raw sample, so neither
+filter adds delay to protection.
+
+**The coefficients assume 31.25 kHz and the converter runs at 31.96 kSPS.**
+CLKIN is 90 MHz / 11 = 8.1818 MHz. The old truncating divide gave TBPRD 9,
+which was 9.0 MHz and over the 8.4 MHz HR-mode limit. The nearest in-spec
+value is 8.1818 MHz, so `BTS_DRV_ADC_PERIOD_TICKS` now rounds to nearest.
+That leaves the loops 2.3 % fast against their design rate, which shifts each
+zero and pole by the same 2.3 %. That is small, but they have not been
+re-derived for it. The switching frequency is fixed at 99.67 kHz and is no
+longer derived from the ADC clock.
+
+**`Isense_A` / `Vsense_V` are a 1 ms window, not a 1 s average.** The ring
+holds the most recent 32 samples. `C1()` reads it once per pass, which is
+150 ms nominal and ~35 ms as measured (28.6 Hz, 2026-10-02). The reported
+value is therefore a 1.0 ms box mean taken every few tens of milliseconds, so
+anything slower than
+~442 Hz passes straight through, and anything that shows up between snapshots
+is never seen at all. The accumulators integrate those snapshots. That is
+sound for DC, but a load with low-frequency ripple will read according to
+where in the ripple the snapshot happened to land.
 
 ### The internal ADC is filtered by the CLA, for telemetry *and* protection
 
@@ -181,8 +329,8 @@ flowchart LR
     I2["ADCA INT2 ← SOC6<br/>PIE masked, continuous"]
     ISR["adcCellVoltageISR<br/>registered, never fires"]
     CLA1["CLA1 task 1<br/>Filt alpha 0.0012608<br/>Fast alpha 0.22222"]
-    FAST["BTS_refreshCellFromCla()<br/>fast pair → V/A @ 10 Hz"]
-    UPD["BTS_updateFilteredTelemetry()<br/>counts → V/A @ 10 Hz"]
+    FAST["BTS_refreshCellFromCla()<br/>fast pair → V/A per C1 pass"]
+    UPD["BTS_updateFilteredTelemetry()<br/>counts → V/A per C1 pass"]
     SAFE["Reverse polarity,<br/>group supervision,<br/>BTS_cellVoltageAsCtrl16b()"]
     TEL["cpu1Status, canData,<br/>calibration telemetry"]
 
@@ -245,18 +393,86 @@ The resource side of this — which LS RAM block, which interrupt, why the
 PIE channel is masked — is in
 [`hardware-resources.md` §7](hardware-resources.md#7-cla1-allocation).
 
+### Input bus voltage (Vin_sense)
+
+A single 12-bit conversion used to be the whole measurement. The sense chain
+has a gain of ~6.2, so a few counts of ADC noise became ±0.5 V at a host.
+The reading is now oversampled within each pass and smoothed across passes.
+
+```mermaid
+flowchart LR
+    BUS["Input bus<br/>(supply rail)"]
+    DIV["Sense divider + amp<br/>gain 1/0.139 − 1 = 6.194"]
+    B0["ADCINB0<br/>ADCB SOC1 / SOC2<br/>software-forced"]
+    A0["ADCINA0, 1.25 V ref<br/>ADCA SOC6<br/>EPWM1 sweep @ 99.67 kSPS"]
+    OS["<b>16 × back-to-back</b><br/>force, poll ADCB INT1, read<br/>sumRaw, sumRef<br/>≈ 20 µs per pass"]
+    RATIO["busVoltageNow =<br/>sumRaw / sumRef × 1.25 × 6.194<br/>(0 V on timeout or sumRef = 0)"]
+    IIR["IIR <b>alpha 0.25</b> per C1 pass<br/>≈ 7-pass equivalent window<br/>0 V bypasses and re-primes"]
+    STAT["cpu1Status.inputVoltage"]
+    REG["eInputVoltage (984)<br/>→ ESP32 → BLE / HTTP / LCD"]
+    GUARD["unitState thresholds<br/>C1 charge/discharge restrict"]
+
+    BUS --> DIV --> B0 --> OS
+    A0 --> OS
+    OS --> RATIO --> IIR --> STAT
+    STAT -->|"mirrorCpu1Status() @ 8 Hz"| REG
+    IIR --> GUARD
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C1 as C1() updateInputVoltage()
+    participant ADCB as ADCB SOC1/SOC2 (B0)
+    participant ADCA as ADCA SOC6 (A0, free-running)
+    participant CPU2 as CPU2 timerISR (8 Hz)
+    participant ESP as ESP32 (250 ms)
+
+    loop 16 conversions
+        C1->>ADCB: ADC_forceSOC(SOC1, SOC2)
+        C1->>ADCB: poll ADCB INT1 (bounded)
+        ADCB-->>C1: result SOC1 into sumRaw
+        ADCA-->>C1: latest SOC6 into sumRef
+        C1->>ADCB: clear ADCB INT1
+    end
+    C1->>C1: ratio × 1.25 V × 6.194 = busVoltageNow
+    C1->>C1: vinFilt += 0.25 × (now − vinFilt)
+    C1->>C1: unitState from vinFilt
+    C1->>CPU2: cpu1Status.inputVoltage
+    CPU2->>CPU2: registers[eInputVoltage]
+    ESP->>CPU2: unit burst read
+```
+
+| Stage | Records | Rate | Response | Writes |
+|---|---|---|---|---|
+| ADCB conversion of ADCINB0 | 16 per pass | once per `C1()` pass | white noise ÷ 4 (√16) | `sumRaw` |
+| A0 reference read | 16 per pass | same | same ÷ 4 on the denominator | `sumRef` |
+| Ratiometric scale | — | per pass | ADC reference cancels | `busVoltageNow` |
+| IIR across passes | alpha 0.25 (≈ 7 passes) | per pass | tau ≈ 3.5 passes: ~0.12 s at the measured 28.6 Hz, ~0.5 s at the 6.67 Hz nominal | `vinFilt` → `cpu1Status.inputVoltage` |
+| CPU2 mirror | — | 8 Hz | — | `eInputVoltage` (984) |
+
+**Measured after the change:** 54 readings via the ESP32 over 30 s spanned
+14.370–14.410 V, a 40 mV span, down from about ±0.5 V before.
+`adcbEocTimeouts` stayed at 0.
+
+**A lost supply is not smoothed.** A timeout or a zero reference reports 0 V,
+bypasses the IIR and re-primes it. The input-voltage guard therefore sees the
+loss on the pass it happens, rather than watching it decay in over several
+seconds.
+
 ### Rates
 
 | Stage | Rate | Set by |
 |---|---|---|
-| Control loop ISR | per switching cycle | HRPWM |
-| Converter switching | **99.67 kHz** | `BTS_DRV_EPWM_TBPRD` = 902 at EPWMCLK 90 MHz |
+| ADS131M08 CLKIN | **8.1818 MHz** | EPWM11A / EPWM12A, TBPRD 10 at 90 MHz (`BTS_DRV_ADC_SWITCHING_FREQUENCY` 8.192 MHz, rounded) |
+| ADS131M08 DRDY, control loop ISR | **31.96 kSPS** | CLKIN / 2 / OSR 128; CC input 4-sample mean, CV input 100 Hz IIR |
+| Converter switching | **99.67 kHz** | `BTS_DRV_EPWM_TBPRD` = 902 at EPWMCLK 90 MHz, fixed (`BTS_DRV_EPWM_SWITCHING_FREQUENCY`) |
 | On-chip ADC sweep, 17 SOCs | **99.67 kSPS** | EPWM1 SOCA, `BTS_ADC_SOC_PRESCALE` = 1 — 1:1 with the switching period |
 | `adcCellVoltageISR` (ADCA INT1 ← SOC0) | **never fires** | PIE-masked; ADCA INT1 left in continuous mode |
 | CLA1 task 1 (ADCA INT2 ← SOC6) | **99.67 kHz** | same trigger |
 | Task A / B / C | 1 kHz / 200 Hz / 20 Hz | `TASKA/B/C_FREQ_HZ` |
-| `BTS_monitor_Iout_Vout()` | 10 Hz | Task C |
-| Accumulator integration | 150 ms fixed step | Task C |
+| `C1()`: `BTS_monitor_Iout_Vout()`, `updateInputVoltage()` | 6.67 Hz nominal (Task C ÷ 3); **measured 28.6 Hz** (2026-10-02) | Task C rotation |
+| Accumulator integration | measured interval (`accTick`) | `C2()` |
 | ADS1119 conversion | DRDY-driven, 4 channels round-robin | converter |
 | ESP32 poll cycle | **250 ms, 9 I2C transactions** | `s_poll_interval_ms` |
 | BLE notify | 500 ms tick; slots and unit on alternate passes = 1 Hz | `notify_task()` |
@@ -611,8 +827,10 @@ unit for 30 seconds, every running slot pauses with the converter off and
 `BTS_STATUS_WD_TRIPPED` set.
 
 It is a supervision timeout measured in seconds. It is **not** over-current
-protection, and with the hardware trips disabled in this build the only fast
-protection is the bench supply's own current limit.
+protection. That is the software check in `BTS_tripEpwm()` (±8 A, every
+control pass) and the CMPSS hardware trips (±9.5 A, within a switching cycle)
+— whose level is still untested against a real over-current, so on the bench
+the supply's own current limit remains the protection to trust.
 
 ---
 
@@ -819,5 +1037,6 @@ all. Fixed-point removed the failure mode rather than narrowing it.
 
 **This is a breaking wire change.** The two layouts are not distinguishable
 on the wire, so a host must be updated together with the firmware. The
-in-tree decoder (`lion-lvrt-integration/.../protocol/can.py`) and its
-simulator were updated with it.
+decoder in the Home Assistant integration
+(`lion-lvrt-integration/.../protocol/can.py`, now the ha-lion-irvt submodule)
+and its simulator were updated with it.

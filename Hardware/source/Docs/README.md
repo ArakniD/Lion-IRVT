@@ -17,12 +17,52 @@ a calibration.
 | [`calibration-design.md`](calibration-design.md) | The calibration mathematics, opcodes and state machine. A design document — for any address, `api-specification.md` §2.8 is the authority |
 | [`calibration-flow.md`](calibration-flow.md) | The calibration procedure and state machine as diagrams |
 | [`hardware-resources.md`](hardware-resources.md) | PIE, ACK groups, XINT, X-BAR, ADC base and CLA1 allocation across both cores |
+| [`esp32-hardware-connections.md`](esp32-hardware-connections.md) | ESP32 proxy pin usage: the ST7789 LCD, rotary encoder, WS2812B slot LEDs and I2C link, by header pin and GPIO |
 
 ---
 
 ## Read this first
 
-> ### The hardware over-current trips have never fired on a board
+> ### Hardware status, 2026-10-08 - converter verified, trip levels not
+>
+> Slot 1 has now run real current both ways on this firmware, and ended on its
+> own termination rule. Measured on the bench:
+>
+> | Test | Result |
+> |---|---|
+> | Charge, 1 A into a short | ran 205 s, regulated at 1.00 A, no trip |
+> | Discharge, 1 A into a 3.46 V supply | ran 206 s, 57.7 mAh, no trip on enable |
+> | Discharge, 100 mA | ran until stopped, no trip on enable |
+> | Discharge termination, `V_MIN` 0.5 V | supply wound to 0 V; slot ended as **END** (`FINISHED`), not as a trip |
+>
+> The two current paths agree at 1 A (ADS131M08 1.00 A, internal ADC 0.98 A),
+> and the charge counter integrates to the commanded current (57.0 mAh in
+> 205 s at 1 A). Before this, a discharge latched the CMPSS low comparator on
+> every enable; the deadband input fix and the converter duty seed cleared it.
+>
+> **What is still unproven is the trip LEVEL**, which is why the section below
+> stands. The comparators have now been seen to latch - wrongly, on the old
+> deadband - but never against a real over-current at the ±9.5 A threshold.
+>
+> **Two things that look like faults and are not:**
+>
+> - **A discharge that stops after a few seconds with no fault bit** is the
+>   input-bus guard. The energy a discharge removes goes back onto the input;
+>   a supply that cannot sink it rises toward `eDischargeRestrictV`, and the
+>   slot is stopped there. Raise the limits (now 16.0 / 16.8 V, and 16.8 V is
+>   the firmware ceiling) or give the input a load.
+> - **A discharge that ends at once as `FINISHED`** is the `V_MIN` cutoff, not
+>   a trip. A bench supply in current limit collapses the slot voltage the
+>   moment the converter starts drawing; give it more current headroom.
+>
+> **The internal-ADC current reads ~60 mA high at low current** (0.16 A
+> against the ADS131M08's 0.10 A at a 100 mA setpoint), while agreeing to 2%
+> at 1 A - a fixed zero offset, uncorrected because the slot has not been
+> through the two-point routine. The control loop and the counters use the
+> ADS131M08, so regulation is unaffected; anything reading `eChX_CellCurrent`
+> at low current is not.
+
+> ### The hardware over-current trips have not been tested at their level
 >
 > All eight are **enabled** in this build (`BTS_TRIP_HW_CH1..8_ENABLED (true)`,
 > [`bts_user_settings.h`](../tida-010086/bts_F2837xD_8ch/bts_user_settings.h)),
@@ -39,10 +79,10 @@ a calibration.
 > running. In an ungrouped build (MODE 0) each slot is its own group and the
 > exception does not arise.
 >
-> The caution is therefore not "there is no trip". It is this: **the trips were
-> enabled by a compile-verified change and no board has yet been seen to
-> trip.** The levels (±9.5 A hardware, above the 8 A software trip) have not
-> been measured against a real over-current.
+> The caution is therefore not "there is no trip". It is this: **the trips are
+> live and have been seen to latch, but never against a real over-current.**
+> The levels (±9.5 A hardware, above the 8 A software trip) have not been
+> measured, so treat the supply's own limit as the protection you trust.
 >
 > Three consequences, all of which matter during calibration because
 > calibration deliberately drives real current:
@@ -377,7 +417,6 @@ to the log; the procedure is driven over BLE or HTTP.
 | A slot shows `restored` after you power-cycled the unit | The F-RAM state block. It was mid-run when the unit went down, and came back paused with its counters rather than resuming into a cell that may have been changed. | Working as designed. Stop it before calibrating; resume it only if you know the same cell is still in the slot. |
 | All eight LEDs flashing amber together | The ESP32 proxy cannot reach the unit over I2C. The proxy itself is alive — it is still driving the strip — but it has nothing current to show. Amber is used for nothing else, so this is always the link, never a slot condition. | Check the I2C wiring between the proxy and the unit, and `GET /api/i2c_diag`. Everything the proxy reports — display, HTTP, BLE — is stale until it clears. |
 | The LEDs are frozen on a colour and never change | The ESP32 is dead, unplugged or held in reset. It drives the strip, and a WS2812B holds its last colour indefinitely once the frames stop — so you are looking at whatever was true when the proxy stopped. **Do not trust them.** A slot showing green may have tripped since. | Confirm it: the display, HTTP and BLE all come from the same ESP32, so they will be gone too. Power-cycle the proxy, then read the slot state back before touching anything. |
-| The AT console prints `WARNING: host watchdog DISABLED` repeatedly | **Known bug.** The message is spurious — supervision is armed. | Ignore it. Confirm with `AT+WD?`, which should answer `+WD=30.00`. |
 | The AT console answers only garbage | **Build skew**, not a hardware fault. The console is served by **CPU2**, and `SCI_setConfig()` derives its divisor from `DEVICE_LSPCLK_FREQ`. Editing the clock config and rebuilding only CPU1 leaves CPU2's divisor built for the old clock. | Rebuild and reload **both** cores, then connect at **115200 8N1**. |
 | The AT console says nothing at all to `AT` | **By design.** `uartRxISR()` matches only `"AT+"`; a bare `AT` is dropped with no `OK` and no `ERROR`. | Probe with a real command, e.g. `AT+InputVoltage?`. |
 | Current reads the right size with the wrong sign afterwards | A signed value was entered where a magnitude was wanted. | Recalibrate that slot's current. Enter the absolute value. |
@@ -436,8 +475,10 @@ Verify the result independently before you trust the unit:
 
 ## Known issues
 
-One cosmetic defect in the debug console. It does not affect calibration
-accuracy or the safety paths, but it will waste your time if you meet it cold.
+None in the debug console today. The spurious
+`WARNING: host watchdog DISABLED` banner that earlier revisions described here
+was removed from the firmware on 2026-09-22; if you see it, the unit is
+running an old build.
 
 > ### The AT console baud rate is no longer an issue — it works at 115200
 >
@@ -462,18 +503,3 @@ accuracy or the safety paths, but it will waste your time if you meet it cold.
 > `AT+InputVoltage?` — a bare `AT` is silently ignored by design, which reads
 > exactly like a dead console.
 
-### A spurious watchdog-disabled warning
-
-The console periodically prints:
-
-```
-WARNING: host watchdog DISABLED - slots will not pause if the host stops responding
-```
-
-**This is wrong.** `AT+WD?` answers `+WD=30.00` and the countdown at
-`eWatchdogRemaining_s` is healthy. The flag that raises the message is set
-only where a write of `0.0` arrives at `eHostWatchdog_s`, and it reads 0 when
-sampled, so the trigger has not been identified.
-
-Cosmetic — supervision is verifiably armed — but alarming and wrong. Confirm
-with `AT+WD?` rather than believing the banner.

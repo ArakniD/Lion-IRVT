@@ -24,7 +24,7 @@ still say `EEPROM_*`** (`com_cpu2.c:88-106`, `762-780`). That naming is
 historical. Do not read it as evidence of an EEPROM's constraints, and do not
 "fix" it casually — the names are load-bearing across `com_cpu2.c`.
 
-It shares I2CB (GPIO40/41, 400 kHz) with the two ADS1119 temperature
+It shares I2CB (GPIO40/41, 100 kHz) with the two ADS1119 temperature
 converters. The F-RAM is memory-addressed and uses
 `i2cWriteBlock` / `i2cReadBlock`, which always emit a 16-bit word address; the
 ADS1119 is command-based and **must not** go through those helpers.

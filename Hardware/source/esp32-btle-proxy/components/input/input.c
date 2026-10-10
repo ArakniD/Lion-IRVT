@@ -1,8 +1,11 @@
 /*
  * input.c
  *
- * Rotary encoder via PCNT, plus a debounced push switch. See input.h for
- * the wiring and why PCNT rather than GPIO interrupts.
+ * Rotary encoder via PCNT, plus a debounced push switch and a debounced KEY0
+ * button. See input.h for the wiring and why PCNT rather than GPIO interrupts.
+ * The two buttons are polled and debounced in the same task rather than taken
+ * on interrupts, for the same reason: a mechanical contact bounces far faster
+ * than an ISR can usefully respond to.
  */
 
 #include <string.h>
@@ -98,6 +101,9 @@ static void input_task(void *arg)
     int64_t press_start  = 0;
     bool    long_fired   = false;
 
+    bool    key0_stable  = false;    /* KEY0 debounced state          */
+    bool    key0_raw     = false;
+    int64_t key0_since_us = 0;
     for (;;) {
         /* ---- rotation ---- */
         int count = 0;
@@ -158,6 +164,24 @@ static void input_task(void *arg)
             }
         }
 
+        /* ---- KEY0 ---- */
+        if (s_cfg.key0_gpio >= 0) {
+            /* Active low: pulled up on the LCD board, button to ground. */
+            const bool raw_down = (gpio_get_level(s_cfg.key0_gpio) == 0);
+            const int64_t now = esp_timer_get_time();
+
+            if (raw_down != key0_raw) {
+                key0_raw = raw_down;
+                key0_since_us = now;
+            } else if (raw_down != key0_stable &&
+                       (now - key0_since_us) >= (DEBOUNCE_MS * 1000LL)) {
+                key0_stable = raw_down;
+                if (raw_down) {
+                    post(INPUT_EVENT_KEY0_PRESS, 1);
+                }
+            }
+        }
+
         /*
          * Diagnostic heartbeat while the encoder is being brought up. Cheap
          * enough at 0.5 Hz, and it makes a dead pad obvious from the log
@@ -197,11 +221,12 @@ void input_log_pin_state(const char *when)
     if (s_pcnt != NULL) {
         (void)pcnt_unit_get_count(s_pcnt, &count);
     }
-    ESP_LOGI(TAG, "encoder %s: A=%d B=%d SW=%d raw_count=%d",
+    ESP_LOGI(TAG, "encoder %s: A=%d B=%d SW=%d KEY0=%d raw_count=%d",
              when ? when : "",
              gpio_get_level(s_cfg.encoder_a_gpio),
              gpio_get_level(s_cfg.encoder_b_gpio),
              s_cfg.switch_gpio >= 0 ? gpio_get_level(s_cfg.switch_gpio) : -1,
+             s_cfg.key0_gpio >= 0 ? gpio_get_level(s_cfg.key0_gpio) : -1,
              count);
 }
 
@@ -231,6 +256,23 @@ esp_err_t input_init(const input_config_t *config)
             .intr_type = GPIO_INTR_DISABLE,
         };
         ESP_RETURN_ON_ERROR(gpio_config(&sw), TAG, "switch gpio");
+    }
+
+    /*
+     * ---- KEY0 ----
+     *
+     * No pull is requested: the intended pin, GPIO34, is input only and has
+     * none to enable, and the LCD board pulls the line up to 3V3 itself.
+     */
+    if (s_cfg.key0_gpio >= 0) {
+        const gpio_config_t key0 = {
+            .pin_bit_mask = BIT64(s_cfg.key0_gpio),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_RETURN_ON_ERROR(gpio_config(&key0), TAG, "key0 gpio");
     }
 
     /*
@@ -334,8 +376,9 @@ esp_err_t input_init(const input_config_t *config)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "encoder A=%d B=%d SW=%d (%s), %d counts/detent, pull-ups on",
+    ESP_LOGI(TAG, "encoder A=%d B=%d SW=%d KEY0=%d (%s), %d counts/detent, pull-ups on",
              s_cfg.encoder_a_gpio, s_cfg.encoder_b_gpio, s_cfg.switch_gpio,
+             s_cfg.key0_gpio,
              s_cfg.switch_active_low ? "pull-up, active low" : "active high",
              INPUT_COUNTS_PER_DETENT);
     input_log_pin_state("at init");

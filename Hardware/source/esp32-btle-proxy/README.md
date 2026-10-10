@@ -17,10 +17,11 @@ a GATT service (for a Web Bluetooth UI) and a JSON HTTP API.
 | Target | `esp32` (Xtensa, dual core) |
 | Flash | 4 MB |
 | Programming port | COM6 (Silicon Labs CP210x) |
-| BTS link | I2C master, SDA = GPIO21, SCL = GPIO22, 100 kHz |
-| Status panel | ST7789 on SPI2/HSPI, MOSI = GPIO23, SCK = GPIO18, DC = GPIO16, RST = GPIO17, BL = GPIO4 |
+| BTS link | I2C controller, SDA = GPIO21, SCL = GPIO22, **50 kHz** (see below) |
+| Status panel | ST7789 on SPI2/HSPI, MOSI = GPIO23, SCK = GPIO18, CS = GPIO19 (external 10 k pull-up), DC = GPIO16, RST = GPIO17, BL = GPIO4 |
 | Slot LEDs | 8x WS2812B on SPI3/VSPI, DIN = GPIO13 |
-| Encoder | A = GPIO15, B = GPIO27, switch = GPIO2 |
+| Encoder | A = GPIO32, B = GPIO27, switch = GPIO33 |
+| KEY0 button | GPIO34 (input only, pulled up on the LCD board) |
 | BTS address | `0x50` |
 | Unit envelope | 0–5 V and ±10 A per channel, 8 channels |
 
@@ -28,6 +29,31 @@ The backup cell is why `test_engine_init()` stops the channels at boot: the
 proxy can outlive a BTS power cycle, so at startup it cannot know what the
 unit is doing and must not assume the channels are idle. The one exception is
 a slot the BTS reports `PAUSED` — see the watchdog and pause section below.
+
+### The I2C link runs at 50 kHz
+
+`main.c` asks for 100 kHz, but `bts_link.c` sets the device to **50 kHz**,
+and that is what runs. The BTS board pulls the bus up with only 10 kΩ, over a
+ribbon, so rise time — not bandwidth — is the limit: at 100 pF a 10 k
+pull-up takes ~850 ns to rise, against the 1000 ns standard mode allows. The
+ESP32's internal pull-ups are enabled as well. A poll cycle is nine
+transactions, so 50 kHz costs nothing that matters.
+
+At start-up the link tries 50 kHz and 10 kHz, in both pin orders, before
+falling back to the configured pins, so a swapped SDA/SCL or a marginal
+harness still comes up. After any failed transfer the bus is reset
+(`bus_recover()`), and the poll task does **not** scan the bus while the link
+is down — ESP-IDF v6.1's `i2c_master_probe()` leaves state behind on failure
+that crashed the next transfer.
+
+### Verified on a bare ESP32, 2026-10-08
+
+On a fresh board with no BTS attached: BLE GATT (all 12 characteristics,
+reads and notifications, proto 7, with register access correctly refused —
+`tools/ble_verify.py --no-bts`), the setup page, every WiFi and OTA error
+path, and two full WiFi updates, one rolled back by a reset during its trial
+and one confirmed. **Not yet seen:** an update confirming itself on a live
+BTS link, rather than through the 180 s fallback.
 
 ---
 
@@ -144,7 +170,7 @@ via registers, then initiate the discharge". The **populated** half of that is
 solved on the BTS side; the **host-commanded reset** half is not:
 
 - CPU1 integrates `Isense_A`/`Vsense_V` — the 16-bit ADS131M08 pair — in its
-  6.67 Hz `C1()` task and publishes both directions' totals in each slot's
+  `C1()` task and publishes both directions' totals in each slot's
   runtime block, now with a run-time seconds counter beside each mAh/mWh
   pair. Both accumulate positive magnitude into their own direction, so a
   charge and a discharge on one slot give two separate totals.
@@ -156,8 +182,8 @@ solved on the BTS side; the **host-commanded reset** half is not:
 
 **What this firmware does:** keeps its own trapezoidal integration
 (`coulomb_counter.c`) as the reported figure, because it samples on real
-elapsed time at the 250 ms poll rather than a fixed 150 ms step and does not
-lose a partial interval at the ends of a run. The BTS's own counters are read
+elapsed time at the 250 ms poll and does not lose a partial interval at the
+ends of a run. The BTS's own counters are read
 each poll and reported beside it (`bts_raw` in the result JSON, `bts` in the
 slot status) so the two can be compared. `try_reset_bts_accumulators()` still
 issues the write for a future build that makes the registers writable.
@@ -170,14 +196,19 @@ Note that `bts_link_stats_are_live()` is a **positive test only**: a unit that
 has been idle since power-up reads all-zero and is indistinguishable from an
 older firmware that never wrote these registers.
 
-### End-of-test is now signalled — but the engine still owns the cutoff
+### End-of-test: the BTS terminates, the engine sequences
 
-`BTS_STATUS_FINISHED` (bit 2) was declared and never assigned on either core.
-In v2 it carries the `END` semantic and is driven, alongside an explicit
-`BTS_STATUS_END` at bit 16; `BTS_STATUS_ENDED_MASK` accepts either, so the
-engine works against a unit built either way. It still watches cell voltage
-against the cutoff itself and issues the stop rather than depending on the
-unit to do so.
+The C2000 now ends a phase itself and reports it as END, status bit 2
+(`BTS_STATUS_FINISHED`; `BTS_STATUS_END` is an alias for it, and bit 16 is
+unused). A discharge ends at `V_MIN`; a charge ends once its CV loop holds
+`V_MAX` and the current has fallen to `I_MIN`. `bts_says_done()` treats END
+as the end of the current phase, and the engine moves on to the next step of
+the test — rest, discharge, recharge.
+
+The engine still watches the cell voltage against its own cutoffs and can
+issue the stop itself, so a unit that never asserts END still finishes a
+test. Discharge termination is verified on hardware; charge termination is
+not yet.
 
 ---
 
@@ -332,9 +363,11 @@ strips and fails on others, which on a safety indicator is the worst failure
 mode available.
 
 **The encoder's B channel moved from GPIO13 to GPIO27** to free the MOSI pin.
-GPIO14 was the other candidate and was rejected: it is MTMS, and with A already
-on MTDO (GPIO15) a second JTAG pin on one encoder would make the box awkward to
-debug later. GPIO27 carries no strapping or JTAG role.
+GPIO14 was the other candidate and was rejected: it is MTMS, and a JTAG pin on
+the encoder would make the box awkward to debug later. GPIO27 carries no
+strapping or JTAG role. A and the switch have since moved off GPIO15 and GPIO2,
+which are strapping pins, to GPIO32 and GPIO33. Full pin map:
+[`Docs/esp32-hardware-connections.md`](../Docs/esp32-hardware-connections.md).
 
 ### What it costs
 
@@ -423,7 +456,12 @@ survive an operator walking away with the tablet.
 | GET | `/api/catalog` | chemistries and cell models |
 | POST | `/api/chemistry/<name>` | override and persist a chemistry profile |
 | POST | `/api/abort_all` | |
+| GET | `/` | the setup page: unit state, WiFi and firmware update |
+| GET | `/api/wifi` | station SSID, join state, addresses. Never the password |
 | POST | `/api/wifi` | `{"ssid":"...","password":"..."}` |
+| GET | `/api/ota` | running version and slot, trial state, whether a key is set |
+| POST | `/api/ota/key` | `{"current":"...","key":"..."}` — set or change the update key |
+| POST | `/api/ota` | raw `.bin` body, `X-OTA-Key` header — firmware update |
 | GET | `/api/registers?addr=&count=` | raw BTS registers, for bring-up |
 
 Route ordering matters and is not obvious: `httpd_uri_match_wildcard()`
@@ -455,6 +493,95 @@ WiFi comes up as APSTA. Stored station credentials are joined if present; the
 SoftAP stays up either way, so a tester whose site network changed is still
 reachable. The AP is open by default — a WPA2 key baked into shipped firmware
 is not a security boundary; the bench network is.
+
+### Joining a network from the setup page
+
+Join the `BTS-Tester` access point and browse to `http://192.168.4.1/`. The
+WiFi card takes an SSID and password, saves them to flash and joins at once;
+the AP stays up throughout, so a wrong password costs nothing but a retry.
+
+After five failed joins the station stops retrying continuously. The ESP32
+has one radio, so every attempt to find the saved network takes the AP off
+its channel for a scan; a client notices the beacons stop, drops the AP and
+takes its own time to rejoin. So the retry period depends on whether anyone
+is on the AP:
+
+| | Retry every | Measured, laptop on the AP, saved network absent |
+|---|---|---|
+| Nobody on the AP | **30 s** | — (nothing to disturb) |
+| A client on the AP | **5 min** | page answered 44 of 48 probes over 4 min; the 4 misses were the first 20 s, before the backoff took hold |
+
+A flat 30 s cadence, tried first, left the page unreachable for about 20 s of
+every 35 — usable, but not for typing a password.
+
+To stop it looking at all, **Forget network** on the setup page (or
+`POST /api/wifi` with `{"ssid":""}`) erases the saved credentials; the AP is
+then steady.
+
+The password is write-only: `GET /api/wifi` never returns it, because anything
+it returned would be readable by anyone in range of the open AP.
+
+---
+
+## Firmware update over WiFi
+
+Two app slots, `ota_0` and `ota_1`. An upload is written into whichever is not
+running, the boot slot is switched, and the proxy restarts into it.
+
+**A new image is on trial until the BTS answers.** Rollback is enabled
+(`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`), so the bootloader marks a freshly
+written image `PENDING_VERIFY`. `components/ota` confirms it once the BTS link
+completes a poll — real registers back over I2C, not merely "it booted". An
+image that never gets there and is rebooted is **rolled back** to the previous
+slot automatically.
+
+That cannot be the only rule: the proxy has a backup cell and often runs with
+the rack powered down, and an image that waited forever for the link would be
+rolled back by the next power blip. So after **180 s** without a link it is
+confirmed anyway, and the log says it was confirmed *without* the BTS. Such an
+image is still on WiFi, so it can always be replaced by another upload.
+
+### Doing an update
+
+1. Set an update key once (uploads are refused until there is one):
+   on the setup page, or
+   `curl -X POST http://$BTS/api/ota/key -d '{"key":"choose-one"}'`.
+2. Build as normal; the image is `build/bts_btle_proxy.bin`.
+3. Upload it from the setup page, or:
+
+   ```bash
+   curl -X POST http://$BTS/api/ota -H "X-OTA-Key: choose-one" \n        --data-binary @build/bts_btle_proxy.bin
+   ```
+
+4. The proxy restarts. `GET /api/ota` shows `pending_verify: true` until the
+   BTS answers, then `confirmed: true`.
+
+The upload is checked before any of it is accepted: an image for another chip,
+another ESP-IDF project, or not an app at all (a bootloader or partition table
+posted by mistake) is refused from its first 288 bytes, before a megabyte goes
+over the air. The whole image is then hash-checked before the boot slot moves.
+
+**An update is refused while any slot is running** (`409`). The restart stops
+every slot that is not paused — `test_engine_init()` has to, since a freshly
+booted proxy cannot know what an unheld channel is doing — so an update in the
+middle of a shift would end every test. Pause or finish them first, or add
+`?force=1` to the URL if you mean it.
+
+### What the key is, and is not
+
+The key stops an accidental upload and casual access on a bench LAN. **It is
+not a security boundary.** It is set through the same unauthenticated API
+(trust on first use): the first set needs nothing, every later change needs the
+current key. So it protects a unit provisioned before an attacker reached it,
+and not one provisioned after. The rest of the API has no authentication at
+all. If that matters on your network, the answer is the network.
+
+### First flash after enabling rollback
+
+Rollback changes the **bootloader**, not just the app. The first time, flash
+everything over USB (`idf.py -p COM6 flash`), not just the app — an old
+bootloader ignores the trial state, and every later OTA image would be
+accepted without confirmation.
 
 ---
 

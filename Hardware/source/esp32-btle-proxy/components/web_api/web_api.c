@@ -24,12 +24,36 @@
 #include "result_store.h"
 #include "cell_profiles.h"
 #include "bts_link.h"
+#include "ota.h"
 
 static const char *TAG = "web_api";
 
 #define RESP_BUF        6144
 #define REQ_BUF         1024
 #define RESULTS_PAGE    10
+
+/*
+ * Firmware upload chunk.
+ *
+ * 4 kB rather than something larger: it is a flash sector, so each write
+ * lands on a sector boundary, and the buffer is static because 4 kB off an
+ * 8 kB handler stack would not fit. Only one upload can be in flight
+ * (ota_begin() enforces it), so one buffer is enough.
+ */
+#define OTA_CHUNK       4096
+
+/*
+ * Consecutive receive timeouts tolerated mid-upload. Each is the server's
+ * recv_wait_timeout (5 s), so this is 30 s of silence. A slow client
+ * survives it; a half-open socket from a client that went away does not get
+ * to hold the single HTTP task, and the OTA slot, forever.
+ */
+#define OTA_MAX_STALLS  6
+
+/* The setup page, linked in by EMBED_TXTFILES - see this component's
+ * CMakeLists.txt. The symbol name is the file name with the dot replaced. */
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char index_html_end[]   asm("_binary_index_html_end");
 
 static httpd_handle_t s_server;
 static char           s_resp[RESP_BUF];
@@ -766,17 +790,332 @@ static esp_err_t h_wifi_post(httpd_req_t *req)
         return send_error(req, "400 Bad Request", "missing body");
     }
 
-    char ssid[33];
-    char pass[65] = {0};
+    /*
+     * Buffers twice the field width. json_get_str() truncates silently, so
+     * with exact-size buffers a 40-character SSID would arrive as a valid
+     * 32-character one and be saved - the device would then spend every
+     * boot trying to join a network that does not exist. Over-sized buffers
+     * let the over-long value through to wifi_set_credentials(), which
+     * refuses it.
+     */
+    char ssid[66];
+    char pass[130] = {0};
     if (!json_get_str(body, (size_t)len, "ssid", ssid, sizeof(ssid))) {
         return send_error(req, "400 Bad Request", "missing ssid");
     }
+
+    /*
+     * An explicitly empty SSID forgets the network. Without this there was
+     * no way back from a wrong one short of erasing flash: the device would
+     * keep scanning for it on every boot, unsettling the AP each time.
+     */
+    if (ssid[0] == '\0') {
+        const esp_err_t err = wifi_forget_credentials();
+        if (err == ESP_ERR_NOT_FINISHED) {
+            return send_error(req, "503 Service Unavailable",
+                              "forgotten, but the radio is busy; AP only "
+                              "from the next restart");
+        }
+        if (err != ESP_OK) {
+            return send_error(req, "500 Internal Server Error", "erase failed");
+        }
+        return send_ok(req);
+    }
     (void)json_get_str(body, (size_t)len, "password", pass, sizeof(pass));
 
-    if (wifi_set_credentials(ssid, pass) != ESP_OK) {
+    /*
+     * WPA2 needs 8 to 63 characters (64 is the raw hex PSK). Anything from 1
+     * to 7 can never join, and would only surface as a silent auth failure
+     * after the operator has walked away.
+     */
+    const size_t plen = strlen(pass);
+    if (plen > 0 && plen < 8) {
+        return send_error(req, "400 Bad Request",
+                          "password must be 8 or more characters, or empty "
+                          "for an open network");
+    }
+
+    const esp_err_t err = wifi_set_credentials(ssid, pass);
+    if (err == ESP_ERR_INVALID_SIZE) {
+        return send_error(req, "400 Bad Request",
+                          "SSID is limited to 32 characters, password to 64");
+    }
+    if (err == ESP_ERR_NOT_FINISHED) {
+        return send_error(req, "503 Service Unavailable",
+                          "saved, but the radio is busy; it takes effect at "
+                          "the next restart");
+    }
+    if (err != ESP_OK) {
         return send_error(req, "500 Internal Server Error", "save failed");
     }
     return send_ok(req);
+}
+
+/*
+ * What the setup page needs to show the WiFi card.
+ *
+ * The password is deliberately absent: it is write-only through this API.
+ * Reading it back would hand the site network's key to anyone who can reach
+ * the open SoftAP, which is a strictly worse trade than an operator having
+ * to retype it.
+ */
+static esp_err_t h_wifi_get(httpd_req_t *req)
+{
+    wifi_mgr_info_t info;
+    wifi_mgr_get_info(&info);
+
+    json_out_t j;
+    json_init(&j, s_resp, sizeof(s_resp));
+    json_obj_open(&j, NULL);
+    json_kv_str(&j, "ssid", info.ssid);
+    json_kv_bool(&j, "connected", info.connected);
+    json_kv_str(&j, "ip", info.ip);
+    json_kv_bool(&j, "ap_active", info.ap_active);
+    json_kv_str(&j, "ap_ssid", info.ap_ssid);
+    json_kv_str(&j, "ap_ip", info.ap_ip);
+    json_kv_i(&j, "rssi", info.rssi);
+    json_obj_close(&j);
+    return send_json(req, &j);
+}
+
+/* ------------------------------------------------------------------ */
+/* Firmware update                                                    */
+/* ------------------------------------------------------------------ */
+
+static esp_err_t h_ota_get(httpd_req_t *req)
+{
+    ota_status_t st;
+    ota_get_status(&st);
+
+    json_out_t j;
+    json_init(&j, s_resp, sizeof(s_resp));
+    json_obj_open(&j, NULL);
+    json_kv_str(&j, "version", st.version);
+    json_kv_str(&j, "date", st.date);
+    json_kv_str(&j, "time", st.time);
+    json_kv_str(&j, "idf_version", st.idf_ver);
+    json_kv_str(&j, "elf_sha", st.elf_sha);
+    json_kv_str(&j, "running", st.running_label);
+    json_kv_str(&j, "next", st.next_label);
+    json_kv_bool(&j, "pending_verify", st.pending_verify);
+    json_kv_bool(&j, "confirmed", st.confirmed);
+    json_kv_bool(&j, "rollback_possible", st.rollback_possible);
+    json_kv_bool(&j, "key_set", st.key_set);
+    json_kv_bool(&j, "in_progress", st.in_progress);
+    json_kv_u(&j, "uptime_s", st.uptime_s);
+    json_obj_close(&j);
+    return send_json(req, &j);
+}
+
+static esp_err_t h_ota_key_post(httpd_req_t *req)
+{
+    char body[REQ_BUF];
+    const int len = read_body(req, body, sizeof(body));
+    if (len <= 0) {
+        return send_error(req, "400 Bad Request", "missing body");
+    }
+
+    /*
+     * Twice the field width, for the reason h_wifi_post() gives: the JSON
+     * parser truncates without saying so. With exact-size buffers a 70
+     * character key was cut to 64 and saved, and the operator walked away
+     * holding a key the unit did not have - found on the bench. Over-sized
+     * buffers let ota_key_set() see the real length and refuse it.
+     */
+    char current[2 * OTA_KEY_MAX] = {0};
+    char next[2 * OTA_KEY_MAX]    = {0};
+    (void)json_get_str(body, (size_t)len, "current", current, sizeof(current));
+    if (!json_get_str(body, (size_t)len, "key", next, sizeof(next))) {
+        return send_error(req, "400 Bad Request", "missing key");
+    }
+
+    const esp_err_t err = ota_key_set(current, next);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return send_error(req, "403 Forbidden", "current key does not match");
+    }
+    if (err == ESP_ERR_INVALID_SIZE) {
+        return send_error(req, "400 Bad Request",
+                          "key is limited to 64 characters");
+    }
+    if (err != ESP_OK) {
+        return send_error(req, "500 Internal Server Error", esp_err_to_name(err));
+    }
+    return send_ok(req);
+}
+
+/*
+ * Counts slots that a restart would cut short.
+ *
+ * Two views, because either alone misses a case. The BTS bits catch a slot
+ * driven straight through the register API, which the engine never saw; the
+ * engine states catch a test resting between phases, where the converter is
+ * off but the test is very much in progress. Paused slots are not counted:
+ * test_engine_init() leaves a paused slot held across a reboot, so a restart
+ * does not disturb it.
+ */
+static int slots_a_restart_would_stop(void)
+{
+    bts_snapshot_t snap;
+    bts_link_get_snapshot(&snap);
+
+    int busy = 0;
+    for (uint8_t slot = 0; slot < SLOT_COUNT; slot++) {
+        const bts_channel_state_t *ch = &snap.channel[slot];
+        const bool bts_running = ch->valid && !ch->paused &&
+                                 (ch->status_bits & BTS_STATUS_RUNNING) != 0;
+
+        slot_status_t st;
+        test_engine_get_status(slot, &st);
+        bool engine_busy;
+        switch (st.state) {
+        case SLOT_STATE_IDLE:
+        case SLOT_STATE_COMPLETE:
+        case SLOT_STATE_FAULT:
+        case SLOT_STATE_ABORTED:
+        case SLOT_STATE_BTS_PAUSED:
+            engine_busy = false;
+            break;
+        default:
+            engine_busy = true;
+            break;
+        }
+
+        if (bts_running || engine_busy) {
+            busy++;
+        }
+    }
+    return busy;
+}
+
+/*
+ * Streams the posted image into the spare partition.
+ *
+ * The body is the raw .bin, not multipart: parsing a multipart envelope on
+ * the way to flash would mean finding the boundary in a stream being written
+ * sector by sector, for no gain. The page posts the File object directly,
+ * and curl needs --data-binary.
+ *
+ * Every error path aborts the OTA and returns a failure, which closes the
+ * socket - the rest of the request body is still coming and there is no
+ * point draining a megabyte of it to keep the connection alive.
+ */
+static esp_err_t h_ota_post(httpd_req_t *req)
+{
+    static char chunk[OTA_CHUNK];
+
+    if (!ota_key_is_set()) {
+        return send_error(req, "403 Forbidden",
+                          "no update key is set; set one before updating");
+    }
+
+    char key[OTA_KEY_MAX] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-OTA-Key", key,
+                                    sizeof(key)) != ESP_OK ||
+        !ota_key_check(key)) {
+        ESP_LOGW(TAG, "firmware upload refused: bad or missing key");
+        return send_error(req, "403 Forbidden", "bad or missing X-OTA-Key");
+    }
+
+    if (req->content_len == 0) {
+        return send_error(req, "400 Bad Request", "empty body");
+    }
+
+    /*
+     * The restart at the end stops every slot that is not paused - see
+     * stop_unheld_channels() in test_engine.c, which has to, because a
+     * freshly booted proxy cannot know what an unheld channel is doing. So
+     * an update in the middle of a shift would end every running test. That
+     * is refused unless the caller says it means it with ?force=1.
+     */
+    const int busy = slots_a_restart_would_stop();
+    if (busy > 0 && query_u32(req, "force", 0) == 0) {
+        /* Under 160 with the JSON envelope, which is send_error's body. */
+        char msg[112];
+        snprintf(msg, sizeof(msg),
+                 "%d slot%s running; the restart would stop %s. "
+                 "Pause or finish them, or add ?force=1",
+                 busy, busy == 1 ? " is" : "s are", busy == 1 ? "it" : "them");
+        return send_error(req, "409 Conflict", msg);
+    }
+
+    esp_err_t err = ota_begin((size_t)req->content_len);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return send_error(req, "409 Conflict", "an update is already running");
+    }
+    if (err == ESP_ERR_INVALID_SIZE) {
+        return send_error(req, "413 Payload Too Large",
+                          "image is larger than the partition");
+    }
+    if (err != ESP_OK) {
+        return send_error(req, "500 Internal Server Error", esp_err_to_name(err));
+    }
+
+    ESP_LOGW(TAG, "firmware upload started, %d bytes", req->content_len);
+
+    size_t remaining = (size_t)req->content_len;
+    int    stalls    = 0;
+    while (remaining > 0) {
+        const size_t want = (remaining < sizeof(chunk)) ? remaining : sizeof(chunk);
+        const int got = httpd_req_recv(req, chunk, want);
+        if (got == HTTPD_SOCK_ERR_TIMEOUT && ++stalls < OTA_MAX_STALLS) {
+            continue;       /* slow client, not a failed one - yet */
+        }
+        if (got <= 0) {
+            ota_abort();
+            ESP_LOGE(TAG, "upload socket failed with %u bytes to go",
+                     (unsigned)remaining);
+            return send_error(req, "400 Bad Request", "upload interrupted");
+        }
+
+        err = ota_write(chunk, (size_t)got);
+        if (err != ESP_OK) {
+            ota_abort();
+            return send_error(req,
+                              err == OTA_ERR_BAD_IMAGE
+                                  ? "400 Bad Request"
+                                  : "500 Internal Server Error",
+                              err == OTA_ERR_BAD_IMAGE
+                                  ? "not a valid image for this device"
+                                  : esp_err_to_name(err));
+        }
+        remaining -= (size_t)got;
+        stalls     = 0;
+    }
+
+    err = ota_finish();
+    if (err != ESP_OK) {
+        return send_error(req, "400 Bad Request",
+                          err == OTA_ERR_BAD_IMAGE
+                              ? "image failed verification"
+                              : esp_err_to_name(err));
+    }
+
+    /*
+     * Answer before restarting, and leave time for the response to reach the
+     * client - a reboot inside the handler would look like a failed upload
+     * from the browser's side.
+     */
+    const esp_err_t sent = send_ok(req);
+    ota_schedule_restart(1500);
+    return sent;
+}
+
+/* ------------------------------------------------------------------ */
+/* Setup page                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The one HTML page: unit state, WiFi credentials and firmware update.
+ *
+ * Served from flash with no templating - everything on it is filled in by
+ * fetch() against the JSON API, so the page itself is a constant and the
+ * API stays the single source of truth.
+ */
+static esp_err_t h_root(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, index_html_start,
+                           (size_t)(index_html_end - index_html_start - 1));
 }
 
 /*
@@ -1175,6 +1514,8 @@ static esp_err_t h_cal_post_dispatch(httpd_req_t *req)
 }
 
 static const httpd_uri_t s_routes[] = {
+    { .uri = "/",                    .method = HTTP_GET,  .handler = h_root         },
+    { .uri = "/index.html",          .method = HTTP_GET,  .handler = h_root         },
     { .uri = "/api/status",          .method = HTTP_GET,  .handler = h_status       },
     { .uri = "/api/catalog",         .method = HTTP_GET,  .handler = h_catalog      },
     { .uri = "/api/results",         .method = HTTP_GET,  .handler = h_results      },
@@ -1183,7 +1524,16 @@ static const httpd_uri_t s_routes[] = {
     { .uri = "/api/calibration",     .method = HTTP_GET,  .handler = h_calibration_get },
     { .uri = "/api/i2c_diag",        .method = HTTP_GET,  .handler = h_i2c_diag     },
     { .uri = "/api/abort_all",       .method = HTTP_POST, .handler = h_abort_all    },
+    { .uri = "/api/wifi",            .method = HTTP_GET,  .handler = h_wifi_get     },
     { .uri = "/api/wifi",            .method = HTTP_POST, .handler = h_wifi_post    },
+    /*
+     * `/api/ota` before `/api/ota/key`: both are exact patterns so the order
+     * does not matter to the matcher, but keeping the bare path first mirrors
+     * how the calibration pair above is written.
+     */
+    { .uri = "/api/ota",             .method = HTTP_GET,  .handler = h_ota_get      },
+    { .uri = "/api/ota",             .method = HTTP_POST, .handler = h_ota_post     },
+    { .uri = "/api/ota/key",         .method = HTTP_POST, .handler = h_ota_key_post },
     { .uri = "/api/chemistry/*",     .method = HTTP_POST, .handler = h_chemistry_post },
     /*
      * One entry per method; the action is dispatched from the trailing

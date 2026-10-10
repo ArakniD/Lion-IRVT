@@ -70,8 +70,10 @@ flowchart TD
 
 The red-tinted steps are the only ones where the slot is driving current.
 Everything from `CAL_CMD_SET_FIXED_CURRENT` to `CAL_CMD_COMPUTE_SAVE` runs with
-roughly 2.5 A flowing and the hardware trips disabled — this is the window that
-must not be left unattended.
+roughly 2.5 A flowing — this is the window that must not be left unattended.
+The hardware trips are armed throughout, but their level has not been tested
+against a real over-current, so the supply's current limit is the protection
+to rely on.
 
 ---
 

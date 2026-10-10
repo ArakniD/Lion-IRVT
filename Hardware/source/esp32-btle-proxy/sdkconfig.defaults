@@ -10,6 +10,15 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# Rollback: the bootloader marks a freshly written image PENDING_VERIFY and
+# reverts to the previous slot unless the image confirms itself. components/ota
+# does that once the BTS link answers a register poll, so an image that boots
+# but cannot talk to the unit is rolled back rather than left in place.
+#
+# This makes a remote firmware update safe to do with nobody at the bench,
+# which is the whole point of having two slots.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # NimBLE rather than Bluedroid: this is a BLE-only peripheral and NimBLE
 # costs roughly 100 kB less flash, which matters with two OTA slots.
 CONFIG_BT_ENABLED=y

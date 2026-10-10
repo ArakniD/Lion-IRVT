@@ -30,6 +30,13 @@ claimed twice. Both have since been fixed; the timer conflict has additionally
 been dissolved, because the subsystem that was the second claimant no longer
 runs on this device at all.
 
+[§10](#10-i2c-buses) covers the two I2C buses: why both run slowly on this
+board's 10 kΩ pull-ups, and the latches that made the F-RAM fail at boot.
+
+[§11](#11-mode-and-enable-straps) covers the **MODE and ENABLE DIP switches**:
+what each setting does, which combinations make sense, and how the switches
+are decoded.
+
 [§7](#7-cla1-allocation) covers CLA1, which is a third processor on this die
 and does not appear in any of the PIE, X-BAR or timer tables — its trigger
 never reaches a PIE channel and its code and data live in RAM blocks the C28x
@@ -256,25 +263,41 @@ last select register; the next register is `INPUTSELECTLOCK`. There is no
 | `INPUT11` | eCAP5 | Channel 3 GPIO trip | GPIO27 | `bts_hal.c:1242` | Compiled out |
 | `INPUT12` | eCAP6 | Channel 4 GPIO trip | GPIO34 | `bts_hal.c:1245` | Compiled out |
 | `INPUT13` | XINT4 | Channel 5 GPIO trip | GPIO39 | `bts_hal.c:1248` | Compiled out |
-| `INPUT14` | XINT5 | **SPI ADC2 DRDY (CPU1)** *and* **channel 6 GPIO trip** | GPIO49 / GPIO44 | `bts_hal.c:455` / `bts_hal.c:1251` | **DOUBLE-BOOKED** |
+| `INPUT14` | XINT5 | **SPI ADC2 DRDY (CPU1)** *and* channel 6 GPIO trip | GPIO49 / GPIO44 | `bts_hal.c:455` / `bts_hal.c:1251` | Double-booked, but the trip is **compiled out** |
 | *(`INPUT15`)* | — | Channel 7 GPIO trip | GPIO45 | `bts_hal.c:1254` | **Does not exist** — call rejected |
 | *(`INPUT16`)* | — | Channel 8 GPIO trip | GPIO46 | `bts_hal.c:1257` | **Does not exist** — call rejected |
 
 **Free inputs: `INPUT1`, `INPUT2`, `INPUT3`, `INPUT7`, `INPUT8`.**
 
-> ### `INPUT14` is double-booked
+> ### `INPUT14` is double-booked — latent again since 2026-10-09
 >
 > XINT5 (CPU1's SPI ADC2 DRDY, GPIO49) and the channel-6 GPIO trip (GPIO44)
-> both target `INPUT14`. Only one can win. **Today the hardware trips are all
-> compiled out (`BTS_TRIP_HW_CH1..8_ENABLED (false)`,
-> `bts_user_settings.h:113-120`), so XINT5 owns it and slots 5–8 acquire
-> correctly.**
+> both target `INPUT14`. Only one can win.
 >
-> Re-enabling `BTS_TRIP_HW_CH6_ENABLED` without moving one of them will
-> silently repoint `INPUT14` at GPIO44 and kill slot 5–8 acquisition — the
-> same failure mode as Defect 1, in the opposite direction. Move the channel-6
-> trip to `INPUT7` or `INPUT8`, or move XINT5's DRDY to XINT4/`INPUT13` (and
-> then relocate the channel-5 trip).
+> **The GPIO trips are compiled out now.** They have their own switches,
+> `BTS_TRIP_GPIO_CH1..8_ENABLED`, all `(false)`, because no external trip
+> line is fitted on this board. Until 2026-10-09 the GPIO pin setup and X-BAR
+> routing were gated only on `BTS_TRIP_HW_CHn_ENABLED` — the CMPSS switch — so
+> enabling the comparators also wrote `INPUT14` ← GPIO44. Acquisition won by
+> running later, so slots 5–8 still read, but only by ordering. Verified in
+> the build: `BTS_HAL_setupTripSystem()` now calls `BTS_HAL_setupInputXBAR()`
+> twice (the ADS1119 DRDYs, `INPUT4`/`INPUT5`), where it used to call it nine
+> times plus seven GPIO pin setups.
+>
+> Before fitting the channel-6 line on a later board: move it to `INPUT7` or
+> `INPUT8`, or move XINT5's DRDY to XINT4/`INPUT13` and relocate the channel-5
+> trip. Channel 6's comparator trip is unaffected either way: it reaches the
+> trip zone through the ePWM X-BAR and Digital Compare, which never touch the
+> Input X-BAR.
+>
+> **Channel 6 is being debugged at the bench (2026-10-09):** its trip input is
+> suspected of not being properly connected. The comparator is CMPSS6, whose
+> positive input `CMPIN6P` is `ADCINC2` (TRM SPRUHM8K, Figure 10-1) — the pin
+> the firmware also samples as slot 6's current (ADCC SOC2), on the
+> schematic's `IoutS6` net, through 0-ohm link R253 to `J5` pin 90. With the
+> GPIO trips compiled out, that net is the only trip input channel 6 has.
+> Slot 6 is one of the three slots whose comparator was already right, so the
+> 2026-10-09 remap (§5.0) does not change it.
 
 > ### Channels 7 and 8 have no Input X-BAR path at all
 >
@@ -324,26 +347,119 @@ last select register; the next register is `INPUTSELECTLOCK`. There is no
 and routed; see §5.1 for how a comparator actually reaches a trip zone, which
 is not the obvious path.
 
+**Seen on hardware, 2026-10-08.** The CMPSS1 low comparator latched
+(`TZOSTFLG` 0x0040, DCAEVT1) on every discharge enable while
+the deadband took its two delays from two independent sources (`DBCTL`
+IN_MODE 2). Both now come from EPWMA (IN_MODE 0), and 1 A charge, 1 A
+discharge and 100 mA discharge all start and run with no latch. So the trip
+path is proven end to end - comparator, ePWM X-BAR, Digital Compare, one-shot
+- but only by a fault. **The ±9.5 A level itself has not been tested against
+a real over-current.**
+
 The CMPSS comparators do **not** go through the Input X-BAR. They reach the
 ePWM trip zones through the separate **ePWM X-BAR** at `EPWMXBAR_BASE`
 `0x7A00`. Each `TRIPn` output selects among 16 muxes and **can enable several
 at once, OR-ing them onto that one output** — which is what makes a grouped
 trip possible with no software in the path. `CMPSSn` occupies mux `(n-1)*2`.
 
-| Slot | CMPSS | ePWM X-BAR trip | Mux |
-|---|---|---|---|
-| 1 | `CMPSS1` | `XBAR_TRIP4` | `MUX00` |
-| 2 | `CMPSS2` | `XBAR_TRIP5` | `MUX02` |
-| 3 | `CMPSS3` | `XBAR_TRIP7` | `MUX04` |
-| 4 | `CMPSS4` | `XBAR_TRIP8` | `MUX06` |
-| 5 | `CMPSS5` | `XBAR_TRIP9` | `MUX08` |
-| 6 | `CMPSS6` | `XBAR_TRIP10` | `MUX10` |
-| 7 | `CMPSS7` | `XBAR_TRIP11` | `MUX12` |
-| 8 | `CMPSS8` | `XBAR_TRIP12` | `MUX14` |
+> **Slot *n* is not watched by `CMPSSn`.** Each comparator's input pins are
+> fixed by the device, and the board routes each slot's sense nets to
+> whichever ADC pins suited the layout. So the comparator for a slot is the
+> one that owns the pin its current lands on — a different number for slots
+> 2, 3, 5, 7 and 8. Until 2026-10-09 the firmware used `CMPSSn` for slot *n*,
+> which was right for slots 1, 4 and 6 only.
 
-The tables live at the top of `BTS_HAL_setupTripRouting()`'s block in
-`bts_hal.c`; the routing itself is built there, and the trip zones are
-configured in `BTS_HAL_setupEPWMTripZone()`.
+| Slot | ePWM | Comparator | ePWM X-BAR trip | Mux | DC input |
+|---|---|---|---|---|---|
+| 1 | `EPWM1` | **`CMPSS1`** | `XBAR_TRIP4` | `MUX00` | `TRIPIN4` |
+| 2 | `EPWM2` | **`CMPSS3`** | `XBAR_TRIP5` | `MUX04` | `TRIPIN5` |
+| 3 | `EPWM3` | **`CMPSS2`** | `XBAR_TRIP7` | `MUX02` | `TRIPIN7` |
+| 4 | `EPWM4` | **`CMPSS4`** | `XBAR_TRIP8` | `MUX06` | `TRIPIN8` |
+| 5 | `EPWM5` | **`CMPSS7`** | `XBAR_TRIP9` | `MUX12` | `TRIPIN9` |
+| 6 | `EPWM6` | **`CMPSS6`** | `XBAR_TRIP10` | `MUX10` | `TRIPIN10` |
+| 7 | `EPWM7` | **`CMPSS8`** | `XBAR_TRIP11` | `MUX14` | `TRIPIN11` |
+| 8 | `EPWM8` | **`CMPSS5`** | `XBAR_TRIP12` | `MUX08` | `TRIPIN12` |
+
+The trip output and the Digital Compare input belong to the **slot**; the mux
+belongs to the **comparator**. `btsSlotCmpss[]` in `bts_hal.c` joins the two,
+from `BTS_TRP_CMPSS_CH1..8` in `bts_user_settings.h` — which fails the build
+unless every slot has a comparator of its own. The routing is built in
+`BTS_HAL_setupTripRouting()`, and the trip zones are configured in
+`BTS_HAL_setupEPWMTripZone()`.
+
+**Read back from the board, 2026-10-09** (MODE 0, ENABLE 1, both cores
+loaded): `TRIP4MUXENABLE` = `0x0001` (`MUX00`, `CMPSS1`) and
+`TRIP5MUXENABLE` = `0x0010` (`MUX04`, `CMPSS3`), each selecting
+`CTRIPH_OR_L` (`TRIP5MUX0TO15CFG` = `0x0100`); ePWM2's `DCTRIPSEL` = 4,
+which is `TRIPIN5`. Slots 3–8 were strap-disabled and left unrouted, as
+designed. So slot 2 is watched by its own current for the first time. No
+trip was forced, so the comparator has still not been seen to fire on a real
+over-current.
+
+At the same moment every slot's current sense read 1694–1717 counts on the
+internal ADC — about 1.25 V, zero current — **including the six
+strap-disabled slots**, and no comparator's live output was asserted. So on
+this board a disabled slot's sense chain is powered and reads 0 A, not the
+−10 A that §5.3 and §5.4 assume for an unpowered chain. That case still
+applies before the supply is up, which is what deferred arming is for.
+
+### 5.0 Which comparator watches which slot
+
+Both sense nets of every slot, from the schematic to the comparator. Sources:
+schematic **XTIDA-010086E3 sheet 13**, "Control card pin mapping_28379" (the
+net, its 0-ohm link and its `J5` pin); the device datasheet **SPRS880 Table
+4-1**, which names each analog pin's comparator input (the same as TRM
+SPRUHM8K Figure 10-1); and the firmware's own ADC SOCs in
+`BTS_HAL_setupADC()` and `bts_cla.cla`, which already sampled these pins.
+
+| Slot | Current net | Link | `J5` | Device pin | Comparator input | ADC SOC | Voltage net | Link | `J5` | Device pin | Comparator input | ADC SOC | Comparator |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | `IoutS1` | R249 | 106 | `ADCINA2` | `CMPIN1P` | ADCA SOC3 | `VoutS1` | R250 | 104 | `ADCINA3` | `CMPIN1N` | ADCA SOC0 | **CMPSS1** |
+| 2 | `IoutS2` | R251 | 103 | `ADCINB2` | `CMPIN3P` | ADCB SOC3 | `VoutS2` | R252 | 101 | `ADCINB3` | `CMPIN3N` | ADCB SOC0 | **CMPSS3** |
+| 3 | `IoutS3` | R43 | 100 | `ADCINA4` | `CMPIN2P` | ADCA SOC4 | `VoutS3` | R47 | 98 | `ADCINA5` | `CMPIN2N` | ADCA SOC1 | **CMPSS2** |
+| 4 | `IoutS4` | R49 | 96 | `ADCIN14` | `CMPIN4P` | ADCA SOC5 | `VoutS4` | R51 | 94 | `ADCIN15` | `CMPIN4N` | ADCA SOC2 | **CMPSS4** |
+| 5 | `IoutS5` | R52 | 93 | `ADCIND0` | `CMPIN7P` | ADCD SOC2 | `VoutS5` | R53 | 91 | `ADCIND1` | `CMPIN7N` | ADCD SOC0 | **CMPSS7** |
+| 6 | `IoutS6` | R253 | 90 | `ADCINC2` | `CMPIN6P` | ADCC SOC2 | `VoutS6` | R254 | 88 | `ADCINC3` | `CMPIN6N` | ADCC SOC0 | **CMPSS6** |
+| 7 | `IoutS7` | R255 | 87 | `ADCIND2` | `CMPIN8P` | ADCD SOC3 | `VoutS7` | R256 | 85 | `ADCIND3` | `CMPIN8N` | ADCD SOC1 | **CMPSS8** |
+| 8 | `IoutS8` | R54 | 84 | `ADCINC4` | `CMPIN5P` | ADCC SOC3 | `VoutS8` | R55 | 82 | `ADCINC5` | `CMPIN5N` | ADCC SOC1 | **CMPSS5** |
+
+The same table the other way round, for anyone starting from a comparator:
+
+| Comparator | Watches | Positive input | Negative input (not used) |
+|---|---|---|---|
+| CMPSS1 | slot 1 | `ADCINA2`, `IoutS1` | `ADCINA3`, `VoutS1` |
+| CMPSS2 | **slot 3** | `ADCINA4`, `IoutS3` | `ADCINA5`, `VoutS3` |
+| CMPSS3 | **slot 2** | `ADCINB2`, `IoutS2` | `ADCINB3`, `VoutS2` |
+| CMPSS4 | slot 4 | `ADCIN14`, `IoutS4` | `ADCIN15`, `VoutS4` |
+| CMPSS5 | **slot 8** | `ADCINC4`, `IoutS8` | `ADCINC5`, `VoutS8` |
+| CMPSS6 | slot 6 | `ADCINC2`, `IoutS6` | `ADCINC3`, `VoutS6` |
+| CMPSS7 | **slot 5** | `ADCIND0`, `IoutS5` | `ADCIND1`, `VoutS5` |
+| CMPSS8 | **slot 7** | `ADCIND2`, `IoutS7` | `ADCIND3`, `VoutS7` |
+
+Three things the table settles:
+
+- **The voltage net lands on the same comparator's negative pin**, on every
+  slot. Nothing reads it there: both the high and the low comparator take
+  their negative input from the internal DAC (`CMPSS_INSRC_DAC`), which is
+  what sets the ±9.5 A threshold. Switching either to `CMPSS_INSRC_PIN` would
+  compare a slot's current against its own voltage.
+- **`J5` is the controlCARD socket.** TI's controlCARD pinout numbers the same
+  pins 121 − *n* (`J5` 106 is its pin 15, `ADC-A2`), so check which numbering
+  a drawing uses before probing.
+- **The board, not the device, fixes this table.** A layout that moves a sense
+  net changes the comparator for that slot, the ADC SOC that samples it and
+  `BTS_TRP_CMPSS_CHn` together.
+
+**What the old binding did.** It paired slot *n* with `CMPSSn`:
+
+| Grouping (MODE) | Effect of the old binding |
+|---|---|
+| Ungrouped (0, 4) | An over-current on slot 2 stopped slot 3 instead, and the reverse; slots 5, 7 and 8 did the same in a ring (5 stopped 7, 7 stopped 8, 8 stopped 5). The faulted slot kept switching until its software trip caught it, and with the other slot masked by the ENABLE strap nothing stopped in hardware at all |
+| Pairs (1, 5) | The first pair's output was `CMPSS1` \| `CMPSS2`, which is slot 1 \| slot **3**; the third was slot 8 \| slot 6, the fourth slot 5 \| slot 7 |
+| Quads, octet (2, 3) | **Unaffected.** Each group's OR covered the same set of comparators either way |
+
+The software trip (±8 A, each slot's own ADS131M08 current) was never
+affected and remains the first line; only the ±9.5 A backstop was mis-aimed.
 
 > `XBAR_TRIP6` is skipped: `INPUT6` feeds ePWM TRIP6 directly, and `INPUT6` is
 > XINT3's input (CPU1's SPI ADC1 DRDY). Do not route a CMPSS to TRIP6.
@@ -417,12 +533,18 @@ group **one** trip output carrying the OR of that group's comparators, and
 points every ePWM in the group at it — so all of them trip in the same
 switching cycle, in hardware:
 
-```
-ungrouped   TRIP4 = CMPSS1            -> ePWM1
-pairs       TRIP4 = CMPSS1 | CMPSS2   -> ePWM1, ePWM2
-quads       TRIP4 = CMPSS1..CMPSS4    -> ePWM1..ePWM4
-octet       TRIP4 = CMPSS1..CMPSS8    -> ePWM1..ePWM8
-```
+Each member contributes **its own** comparator, from the table in §5.0:
+
+| Grouping | Trip output | OR of | Trips |
+|---|---|---|---|
+| ungrouped | `TRIP4`, `TRIP5`, `TRIP7` … `TRIP12` | one comparator each: `CMPSS1`, `CMPSS3`, `CMPSS2`, `CMPSS4`, `CMPSS7`, `CMPSS6`, `CMPSS8`, `CMPSS5` | that slot's ePWM |
+| pairs | `TRIP4` | `CMPSS1` \| `CMPSS3` | ePWM1, ePWM2 |
+| | `TRIP7` | `CMPSS2` \| `CMPSS4` | ePWM3, ePWM4 |
+| | `TRIP9` | `CMPSS7` \| `CMPSS6` | ePWM5, ePWM6 |
+| | `TRIP11` | `CMPSS8` \| `CMPSS5` | ePWM7, ePWM8 |
+| quads | `TRIP4` | `CMPSS1`–`CMPSS4` | ePWM1 – ePWM4 |
+| | `TRIP9` | `CMPSS5`–`CMPSS8` | ePWM5 – ePWM8 |
+| octet | `TRIP4` | all eight | ePWM1 – ePWM8 |
 
 The group leader's `TRIPn` is the one used, matching `BTS_GROUP_LEADER()`.
 
@@ -492,6 +614,23 @@ that already-divided value rather than dividing again.
 | `EPWM11` | ADS131M08 #1 master clock, GPIO20 | `bts_hal.c:763` via `bts_cpu1.c:958` |
 | `EPWM12` | ADS131M08 #2 master clock, GPIO22 | `bts_hal.c:763` via `bts_cpu1.c:959` |
 | `EPWM9`, `EPWM10` | — | **Free** |
+
+**ADS131M08 CLKIN is 8.1818 MHz.** `EPWM11A` / `EPWM12A` count up and toggle
+at ZERO and CMPA, so the output period is one TB period:
+`TBPRD = round(90 MHz / BTS_DRV_ADC_SWITCHING_FREQUENCY) - 1 = 10`, which
+gives 90 MHz / 11. That yields fDATA = CLKIN / 2 / OSR 128 = **31.96 kSPS**,
+one DRDY every 31.29 µs.
+
+The divide used to truncate, giving TBPRD 9 and a 9.0 MHz CLKIN. That is over
+the ADS131M08's 8.4 MHz high-resolution-mode limit (35.16 kSPS).
+`BTS_DRV_ADC_PERIOD_TICKS` now rounds to nearest, and TBPRD = 10 has been
+verified on the target.
+
+The switching frequency (`BTS_DRV_EPWM_SWITCHING_FREQUENCY`, 99.67 kHz,
+TBPRD 902) used to be derived as (ADC clock / 256) × 3. It is now a fixed
+value, so retuning the ADC clock no longer moves the converter. The full
+filter chain is in
+[`data-flow.md`](data-flow.md#the-ads131m08-from-clkin-to-every-consumer).
 
 `EPWM1` is also the sync-chain master for group interleaving; every other
 module forwards its pulse (`BTS_HAL_setupGroupPhase()`, `bts_hal.c:1379`).
@@ -1196,7 +1335,325 @@ session.
 
 ---
 
-## 10. Source index
+## 10. I2C buses
+
+Two buses, both on CPU2, both with **10 kΩ pull-ups on the board** — which
+sets their speed.
+
+| | I2CA — host | I2CB — peripherals |
+|---|---|---|
+| Pins | GPIO32 SDA, GPIO33 SCL | GPIO40 SDA, GPIO41 SCL |
+| Pad config (by CPU1, `BTS_HAL_setupCpu2Pins()`) | open drain + internal pull-up, async qualification | same |
+| Role | **target** at 0x50 | **controller** |
+| Devices | the ESP32 clocks it | FM24V10 F-RAM 0x50; ADS1119 0x40 (slots 1–4), 0x41 (slots 5–8) |
+| Speed | **50 kHz**, set by the ESP32 (`bts_link.c`) | **100 kHz** (`I2C_initController(I2CB_BASE, …)`) |
+| Interrupts | `INT_I2CA` 8.1 and `INT_I2CA_FIFO` 8.2 (§1.2) | **none** — bounded polled loops from CPU2's idle loop |
+| Stuck-bus recovery | `serviceI2CTargetWatchdog()` resets the target after `BTS_I2C_TARGET_STUCK_PASSES` busy passes | `i2cRecoverBus()`: nine SCL pulses with SDA released, then a stop, then a module reset |
+
+### 10.1 Why 100 kHz, and not 400
+
+An RC pull-up rises in about 0.85 × R × C. With 10 kΩ that is 424 ns at an
+optimistic 50 pF and 847 ns at 100 pF. **Fast mode allows 300 ns**, so at
+400 kHz the bus is out of spec at any realistic capacitance: edges arrive late
+enough to be sampled wrong, which looks like a NACK, an arbitration loss, or a
+frame that never finishes. **Standard mode allows 1000 ns**, which 10 k meets
+up to about 118 pF.
+
+**Measured, 2026-10-08.** I2CB at 400 kHz: ~327 F-RAM save failures and about
+one ADS1119 bus stall a second. At 100 kHz: 0 save failures across all eight
+slots, 0 boot read failures and 0 stalls.
+
+Nothing on I2CB needs the bandwidth. The longest transfer is a 162-byte
+calibration record — ~15 ms at 100 kHz, once, at boot. Running at 400 kHz
+would need ~2.2 kΩ pull-ups.
+
+The polled loops are bounded in iterations, not time, so the speed change
+raised them 4×: `BTS_I2C_TIMEOUT_ITERATIONS` 80000, `ADS1119_PHASE_MAX_POLLS`
+8000, `ADS1119_WREG_BYTE_TIMEOUT` 80000. One byte at 100 kHz is 90 µs, so the
+longest phase is ~270 µs, and 80000 iterations is several milliseconds —
+about 10× margin, while a genuinely absent target still fails fast.
+
+### 10.2 I2CB has two users with incompatible styles
+
+The ADS1119 driver is a non-blocking state machine that leaves a transfer in
+flight across service calls; the F-RAM helpers block until done. Interleaved,
+both frames corrupt and the controller is left holding SCL.
+`i2cbFramAcquire()` grants the F-RAM the bus only while **both** converters
+are parked (`eAdsIdle` or `eAdsSettle`), and sets `i2cbFramBusy`, which the
+converter state machine checks before starting or advancing a frame. A save that cannot get the bus stays
+pending and retries; it is never dropped.
+
+### 10.3 `I2CMDR` must be written outright
+
+`I2C_setConfig()` and `I2C_sendStartCondition()` are read-modify-write and
+**preserve `STP`**. A stop left armed by an earlier transfer then rides into
+the next start: the module sends `S ADDR P` and never the memory address.
+That was the boot-time F-RAM read failure — `I2CMDR` 0x4E20, `I2CCNT` 2,
+every time — and it silently put every slot on default calibration.
+`i2cReadBlock()` and `i2cWriteBlock()` now write `I2CMDR` whole in each phase,
+and every exit waits for the stop to reach the wire, resetting the module if
+it never does. Boot-time reads retry up to 8 times, 1 ms apart
+(`framReadBoot()`).
+
+Two more latches that a module reset does **not** clear, both seen on
+hardware: `STP` itself (cleared by writing `I2CMDR` = 0 before and after
+`SysCtl_resetPeripheral()`), and `DLB`, digital loopback, which ties the
+transmitter to the receiver so the controller ACKs its own address and never
+drives the pins.
+
+### 10.4 Finding out who held the bus
+
+Every I2CB transfer records its owner (F-RAM read or write, ADS1119 command,
+read, data, mux or start, or recovery), the device and memory address, the
+count, how far it got and how it ended. `i2cbFaultSnap` freezes the **first**
+failure and is never overwritten; `i2cbHist[16]` holds the last sixteen;
+`BTS_dbgI2cbEnds[]` counts each ending; `BTS_dbgI2cbStuckOwner` names whoever
+held a bus that had to be forced free. Read them in the debugger — this is
+what found the `STP` bug above.
+
+### 10.5 The ADS1119s
+
+20 SPS continuous conversion, so DRDY falls every 50 ms on GPIO42/43 → XINT1/
+XINT2 (`INPUT4`/`INPUT5`, routed by CPU1). DRDY is armed by clearing the
+channel's stale PIE flag and acknowledging group 1 before enabling.
+
+The whole temperature path hangs off one falling edge per conversion, so a
+lost edge used to leave the state machine idle and every slot at 0.00 °C.
+Two backstops now: a converter that has published nothing for **1 s** is read
+anyway (`ADS1119_QUIET_TICKS`), and one disabled after repeated failures is
+re-armed after **10 s** (`ADS1119_REARM_TICKS`).
+
+**18.32–18.9 °C is an open input**, not a temperature — the amplifier floor
+for an empty slot. Measured 2026-10-10 with one thermistor fitted (slot 1,
+taped to the ESP32's heat shield, 36.4 °C): slots 2–7 read ADS1119 codes
+around 260 (20 mV, 18.89 °C) and slot 8 reads 0 (18.32 °C). Both are "nothing
+plugged in".
+
+### 10.6 A new frame must wait for STP, not just for the bus
+
+**Found 2026-10-10.** About **1.5 % of every I2CB frame timed out**, and they
+all failed the same way: the module emitted the start and the address, then
+moved no further bytes. At the end of each one I2CSTR held `SCD | XSMT |
+NACKSNT` (0x2420) and I2CMDR still held the frame's own start word, `FREE |
+STT | TRX | IRS` (0x6220).
+
+The cause is a gap between two bits that look as if they move together. When
+a frame's stop reaches the wire, the module drops **BB** at once but clears
+**STP** only after it has set **SCD**, a few cycles later. Every frame start
+here waited for `!BB` alone, so a frame started inside that gap — most often
+the next ADS1119 phase, which follows its predecessor immediately — wrote its
+start word while the module was still finishing the last stop, and the start
+was lost. The TRM states the rule (SPRUHM8K, I2CMDR.STP): *"the user must wait
+until this bit is clear before initiating a new message"*, and TI's
+`i2c_ex2_eeprom` example does exactly that.
+
+What it cost: each lost frame counted as an ADS1119 failure and was retried,
+so readings still arrived but late and in bursts, and at that rate the
+quiet-converter watchdog and the 8-failure disable were both close enough to
+trip that a converter could go quiet for seconds at a time. One boot-time
+F-RAM read (the tuning record at 0x0700) needed a retry for the same reason.
+
+**Fixed:** `i2cbNotReady()` in `com_cpu2.c` is BB **or** STP. Every frame
+start waits on it — the ADS1119 state machine's idle, mux and start states,
+`i2cMasterWaitBusFree()` for the blocking F-RAM and start-up helpers, and the
+F-RAM's bus acquire — and so does every "frame finished" wait, so the bus is
+never handed on mid-stop. The module resets in the recovery paths now write
+I2CMDR outright instead of toggling IRS, because an IRS toggle carries a
+stale STP straight through the reset.
+
+| | Good frames | Timed out | Converter failures | Quiet kicks |
+|---|---|---|---|---|
+| Before (~4 min) | 2480 | 38 (1.5 %) | climbing to the disable threshold | 73 |
+| After (~3 min) | 4523 | 1 (0.02 %) | 0 | 0 |
+
+The one remaining timeout ended differently — `BB | SCD | XRDY` with STP
+still set, the stop not yet out — and it recovered on its own. It is rare
+enough to leave alone, but its signature is recorded here in case it ever
+rises.
+
+### 10.7 Rules
+
+1. **Do not raise either bus above 100 kHz** without stiffer pull-ups.
+2. **Do not halt CPU2 mid-transfer** (§9 rule 5) — the I2CA target wedges
+   with SCL low, and its recovery runs on the core you halted.
+3. **Write `I2CMDR` whole.** Never build a start on a read-modify-write of it.
+4. **The F-RAM never takes I2CB while a converter is mid-frame.**
+5. **Start a frame only when `i2cbNotReady()` is false** — bus free *and*
+   STP clear (§10.6). `I2C_isBusBusy()` alone is not enough.
+6. **Reset the module by writing I2CMDR outright**, not with
+   `I2C_disableModule()`/`I2C_enableModule()`: those toggle IRS only and keep
+   STP.
+
+---
+
+## 11. MODE and ENABLE straps
+
+Two 8-way DIP switches set how the unit runs: **MODE** groups the slots and
+picks the control loop's voltage sensor, **ENABLE** says how many slots are
+fitted. Both are read **once, at power-on** — change a switch, then
+power-cycle. Turn on **one switch per strap**. DIP *n* selects setting *n* − 1.
+
+### 11.1 MODE — slot grouping
+
+| MODE DIP | `eSlotMode` | Name | Slot groups | Voltage loop from | What it is for |
+|---|---|---|---|---|---|
+| **1** | **0** | Independent | 8 groups of 1 | ADS131M08 | **Normal use.** Eight separate cells, each with its own test |
+| 2 | 1 | Pairs | 1+2, 3+4, 5+6, 7+8 | ADS131M08 | One cell on two slots in parallel, up to twice the current |
+| 3 | 2 | Quads | 1–4, 5–8 | ADS131M08 | One cell on four slots, up to four times the current |
+| 4 *(or none)* | 3 | Octet | 1–8 | ADS131M08 | One cell on all eight slots |
+| 5 | 4 | Independent, internal ADC | 8 groups of 1 | C2000 12-bit ADC | As MODE DIP 1, with the voltage loop closed on the on-chip ADC |
+| 6 | 5 | Pairs, internal ADC | as MODE DIP 2 | C2000 12-bit ADC | As MODE DIP 2, internal ADC |
+| 7 | 6 | Loop tuning — plant | one slot | — | Bench only. SFRA sweep of the converter with its loop open |
+| 8 | 7 | Loop tuning — closed loop | one slot | — | Bench only. SFRA sweep of the closed current loop |
+
+In a group, **only the leader — the lowest-numbered slot — is commanded**; a
+host addresses it alone and the other members follow its duty cycle.
+`modeCallback()` refuses a mode write to a follower. Grouped slots are wired in
+parallel onto one cell, so:
+
+- **Voltage limits** apply to the group as written — every member sits at the
+  same voltage.
+- **Current limits are the group total**, divided by the number of *enabled*
+  members. Pairs set to 6 A run 3 A per slot.
+- **Charge counters stay per slot.** A group's delivered mAh is the sum of its
+  members'.
+- **The members switch out of phase** — 180° apart in a pair, 90° in a quad,
+  45° in the octet — to cut ripple.
+- **One over-current stops the whole group**, in hardware, in the same
+  switching cycle ([§5.3](#53-grouped-trips-one-x-bar-output-per-group)). A
+  member whose voltage strays more than 10 % (at least 0.2 V) from the
+  leader's for five consecutive passes also stops the group, as
+  `groupDisconnect`.
+
+Full group semantics: [§5.5](#55-group-semantics-what-the-leader-owns).
+
+**Voltage sensor.** In MODE DIP 1–4 the voltage loop uses the ADS131M08, the
+16-bit external converter. MODE DIP 5–6 close it on the C2000's 12-bit
+internal ADC instead (`btsSlotUsesIntAdc[]`). The **current** loop, the
+software over-current trip and the charge counters use the ADS131M08 in every
+mode.
+
+**Loop tuning (MODE DIP 7, 8)** runs an SFRA frequency sweep on one slot
+instead of a test, with the AT console's serial port handed to TI's SFRA GUI.
+The slot under test is set by the ENABLE strap — ENABLE DIP *n* tunes slot
+*n* — and nothing else runs. The sweep needs a tuning build (`cpu1_sfra`,
+which defines `BTS_SFRA_BUILD`). **In a production build these two modes run
+no sweep:** the unit treats every slot as a group of one, and the console
+keeps its port. Don't strap them in normal use.
+
+### 11.2 ENABLE — fitted slots
+
+| ENABLE DIP | `eSlotEnable` | Slots enabled | Slots off |
+|---|---|---|---|
+| 1 | 0 | 1 | 2–8 |
+| 2 | 1 | 1–2 | 3–8 |
+| 3 | 2 | 1–3 | 4–8 |
+| 4 *(or none)* | 3 | 1–4 | 5–8 |
+| 5 | 4 | 1–5 | 6–8 |
+| 6 | 5 | 1–6 | 7–8 |
+| 7 | 6 | 1–7 | 8 |
+| **8** | **7** | **all eight** | — |
+
+ENABLE is the **highest** enabled slot, not a bitmask: slots are always
+enabled from slot 1 upward. A disabled slot never switches, rejects every
+command, and shows `SLOT_DISABLED` in its status word. Disable slots that have
+no power stage or sense chain fitted — an unpowered sense chain reads −10 A.
+
+**A group is only usable if every member is enabled.** If ENABLE cuts a group
+short, the whole group's hardware trips are left unrouted
+([§5.3](#53-grouped-trips-one-x-bar-output-per-group)) — so match the two
+straps: pairs need an even count of slots, quads four or eight, the octet all
+eight.
+
+### 11.3 Common settings
+
+| To run | MODE DIP | ENABLE DIP |
+|---|---|---|
+| Eight cells, one per slot | 1 | 8 |
+| One cell on slot 1 only (bench bring-up) | 1 | 1 |
+| Four cells, two slots each | 2 | 8 |
+| Two cells, four slots each | 3 | 8 |
+| One cell on all eight slots | 4 | 8 |
+| Tune slot 3's current loop (tuning build) | 8 | 3 |
+
+### 11.4 How the switches are read
+
+Each strap is an 8-way DIP switch read through an SN74HC148 8:3 priority encoder:
+S4 → U26 for ENABLE, S5 → U27 for MODE (schematic XTIDA-010086E3 sheet 13).
+Every encoder input has a 10 kΩ pull-up and a switch to ground, so an ON
+switch drives its input low. EI is tied low; **GS and EO are not connected**.
+The encoder's A0–A2 reach the controlCARD through 0-ohm links:
+
+| Strap | A0 | A1 | A2 | Links | `J5` pins |
+|---|---|---|---|---|---|
+| ENABLE | GPIO57 | GPIO58 | GPIO59 | R276, R283, R281 | 15, 13, 11 |
+| MODE | GPIO54 | GPIO55 | GPIO56 | R257, R270, R278 | 21, 19, 17 |
+
+CPU1 samples them once, in `BTS_HAL_setupGPIO()`, and decodes the 3-bit code
+`A2 A1 A0` through `truth_table[]`.
+
+The switches are not wired to the encoder in order. DIP 1–4 reach its inputs
+3–0, reversed; DIP 5–8 reach inputs 4–7. With the 148's inverted outputs:
+
+| DIP on | Encoder input | A2 A1 A0 | Index | Setting |
+|---|---|---|---|---|
+| 1 | 3 | H L L | 4 | 0 |
+| 2 | 2 | H L H | 5 | 1 |
+| 3 | 1 | H H L | 6 | 2 |
+| 4 | 0 | H H H | 7 | 3 |
+| 5 | 4 | L H H | 3 | 4 |
+| 6 | 5 | L H L | 2 | 5 |
+| 7 | 6 | L L H | 1 | 6 |
+| 8 | 7 | L L L | 0 | 7 |
+| **none** | — | **H H H** | **7** | **3** |
+
+**No switch on is indistinguishable from DIP 4.** With every input high the
+148 outputs `H H H`, which is exactly what input 0 produces; only GS separates
+the two, and GS goes nowhere. An unstrapped board therefore decodes to setting
+3 on both straps — MODE 3, one group of eight, with ENABLE 3, slots 1–4. That
+is a part-populated group, so its trips stay unrouted (§5.3) and it cannot run
+a sensible test. This was a choice (2026-10-09): every switch selects the
+number printed beside it, at the cost of a useful unstrapped default.
+
+**One switch at a time.** With two on, the 148 reports only the
+higher-numbered input, and nothing downstream can tell.
+
+> **The table must be `const`.** The project links with `--ram_model`, which
+> initialises `.data` only during a debugger load — a boot from flash never
+> writes it. `truth_table[]` was an initialised array in `.data` until
+> 2026-10-09, so it held its values after a CCS load and **zeros after a power
+> cycle**, and every switch position then decoded to 0: MODE 0, ENABLE 0. That
+> is why the unit reported slot 1 only with ENABLE DIP 8 on. It is
+> `static const` now and links into flash (`.const:truth_table`).
+>
+> The same trap applies to every other initialised variable on either core.
+> On 2026-10-09 the rest were all rewritten at boot before use —
+> `btsSlotLeader[]`, `btsSlotIsLeader[]`, `btsSlotEnabled[]` and
+> `btsGroupMembers[]` by `BTS_initSlotGrouping()`, `btsTripRoute[]` by
+> `BTS_HAL_setupTripRouting()`, and the DCL coefficients by
+> `BTS_initController()` — or unused (`ePWM[]`, `BTS_ctrl_ch1..8`). **A new
+> initialised variable that relies on its initialiser is wrong in a
+> standalone boot**: make it `const`, or assign it at runtime.
+
+**Read back, 2026-10-09**, both cores loaded, with ENABLE DIP 8 reported on:
+GPIO54–56 (MODE A0–A2) read `1, 1, 1` — index 7, setting 3: no MODE switch
+on, or DIP 4. GPIO57–59 (ENABLE A0–A2) read `0, 1, 1` — index 6, setting 2,
+which is the code for DIP **3**. DIP 8 would read `0, 0, 0`. CPU1 latched
+MODE 3 / ENABLE 2, and `AT+SMD?` / `AT+SEN?` on the ESP32 returned 3 and 2:
+the path from CPU1 through CPU2 and I2C to the ESP32 carries the value
+faithfully.
+
+> **Open: the ENABLE encoder's outputs do not match the switch.** With the
+> C2000's internal pull-ups switched on for a moment, all three ENABLE lines
+> read high — none is being driven low, as DIP 8 requires — and GPIO57 (A0)
+> went from 0 to 1, which a driven output would not do: the A0 line is
+> floating. Check, with ENABLE DIP 8 on: U26 pin 16 at 3.3 V and pin 5 (EI)
+> at 0 V; U26 pins 9, 7, 6 (A0, A1, A2) all low; and the same at `J5` pins
+> 15, 13, 11, across R276, R283 and R281.
+
+---
+
+## 12. Source index
 
 | Resource | Declared in | Applied in |
 |---|---|---|
@@ -1216,6 +1673,8 @@ session.
 | CLA1 init: LS4/LS5, `MVECT`, `MIER`, trigger | — | `bts_cpu1.c:843-910`; called `:929` |
 | CLA1 memory placement | — | `2837xD_RAM_lnk_cpu1.cmd` (`Cla1Prog`, `CLADataLS5`, `.scratchpad`) |
 | Trip zone signals and interrupt masking | `bts_user_settings.h:113-120` | `bts_hal.c:1437-1490` |
+| Slot → comparator binding | `BTS_TRP_CMPSS_CH1..8`, `bts_user_settings.h` | `btsSlotCmpss[]` in `BTS_HAL_setupTripRouting()`, `bts_hal.c` |
+| MODE / ENABLE strap pins and decode | `BTS_MODE_GPIO_PIN_*`, `BTS_EN_GPIO_PIN_*`, `bts_user_settings.h` | `truth_table[]` and `BTS_HAL_setupGPIO()`, `bts_hal.c` |
 | PIE group numbers | `driverlib/f2837xd/driverlib/inc/hw_ints.h` | — |
 | XINT → X-BAR input mapping | `driverlib/f2837xd/driverlib/gpio.c:127-147` | — |
 | X-BAR input → peripheral mapping | `driverlib/f2837xd/driverlib/xbar.h:199-215` | — |

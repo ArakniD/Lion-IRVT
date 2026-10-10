@@ -537,6 +537,63 @@ static inline void BTS_storeValuesAds(BTS_measValue* measValue, int32_t current_
 }
 
 //
+// Conditions one ADS131M08 sample pair for the control loops, on EVERY DRDY.
+//
+// This is the control path, and it is separate from the telemetry ring
+// BTS_storeValuesAds() fills. The ring is only meaned at the C1() rate into
+// Isense_A / Vsense_V for reporting; the loops never read it.
+//
+//   current  rolling mean of the last BTS_CC_AVG_N samples. Running sum,
+//            so each sample is one add and one subtract, not N adds.
+//   voltage  single-pole IIR, y += alpha * (x - y), corner
+//            BTS_CV_FILT_FC_HZ. The outer (CV) loop sees a ~100 Hz input
+//            against the inner (CC) loop's ~3.5 kHz.
+//
+// Returned in the signed 16-bit full-scale domain BTS_ctrlISR() takes, so
+// the per-unit scaling downstream is unchanged.
+//
+// The first call LOADS both filters from the sample instead of converging
+// from zero, so the loops never see a ramp from 0 A / 0 V after boot. A slot
+// that is idle still runs this every sample, so a start begins on a settled
+// value rather than on the first sample it happens to get.
+//
+#pragma FUNC_ALWAYS_INLINE(BTS_conditionCtrlInputs)
+static inline void BTS_conditionCtrlInputs(BTS_measValue* m,
+                                           int32_t current_raw,
+                                           int32_t voltage_raw,
+                                           int16_t *current_16b,
+                                           int16_t *voltage_16b)
+{
+    int32_t i = BTS_ADS131_SIGN_EXTEND(current_raw);
+    int32_t v = BTS_ADS131_SIGN_EXTEND(voltage_raw);
+    uint16_t k;
+
+    if (m->ctrlPrimed == 0U) {
+        for (k = 0U; k < BTS_CC_AVG_N; k++) {
+            m->ctrlI_ring[k] = i;
+        }
+        m->ctrlI_sum  = i * (int32_t)BTS_CC_AVG_N;
+        m->ctrlI_idx  = 0U;
+        m->ctrlV_filt = (float32_t)v;
+        m->ctrlPrimed = 1U;
+    } else {
+        m->ctrlI_sum += i - m->ctrlI_ring[m->ctrlI_idx];
+        m->ctrlI_ring[m->ctrlI_idx] = i;
+        m->ctrlI_idx = (m->ctrlI_idx + 1U) & (BTS_CC_AVG_N - 1U);
+
+        m->ctrlV_filt += BTS_CV_FILT_ALPHA * ((float32_t)v - m->ctrlV_filt);
+    }
+
+    //
+    // An arithmetic shift of a signed sum rounds toward minus infinity, so a
+    // mean of exactly -0.5 LSB reads -1 rather than 0. At 1 LSB in 32768
+    // that is below anything the loop can act on.
+    //
+    *current_16b = (int16_t)(m->ctrlI_sum >> BTS_CC_AVG_SHIFT);
+    *voltage_16b = (int16_t)m->ctrlV_filt;
+}
+
+//
 // Store one on-chip ADC sample pair. 12-bit single-ended, so int16_t is
 // exact - the width only needs widening on the ADS path above.
 //
@@ -665,10 +722,23 @@ static inline void BTS_ctrlDirection(uint32_t EPWM_BASE, BTS_ctrlLoopVariable *c
 }
 
 #pragma FUNC_ALWAYS_INLINE(BTS_ctrlISR)
-static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ctrl_cv, uint32_t EPWM_BASE, BTS_ctrlLoopVariable *ctrlLoopVariable, int16_t current_16b, int16_t voltage_16b){
+static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ctrl_cv, uint32_t EPWM_BASE, BTS_ctrlLoopVariable *ctrlLoopVariable, int16_t current_16b, int16_t voltage_16b, int16_t currentRaw_16b){
 
+    //
+    // TWO current readings, for two different jobs.
+    //
+    //   currentRaw_16b  this DRDY's sample, unfiltered. The software
+    //                   over-current trip and the reverse-current guard in
+    //                   BTS_ctrlDirection() use it - a protection test must
+    //                   not wait for an average to catch up.
+    //   current_16b     the BTS_CC_AVG_N rolling mean. The CC loop's error
+    //                   is formed on this.
+    //
+    // voltage_16b is already the ~100 Hz CV input; nothing here needs the
+    // raw voltage. See BTS_conditionCtrlInputs().
+    //
 #if(BTS_TRIP_CODE)
-    BTS_tripEpwm(EPWM_BASE, ctrl_cc, ctrlLoopVariable, current_16b);
+    BTS_tripEpwm(EPWM_BASE, ctrl_cc, ctrlLoopVariable, currentRaw_16b);
 
 #endif
 
@@ -751,7 +821,7 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
         if(BTS_DCL_RUN_CLAMP(&(ctrlLoopVariable->uk_cc_pu),BTS_DUTY_SET_MAX_PU, BTS_DUTY_SET_MIN_PU) == 0){
             //         Only update the duty cycle if the control effort is within range
             ctrlLoopVariable->dutySet_pu = ctrlLoopVariable->uk_cc_pu;
-            BTS_ctrlDirection(EPWM_BASE, ctrlLoopVariable, current_16b);
+            BTS_ctrlDirection(EPWM_BASE, ctrlLoopVariable, currentRaw_16b);
 
             BTS_HAL_updateDuty(EPWM_BASE, ctrlLoopVariable->dutyH_pu,ctrlLoopVariable->dutyL_pu);
             BTS_DCL_RUN_PARTIAL(ctrl_cc,
@@ -798,7 +868,7 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
         ctrlLoopVariable->dutySet_pu = BTS_DUTY_SET_MAX_PU;
     }
 
-    BTS_ctrlDirection(EPWM_BASE, ctrlLoopVariable,current_16b);
+    BTS_ctrlDirection(EPWM_BASE, ctrlLoopVariable,currentRaw_16b);
 
     BTS_HAL_updateDuty(EPWM_BASE, ctrlLoopVariable->dutyH_pu,ctrlLoopVariable->dutyL_pu);
 
@@ -882,12 +952,25 @@ static inline void BTS_balanceSlot(uint16_t ch, uint32_t EPWM_BASE,
     BTS_HAL_updateDuty(EPWM_BASE, duty, duty);
 }
 
+//
+// Takes the RAW DRDY sample pair. Conditioning happens here, once per slot
+// per sample, so leaders, followers and disabled slots all keep their filters
+// primed and current - a slot that starts, or a follower that is promoted by
+// a re-strap, begins from a settled value. See BTS_conditionCtrlInputs().
+//
 #pragma FUNC_ALWAYS_INLINE(BTS_runSlot)
 static inline void BTS_runSlot(uint16_t ch, BTS_DCL_CTRL_TYPE* ctrl_cc,
                                BTS_DCL_CTRL_TYPE* ctrl_cv, uint32_t EPWM_BASE,
                                BTS_ctrlLoopVariable *ctrlLoopVariable,
-                               int16_t current_16b, int16_t voltage_16b)
+                               int32_t current_raw, int32_t voltage_raw)
 {
+    int16_t currentRaw_16b = (int16_t)BTS_ADS131_SIGN_EXTEND(current_raw);
+    int16_t current_16b;
+    int16_t voltage_16b;
+
+    BTS_conditionCtrlInputs(&BTS_measValues[ch], current_raw, voltage_raw,
+                            &current_16b, &voltage_16b);
+
     if (btsSlotEnabled[ch] == 0U) {
         BTS_HAL_updateDuty(EPWM_BASE, (float32_t)0.0, (float32_t)0.0);
         return;
@@ -914,12 +997,19 @@ static inline void BTS_runSlot(uint16_t ch, BTS_DCL_CTRL_TYPE* ctrl_cc,
             return;
         }
 
+        //
+        // MODE 4/5 close the voltage loop on the internal ADC instead. That
+        // reading comes from the CLA's FAST filter (~4 kHz corner at
+        // 99.67 kSPS), not from the ~100 Hz CV filter the ADS131M08 path
+        // gets in BTS_conditionCtrlInputs(). Left as it is: those modes are
+        // a comparison path and have not run on hardware.
+        //
         if (btsSlotUsesIntAdc[ch] != 0U) {
             voltage_16b = BTS_cellVoltageAsCtrl16b(&BTS_measValues[ch],
                                                    &BTS_userInputs[ch]);
         }
         BTS_ctrlISR(ctrl_cc, ctrl_cv, EPWM_BASE, ctrlLoopVariable,
-                    current_16b, voltage_16b);
+                    current_16b, voltage_16b, currentRaw_16b);
     } else {
         const BTS_ctrlLoopVariable *leader =
             &BTS_ctrlLoopVariables[btsSlotLeader[ch]];
@@ -929,7 +1019,7 @@ static inline void BTS_runSlot(uint16_t ch, BTS_DCL_CTRL_TYPE* ctrl_cc,
         // so its over-current protection still bites independently.
         //
 #if(BTS_TRIP_CODE)
-        BTS_tripEpwm(EPWM_BASE, ctrl_cc, ctrlLoopVariable, current_16b);
+        BTS_tripEpwm(EPWM_BASE, ctrl_cc, ctrlLoopVariable, currentRaw_16b);
 #endif
         ctrlLoopVariable->ioutSense_pu = (float32_t)current_16b / (float32_t)32768.0;
         ctrlLoopVariable->voutSense_pu = (float32_t)voltage_16b / (float32_t)32768.0;
@@ -981,7 +1071,20 @@ static inline void BTS_ISR_SFRA(void){
     BTS_detectEnable(EPWMx_BASE,&BTS_ctrlLoopVariable_chx , &BTS_userInput_chx);
 #endif
 
-    BTS_ctrlISR(&BTS_ctrl_cc_chx,&BTS_ctrl_cv_chx,EPWMx_BASE, &BTS_ctrlLoopVariable_chx, BTS_ADC_current, BTS_ADC_voltage);
+    //
+    // The sweep measures the loop as it actually runs, so it gets the same
+    // conditioned inputs the production path does.
+    //
+    {
+        int16_t sfraI_16b;
+        int16_t sfraV_16b;
+
+        BTS_conditionCtrlInputs(&BTS_measValues_chx, BTS_ADC_current,
+                                BTS_ADC_voltage, &sfraI_16b, &sfraV_16b);
+        BTS_ctrlISR(&BTS_ctrl_cc_chx, &BTS_ctrl_cv_chx, EPWMx_BASE,
+                    &BTS_ctrlLoopVariable_chx, sfraI_16b, sfraV_16b,
+                    (int16_t)BTS_ADS131_SIGN_EXTEND(BTS_ADC_current));
+    }
 
     //
     // SFRA COLLECT - the reference is whichever signal was injected, and the

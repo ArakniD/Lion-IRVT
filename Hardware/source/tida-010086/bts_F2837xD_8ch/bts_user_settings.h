@@ -81,8 +81,6 @@
 
     // GPIO29 is the console TX, so the LED string cannot have it.
     #define BTS_LED_DRIVER_ENABLED    (false)
-
-    #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #else
     //
     // Production: no console. GPIO29 is left muxed to SCITXDA and idle -
@@ -90,21 +88,47 @@
     //
     #define BTS_CONSOLE_ENABLED       (false)
     #define BTS_LED_DRIVER_ENABLED    (false)
-    #define BTS_TRIP_GPIO_CH1_ENABLED (false)
 #endif
 
-//
-// CHANNEL 1'S GPIO TRIP INPUT IS NEVER ENABLED, in either build.
-//
-// It is not useful: channel 1 keeps its CMPSS over-current trip in both
-// modes, which is the hardware comparator that actually protects the slot and
-// responds in nanoseconds. The separate GPIO trip was a second, slower path
-// on a pin that is contended with the console RX, and nothing depends on it.
-//
-// Hard-coded false above rather than left as a build option so the two
-// branches cannot drift, and so GPIO28 stays a plain input in every build.
-
 #define BTS_ENABLE_DETECT_CODE (false)
+
+//
+//=============================================================================
+// External GPIO trip inputs (per slot) - NOT FITTED ON THIS BOARD
+//=============================================================================
+//
+// The board has no external trip line wired to any slot, so every one of
+// these is false and stays false. The only hardware trip is each slot's CMPSS
+// over-current comparator - BTS_TRIP_HW_CHn_ENABLED below.
+//
+// These were not separate switches until 2026-10-09. The GPIO pin setup and
+// the Input X-BAR routing were compiled in for every slot whose
+// BTS_TRIP_HW_CHn_ENABLED was true, so enabling the comparators also
+// configured eight GPIO trip inputs that go nowhere - and one of them,
+// channel 6's INPUT14 <- GPIO44, collides with CPU1's slot 5-8 acquisition
+// DRDY (XINT5, INPUT14 <- GPIO49). Acquisition happened to be configured
+// later and won, so nothing broke, but only by ordering.
+//
+// A later board revision may fit the lines. Before setting any of these true:
+//
+//   * The one-shot inputs read TZ1/TZ2 (Input X-BAR INPUT1/INPUT2), not the
+//     INPUT9..INPUT14 the routing in BTS_HAL_setupTripSystem() uses. A GPIO
+//     trip has to reach the trip zone through Digital Compare (DCBH, say),
+//     as the comparators do - see BTS_HAL_setupEPWMTripZone().
+//   * Channel 6's INPUT14 must move first: INPUT7 and INPUT8 are free.
+//   * Channels 7 and 8 have no input at all - INPUT15/16 do not exist.
+//   * Channel 1's pin, GPIO28, is the debug console RX.
+//
+// Each still requires that slot's BTS_TRIP_HW_CHn_ENABLED as well.
+//
+#define BTS_TRIP_GPIO_CH1_ENABLED (false)
+#define BTS_TRIP_GPIO_CH2_ENABLED (false)
+#define BTS_TRIP_GPIO_CH3_ENABLED (false)
+#define BTS_TRIP_GPIO_CH4_ENABLED (false)
+#define BTS_TRIP_GPIO_CH5_ENABLED (false)
+#define BTS_TRIP_GPIO_CH6_ENABLED (false)
+#define BTS_TRIP_GPIO_CH7_ENABLED (false)
+#define BTS_TRIP_GPIO_CH8_ENABLED (false)
 
 //
 //=============================================================================
@@ -115,9 +139,10 @@
 // latches the PWM low within a switching cycle. Enabled here; the routing is
 // built by BTS_HAL_setupTripRouting() and armed by BTS_HAL_armTripZones().
 //
-// The GPIO trip inputs (OSHT2) remain masked - those links are not wired on
-// this board, and the Input X-BAR path they need has the defaulting problem
-// described below.
+// THESE ENABLE THE COMPARATOR TRIPS ONLY. The external GPIO trip inputs are
+// not fitted on this board and have their own switches, all false - see
+// BTS_TRIP_GPIO_CHn_ENABLED above. The one-shot inputs they would arrive on
+// (OSHT1/OSHT2) stay masked either way.
 //
 // HOW THE COMPARATOR REACHES THE TRIP ZONE, because the obvious route does
 // not work. The one-shot inputs OSHT1/OSHT2 read TZ1/TZ2, which are hardwired
@@ -679,15 +704,64 @@
 #define BTS_TRP_PIN_GPIO_CH8            46U
 
 
- // Map: A2->COMP1A, B2->COMP2B, A4->COMP3A, IN14->COMP4A, D0->COMP5D, C2->COMP6C, D2->COMP7D, C4->COMP8C
-#define BTS_TRP_PIN_CONFIG_COMP_CH1 ADC_CH_ADCIN2
-#define BTS_TRP_PIN_CONFIG_COMP_CH2 ADC_CH_ADCIN2
-#define BTS_TRP_PIN_CONFIG_COMP_CH3 ADC_CH_ADCIN4
-#define BTS_TRP_PIN_CONFIG_COMP_CH4 ADC_CH_ADCIN14
-#define BTS_TRP_PIN_CONFIG_COMP_CH5 ADC_CH_ADCIN0
-#define BTS_TRP_PIN_CONFIG_COMP_CH6 ADC_CH_ADCIN2
-#define BTS_TRP_PIN_CONFIG_COMP_CH7 ADC_CH_ADCIN2
-#define BTS_TRP_PIN_CONFIG_COMP_CH8 ADC_CH_ADCIN4
+//
+//=============================================================================
+// Over-current comparator per slot - NOT CMPSSn for slot n
+//=============================================================================
+//
+// Each CMPSS has a fixed pair of input pins (datasheet SPRS880 Table 4-1, TRM
+// SPRUHM8K Figure 10-1), and this board routes each slot's sense nets to
+// whichever ADC pins suited the layout. So the comparator that can watch a
+// slot is the one that owns the pin its current-sense net IoutSn lands on -
+// and for slots 2, 3, 5, 7 and 8 that is a different number:
+//
+//   slot  ePWM   IoutSn  J5   device pin  comparator input  CMPSS   X-BAR mux
+//    1    ePWM1  IoutS1  106  ADCINA2     CMPIN1P           CMPSS1  MUX00
+//    2    ePWM2  IoutS2  103  ADCINB2     CMPIN3P           CMPSS3  MUX04
+//    3    ePWM3  IoutS3  100  ADCINA4     CMPIN2P           CMPSS2  MUX02
+//    4    ePWM4  IoutS4   96  ADCIN14     CMPIN4P           CMPSS4  MUX06
+//    5    ePWM5  IoutS5   93  ADCIND0     CMPIN7P           CMPSS7  MUX12
+//    6    ePWM6  IoutS6   90  ADCINC2     CMPIN6P           CMPSS6  MUX10
+//    7    ePWM7  IoutS7   87  ADCIND2     CMPIN8P           CMPSS8  MUX14
+//    8    ePWM8  IoutS8   84  ADCINC4     CMPIN5P           CMPSS5  MUX08
+//
+// IoutSn to J5 pin to device pin is schematic XTIDA-010086E3 sheet 13. J5 is
+// the controlCARD socket; TI's controlCARD pinout numbers the same pin
+// 121 - n. These are also the pins the ADC samples as each slot's current
+// (BTS_HAL_setupADC() and bts_cla.cla), so a board that moves one changes
+// both places.
+//
+// Each slot's voltage-sense net VoutSn lands on the SAME comparator's
+// negative pin (VoutS2 on ADCINB3 = CMPIN3N, and so on). Nothing reads it
+// there: the high and the low comparator both take their negative input
+// from the internal DAC (CMPSS_INSRC_DAC, BTS_HAL_setupCMPSS()).
+//
+// Until 2026-10-09 the routing used CMPSSn for slot n - right for slots 1, 4
+// and 6 only. Applied by btsSlotCmpss[] in bts_hal.c. The full per-slot map,
+// with both sense nets, their links and ADC channels, is in
+// Docs/hardware-resources.md section 5.
+//
+#define BTS_TRP_CMPSS_CH1               (1U)
+#define BTS_TRP_CMPSS_CH2               (3U)
+#define BTS_TRP_CMPSS_CH3               (2U)
+#define BTS_TRP_CMPSS_CH4               (4U)
+#define BTS_TRP_CMPSS_CH5               (7U)
+#define BTS_TRP_CMPSS_CH6               (6U)
+#define BTS_TRP_CMPSS_CH7               (8U)
+#define BTS_TRP_CMPSS_CH8               (5U)
+
+//
+// Eight slots, eight comparators, one each. A repeated entry would leave a
+// slot watched by another slot's current, so anything but a one-to-one
+// assignment of CMPSS1..8 fails the build. This checks only that the table
+// IS one; whether it matches the board is the schematic's question.
+//
+#if (((1U << (BTS_TRP_CMPSS_CH1 - 1U)) | (1U << (BTS_TRP_CMPSS_CH2 - 1U)) | \
+      (1U << (BTS_TRP_CMPSS_CH3 - 1U)) | (1U << (BTS_TRP_CMPSS_CH4 - 1U)) | \
+      (1U << (BTS_TRP_CMPSS_CH5 - 1U)) | (1U << (BTS_TRP_CMPSS_CH6 - 1U)) | \
+      (1U << (BTS_TRP_CMPSS_CH7 - 1U)) | (1U << (BTS_TRP_CMPSS_CH8 - 1U))) != 0xFFU)
+#error "BTS_TRP_CMPSS_CH1..8 must give each slot its own comparator, CMPSS1..8"
+#endif
 
 
 #define BTS_DRV_EPWM_HR_ENABLED           true
@@ -931,6 +1005,78 @@
 #define BTS_senseAverageFactor 32 //32U
 
 //
+//=============================================================================
+// ADS131M08 control-path conditioning
+//=============================================================================
+//
+// The DRDY interrupt delivers one current/voltage pair per slot every
+// 1 / BTS_ADS131_FDATA_HZ. The two loops take it differently, on purpose:
+//
+//   CC (current)  a ROLLING MEAN of the last BTS_CC_AVG_N samples, updated
+//                 every sample. Short enough to stay well inside the loop's
+//                 bandwidth, long enough to knock down sample-to-sample
+//                 noise. Before 2026-10-10 the loop took the single latest
+//                 raw sample.
+//   CV (voltage)  a single-pole IIR at BTS_CV_FILT_FC_HZ, also updated every
+//                 sample. The voltage loop is the OUTER loop and must be
+//                 slower than the current loop it commands, so its input is
+//                 deliberately much heavier filtered: ~100 Hz against the CC
+//                 path's ~3.5 kHz - comfortably more than the 10x separation
+//                 the outer loop needs.
+//
+// Both loops still EXECUTE on every DRDY sample, so the DCL biquads keep the
+// sample period they were designed for (BTS_SFRA_ISR_FREQ, 31.25 kHz - see
+// BTS_DCL_CC_* below; the actual rate is BTS_ADS131_FDATA_HZ, within 2.3%).
+// Only the input is conditioned; the loop rate is unchanged.
+//
+// The 32-deep ring above is the TELEMETRY path. It is meaned at the C1()
+// rate into Isense_A / Vsense_V and is never read by either loop.
+//
+// fDATA = CLKIN / 2 / OSR = (90 MHz / (BTS_DRV_ADC_TBPRD + 1)) / 2 / 128.
+// Written out rather than derived, because BTS_DRV_ADC_TBPRD is computed
+// with truncating integer division and the true clock is what matters.
+//
+#define BTS_ADS131_OSR             (128U)
+#define BTS_ADS131_FDATA_HZ        ((float32_t)31960.2)   // 8.1818 MHz / 2 / 128
+
+//
+// Samples in the CC loop's rolling mean. A power of two keeps the divide a
+// shift. 4 at 31.96 kSPS spans 125 us, puts the first null at 8 kHz and the
+// -3 dB point at ~3.5 kHz, and adds 1.5 samples (47 us) of group delay.
+//
+#define BTS_CC_AVG_N               (4U)
+#define BTS_CC_AVG_SHIFT           (2U)
+
+#if ((1U << BTS_CC_AVG_SHIFT) != BTS_CC_AVG_N)
+#error "BTS_CC_AVG_N must equal 1 << BTS_CC_AVG_SHIFT"
+#endif
+
+//
+// CV input filter: y += alpha * (x - y), alpha = 1 - exp(-2*pi*fc/fs).
+// fc = 100 Hz at fs = 31.96 kSPS gives alpha = 0.019467.
+//
+#define BTS_CV_FILT_FC_HZ          ((float32_t)100.0)
+#define BTS_CV_FILT_ALPHA          ((float32_t)0.019467)
+
+//
+// Input bus voltage (Vin sense) smoothing.
+//
+// updateInputVoltage() runs from C1(). Each pass it now takes
+// BTS_VIN_OVERSAMPLE back-to-back conversions of the sense pin and of the A0
+// reference and averages them, then runs the result through a single-pole
+// IIR. The raw single conversion it used to take moved by +/-0.5 V on BTLE -
+// a few counts of switching noise on a 12-bit reading, multiplied by the
+// sense gain of ~6.2. The filter weight below gives a time constant of
+// roughly 1 / BTS_VIN_FILT_ALPHA C1() passes.
+//
+// Both thresholds the bus voltage drives (restrict and disable) already
+// debounce their own transitions, so the filter only has to remove noise,
+// not decide anything.
+//
+#define BTS_VIN_OVERSAMPLE         (16U)
+#define BTS_VIN_FILT_ALPHA         ((float32_t)0.25)
+
+//
 // Full-scale divisor for the ADS131M08 sample ring.
 //
 // This tracks the configured SPI WORD length, NOT the converter's silicon
@@ -1054,6 +1200,12 @@
     //#define BTS_SFRA_EPWM               (EPWM9_BASE)
     //#define BTS_SFRA_TDRD               ((BTS_DRV_EPWM_SWITCHING_FREQUENCY / BTS_SFRA_ISR_FREQ_REQ ) - 1)
 #if (BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_ADC)
+    //
+    // The DRDY rate the loops run at - 31.96 kSPS since CLKIN went to
+    // 8.1818 MHz (BTS_ADS131_FDATA_HZ). Left at the 31.25 kHz the DCL
+    // coefficients were designed for; the 2.3% difference shifts every
+    // swept frequency by the same 2.3%.
+    //
     #define BTS_SFRA_ISR_FREQ             ((float32_t)31250)
     #define BTS_SFRA_FREQ_LENGTH          ((int16_t)103)
 #else
@@ -1154,9 +1306,23 @@
 #define BTS_DRV_EPWM_DC_TRIP_OC           EPWM_DC_TRIP_TRIPIN4
 #define BTS_DRV_EPWM_DC_TRIP_PCMC         EPWM_DC_TRIP_TRIPIN5
 
-#define BTS_DRV_EPWM_SWITCHING_FREQUENCY  ((BTS_DRV_ADC_SWITCHING_FREQUENCY / (float32_t)2 / (float32_t)128 ) * (float32_t)3)
+//
+// Converter switching frequency. A FIXED figure, deliberately no longer
+// derived from BTS_DRV_ADC_SWITCHING_FREQUENCY.
+//
+// It used to be (CLKIN / 2 / 128) * 3, which with the old 8.5 MHz CLKIN
+// constant came to 99,609.375 Hz and TBPRD 902 (99.67 kHz actual). Lowering
+// CLKIN to 8.192 MHz through that formula would have silently moved the
+// converter to 96 kHz and TBPRD 936 - changing the inductor ripple, the
+// CLA's sample rate and every alpha tied to it. The ADS131M08 and the
+// switching stage are not synchronised (separate ePWMs, no SYNC/RESET
+// alignment), so nothing requires the two to be related.
+//
+// 99,609.375 keeps TBPRD 902, exactly what has run on the board.
+//
+#define BTS_DRV_EPWM_SWITCHING_FREQUENCY  ((float32_t)99609.375)
 
-// 99,609.375 Hz
+// 99,609.375 Hz requested -> TBPRD 902 -> 99.67 kHz actual
 
 #define BTS_DRV_ADC_EPWMCLK_DIV          EPWM_CLOCK_DIVIDER_1
 #define BTS_DRV_ADC_HSCLK_DIV            EPWM_HSCLOCK_DIVIDER_1
@@ -1167,11 +1333,26 @@
     #define BTS_DRV_ADC_TOTAL_CLKDIV     (((uint16_t)0x1 << BTS_DRV_ADC_EPWMCLK_DIV) * (BUCK_DRV_ADC_HSCLK_DIV << 1))
 #endif
 
-#define BTS_DRV_ADC_PERIOD_TICKS         ((uint32_t)((BTS_EPWM_HZ) / BTS_DRV_ADC_SWITCHING_FREQUENCY / BTS_DRV_ADC_TOTAL_CLKDIV))
+//
+// ADS131M08 master clock (CLKIN), driven by EPWM11A (ADC1, slots 1-4) and
+// EPWM12A (ADC2, slots 5-8). See BTS_HAL_setupAdcClock().
+//
+// The period is the NEAREST integer to EPWMCLK / f, not the truncated one.
+// The truncating divide this used to be turned a requested 8.5 MHz into
+// TBPRD 9 and an actual 90 MHz / 10 = 9.0 MHz - read back off EPwm11Regs
+// on 2026-10-10 - 7% above the part's 8.4 MHz limit for high-resolution
+// mode (datasheet SBAS950B, 6.3: fCLKIN 0.3 / 8.192 / 8.4 MHz at gain 1-2).
+//
+// 8.192 MHz nominal rounds to TBPRD 10: 90 MHz / 11 = 8.1818 MHz, 0.13%
+// under nominal. Duty 50% (toggle at zero and at CMPA = TBPRD/2), inside the
+// 40-60% window. That gives fMOD 4.091 MHz and, at OSR 128,
+// fDATA = 31.96 kSPS - see BTS_ADS131_FDATA_HZ.
+//
+#define BTS_DRV_ADC_PERIOD_TICKS         ((uint32_t)(((BTS_EPWM_HZ) / BTS_DRV_ADC_SWITCHING_FREQUENCY / BTS_DRV_ADC_TOTAL_CLKDIV) + (float32_t)0.5))
 #define BTS_DRV_ADC_TBPRD                ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS - 1)
 #define BTS_DRV_ADC_PERIOD_SEC           ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS / BTS_EPWM_HZ / 2)
 
-#define BTS_DRV_ADC_SWITCHING_FREQUENCY  ((float32_t)8500 * 1000)
+#define BTS_DRV_ADC_SWITCHING_FREQUENCY  ((float32_t)8192 * 1000)
 
 //
 // ADC acquisition rate for adcCellVoltageISR (cell V/I on the internal ADC).

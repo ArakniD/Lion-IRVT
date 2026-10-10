@@ -193,16 +193,15 @@ bit (ch*2 + 1) GPIO group trip on channel ch
 bits 16-31     reserved, zero
 ```
 
-> **This word is currently always zero.** The bits are set only in
-> `epwmTripISR()` (`bts_cpu1.c:1715-1718`), whose trip-zone interrupt is
-> enabled per channel only when `BTS_TRIP_HW_CHn_ENABLED` is true
-> (`bts_hal.c:1098-1102`). All eight are `(false)` in this build
-> (`bts_user_settings.h:113-120`), so the ISR is never entered and the
-> hardware trip sources are masked at the module. The **software**
-> over-current path (`BTS_tripEpwm()`, `bts.h:350-380`) forces the trip zone
-> and brings the PWM down, but it does not raise the interrupt and does not
-> set these bits. Do not use `trip_status` as a fault indicator on this
-> firmware.
+> **Set by real trips; cleared when the slot is handed back.** A CMPSS
+> over-current sets the channel's bit in `epwmTripISR()`. It stays set until
+> the fault is cleared (`BLE_CMD_CLEAR_FAULT`, which sends the unit mode
+> `0x40`), or the slot is started again, re-armed for a cell, or emptied —
+> **a stop does not clear it**, because the ESP32 sends a stop as its first
+> reaction to a trip. Before 2026-10-09 nothing cleared it. The GPIO bit (`ch*2 + 1`) is
+> never set: the GPIO trip inputs are not fitted on this board. The software
+> over-current check (`BTS_tripEpwm()`) forces the trip zone itself and does
+> not set these bits.
 
 #### 3.1.3 `stats_live`
 
@@ -237,7 +236,7 @@ slot-select.
 |---|---|---|
 | 1 | `BLE_CMD_START` | `test_engine_start(slot)` |
 | 2 | `BLE_CMD_ABORT` | `test_engine_abort(slot)` |
-| 3 | `BLE_CMD_CLEAR_FAULT` | `test_engine_clear_fault(slot)` |
+| 3 | `BLE_CMD_CLEAR_FAULT` | `test_engine_clear_fault(slot)` — also clears the unit's trip indication (mode `0x40`) |
 | 4 | `BLE_CMD_ABORT_ALL` | `test_engine_abort_all()` |
 | 5 | `BLE_CMD_PAUSE` | `test_engine_pause(slot)` — **new in proto 3** |
 | 6 | `BLE_CMD_RESUME` | `test_engine_resume(slot)` — **new in proto 3** |
@@ -440,8 +439,8 @@ Offsets sum to 70: 4×1 + 6×4 + 3×4 + 4×1 + 6×4 + 2×1.
 > **Proto 6 appended two bytes at the END of this record.** Every offset
 > above is unchanged, so a client written for proto 3-5 reads the first 68
 > bytes exactly as before. The two flags were published as status bits 6 and
-> 7 long before this, but read a constant 0: the CC-only control law pinned
-> `ctrlMode_logic` to 0 and the CV branch was compiled out entirely.
+> 7 long before this, but read a constant 0 under the old CC-only control
+> law. The build is CC-CV now, so they track the loop.
 
 > **This record grew by 28 bytes in proto 3**, from 40. Every pre-existing
 > field kept its offset, so a version-2 client decoding the first 40 bytes
@@ -502,12 +501,12 @@ carried through unchanged. Authoritative table:
 |---|---|---|---|
 | 0 | `RUNNING` | Slot is executing a charge or discharge. **Stays set while paused** | yes |
 | 1 | `STOPPED` | Slot is not running | yes |
-| 2 | `FINISHED` / `END` | Test finished normally | **yes — new in v2** |
-| 3 | `OVERCURRENT` | An over-current trip latched | **never in this build** |
+| 2 | `FINISHED` / `END` | Test finished normally | **yes** — set by the C2000's termination |
+| 3 | `OVERCURRENT` | An over-current trip latched | yes — cleared on restart, see below |
 | 4 | `CHARGING` | Mode bit 1 set at the last start | yes |
 | 5 | `DISCHARGING` | Mode bit 1 clear at the last start | yes |
-| 6 | `CONST_VOLTAGE` | Loop is in CV regulation | always 0, see below |
-| 7 | `CONST_CURRENT` | Loop is in CC regulation | always 1, see below |
+| 6 | `CONST_VOLTAGE` | Loop is in CV regulation | yes, while running |
+| 7 | `CONST_CURRENT` | Loop is in CC regulation | yes, while running |
 | 8 | `SLAVE_MODE` | Slot follows a lower-numbered group leader | yes |
 | 9 | `GROUP_DISCONNECT` | A member of this slot's group fell out of sync | yes |
 | 10 | `REVERSE_POLARITY` | Measured cell voltage is negative | yes |
@@ -535,23 +534,18 @@ bytes exist so a thin client does not have to carry a bit table.
 > rather than spending another bit. **Bit 16 is unused and reads a constant
 > 0.** Test bit 2, or read `bts_ended`.
 
-Three of these are not what their names suggest:
+Three of these need more than their names:
 
-- **Bit 3 (`OVERCURRENT`) is never set in this build**, for the same reason
-  `trip_status` is always zero — see §3.1.2.
-- **Bits 6 and 7 are constant.** The build is CC-only
-  (`BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_ACMC_IOUT` →
-  `BTS_ISR_CL_MODE_CC`, `bts_user_settings.h:305-315`), so
-  `ctrlMode_logic` is hard-assigned 0 (`bts.h:572-576`) and the CV branch is
-  compiled out. Bit 7 is therefore always 1 and bit 6 always 0 whenever the
-  slot is running. They are genuinely reported now — before the calibration
-  work they were both stuck at 0 — but they cannot vary.
-- **Bit 2 is wired but nothing asserts it yet.** The C2000 drives it from
-  `status[].finished`, which is cleared on start, pause and stop and
-  **restored from F-RAM** at boot — so a slot that ended before a reset comes
-  back showing END. No termination path sets it: termination is still the
-  ESP32 engine's job, against its own `state == COMPLETE`. A future
-  C2000-side termination will light the bit without any client change.
+- **Bit 3 (`OVERCURRENT`) latches until the slot is handed back**, like
+  `trip_status` — see §3.1.2.
+- **Bits 6 and 7 track the loop.** The build is CC-CV, so they follow the CV
+  loop taking over from CC. Both are 0 while the slot is not running.
+- **Bit 2 is set by the C2000's own termination**: a discharge ends at
+  `V_MIN`, a charge once the CV loop holds `V_MAX` and the current has fallen
+  to `I_MIN`. The ESP32 engine still decides when a test is complete. See
+  [`supervision-and-state-design.md`](supervision-and-state-design.md) §2.6;
+  discharge termination is verified on hardware, charge termination is not
+  yet.
 
 > **Why bit 23 is the ceiling.** The status word reaches a host as a
 > `float32`, whose 24-bit significand represents integers exactly only up to

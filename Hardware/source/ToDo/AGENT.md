@@ -41,3 +41,92 @@ and **CPU Timer 2 on CPU2 is free again**.
 See [`04.CPU2 Timer0 double booked for LED and ADS1119.md`](04.CPU2%20Timer0%20double%20booked%20for%20LED%20and%20ADS1119.md)
 for the full note, and `Docs/supervision-and-state-design.md` §2.5.1 for the
 current design.
+
+### Addendum, 2026-10-08 - first FET-driving runs on hardware
+
+Earlier entries here say the trips never fired, the CV coefficients never
+ran, and "nothing that drives a FET has run on hardware". The first and last
+are no longer true for slot 1:
+
+- **Charge**, 1 A into a short: 205 s at 1.00 A, no trip.
+- **Discharge**, 1 A and 100 mA from an external supply: steady, no trip on
+  enable - previously every discharge enable latched the CMPSS comparator.
+- **Discharge termination**: `V_MIN` 0.5 V, supply wound to 0 V, slot ended
+  in END (`FINISHED`).
+- **Standalone flash boot**: both cores from flash with the debugger
+  unplugged (`c490094`).
+- **F-RAM**: boot reads now succeed; slot 1's calibration, slot state and the
+  global voltage thresholds load at boot.
+
+Still NOT verified on hardware: **charge termination** (the short never
+reaches CV), **the CV loop** on a real cell, and **the trip level** against a
+real over-current. Commits: `c490094` (C2000), `b373e90` (ESP32).
+
+### Addendum, 2026-10-08 (later) - ESP32 OTA, WiFi setup, HACS
+
+Not ToDo items, recorded here for the same reason:
+
+- **ESP32 firmware update over WiFi** with rollback; a new image confirms
+  itself once the BTS link answers, or after 180 s. A setup page at `/` for
+  WiFi credentials and updates. Verified on a bare ESP32 (no BTS): two full
+  updates, one rolled back by a reset mid-trial. Not yet seen confirming on a
+  live BTS link. Commits `69f847a`, `985b82b`.
+- **Home Assistant integration moved** to its own repository, ha-lion-irvt,
+  checked out as the `lion-lvrt-integration` submodule (`7d8f53e`). Release
+  v1.0.0 passes the HACS validator and hassfest on GitHub.
+- **I2CB at 100 kHz, not 400** (`c490094`): the board has 10 kOhm pull-ups,
+  out of spec for fast mode. 400 kHz caused ~327 F-RAM save failures and a
+  bus stall a second; 100 kHz, 0 of each. Recorded in
+  `Docs/hardware-resources.md` section 10.
+
+Open, found while documenting:
+
+- ~~`eTripStatus` and status bit 3 never clear~~ - fixed 2026-10-09: they
+  clear on a fresh start, a WAITING re-arm, or cell removal; not on a stop.
+- ~~Channel 6's GPIO trip loses `INPUT14`~~ - moot 2026-10-09: the GPIO
+  trips have their own switches, all false (not fitted on this board).
+  Channel 6's trip input is being debugged at the bench - see
+  `Docs/hardware-resources.md` section 4.
+- ~~Slots 2, 3, 5, 7 and 8 were tripped by another slot's comparator~~ -
+  fixed 2026-10-09: each slot is bound to the comparator on its own current
+  pin (`BTS_TRP_CMPSS_CH1..8`: CMPSS 1, 3, 2, 4, 7, 6, 8, 5). ToDo 02 had
+  specified the groups as CMPSSn for slot n, which the device's fixed
+  comparator pins and this board's routing do not allow. Read back on the
+  board: slot 2's trip now carries CMPSS3. Not yet seen to fire on a real
+  over-current. See `Docs/hardware-resources.md` section 5.0.
+- ~~The MODE and ENABLE straps decoded to 0 after every power cycle~~ -
+  fixed 2026-10-09: `truth_table[]` was in `.data`, which `--ram_model`
+  initialises only on a debugger load, so a standalone boot read zeros. Now
+  `static const`, in flash, and re-derived from the schematic so DIP n
+  selects setting n-1. No switch on reads as DIP 4 (setting 3). Verified on
+  the board and through the ESP32. See `Docs/hardware-resources.md`
+  section 11.
+- The ENABLE strap does not read DIP 8 (2026-10-09): the encoder lines show
+  DIP 3's code, none is pulled low, and A0 (GPIO57) floats. Hardware -
+  check U26 and R276/R283/R281. `Docs/hardware-resources.md` section 11.
+- A calibration commit (`CALM=2`) does not set a slot's calibration-valid
+  flags.
+- The ESP32's AT console once repeated its last reply ~17,000 times.
+
+
+### Addendum, 2026-10-10 - ADS131M08 clock, loop input filtering, Vin smoothing
+
+Not a ToDo item, recorded here for the same reason:
+
+- **ADS131M08 CLKIN 9.0 -> 8.18 MHz.** The truncating divide gave TBPRD 9
+  (9.0 MHz, over the 8.4 MHz HR-mode limit). It now rounds, giving TBPRD 10:
+  fDATA 31.96 kSPS, down from 35.16. The switching frequency is fixed at
+  99.67 kHz instead of being derived from the ADC clock. Read back on the
+  board: EPWM11/12 TBPRD = 10, EPWM1 TBPRD = 902.
+- **Loop inputs conditioned on every DRDY.** CC uses a 4-sample rolling mean
+  (-3 dB 3.54 kHz). CV uses an IIR with fc 100 Hz. The trip and the
+  direction guard stay on the raw sample. The loops still execute on every
+  sample, and the DCL coefficients are unchanged (designed for 31.25 kHz,
+  2.3 % off).
+- **Vin**: 16 x oversampled with the A0 reference, then an IIR with alpha
+  0.25 per C1 pass. Measured via the ESP32: 40 mV span over 30 s, down from
+  about +/-0.5 V.
+- Data flow with rates, record counts and corners: `Docs/data-flow.md` §2.
+
+**Not verified:** CC/CV loop stability on a running converter. That needs a
+scope.

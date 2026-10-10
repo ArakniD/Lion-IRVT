@@ -37,7 +37,7 @@ records the known disagreements, including a live one in the ESP32 mirror.
 
 ## Read this before touching anything
 
-Nine facts that invalidate the obvious guess. Each is confirmed in source.
+Ten facts that invalidate the obvious guess. Each is confirmed in source.
 
 0. **The register map is v2.1, and every v1 address is wrong.** Four regions
    — runtime (base 0, stride 48 B, RO), settings (base 384, stride 72 B),
@@ -71,10 +71,14 @@ Nine facts that invalidate the obvious guess. Each is confirmed in source.
    `bts_regs.h` compiles and is silently wrong. **They have drifted before** —
    see that section for the failure mode.
 
-4. **The build is CC-only.** `BTS_LAB_TYPE = BTS_LAB_CLOSED_LOOP_ACMC_IOUT`
-   (`bts_user_settings.h:305`) selects `BTS_ISR_CL_MODE_CC`, so the CV loop
-   and the CC-CV crossover are compiled out. `voutRef_pu` is computed every
-   millisecond and ignored.
+4. **The build is CC-CV, and the C2000 terminates.** `BTS_LAB_TYPE =
+   BTS_LAB_CLOSED_LOOP_CCCV`. `serviceTermination()` ends a running leader,
+   and its whole group, in END: a discharge at `V_MIN` on the ADS131M08, a
+   charge only once the CV loop holds `V_MAX` and the current has fallen to
+   `I_MIN`, each held for 5 C1 passes. `V_MIN = 0` disables the discharge
+   check. Discharge termination is verified on hardware (2026-10-08); charge
+   termination and the CV loop are not yet. It was CC-only until then, and
+   anything that says so is stale.
 
 5. **The hardware over-current trips are live, and they arm on first run.**
    All eight are enabled at ±9.5 A, above the software trip's ±8 A — layered,
@@ -90,6 +94,15 @@ Nine facts that invalidate the obvious guess. Each is confirmed in source.
    before the board did anything. In a grouped mode one X-BAR output carries
    the OR of the group's comparators, so a trip stops every member in the
    same switching cycle. Details: `Docs/hardware-resources.md` §5.
+
+   **Slot *n* is not watched by `CMPSSn`.** Each comparator's input pins are
+   fixed by the device and the board routes the sense nets for layout: slots
+   1–8 use CMPSS 1, 3, 2, 4, 7, 6, 8, 5. `BTS_TRP_CMPSS_CH1..8`
+   (`bts_user_settings.h`) holds the binding and fails the build unless it
+   is one-to-one; `btsSlotCmpss[]` applies it. Index the mux tables by the
+   **comparator** and the trip/DC tables by the **slot** — mixing the two is
+   how slots 2, 3, 5, 7 and 8 were tripped by another slot's current until
+   2026-10-09. Full pin table: `Docs/hardware-resources.md` §5.0.
 
 6. **The Input X-BAR is device-global, not per-core.** Each core has its own
    PIE vector, but `GPIO_setInterruptPin()` writes the **single shared Input
@@ -116,6 +129,17 @@ Nine facts that invalidate the obvious guess. Each is confirmed in source.
    constant. **CPU Timer 1/2 go direct to INT13/INT14 and must not ack at
    all**; Timer 0 is a PIE interrupt and must. Table:
    `Docs/hardware-resources.md` §2.
+
+9. **The loops run at the ADS131M08 data rate, 31.96 kSPS, on filtered
+   inputs.** CLKIN is 8.1818 MHz from EPWM11A/12A (TBPRD 10, rounded from
+   `BTS_DRV_ADC_SWITCHING_FREQUENCY`; it was 9.0 MHz, out of spec). Every
+   DRDY, `BTS_conditionCtrlInputs()` feeds the CC loop a 4-sample rolling
+   mean (3.54 kHz) and the CV loop a 100 Hz IIR. The trip and
+   `BTS_ctrlDirection()` take the raw sample. The DCL coefficients were
+   designed for 31.25 kHz. `Isense_A`/`Vsense_V` are a separate 32-sample
+   (1 ms) ring meaned in `C1()`, and are never a loop input. Vin is 16×
+   oversampled plus an IIR with alpha 0.25. Full chain:
+   `Docs/data-flow.md` §2.
 
 ---
 
@@ -174,7 +198,7 @@ read from the map files after the v2.1 build:
 
 | Block | Used | Free |
 |---|---|---|
-| `CPU2TOCPU1RAM` | 790 words (`0x316`) | **234 words** (`0x0EA`) |
+| `CPU2TOCPU1RAM` | 720 words (`0x2D0`) | **304 words** (`0x130`) |
 | `CPU1TOCPU2RAM` | 508 words (`0x1FC`) | 516 words (`0x204`) |
 
 Overflow is a link-time failure (`#10099-D ... section
@@ -203,7 +227,8 @@ temperature window and trip protection.
 
 - `eChX_Mode` (settings offset 0) encodes run + direction + calibration entry
   + pause/resume. Bit 0 = run, bit 1 = **charge** (clear = discharge), bit 2 =
-  enter calibration, bit 3 = **pause**, bit 4 = **resume**. Note the
+  enter calibration, bit 3 = **pause**, bit 4 = **resume**, bit 5 =
+  **waiting** (arm pre-charge), bit 6 = **clear fault**. Note the
   asymmetry: `0x00` is stop and `0x01` is *start a discharge*, one bit apart.
   Bits 3 and 4 are **edge commands** — acted on at the write, not retained,
   handled before the run/stop decode.
@@ -279,10 +304,9 @@ Three rules that are easy to break:
 > Bit 16 is unused and reads a constant 0. An early revision of the ESP32
 > header defined END at bit 16; that is stale.
 >
-> The bit is now driven end to end, but **no C2000 path currently asserts
-> it**: `status[].finished` is cleared on start, pause and stop, and restored
-> from F-RAM at boot, but termination is still the ESP32's job.
-> `iref_cuttout_A` is loaded from `eChX_ChargeCurrentMin` and never read.
+> The bit is set by `serviceTermination()` (fact 4 above), cleared on start,
+> pause and stop, and restored from F-RAM at boot. `iref_cuttout_A`, loaded
+> from `eChX_CurrentMin`, is the charge termination current.
 
 ### Counters
 
@@ -398,7 +422,10 @@ Complete map: `Docs/api-specification.md` Part 2.
 
 ### I2C controller (I2CB) — F-RAM + ADS1119
 
-- **GPIO40 = SDA, GPIO41 = SCL**, 400 kHz. (Not GPIO34/35.)
+- **GPIO40 = SDA, GPIO41 = SCL**, **100 kHz**. (Not GPIO34/35.) It was
+  400 kHz until 2026-10-08; with only 10 kΩ pull-ups that is out of spec, and
+  it caused ~327 F-RAM save failures and a bus stall a second. Do not raise
+  it without stiffer pull-ups. Full detail: `Docs/hardware-resources.md` §10.
 - FM24V10 F-RAM at `0x50` — same address as the target, different bus.
 - Two ADS1119 at `0x40` (slots 1-4) and `0x41` (slots 5-8), continuous
   conversion, DRDY on GPIO42/43 → XINT1/XINT2, round-robin mux.
@@ -459,11 +486,9 @@ a mode bitmask to stop a cell safely.
 **Verified on hardware:** `AT+WD?` → `+WD=30.00`; `AT+C0CHS?`, `AT+C0PAUSE`
 and `AT+C0RESUME` all answer `OK`.
 
-> **Known bug:** the console periodically prints `WARNING: host watchdog
-> DISABLED` even when `eHostWatchdog_s` reads 30.0 and the countdown is
-> healthy. `hostWdDisableWarn` is set only where a write of `0.0` arrives
-> (`com_cpu2.c:2573`) and reads 0 when sampled, so the trigger has not been
-> found. Cosmetic — supervision is verifiably armed — but alarming and wrong.
+> The `WARNING: host watchdog DISABLED` banner older notes describe is gone:
+> it and `hostWdDisableWarn` were removed in `8070d2e` (2026-09-22). Setting
+> `AT+WD=0` now prints nothing; the countdown simply reads 0.
 
 There is no SCIB console: GPIO18 is SPICLKA and GPIO19 is the ADC1 chip
 select. In a production build the host must use I2C or CAN.
@@ -585,12 +610,12 @@ you came for.
 |---|---|---|
 | 0 | `RUNNING` | yes — **stays set while PAUSED** |
 | 1 | `STOPPED` | yes |
-| 2 | `FINISHED` / `END` | **driven since v2** — but nothing asserts it yet |
-| 3 | `OVERCURRENT_TRIP` | never in this build |
+| 2 | `FINISHED` / `END` | yes — set by `serviceTermination()` |
+| 3 | `OVERCURRENT_TRIP` | yes — latches until clear-fault (0x40), restart, re-arm or cell removal; **not** on stop |
 | 4 | `CHARGING` | yes |
 | 5 | `DISCHARGING` | yes |
-| 6 | `CONST_VOLTAGE` | always 0 — CC-only build |
-| 7 | `CONST_CURRENT` | always 1 — CC-only build |
+| 6 | `CONST_VOLTAGE` | yes, while running; 0 when stopped |
+| 7 | `CONST_CURRENT` | yes, while running; 0 when stopped |
 | 8 | `SLAVE_MODE` | yes |
 | 9 | `GROUP_DISCONNECT` | yes |
 | 10 | `REVERSE_POLARITY` | yes |
@@ -623,19 +648,22 @@ brought to life.
 |---|---|
 | `eChX_MinVoltage`, `eChX_MaxVoltage` | **Deleted from the map.** RO and never written on either core, 16 registers of permanent 0.0. Removing them paid for most of the 16 new run-time-seconds registers. If per-run extremes are wanted back, use the settings block's spare register — and actually write them |
 | The four accumulators + two seconds counters | **Live.** All six per slot, in the runtime block. See the counters section above |
-| Status bit 2 (`FINISHED` / `END`) | **Driven**, but no termination path asserts it yet |
+| Status bit 2 (`FINISHED` / `END`) | **Driven, and asserted by the C2000's termination** |
 | `eChX_SettingsSpare` | Reserved by design. RO, reads 0.0, one per slot at settings offset 23 — the place to put a future per-slot setting without moving anything |
-| `iref_cuttout_A` | Still loaded from `eChX_ChargeCurrentMin` and read by nothing. CC-to-cutoff taper is the ESP32's job |
-| `eTripStatus` (1180) | Still always 0. See below |
+| `iref_cuttout_A` | The charge termination current, read by `serviceTermination()` |
+| `eTripStatus` (988) | **Live**; cleared on restart. See below |
 
-`eTripStatus` is mirrored from `cpu1Status.tripStatus`, which is only ever
-written by `epwmTripISR`. That ISR is registered and enabled unconditionally,
-but `BTS_HAL_setupEPWMTripZone()` masks the one-shot trip **signals** and
-disables the trip-zone **interrupt** on any slot whose
-`BTS_TRIP_HW_CHn_ENABLED` is false — which is all eight. So the word stays 0
-until the trip links are wired and those flags are turned back on. The
-software trip path forces the outputs low through the same trip zone without
-going near this ISR.
+`eTripStatus` is mirrored from `cpu1Status.tripStatus`. `epwmTripISR` sets a
+channel's bit on a CMPSS trip, and `slotClearOverCurrent()` clears it, with
+`status[].overCurrentTrip` (bit 3), when the slot is handed back: an
+explicit `BTS_MODE_CLEAR_FAULT` (0x40, which the ESP32 sends when its own
+fault is cleared), a fresh start, a `BTS_MODE_WAITING` re-arm, or the cell
+being removed. **Never on a
+stop** — the ESP32 engine stops a slot as its first reaction to a trip, and
+clearing there would wipe the fault before anyone saw it. The software trip
+path forces the outputs low through the same trip zone without going near
+this ISR, so it sets neither. The GPIO bit is never set: no GPIO trip is
+fitted (`BTS_TRIP_GPIO_CHn_ENABLED`, all false).
 
 The ESP32 still integrates charge and energy itself (`coulomb_counter.c`) and
 reports the BTS figures beside its own, because it samples on real elapsed
@@ -678,7 +706,7 @@ time rather than the BTS's fixed 150 ms step.
   them is the single most common bug in this codebase and produces silent
   cross-channel corruption rather than an error.
 - **A new CPU1-visible register costs `CPU2TOCPU1RAM`** — two words each,
-  234 words free. Check the map.
+  304 words free. Check the map.
 - **If CPU1 needs to act on a register write, add it to the decode.**
   `BTS_HandleRegisterWrite()` decodes the settings region (the mode register
   and the calibration group) and `eCalCommand`. Everything else — including

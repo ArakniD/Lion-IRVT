@@ -187,7 +187,7 @@ while the ESP32 polls, with no writes on the bus.
 | Property | Value |
 |---|---|
 | Pins | **GPIO40 = SDAB, GPIO41 = SCLB** |
-| Speed | 400 kHz |
+| Speed | **100 kHz** — 10 kΩ pull-ups rule out 400 kHz. See `Docs/hardware-resources.md` §10 |
 | Devices | FM24V10 F-RAM `0x50`; ADS1119 `0x40` (slots 1-4), `0x41` (slots 5-8) |
 | DRDY | GPIO42 → XINT1, GPIO43 → XINT2 |
 
@@ -283,7 +283,10 @@ transcription of `registers.h` with **no build coupling**.
 > There is also a **third** transcription, in the Home Assistant integration
 > at `lion-lvrt-integration/.../protocol/registers.py`. It is current, but it
 > has no build coupling to either of the others, so a map change means editing
-> all three.
+> all three. That directory is a **git submodule** (ha-lion-irvt): commit and
+> push the change inside it, then commit the new pointer here. Its
+> `tests/test_registers.py` diffs the transcription against both headers, so
+> run it from the submodule after any map change.
 >
 > When any of them changes, diff them register by register. `registers.h` is
 > authoritative.

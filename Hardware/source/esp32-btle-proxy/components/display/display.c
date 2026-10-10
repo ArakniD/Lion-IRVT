@@ -769,6 +769,11 @@ static void display_task(void *arg)
                 flash_border(C_FLASH_LONG);
                 ESP_LOGI(TAG, "menu request on slot %d", s_selected_slot + 1);
                 break;
+            case INPUT_EVENT_KEY0_PRESS:
+                /* No UI action assigned yet; logged so the button can be
+                 * proven on the bench. */
+                ESP_LOGI(TAG, "KEY0 pressed");
+                break;
             default:
                 break;
             }
@@ -879,10 +884,11 @@ esp_err_t display_init(const display_config_t *config)
 
     const esp_lcd_panel_io_spi_config_t io_cfg = {
         /*
-         * No chip select: the panel is alone on this bus, and the common
-         * 1.3" modules tie CS low on the board.
+         * The panel is alone on this bus, but this module has no tie from CS
+         * to ground, so the driver asserts it around each transaction. -1
+         * remains valid for a module that does tie it low.
          */
-        .cs_gpio_num = -1,
+        .cs_gpio_num = s_cfg.cs_gpio,
         .dc_gpio_num = s_cfg.dc_gpio,
         .spi_mode = s_cfg.spi_mode,
         .pclk_hz = s_cfg.pclk_hz,
@@ -940,9 +946,9 @@ esp_err_t display_init(const display_config_t *config)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "ST7789 up: MOSI=%d SCK=%d RES=%d DC=%d BLK=%d, %dx%d, "
+    ESP_LOGI(TAG, "ST7789 up: MOSI=%d SCK=%d CS=%d RES=%d DC=%d BLK=%d, %dx%d, "
                   "SPI mode %d at %lu Hz, offset %d,%d, invert %d",
-             s_cfg.mosi_gpio, s_cfg.sclk_gpio, s_cfg.reset_gpio,
+             s_cfg.mosi_gpio, s_cfg.sclk_gpio, s_cfg.cs_gpio, s_cfg.reset_gpio,
              s_cfg.dc_gpio, s_cfg.backlight_gpio, s_cfg.width, s_cfg.height,
              s_cfg.spi_mode, (unsigned long)s_cfg.pclk_hz,
              s_cfg.x_offset, s_cfg.y_offset, (int)s_cfg.invert_colour);

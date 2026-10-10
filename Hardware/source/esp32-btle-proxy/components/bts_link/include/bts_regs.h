@@ -62,6 +62,8 @@
  * integration at lion-lvrt-integration/.../protocol/registers.py. It is
  * current as of v2.1, but it is a separate file with no build coupling to
  * either this one or registers.h, so a map change means editing all three.
+ * That directory is a git submodule (ha-lion-irvt), so its edit is a commit
+ * in that repo plus a pointer update here.
  *
  * The strides are deliberately larger than the fields in use, so adding a
  * field later does not move every slot again.
@@ -327,6 +329,12 @@ typedef enum {
 #define BTS_MODE_RESUME             0x10u
 /* Arms the pre-charge sequence. Only accepted from STOPPED or END. */
 #define BTS_MODE_WAITING            0x20u
+/*
+ * Edge command: acknowledges a fault, clearing the latched over-current
+ * (status bit 3, eTripStatus) and group-disconnect indicators on a slot that
+ * is not driving. A firmware older than 2026-10-09 ignores it.
+ */
+#define BTS_MODE_CLEAR_FAULT        0x40u
 #define BTS_MODE_RUN_DISCHARGE      (BTS_MODE_RUN)
 #define BTS_MODE_RUN_CHARGE         (BTS_MODE_RUN | BTS_MODE_CHARGE)
 

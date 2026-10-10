@@ -204,15 +204,12 @@ says the command parsed.
 - **Any AT command reloads the host watchdog**, because they all funnel
   through `applyHostRegisterWrite()`. A console session alone keeps
   supervision fed. Verified: `AT+WD?` → `+WD=30.00`.
-- `AT+WD=0` **disables supervision** and prints a warning from the idle loop.
-  On a machine that charges lithium cells unattended that is a bench setting
-  and a dangerous production one.
-
-  > **Known bug:** the same warning is printed periodically even when the
-  > watchdog is armed and `WD` reads 30.0. `hostWdDisableWarn` is set only on
-  > a write of `0.0` and reads 0 when sampled, so the trigger has not been
-  > found. Cosmetic — supervision is verifiably armed — but alarming and
-  > wrong. Check `AT+WD?` rather than believing the banner.
+- `AT+WD=0` **disables supervision**, silently: nothing is printed, and
+  `eWatchdogRemaining_s` reads 0 — the same as a watchdog that has fired, so
+  read `AT+WD?` beside it to tell the two apart. On a machine that charges
+  lithium cells unattended that is a bench setting and a dangerous production
+  one. (Older builds printed a `WARNING: host watchdog DISABLED` banner, and
+  spuriously; it was removed in `8070d2e`.)
 - `AT+CALM=2` sets `calibrationSavePending`; the idle loop then saves all
   eight channels plus the global voltage thresholds to F-RAM. There is **no
   completion response** — `OK` acknowledges the register write, not the save.
@@ -246,8 +243,9 @@ OK
 
 `145` = `0b10010001` → bit 0 RUNNING, bit 4 CHARGING, bit 7 CONST_CURRENT.
 Bit 7 is genuinely populated from `ctrlMode_logic`; on builds before the
-calibration work the same state read as `17`. The build is CC-only, so bit 6
-(CONST_VOLTAGE) will not appear.
+calibration work the same state read as `17`. The build is CC-CV, so once a
+charge reaches its voltage limit bit 6 (CONST_VOLTAGE) replaces bit 7 —
+`145` becomes `81`.
 
 Pause that slot and read it back:
 

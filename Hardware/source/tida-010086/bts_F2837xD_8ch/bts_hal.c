@@ -509,18 +509,59 @@ void BTS_HAL_setupDevice(void)
 extern volatile uint32_t startup_mode;
 extern volatile uint32_t startup_enable;
 
-/* SN74HC148DR
- * This is attached to the three inputs, so its a single select
- * based on parity really */
-uint8_t truth_table[8] = {
-  7, // 0 Input 7=L
-  6, // 1 Input 6=L
-  5, // 2 Input 5=L
-  4, // 3 Input 4=L
-  3, // 4 Input 3=L
-  2, // 5 Input 2=L
-  1, // 6 Input 1=L
-  0  // 7 Input 0=L or ALL OFF
+//
+// MODE and ENABLE strap decode: SN74HC148 code -> setting.
+//
+// Each strap is an 8-way DIP switch into an SN74HC148 priority encoder (S4 ->
+// U26 for ENABLE, S5 -> U27 for MODE; schematic XTIDA-010086E3 sheet 13).
+// Every encoder input has a 10k pull-up and a switch to ground, so an ON
+// switch drives its input LOW. EI is tied low and GS is not connected. The
+// three outputs A0..A2 arrive on GPIO57..59 (ENABLE) and GPIO54..56 (MODE),
+// and that 3-bit code, A2 A1 A0, is the index here.
+//
+// The switches are not wired to the encoder in order: DIP 1-4 reach inputs
+// 3-0, reversed, and DIP 5-8 reach inputs 4-7. With the 148's inverted
+// outputs that gives:
+//
+//   DIP on   input   A2 A1 A0   index   setting
+//     1        3      H  L  L      4       0
+//     2        2      H  L  H      5       1
+//     3        1      H  H  L      6       2
+//     4        0      H  H  H      7       3
+//     5        4      L  H  H      3       4
+//     6        5      L  H  L      2       5
+//     7        6      L  L  H      1       6
+//     8        7      L  L  L      0       7
+//    none      -      H  H  H      7       3   <- the same code as DIP 4
+//
+// so each DIP switch selects the setting printed beside it, counting from 0.
+//
+// ALL SWITCHES OFF READS AS DIP 4. With no input low the 148 outputs H H H,
+// which is exactly what input 0 - DIP 4 - produces, and only GS could tell
+// them apart. So an unstrapped board decodes to setting 3 on both straps:
+// MODE 3 (all eight slots as one group) and ENABLE 3 (slots 1-4). That is a
+// partial group, so its hardware trips are left unrouted and it cannot run a
+// sensible test. Strap the board.
+//
+// ONE SWITCH AT A TIME. With two on, the 148 reports only the
+// higher-numbered input, and nothing here can tell.
+//
+// static const, NOT a plain array, and this is what broke a standalone boot.
+// The project links with --ram_model: .data is initialised only by the
+// debugger's program load, never by a boot from flash. As an initialised
+// array in .data, this table held its values after a CCS load and zeros
+// after a power cycle - so every switch position decoded to 0, MODE 0 /
+// ENABLE 0, whatever the switches said. const puts it in flash.
+//
+static const uint16_t truth_table[8] = {
+    7U,     // 0  L L L  DIP 8
+    6U,     // 1  L L H  DIP 7
+    5U,     // 2  L H L  DIP 6
+    4U,     // 3  L H H  DIP 5
+    0U,     // 4  H L L  DIP 1
+    1U,     // 5  H L H  DIP 2
+    2U,     // 6  H H L  DIP 3
+    3U,     // 7  H H H  DIP 4, or all switches off
 };
 
 
@@ -548,13 +589,13 @@ void BTS_HAL_setupGPIO(void)
     GPIO_setPadConfig(BTS_EN_GPIO_PIN_1, GPIO_PIN_TYPE_STD);
     GPIO_setPadConfig(BTS_EN_GPIO_PIN_2, GPIO_PIN_TYPE_STD);
 
-    // startup_enable
+    // startup_enable - A0..A2 of U26, decoded by truth_table[] above
     startup_enable  = (GPIO_readPin(BTS_EN_GPIO_PIN_0) ? 1 : 0) << 0;
     startup_enable |= (GPIO_readPin(BTS_EN_GPIO_PIN_1) ? 1 : 0) << 1;
     startup_enable |= (GPIO_readPin(BTS_EN_GPIO_PIN_2) ? 1 : 0) << 2;
     startup_enable = truth_table[startup_enable];
 
-    // startup_mode
+    // startup_mode - A0..A2 of U27, decoded the same way
     startup_mode  = (GPIO_readPin(BTS_MODE_GPIO_PIN_0) ? 1 : 0) << 0;
     startup_mode |= (GPIO_readPin(BTS_MODE_GPIO_PIN_1) ? 1 : 0) << 1;
     startup_mode |= (GPIO_readPin(BTS_MODE_GPIO_PIN_2) ? 1 : 0) << 2;
@@ -656,7 +697,16 @@ void BTS_HAL_setupExAdc_ch1_4(void)
 #endif
     SysCtl_delay(100000);
 
-    //adc register 0x03. mode register, 0xFF47, external reference ENABLED, OSR 128 16k SAMPLE RATE
+    //
+    // CLOCK register (0x03) = 0xFF43: all eight channels on, external
+    // reference, OSR 128 (OSR[2:0] = 000), high-resolution power mode.
+    //
+    // fDATA = CLKIN / 2 / 128. CLKIN is EPWM11A at 8.1818 MHz (see
+    // BTS_DRV_ADC_SWITCHING_FREQUENCY), so DRDY falls every 31.3 us -
+    // 31.96 kSPS. The old "16k SAMPLE RATE" note above this write was never
+    // true of 0xFF43: at the 9.0 MHz the clock used to run at it was
+    // 35.16 kSPS.
+    //
     // cs1 bar low
     GPIO_writePin(BTS_SPI_CS_GPIO_ADC1, 0);
     //wreg add
@@ -754,8 +804,10 @@ void BTS_HAL_setupExAdc_ch5_8(void)
     SysCtl_delay(100000);
 
 
-    //adc register 0x03. mode register, 0xFF47, external reference ENABLED, OSR 256 13.95k SAMPLE RATE ( 0xFF47)
-    //adc register 0x03. mode register, 0xFF4B, external reference ENABLED, OSR 512 13.95k SAMPLE RATE ( 0xFF47)
+    //
+    // CLOCK register (0x03) = 0xFF43, identical to ADC1: OSR 128 at
+    // CLKIN 8.1818 MHz (EPWM12A) = 31.96 kSPS. See BTS_HAL_setupExAdc_ch1_4().
+    //
     // cs1 bar low
     GPIO_writePin(BTS_SPI_CS_GPIO_ADC2, 0);
     //wreg add
@@ -1283,7 +1335,9 @@ void BTS_HAL_setupAdcClock(uint32_t EPWM_BASE)
 //
 // Note the negative input must be CMPSS_INSRC_DAC: with CMPSS_INSRC_PIN the
 // comparator ignores the DAC entirely and no threshold applies, which left
-// the trip asserted permanently.
+// the trip asserted permanently. On this board the negative pin carries the
+// same slot's VOLTAGE sense, VoutSn, so a pin-referenced comparator would be
+// comparing a current against a voltage.
 //
 void BTS_HAL_setupCMPSS(uint32_t cmpssBase) {
     EALLOW;
@@ -1466,7 +1520,7 @@ void BTS_HAL_setupTripGPIO(uint32_t pinConfig, uint32_t pin) {
 }
 
 //
-// Per-slot CMPSS -> ePWM X-BAR facts. Index is the slot, 0-based.
+// The ePWM X-BAR side of the hardware trips.
 //
 // Each ePWM X-BAR TRIPn output selects among 16 muxes and can enable SEVERAL
 // at once, in which case the selected sources are OR-ed onto that one output.
@@ -1474,25 +1528,51 @@ void BTS_HAL_setupTripGPIO(uint32_t pinConfig, uint32_t pin) {
 // path: point every ePWM in a group at one TRIPn, and enable that group's
 // comparator muxes on it.
 //
-// CMPSSn occupies mux (n-1)*2. TRIP6 is deliberately absent from this table -
-// INPUT6 feeds ePWM TRIP6 directly and INPUT6 is XINT3's input (CPU1's SPI
-// ADC1 DRDY), so routing a comparator there would fight the SPI ADC.
+// TWO INDEXES, kept apart on purpose - running them together is how slots 2,
+// 3, 5, 7 and 8 came to be tripped by another slot's current:
+//
+//   btsTripNum[], btsTripDcInput[]        by SLOT: the slot's own TRIPn
+//   btsCmpssMuxCfg[], btsCmpssMuxMask[]   by COMPARATOR: where CMPSSn sits
+//
+// btsSlotCmpss[] joins the two: the comparator that watches each slot. It is
+// NOT CMPSSn for slot n. The table, and the schematic and datasheet it comes
+// from, are at BTS_TRP_CMPSS_CH1..8 in bts_user_settings.h.
+//
+// TRIP6 is deliberately absent from btsTripNum[] - INPUT6 feeds ePWM TRIP6
+// directly and INPUT6 is XINT3's input (CPU1's SPI ADC1 DRDY), so routing a
+// comparator there would fight the SPI ADC.
 //
 static const XBAR_TripNum        btsTripNum[8] = {
     XBAR_TRIP4,  XBAR_TRIP5,  XBAR_TRIP7,  XBAR_TRIP8,
     XBAR_TRIP9,  XBAR_TRIP10, XBAR_TRIP11, XBAR_TRIP12,
 };
 
-static const XBAR_EPWMMuxConfig  btsTripMuxCfg[8] = {
+//
+// Where each comparator sits on the ePWM X-BAR. Index is the comparator,
+// CMPSS1 first, and this part IS fixed by the device: CMPSSn always occupies
+// mux (n-1)*2.
+//
+static const XBAR_EPWMMuxConfig  btsCmpssMuxCfg[8] = {
     XBAR_EPWM_MUX00_CMPSS1_CTRIPH_OR_L, XBAR_EPWM_MUX02_CMPSS2_CTRIPH_OR_L,
     XBAR_EPWM_MUX04_CMPSS3_CTRIPH_OR_L, XBAR_EPWM_MUX06_CMPSS4_CTRIPH_OR_L,
     XBAR_EPWM_MUX08_CMPSS5_CTRIPH_OR_L, XBAR_EPWM_MUX10_CMPSS6_CTRIPH_OR_L,
     XBAR_EPWM_MUX12_CMPSS7_CTRIPH_OR_L, XBAR_EPWM_MUX14_CMPSS8_CTRIPH_OR_L,
 };
 
-static const uint32_t            btsTripMuxMask[8] = {
+static const uint32_t            btsCmpssMuxMask[8] = {
     XBAR_MUX00, XBAR_MUX02, XBAR_MUX04, XBAR_MUX06,
     XBAR_MUX08, XBAR_MUX10, XBAR_MUX12, XBAR_MUX14,
+};
+
+//
+// The comparator that watches each slot's current, as a CMPSS number, 1-8.
+// Index is the slot, 0-based. Fixed by the BOARD, not the device - see
+// BTS_TRP_CMPSS_CH1..8, which also refuses to build unless every slot has a
+// comparator of its own.
+//
+static const uint16_t            btsSlotCmpss[8] = {
+    BTS_TRP_CMPSS_CH1, BTS_TRP_CMPSS_CH2, BTS_TRP_CMPSS_CH3, BTS_TRP_CMPSS_CH4,
+    BTS_TRP_CMPSS_CH5, BTS_TRP_CMPSS_CH6, BTS_TRP_CMPSS_CH7, BTS_TRP_CMPSS_CH8,
 };
 
 //
@@ -1536,10 +1616,15 @@ static uint16_t btsTripRoute[8] = {
 // all of them trip in the same switching cycle, in hardware, with no software
 // in the path:
 //
-//   ungrouped   TRIP4 = CMPSS1            -> ePWM1
-//   pairs       TRIP4 = CMPSS1 | CMPSS2   -> ePWM1, ePWM2
-//   quads       TRIP4 = CMPSS1..CMPSS4    -> ePWM1..ePWM4
-//   octet       TRIP4 = CMPSS1..CMPSS8    -> ePWM1..ePWM8
+//   ungrouped   TRIP4 = CMPSS1                      -> ePWM1
+//               TRIP5 = CMPSS3                      -> ePWM2, and so on
+//   pairs       TRIP4 = CMPSS1 | CMPSS3             -> ePWM1, ePWM2
+//   quads       TRIP4 = CMPSS1 | CMPSS3 | CMPSS2 | CMPSS4
+//                                                   -> ePWM1..ePWM4
+//   octet       TRIP4 = all eight                   -> ePWM1..ePWM8
+//
+// Each member contributes its OWN comparator, btsSlotCmpss[member], which is
+// why the first pair is CMPSS1 | CMPSS3 and not CMPSS1 | CMPSS2.
 //
 // The group leader's TRIPn is the one used, matching BTS_GROUP_LEADER().
 //
@@ -1589,7 +1674,8 @@ static uint16_t btsTripRoute[8] = {
 // route that is actually connected.
 //
 // TZ2/OSHT2 stays masked throughout. The external GPIO trip inputs are not
-// wired on this board, and INPUT2 has the same GPIO0 default problem.
+// fitted on this board (BTS_TRIP_GPIO_CHn_ENABLED, all false), and INPUT2
+// has the same GPIO0 default problem.
 //
 void BTS_HAL_setupEPWMTripZone(uint32_t epwmBase, uint16_t channel) {
     static const bool tripHwEnabled[8] = {
@@ -1754,19 +1840,23 @@ void BTS_HAL_armTripZones(bool arm)
 
 // Function to configure all trip mechanisms
 void BTS_HAL_setupTripSystem(void) {
-    // Configure comparators (assuming COMP1-8 map to channels)
-    // Map: A2->COMP1A, B2->COMP2B, A4->COMP3A, IN14->COMP4A, D0->COMP5D, C2->COMP6C, D2->COMP7D, C4->COMP8C
-
-    // Configure CMPSS for each channel. The comparator input pin is fixed by
-    // the device pinout; the trip level comes from the internal DAC.
-    BTS_HAL_setupCMPSS(CMPSS1_BASE); // Channel 1
-    BTS_HAL_setupCMPSS(CMPSS2_BASE); // Channel 2
-    BTS_HAL_setupCMPSS(CMPSS3_BASE); // Channel 3
-    BTS_HAL_setupCMPSS(CMPSS4_BASE); // Channel 4
-    BTS_HAL_setupCMPSS(CMPSS5_BASE); // Channel 5
-    BTS_HAL_setupCMPSS(CMPSS6_BASE); // Channel 6
-    BTS_HAL_setupCMPSS(CMPSS7_BASE); // Channel 7
-    BTS_HAL_setupCMPSS(CMPSS8_BASE); // Channel 8
+    //
+    // All eight comparators, configured identically; the trip level comes
+    // from each one's internal DAC. They are in DEVICE order, which is not
+    // slot order: each comparator's input pins are fixed, and the board
+    // routes the sense nets for layout. Each line names the slot whose
+    // current reaches that comparator; BTS_TRP_CMPSS_CH1..8 is the
+    // authoritative table, and btsSlotCmpss[] applies it when the trips are
+    // routed.
+    //
+    BTS_HAL_setupCMPSS(CMPSS1_BASE); // slot 1, IoutS1 on ADCINA2
+    BTS_HAL_setupCMPSS(CMPSS2_BASE); // slot 3, IoutS3 on ADCINA4
+    BTS_HAL_setupCMPSS(CMPSS3_BASE); // slot 2, IoutS2 on ADCINB2
+    BTS_HAL_setupCMPSS(CMPSS4_BASE); // slot 4, IoutS4 on ADCIN14
+    BTS_HAL_setupCMPSS(CMPSS5_BASE); // slot 8, IoutS8 on ADCINC4
+    BTS_HAL_setupCMPSS(CMPSS6_BASE); // slot 6, IoutS6 on ADCINC2
+    BTS_HAL_setupCMPSS(CMPSS7_BASE); // slot 5, IoutS5 on ADCIND0
+    BTS_HAL_setupCMPSS(CMPSS8_BASE); // slot 7, IoutS7 on ADCIND2
 
     //
     // The CMPSS -> ePWM X-BAR routing is NOT done here. It depends on the
@@ -1775,35 +1865,38 @@ void BTS_HAL_setupTripSystem(void) {
     // main() once the straps are latched. See that function.
     //
 
-    // Configure GPIOs for individual trips, group trip, and AND gate outputs
+    //
+    // External GPIO trip inputs. NONE ARE FITTED ON THIS BOARD, so every
+    // BTS_TRIP_GPIO_CHn_ENABLED is false and nothing below is compiled.
+    //
+    // Each is gated on its own GPIO switch AND the slot's comparator switch.
+    // They used to be gated on the comparator switch alone - so enabling the
+    // CMPSS trips also configured eight unwired GPIO inputs, and routed
+    // channel 6's onto INPUT14, which CPU1's slot 5-8 acquisition needs. See
+    // bts_user_settings.h before turning any of these on.
+    //
 #if (BTS_TRIP_GPIO_CH1_ENABLED == true) && (BTS_TRIP_HW_CH1_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH1, BTS_TRP_PIN_GPIO_CH1);
-#else
-    //
-    // GPIO28 is the debug console RX in this build - leave it to SCIA.
-    // Channel 1 keeps its CMPSS over-current trip; only the GPIO trip
-    // input is unavailable, and it is not physically connected here.
-    //
 #endif
-#if (BTS_TRIP_HW_CH2_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH2_ENABLED == true) && (BTS_TRIP_HW_CH2_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH2, BTS_TRP_PIN_GPIO_CH2);
 #endif
-#if (BTS_TRIP_HW_CH3_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH3_ENABLED == true) && (BTS_TRIP_HW_CH3_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH3, BTS_TRP_PIN_GPIO_CH3);
 #endif
-#if (BTS_TRIP_HW_CH4_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH4_ENABLED == true) && (BTS_TRIP_HW_CH4_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH4, BTS_TRP_PIN_GPIO_CH4);
 #endif
-#if (BTS_TRIP_HW_CH5_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH5_ENABLED == true) && (BTS_TRIP_HW_CH5_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH5, BTS_TRP_PIN_GPIO_CH5);
 #endif
-#if (BTS_TRIP_HW_CH6_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH6_ENABLED == true) && (BTS_TRIP_HW_CH6_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH6, BTS_TRP_PIN_GPIO_CH6);
 #endif
-#if (BTS_TRIP_HW_CH7_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH7_ENABLED == true) && (BTS_TRIP_HW_CH7_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH7, BTS_TRP_PIN_GPIO_CH7);
 #endif
-#if (BTS_TRIP_HW_CH8_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH8_ENABLED == true) && (BTS_TRIP_HW_CH8_ENABLED == true)
     BTS_HAL_setupTripGPIO(BTS_TRP_PIN_CONFIG_GPIO_CH8, BTS_TRP_PIN_GPIO_CH8);
 #endif
 
@@ -1819,18 +1912,14 @@ void BTS_HAL_setupTripSystem(void) {
     // is retained only so the pin assignments are not lost:
     //
     //   * The ePWM one-shot trip zones read TZ1/TZ2, which are hardwired to
-    //     Input X-BAR INPUT1/INPUT2 - not INPUT9..16. Reaching the one-shot
-    //     from INPUT9..12 (TRIPIN9..12) requires the Digital Compare
-    //     submodule (DCTRIPSEL + setTripZoneDigitalCompareEventCondition),
-    //     which this project never configures.
+    //     Input X-BAR INPUT1/INPUT2 - not INPUT9..16. Reaching the trip zone
+    //     from INPUT9..12 (TRIPIN9..12) needs the Digital Compare submodule,
+    //     the way the comparators reach it in BTS_HAL_setupEPWMTripZone().
     //   * INPUT15 and INPUT16 do not exist on this device - it has INPUT1..14
     //     only. Those two calls are now rejected by the bounds check in
     //     BTS_HAL_setupInputXBAR() instead of writing past the register file.
     //
-    // All of this is currently inert because every BTS_TRIP_HW_CHn_ENABLED is
-    // false. Before re-enabling a hardware trip, wire TZ1/TZ2 (INPUT1/INPUT2)
-    // or set up the Digital Compare path - and note INPUT1/INPUT2 default to
-    // GPIO0, which is EPWM1A on this board.
+    // All of it is compiled out: no BTS_TRIP_GPIO_CHn_ENABLED is true.
     //
     // Input X-BAR allocation, since it is one device-global resource shared
     // by both cores and nothing else records who owns what:
@@ -1839,12 +1928,22 @@ void BTS_HAL_setupTripSystem(void) {
     //   INPUT5  XINT2  CPU2, ADS1119 DRDY2
     //   INPUT6  XINT3  CPU1, external SPI ADC1 DRDY
     //   INPUT14 XINT5  CPU1, external SPI ADC2 DRDY
-    //   INPUT9..14     GPIO trips ch1..ch6 (below, all currently compiled out)
+    //   INPUT9..14     GPIO trips ch1..ch6 (below, all compiled out)
     //
-    // INPUT14 is therefore double-booked between XINT5 and the channel-6 GPIO
-    // trip. Only one can win, and today the trips are disabled so it is XINT5.
-    // Re-enabling the channel-6 hardware trip means moving one of them - the
+    // INPUT14 is double-booked between XINT5 and the channel-6 GPIO trip.
+    // Fitting the channel-6 trip line means moving one of them first - the
     // free inputs are INPUT1, 2, 3, 7 and 8.
+    //
+    // HARDWARE NOTE, CHANNEL 6, 2026-10-09: the channel-6 trip input is
+    // suspected of not being properly connected on this board, and is being
+    // debugged at the bench. Its comparator is CMPSS6, whose positive input
+    // CMPIN6P is ADCINC2 (TRM SPRUHM8K, Figure 10-1) - the same pin the
+    // firmware samples as slot 6's current (bts_hal.c, ADCC SOC2), on the
+    // schematic's IoutS6 net, which reaches the controlCARD through 0-ohm
+    // link R253 to J5 pin 90 (sheet 13). Slot 6 is one of the three slots
+    // whose comparator was already right before the 2026-10-09 remap, so
+    // that change does not touch it. Check that net on the board before
+    // suspecting the routing here, which is compiled out.
     //
 
     //
@@ -1867,25 +1966,25 @@ void BTS_HAL_setupTripSystem(void) {
 #if (BTS_TRIP_GPIO_CH1_ENABLED == true) && (BTS_TRIP_HW_CH1_ENABLED == true)
     BTS_HAL_setupInputXBAR(9,  0, BTS_TRP_PIN_GPIO_CH1);
 #endif
-#if (BTS_TRIP_HW_CH2_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH2_ENABLED == true) && (BTS_TRIP_HW_CH2_ENABLED == true)
     BTS_HAL_setupInputXBAR(10, 0, BTS_TRP_PIN_GPIO_CH2);
 #endif
-#if (BTS_TRIP_HW_CH3_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH3_ENABLED == true) && (BTS_TRIP_HW_CH3_ENABLED == true)
     BTS_HAL_setupInputXBAR(11, 0, BTS_TRP_PIN_GPIO_CH3);
 #endif
-#if (BTS_TRIP_HW_CH4_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH4_ENABLED == true) && (BTS_TRIP_HW_CH4_ENABLED == true)
     BTS_HAL_setupInputXBAR(12, 0, BTS_TRP_PIN_GPIO_CH4);
 #endif
-#if (BTS_TRIP_HW_CH5_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH5_ENABLED == true) && (BTS_TRIP_HW_CH5_ENABLED == true)
     BTS_HAL_setupInputXBAR(13, 0, BTS_TRP_PIN_GPIO_CH5);
 #endif
-#if (BTS_TRIP_HW_CH6_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH6_ENABLED == true) && (BTS_TRIP_HW_CH6_ENABLED == true)
     BTS_HAL_setupInputXBAR(14, 0, BTS_TRP_PIN_GPIO_CH6);
 #endif
-#if (BTS_TRIP_HW_CH7_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH7_ENABLED == true) && (BTS_TRIP_HW_CH7_ENABLED == true)
     BTS_HAL_setupInputXBAR(15, 0, BTS_TRP_PIN_GPIO_CH7);
 #endif
-#if (BTS_TRIP_HW_CH8_ENABLED == true)
+#if (BTS_TRIP_GPIO_CH8_ENABLED == true) && (BTS_TRIP_HW_CH8_ENABLED == true)
     BTS_HAL_setupInputXBAR(16, 0, BTS_TRP_PIN_GPIO_CH8);
 #endif
 
@@ -2159,8 +2258,15 @@ void BTS_HAL_setupTripRouting(uint16_t groupSize, uint16_t slotEnable)
 
         if (groupUsable) {
             for (member = leader; member < (leader + groupSize); member++) {
-                XBAR_setEPWMMuxConfig(trip, btsTripMuxCfg[member]);
-                muxMask |= btsTripMuxMask[member];
+                //
+                // The member's OWN comparator, the one its current-sense net
+                // reaches - not CMPSS<member + 1>. CMPSSn is entry n-1 of the
+                // mux tables.
+                //
+                uint16_t cmpss = btsSlotCmpss[member] - 1U;
+
+                XBAR_setEPWMMuxConfig(trip, btsCmpssMuxCfg[cmpss]);
+                muxMask |= btsCmpssMuxMask[cmpss];
                 contributors++;
             }
         }
