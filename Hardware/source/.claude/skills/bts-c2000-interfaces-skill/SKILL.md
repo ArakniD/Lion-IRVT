@@ -37,7 +37,7 @@ records the known disagreements, including a live one in the ESP32 mirror.
 
 ## Read this before touching anything
 
-Nine facts that invalidate the obvious guess. Each is confirmed in source.
+Ten facts that invalidate the obvious guess. Each is confirmed in source.
 
 0. **The register map is v2.1, and every v1 address is wrong.** Four regions
    — runtime (base 0, stride 48 B, RO), settings (base 384, stride 72 B),
@@ -129,6 +129,17 @@ Nine facts that invalidate the obvious guess. Each is confirmed in source.
    constant. **CPU Timer 1/2 go direct to INT13/INT14 and must not ack at
    all**; Timer 0 is a PIE interrupt and must. Table:
    `Docs/hardware-resources.md` §2.
+
+9. **The loops run at the ADS131M08 data rate, 31.96 kSPS, on filtered
+   inputs.** CLKIN is 8.1818 MHz from EPWM11A/12A (TBPRD 10, rounded from
+   `BTS_DRV_ADC_SWITCHING_FREQUENCY`; it was 9.0 MHz, out of spec). Every
+   DRDY, `BTS_conditionCtrlInputs()` feeds the CC loop a 4-sample rolling
+   mean (3.54 kHz) and the CV loop a 100 Hz IIR. The trip and
+   `BTS_ctrlDirection()` take the raw sample. The DCL coefficients were
+   designed for 31.25 kHz. `Isense_A`/`Vsense_V` are a separate 32-sample
+   (1 ms) ring meaned in `C1()`, and are never a loop input. Vin is 16×
+   oversampled plus an IIR with alpha 0.25. Full chain:
+   `Docs/data-flow.md` §2.
 
 ---
 

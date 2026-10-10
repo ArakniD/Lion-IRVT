@@ -864,6 +864,23 @@ typedef struct
     int32_t Sum_CellI;
     uint16_t Index;
     uint16_t F28Index;
+    //
+    // CONTROL-PATH conditioning of the ADS131M08 pair. Updated on EVERY
+    // DRDY sample, in BTS_conditionCtrlInputs() - unlike the 32-deep ring
+    // above, which is telemetry and is only meaned at C1().
+    //
+    //   ctrlI_ring / ctrlI_sum   rolling mean of the last BTS_CC_AVG_N
+    //                            current samples, fed to the CC loop
+    //   ctrlV_filt               single-pole IIR on the voltage, corner
+    //                            BTS_CV_FILT_FC_HZ, fed to the CV loop
+    //   ctrlPrimed               0 until the first sample has loaded both,
+    //                            so neither ramps up from zero after boot
+    //
+    int32_t   ctrlI_ring[BTS_CC_AVG_N];
+    int32_t   ctrlI_sum;
+    float32_t ctrlV_filt;
+    uint16_t  ctrlI_idx;
+    uint16_t  ctrlPrimed;
     float32_t IoutGain_A;
     float32_t IoutOffset_A;
     float32_t VoutGain_V;

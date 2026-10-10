@@ -697,7 +697,16 @@ void BTS_HAL_setupExAdc_ch1_4(void)
 #endif
     SysCtl_delay(100000);
 
-    //adc register 0x03. mode register, 0xFF47, external reference ENABLED, OSR 128 16k SAMPLE RATE
+    //
+    // CLOCK register (0x03) = 0xFF43: all eight channels on, external
+    // reference, OSR 128 (OSR[2:0] = 000), high-resolution power mode.
+    //
+    // fDATA = CLKIN / 2 / 128. CLKIN is EPWM11A at 8.1818 MHz (see
+    // BTS_DRV_ADC_SWITCHING_FREQUENCY), so DRDY falls every 31.3 us -
+    // 31.96 kSPS. The old "16k SAMPLE RATE" note above this write was never
+    // true of 0xFF43: at the 9.0 MHz the clock used to run at it was
+    // 35.16 kSPS.
+    //
     // cs1 bar low
     GPIO_writePin(BTS_SPI_CS_GPIO_ADC1, 0);
     //wreg add
@@ -795,8 +804,10 @@ void BTS_HAL_setupExAdc_ch5_8(void)
     SysCtl_delay(100000);
 
 
-    //adc register 0x03. mode register, 0xFF47, external reference ENABLED, OSR 256 13.95k SAMPLE RATE ( 0xFF47)
-    //adc register 0x03. mode register, 0xFF4B, external reference ENABLED, OSR 512 13.95k SAMPLE RATE ( 0xFF47)
+    //
+    // CLOCK register (0x03) = 0xFF43, identical to ADC1: OSR 128 at
+    // CLKIN 8.1818 MHz (EPWM12A) = 31.96 kSPS. See BTS_HAL_setupExAdc_ch1_4().
+    //
     // cs1 bar low
     GPIO_writePin(BTS_SPI_CS_GPIO_ADC2, 0);
     //wreg add

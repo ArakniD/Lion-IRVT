@@ -3559,59 +3559,85 @@ static void checkGroupIntegrity(void)
 
 static void updateInputVoltage(void)
 {
-    ADC_forceSOC(ADCB_BASE, ADC_SOC_NUMBER1);
-    ADC_forceSOC(ADCB_BASE, ADC_SOC_NUMBER2);
-
     //
-    // Bounded wait. A conversion at ADCCLK/4 with a 15-cycle S+H takes well
-    // under a microsecond, so this budget is generous; the point is that a
-    // misconfigured or disabled ADCBINT1 must never wedge the task loop the
-    // way an unguarded spin does - that would silently disable the input
-    // voltage guard and every other supervisory check in C1().
+    // OVERSAMPLED, then smoothed. A single conversion used to be the whole
+    // measurement, and the bus voltage a host saw moved by +/-0.5 V from one
+    // reading to the next with nothing on the bus changing (seen on BTLE,
+    // 2026-10-10). The sense amplifier's gain is ~6.2, so a reading that is
+    // a few counts noisy on the 12-bit ADC is a volt noisy at the output.
     //
-    uint16_t adcWait = 0U;
-    while ((ADC_getInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1) == 0) &&
-           (adcWait < BTS_ADCB_EOC_MAX_POLLS)) {
-        adcWait++;
-    }
+    // So: BTS_VIN_OVERSAMPLE back-to-back conversions of the sense pin, each
+    // paired with a read of the A0 reference from the free-running EPWM1
+    // sweep, averaged; then a single-pole IIR across C1() passes. Both the
+    // numerator and the reference are averaged - the ratio is only as quiet
+    // as its noisier half, and A0 is one sample of a 99.67 kSPS sweep.
+    //
+    // Cost: BTS_VIN_OVERSAMPLE x (force, ~1 us conversion, poll) in C1(),
+    // about 20 us at 16 - against a C1() budget measured in milliseconds.
+    //
+    static float32_t vinFilt = (float32_t)0.0;
+    static uint16_t  vinPrimed = 0U;
+    uint32_t sumRaw = 0UL;
+    uint32_t sumRef = 0UL;
+    uint16_t n;
+    bool     adcbTimedOut = false;
 
-    bool     adcbTimedOut  = (adcWait >= BTS_ADCB_EOC_MAX_POLLS);
-    uint16_t busVoltageRaw = adcbTimedOut ? 0U :
-                             ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER1);
+    for (n = 0U; n < BTS_VIN_OVERSAMPLE; n++) {
+        ADC_forceSOC(ADCB_BASE, ADC_SOC_NUMBER1);
+        ADC_forceSOC(ADCB_BASE, ADC_SOC_NUMBER2);
 
-    if (adcbTimedOut) {
         //
-        // Treat a timeout as "input voltage unknown", which is the safe
-        // reading: 0 V drives unitState to charge-disabled below rather
-        // than leaving a stale value that looks healthy.
+        // Bounded wait. A conversion at ADCCLK/4 with a 15-cycle S+H takes
+        // well under a microsecond, so this budget is generous; the point is
+        // that a misconfigured or disabled ADCBINT1 must never wedge the task
+        // loop the way an unguarded spin does - that would silently disable
+        // the input voltage guard and every other supervisory check in C1().
         //
-        adcbEocTimeouts++;
-    }
+        uint16_t adcWait = 0U;
+        while ((ADC_getInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1) == 0) &&
+               (adcWait < BTS_ADCB_EOC_MAX_POLLS)) {
+            adcWait++;
+        }
 
-    //
-    // Clear on BOTH paths, and only after the result has been read.
-    //
-    // This used to clear on the timeout branch alone. Nothing else clears
-    // ADCB INT1 - the only other ADC_clearInterruptStatus(ADCB_BASE, ...) is
-    // the one-time setup in BTS_HAL_setupADC() - so from the second call
-    // onward the flag was already set on entry and the wait above exited
-    // immediately, before the freshly-forced conversion had landed. The
-    // reading was one call old: 100 ms at the 10 Hz C1() rate.
-    //
-    // At that timescale a stale bus voltage is still usable, so the guard
-    // behaved correctly and the bug was invisible. The real cost was that the
-    // bounded wait became dead code after the first pass - adcbEocTimeouts
-    // could never increment again, so a genuinely stuck ADCB would have been
-    // indistinguishable from a healthy one and the "treat a timeout as 0 V"
-    // protection above would never have fired.
-    //
-    ADC_clearInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1);
+        if (adcWait >= BTS_ADCB_EOC_MAX_POLLS) {
+            //
+            // Treat a timeout as "input voltage unknown", which is the safe
+            // reading: 0 V drives unitState to charge-disabled below rather
+            // than leaving a stale value that looks healthy.
+            //
+            adcbTimedOut = true;
+            adcbEocTimeouts++;
+        } else {
+            sumRaw += ADC_readResult(ADCBRESULT_BASE, ADC_SOC_NUMBER1);
+            sumRef += ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER6);
+        }
+
+        //
+        // Clear on BOTH paths, and only after the result has been read.
+        //
+        // This used to clear on the timeout branch alone. Nothing else clears
+        // ADCB INT1 - the only other ADC_clearInterruptStatus(ADCB_BASE, ...)
+        // is the one-time setup in BTS_HAL_setupADC() - so from the second
+        // call onward the flag was already set on entry and the wait above
+        // exited immediately, before the freshly-forced conversion had
+        // landed. Inside this loop that would make every sample after the
+        // first a repeat of the previous result.
+        //
+        ADC_clearInterruptStatus(ADCB_BASE, ADC_INT_NUMBER1);
+
+        if (adcbTimedOut) {
+            break;
+        }
+    }
 
     //
     // Ratiometric against the external 1.25 V on ADC-A0, so the ADC's own
     // reference cancels and never has to be assumed.
     //
     //   busVoltage = (raw / refRaw) * 1.25 V * BTS_VIN_SENSE_GAIN
+    //
+    // With both summed over the same N samples the N cancels, so the ratio
+    // of the sums is the ratio of the means.
     //
     // The previous form hard-coded 3.3 V for VREFHI and took the gain as
     // 17.9/2.5. Both were wrong: this controlCARD runs a 3.0 V reference, and
@@ -3620,15 +3646,29 @@ static void updateInputVoltage(void)
     // arithmetic errors. A0 is a genuine divider off the same reference, so
     // the ratio is exact whatever the reference actually is.
     //
-    // refRaw of 0 means the reference conversion has not completed yet -
-    // report 0 V rather than dividing by it, which the input-voltage guard
-    // reads as "supply absent" and refuses to start a slot. That is the safe
-    // direction.
+    // A zero reference sum means the reference conversion has not completed
+    // yet - report 0 V rather than dividing by it, which the input-voltage
+    // guard reads as "supply absent" and refuses to start a slot. That is
+    // the safe direction.
     //
-    uint16_t vinRefRaw = ADC_readResult(ADCARESULT_BASE, ADC_SOC_NUMBER6);
-    float busVoltage = (vinRefRaw == 0U) ? 0.0f
-                     : (((float)busVoltageRaw / (float)vinRefRaw)
-                        * BTS_VIN_REF_VOLTS * BTS_VIN_SENSE_GAIN);
+    float busVoltageNow = (adcbTimedOut || (sumRef == 0UL)) ? 0.0f
+                        : (((float)sumRaw / (float)sumRef)
+                           * BTS_VIN_REF_VOLTS * BTS_VIN_SENSE_GAIN);
+
+    //
+    // Smooth across passes. A timeout or a missing reference is NOT
+    // smoothed: it goes straight through as 0 V and resets the filter, so a
+    // lost supply reaches the guard on the pass it is seen rather than
+    // decaying in over several. The first good reading loads the filter.
+    //
+    if ((busVoltageNow == 0.0f) || (vinPrimed == 0U)) {
+        vinFilt   = busVoltageNow;
+        vinPrimed = (busVoltageNow == 0.0f) ? 0U : 1U;
+    } else {
+        vinFilt += BTS_VIN_FILT_ALPHA * (busVoltageNow - vinFilt);
+    }
+
+    float busVoltage = vinFilt;
 
     //
     // registers[] is CPU2-owned; publish through the CPU1->CPU2 block and

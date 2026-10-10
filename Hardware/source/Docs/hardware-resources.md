@@ -615,6 +615,23 @@ that already-divided value rather than dividing again.
 | `EPWM12` | ADS131M08 #2 master clock, GPIO22 | `bts_hal.c:763` via `bts_cpu1.c:959` |
 | `EPWM9`, `EPWM10` | — | **Free** |
 
+**ADS131M08 CLKIN is 8.1818 MHz.** `EPWM11A` / `EPWM12A` count up and toggle
+at ZERO and CMPA, so the output period is one TB period:
+`TBPRD = round(90 MHz / BTS_DRV_ADC_SWITCHING_FREQUENCY) - 1 = 10`, which
+gives 90 MHz / 11. That yields fDATA = CLKIN / 2 / OSR 128 = **31.96 kSPS**,
+one DRDY every 31.29 µs.
+
+The divide used to truncate, giving TBPRD 9 and a 9.0 MHz CLKIN. That is over
+the ADS131M08's 8.4 MHz high-resolution-mode limit (35.16 kSPS).
+`BTS_DRV_ADC_PERIOD_TICKS` now rounds to nearest, and TBPRD = 10 has been
+verified on the target.
+
+The switching frequency (`BTS_DRV_EPWM_SWITCHING_FREQUENCY`, 99.67 kHz,
+TBPRD 902) used to be derived as (ADC clock / 256) × 3. It is now a fixed
+value, so retuning the ADC clock no longer moves the converter. The full
+filter chain is in
+[`data-flow.md`](data-flow.md#the-ads131m08-from-clkin-to-every-consumer).
+
 `EPWM1` is also the sync-chain master for group interleaving; every other
 module forwards its pulse (`BTS_HAL_setupGroupPhase()`, `bts_hal.c:1379`).
 

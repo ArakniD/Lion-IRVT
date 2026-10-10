@@ -1005,6 +1005,78 @@
 #define BTS_senseAverageFactor 32 //32U
 
 //
+//=============================================================================
+// ADS131M08 control-path conditioning
+//=============================================================================
+//
+// The DRDY interrupt delivers one current/voltage pair per slot every
+// 1 / BTS_ADS131_FDATA_HZ. The two loops take it differently, on purpose:
+//
+//   CC (current)  a ROLLING MEAN of the last BTS_CC_AVG_N samples, updated
+//                 every sample. Short enough to stay well inside the loop's
+//                 bandwidth, long enough to knock down sample-to-sample
+//                 noise. Before 2026-10-10 the loop took the single latest
+//                 raw sample.
+//   CV (voltage)  a single-pole IIR at BTS_CV_FILT_FC_HZ, also updated every
+//                 sample. The voltage loop is the OUTER loop and must be
+//                 slower than the current loop it commands, so its input is
+//                 deliberately much heavier filtered: ~100 Hz against the CC
+//                 path's ~3.5 kHz - comfortably more than the 10x separation
+//                 the outer loop needs.
+//
+// Both loops still EXECUTE on every DRDY sample, so the DCL biquads keep the
+// sample period they were designed for (BTS_SFRA_ISR_FREQ, 31.25 kHz - see
+// BTS_DCL_CC_* below; the actual rate is BTS_ADS131_FDATA_HZ, within 2.3%).
+// Only the input is conditioned; the loop rate is unchanged.
+//
+// The 32-deep ring above is the TELEMETRY path. It is meaned at the C1()
+// rate into Isense_A / Vsense_V and is never read by either loop.
+//
+// fDATA = CLKIN / 2 / OSR = (90 MHz / (BTS_DRV_ADC_TBPRD + 1)) / 2 / 128.
+// Written out rather than derived, because BTS_DRV_ADC_TBPRD is computed
+// with truncating integer division and the true clock is what matters.
+//
+#define BTS_ADS131_OSR             (128U)
+#define BTS_ADS131_FDATA_HZ        ((float32_t)31960.2)   // 8.1818 MHz / 2 / 128
+
+//
+// Samples in the CC loop's rolling mean. A power of two keeps the divide a
+// shift. 4 at 31.96 kSPS spans 125 us, puts the first null at 8 kHz and the
+// -3 dB point at ~3.5 kHz, and adds 1.5 samples (47 us) of group delay.
+//
+#define BTS_CC_AVG_N               (4U)
+#define BTS_CC_AVG_SHIFT           (2U)
+
+#if ((1U << BTS_CC_AVG_SHIFT) != BTS_CC_AVG_N)
+#error "BTS_CC_AVG_N must equal 1 << BTS_CC_AVG_SHIFT"
+#endif
+
+//
+// CV input filter: y += alpha * (x - y), alpha = 1 - exp(-2*pi*fc/fs).
+// fc = 100 Hz at fs = 31.96 kSPS gives alpha = 0.019467.
+//
+#define BTS_CV_FILT_FC_HZ          ((float32_t)100.0)
+#define BTS_CV_FILT_ALPHA          ((float32_t)0.019467)
+
+//
+// Input bus voltage (Vin sense) smoothing.
+//
+// updateInputVoltage() runs from C1(). Each pass it now takes
+// BTS_VIN_OVERSAMPLE back-to-back conversions of the sense pin and of the A0
+// reference and averages them, then runs the result through a single-pole
+// IIR. The raw single conversion it used to take moved by +/-0.5 V on BTLE -
+// a few counts of switching noise on a 12-bit reading, multiplied by the
+// sense gain of ~6.2. The filter weight below gives a time constant of
+// roughly 1 / BTS_VIN_FILT_ALPHA C1() passes.
+//
+// Both thresholds the bus voltage drives (restrict and disable) already
+// debounce their own transitions, so the filter only has to remove noise,
+// not decide anything.
+//
+#define BTS_VIN_OVERSAMPLE         (16U)
+#define BTS_VIN_FILT_ALPHA         ((float32_t)0.25)
+
+//
 // Full-scale divisor for the ADS131M08 sample ring.
 //
 // This tracks the configured SPI WORD length, NOT the converter's silicon
@@ -1128,6 +1200,12 @@
     //#define BTS_SFRA_EPWM               (EPWM9_BASE)
     //#define BTS_SFRA_TDRD               ((BTS_DRV_EPWM_SWITCHING_FREQUENCY / BTS_SFRA_ISR_FREQ_REQ ) - 1)
 #if (BTS_SFRA_ISR_SRC == BTS_SFRA_ISR_SRC_ADC)
+    //
+    // The DRDY rate the loops run at - 31.96 kSPS since CLKIN went to
+    // 8.1818 MHz (BTS_ADS131_FDATA_HZ). Left at the 31.25 kHz the DCL
+    // coefficients were designed for; the 2.3% difference shifts every
+    // swept frequency by the same 2.3%.
+    //
     #define BTS_SFRA_ISR_FREQ             ((float32_t)31250)
     #define BTS_SFRA_FREQ_LENGTH          ((int16_t)103)
 #else
@@ -1228,9 +1306,23 @@
 #define BTS_DRV_EPWM_DC_TRIP_OC           EPWM_DC_TRIP_TRIPIN4
 #define BTS_DRV_EPWM_DC_TRIP_PCMC         EPWM_DC_TRIP_TRIPIN5
 
-#define BTS_DRV_EPWM_SWITCHING_FREQUENCY  ((BTS_DRV_ADC_SWITCHING_FREQUENCY / (float32_t)2 / (float32_t)128 ) * (float32_t)3)
+//
+// Converter switching frequency. A FIXED figure, deliberately no longer
+// derived from BTS_DRV_ADC_SWITCHING_FREQUENCY.
+//
+// It used to be (CLKIN / 2 / 128) * 3, which with the old 8.5 MHz CLKIN
+// constant came to 99,609.375 Hz and TBPRD 902 (99.67 kHz actual). Lowering
+// CLKIN to 8.192 MHz through that formula would have silently moved the
+// converter to 96 kHz and TBPRD 936 - changing the inductor ripple, the
+// CLA's sample rate and every alpha tied to it. The ADS131M08 and the
+// switching stage are not synchronised (separate ePWMs, no SYNC/RESET
+// alignment), so nothing requires the two to be related.
+//
+// 99,609.375 keeps TBPRD 902, exactly what has run on the board.
+//
+#define BTS_DRV_EPWM_SWITCHING_FREQUENCY  ((float32_t)99609.375)
 
-// 99,609.375 Hz
+// 99,609.375 Hz requested -> TBPRD 902 -> 99.67 kHz actual
 
 #define BTS_DRV_ADC_EPWMCLK_DIV          EPWM_CLOCK_DIVIDER_1
 #define BTS_DRV_ADC_HSCLK_DIV            EPWM_HSCLOCK_DIVIDER_1
@@ -1241,11 +1333,26 @@
     #define BTS_DRV_ADC_TOTAL_CLKDIV     (((uint16_t)0x1 << BTS_DRV_ADC_EPWMCLK_DIV) * (BUCK_DRV_ADC_HSCLK_DIV << 1))
 #endif
 
-#define BTS_DRV_ADC_PERIOD_TICKS         ((uint32_t)((BTS_EPWM_HZ) / BTS_DRV_ADC_SWITCHING_FREQUENCY / BTS_DRV_ADC_TOTAL_CLKDIV))
+//
+// ADS131M08 master clock (CLKIN), driven by EPWM11A (ADC1, slots 1-4) and
+// EPWM12A (ADC2, slots 5-8). See BTS_HAL_setupAdcClock().
+//
+// The period is the NEAREST integer to EPWMCLK / f, not the truncated one.
+// The truncating divide this used to be turned a requested 8.5 MHz into
+// TBPRD 9 and an actual 90 MHz / 10 = 9.0 MHz - read back off EPwm11Regs
+// on 2026-10-10 - 7% above the part's 8.4 MHz limit for high-resolution
+// mode (datasheet SBAS950B, 6.3: fCLKIN 0.3 / 8.192 / 8.4 MHz at gain 1-2).
+//
+// 8.192 MHz nominal rounds to TBPRD 10: 90 MHz / 11 = 8.1818 MHz, 0.13%
+// under nominal. Duty 50% (toggle at zero and at CMPA = TBPRD/2), inside the
+// 40-60% window. That gives fMOD 4.091 MHz and, at OSR 128,
+// fDATA = 31.96 kSPS - see BTS_ADS131_FDATA_HZ.
+//
+#define BTS_DRV_ADC_PERIOD_TICKS         ((uint32_t)(((BTS_EPWM_HZ) / BTS_DRV_ADC_SWITCHING_FREQUENCY / BTS_DRV_ADC_TOTAL_CLKDIV) + (float32_t)0.5))
 #define BTS_DRV_ADC_TBPRD                ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS - 1)
 #define BTS_DRV_ADC_PERIOD_SEC           ((uint32_t)BTS_DRV_ADC_PERIOD_TICKS / BTS_EPWM_HZ / 2)
 
-#define BTS_DRV_ADC_SWITCHING_FREQUENCY  ((float32_t)8500 * 1000)
+#define BTS_DRV_ADC_SWITCHING_FREQUENCY  ((float32_t)8192 * 1000)
 
 //
 // ADC acquisition rate for adcCellVoltageISR (cell V/I on the internal ADC).

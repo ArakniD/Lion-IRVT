@@ -108,3 +108,25 @@ Open, found while documenting:
   flags.
 - The ESP32's AT console once repeated its last reply ~17,000 times.
 
+
+### Addendum, 2026-10-10 - ADS131M08 clock, loop input filtering, Vin smoothing
+
+Not a ToDo item, recorded here for the same reason:
+
+- **ADS131M08 CLKIN 9.0 -> 8.18 MHz.** The truncating divide gave TBPRD 9
+  (9.0 MHz, over the 8.4 MHz HR-mode limit). It now rounds, giving TBPRD 10:
+  fDATA 31.96 kSPS, down from 35.16. The switching frequency is fixed at
+  99.67 kHz instead of being derived from the ADC clock. Read back on the
+  board: EPWM11/12 TBPRD = 10, EPWM1 TBPRD = 902.
+- **Loop inputs conditioned on every DRDY.** CC uses a 4-sample rolling mean
+  (-3 dB 3.54 kHz). CV uses an IIR with fc 100 Hz. The trip and the
+  direction guard stay on the raw sample. The loops still execute on every
+  sample, and the DCL coefficients are unchanged (designed for 31.25 kHz,
+  2.3 % off).
+- **Vin**: 16 x oversampled with the A0 reference, then an IIR with alpha
+  0.25 per C1 pass. Measured via the ESP32: 40 mV span over 30 s, down from
+  about +/-0.5 V.
+- Data flow with rates, record counts and corners: `Docs/data-flow.md` §2.
+
+**Not verified:** CC/CV loop stability on a running converter. That needs a
+scope.
