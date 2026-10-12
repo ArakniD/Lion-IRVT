@@ -5,17 +5,12 @@ encoder and push switch, the extra KEY0 button and the eight slot LEDs. The
 BTS I2C link and the console UART are included so the whole board is accounted
 for.
 
-**Source of truth is the firmware, with four exceptions.** Every GPIO below is
-taken from `esp32-btle-proxy/main/main.c` (the `#define`s and the
-`display_config_t`, `input_config_t` and `led_strip_config_t` it builds),
-except the four marked **PROPOSED**:
-
-| Signal | Pin | Status |
-|---|---|---|
-| LCD CS | GPIO19 | **PROPOSED.** Not in firmware yet; see [Firmware changes needed](#firmware-changes-needed) |
-| KEY0 | GPIO34 | **PROPOSED.** Not in firmware yet; see [Firmware changes needed](#firmware-changes-needed) |
-| Encoder A | GPIO32 | **PROPOSED.** Moved from GPIO15; firmware still uses GPIO15 |
-| Encoder PUSH | GPIO33 | **PROPOSED.** Moved from GPIO2; firmware still uses GPIO2 |
+**Source of truth is the firmware.** Every GPIO below is taken from
+`esp32-btle-proxy/main/main.c` (the `#define`s and the `display_config_t`,
+`input_config_t` and `led_strip_config_t` it builds). LCD CS on GPIO19, KEY0
+on GPIO34 and the encoder's A and PUSH on GPIO32 and GPIO33 were proposals in
+an earlier revision of this page; all four are in the firmware and were
+verified at boot on 2026-10-09.
 
 The header positions (P2/P3) and the LCD board pin names come from the board
 and the AliExpress module, not from the code, so they are the part to check
@@ -37,11 +32,11 @@ flowchart LR
         P314["GPIO17 · P3.14"]
         P315["GPIO16 · P3.15"]
         P316["GPIO4 · P3.16"]
-        P39["GPIO19 · P3.9 (proposed)"]
-        P25["GPIO32 · P2.5 (proposed)"]
+        P39["GPIO19 · P3.9"]
+        P25["GPIO32 · P2.5"]
         P211["GPIO27 · P2.11"]
-        P26["GPIO33 · P2.6 (proposed)"]
-        P27["GPIO34 · P2.7 (proposed)"]
+        P26["GPIO33 · P2.6"]
+        P27["GPIO34 · P2.7"]
         P214["GPIO13 · P2.14"]
         P215["5V0 · P2.15"]
         P216["GND · P2.16"]
@@ -98,8 +93,16 @@ flowchart LR
 
 ## LCD and rotary encoder board
 
-ST7789 in SPI mode, 240x240. The module is the one from
+ST7789 in SPI mode. The module is the one from
 <https://www.aliexpress.com/item/1005008766561044.html>.
+
+**Panel: 320x240, landscape.** The board was upgraded from the original
+240x240 panel to a 240x320 one with the same ST7789 controller and the same
+pinout. The firmware turns it 90 degrees counter-clockwise through the
+controller (`rotation = 1` in `main.c`), so the UI is drawn as 320 wide by
+240 high. The boot self-test shows a white square in the top-left corner and
+"DISPLAY OK" along the long edge; if that reads upside down, set
+`rotation = 3`, and if it reads back to front, set `mirror = true`.
 
 | LCD board pin | Signal | ESP32 header | GPIO | Firmware use |
 |---|---|---|---|---|
@@ -109,16 +112,16 @@ ST7789 in SPI mode, 240x240. The module is the one from
 | 4 | SDA (MOSI) | P3.10 | **GPIO23** | SPI2 MOSI. The bus is write-only; MISO is not assigned |
 | 5 | RES | P3.14 | **GPIO17** | Panel reset |
 | 6 | DC | P3.15 | **GPIO16** | Data / command select |
-| 7 | CS | P3.9 | **GPIO19** (proposed) | Chip select, active low. External 10 k pull-up to 3V3 installed. Firmware currently passes `cs_gpio_num = -1` |
+| 7 | CS | P3.9 | **GPIO19** | Chip select, active low, driven by the SPI driver. External 10 k pull-up to 3V3 installed |
 | 8 | BLK | P3.16 | **GPIO4** | Backlight, active high. Held off until the first frame is drawn |
-| 9 | A | P2.5 | **GPIO32** (proposed) | Encoder channel A, decoded by PCNT. Firmware currently uses GPIO15 |
+| 9 | A | P2.5 | **GPIO32** | Encoder channel A, decoded by PCNT |
 | 10 | B | P2.11 | **GPIO27** | Encoder channel B, decoded by PCNT |
-| 11 | PUSH | P2.6 | **GPIO33** (proposed) | Encoder push switch, active low. Short press and 800 ms long press. Firmware currently uses GPIO2 |
-| 12 | KEY0 | P2.7 | **GPIO34** (proposed) | Extra push button, active low. Not read by any firmware yet |
+| 11 | PUSH | P2.6 | **GPIO33** | Encoder push switch, active low. Press selects, 800 ms long press goes back one menu level |
+| 12 | KEY0 | P2.7 | **GPIO34** | Extra push button, active low. Returns the front panel to the slot list from any menu |
 
 ### Why these pins
 
-All four proposed pins are chosen from the free pins on the P2/P3 tables, and
+All four of these pins were chosen from the free pins on the P2/P3 tables, and
 none is a boot strapping pin (the straps are GPIO0, 2, 5, 12 and 15).
 
 - **CS = GPIO19 (P3.9).** CS is an output, so it needs an output-capable pin.
@@ -176,7 +179,10 @@ over.
 |---|---|---|---|
 | WS2812B VDD | P2.15 | — | **5V0** |
 | WS2812B GND | P2.16 | — | GND, shared with the ESP32 |
-| WS2812B DIN | P2.14 | **GPIO13** | SPI3 (VSPI) MOSI. One data line, eight LEDs in series, one LED per BTS slot |
+| WS2812B DIN | P2.14 | **GPIO13** | SPI3 (VSPI) MOSI. One data line, eight LEDs in series, one LED per BTS slot, in reverse order (see below) |
+
+**LED order is reversed.** LED 1, the first after DIN, shows slot 8, and
+LED 8 shows slot 1. `led_for_slot()` in `led_strip.c` holds the mapping.
 
 The strip is not on the LCD board. It has no clock line; the SPI3 bit
 pattern at 2.5 MHz forms the WS2812B pulses (see `led_strip.h`).
@@ -201,8 +207,7 @@ the backup cell alone.
 ## ESP32 board pin usage
 
 `ASSIGNED` is what the firmware does with the pin. A dash means nothing is
-assigned and the pin is free. Entries marked *(proposed)* are not in firmware
-yet.
+assigned and the pin is free.
 
 ### P2
 
@@ -212,9 +217,9 @@ yet.
 | 2 | EN | Reset |
 | 3 | VP | — (GPIO36, input only) |
 | 4 | VN | — (GPIO39, input only) |
-| 5 | GPIO32 | **Encoder A** *(proposed)* (LCD board pin 9) |
-| 6 | GPIO33 | **Encoder PUSH** *(proposed)* (LCD board pin 11) |
-| 7 | GPIO34 | **KEY0** *(proposed)* (LCD board pin 12). Input only, no internal pull |
+| 5 | GPIO32 | **Encoder A** (LCD board pin 9) |
+| 6 | GPIO33 | **Encoder PUSH** (LCD board pin 11) |
+| 7 | GPIO34 | **KEY0** (LCD board pin 12). Input only, no internal pull |
 | 8 | GPIO35 | — (input only) |
 | 9 | GPIO25 | — |
 | 10 | GPIO26 | — |
@@ -237,7 +242,7 @@ yet.
 | 6 | GPIO21 | **BTS I2C SDA** |
 | 7 | GND | — |
 | 8 | GND | **LCD board GND** (pin 1) |
-| 9 | GPIO19 | **LCD CS** *(proposed)* (pin 7). External 10 k pull-up to 3V3 |
+| 9 | GPIO19 | **LCD CS** (pin 7). External 10 k pull-up to 3V3 |
 | 10 | GPIO23 | **LCD SDA / MOSI**, SPI2 (pin 4) |
 | 11 | GPIO18 | **LCD SCL / SCLK**, SPI2 (pin 3) |
 | 12 | GPIO5 | — (strapping pin) |
@@ -255,9 +260,9 @@ yet.
 | Peripheral | Signals | GPIOs |
 |---|---|---|
 | ST7789 LCD, SPI2 (HSPI) | SCLK, MOSI, RES, DC, BLK | 18, 23, 17, 16, 4 |
-| ST7789 LCD chip select *(proposed)* | CS | 19 |
-| Rotary encoder + switch, PCNT | A *(proposed)*, B, PUSH *(proposed)* | 32, 27, 33 |
-| KEY0 button *(proposed)* | KEY0 | 34 |
+| ST7789 LCD chip select | CS | 19 |
+| Rotary encoder + switch, PCNT | A, B, PUSH | 32, 27, 33 |
+| KEY0 button | KEY0 | 34 |
 | Slot LEDs, SPI3 (VSPI) | DIN | 13 |
 | BTS link, I2C controller | SDA, SCL | 21, 22 |
 | Console, UART0 | TX, RX | 1, 3 |
@@ -266,37 +271,12 @@ yet.
 
 ---
 
-## Firmware changes needed
-
-The four proposed pins are documentation only until these are done:
-
-1. **LCD CS.** `display_config_t` has no CS field and `display.c` hard-codes
-   `cs_gpio_num = -1`. Add a `cs_gpio` member, pass it through, and set
-   `LCD_CS_GPIO 19` in `main.c`. The `esp_lcd` SPI driver then asserts CS
-   around each transaction by itself.
-2. **KEY0.** Add a fourth input to `input.c` (or a small separate one),
-   `KEY0_GPIO 34`, active low, with the existing debounce. The GPIO config must
-   leave pulls disabled, as GPIO34 has none. An interrupt is fine here; PCNT is
-   only needed for the encoder.
-3. **Encoder A and PUSH.** In `main.c`, change `ENC_A_GPIO` from 15 to 32 and
-   `ENC_SW_GPIO` from 2 to 33. Update the WIRING and "A NOTE ON THESE PINS"
-   comments in `input.h`, which describe GPIO15 and GPIO2 as strapping pins and
-   would otherwise be wrong. `ENC_B_GPIO` (27) does not change, and `input.c`
-   needs no change: it takes its pins from `input_config_t`.
-4. Update the pin table in `esp32-btle-proxy/README.md`, which still lists
-   the pins as they are in firmware today.
-
----
-
 ## Things worth knowing
 
-**Strapping pins.** With the encoder moved, none of the pins in use on the LCD,
-encoder, KEY0 or LED connections is a strapping or JTAG pin. GPIO4, 13, 19, 27,
-32, 33 and 34 have no boot role. This is the state once the proposed pins are
-in firmware. Until then the firmware still has Encoder A on GPIO15 (MTDO, read
-at reset; held low it silences the ROM boot log) and PUSH on GPIO2 (a
-download-mode strapping pin, so do not hold the button while entering download
-mode by hand).
+**Strapping pins.** None of the pins in use on the LCD, encoder, KEY0 or LED
+connections is a strapping or JTAG pin: GPIO4, 13, 19, 27, 32, 33 and 34 have
+no boot role. Encoder A and PUSH used to be on GPIO15 and GPIO2, both
+strapping pins; moving them took the encoder out of the boot path.
 
 **The LCD is on SPI2 using the VSPI pads.** GPIO23 and GPIO18 are the
 IO_MUX defaults for SPI3 (VSPI), but the LCD uses SPI2 (HSPI) and reaches them

@@ -110,6 +110,18 @@ static void encode_pixel(uint8_t *dst, rgb_t c)
 }
 
 /*
+ * Position in the chain of the LED that shows `slot` (0-based).
+ *
+ * The strip runs backwards relative to the slots: LED 1, the first one after
+ * DIN, sits at slot 8 and LED 8 at slot 1. Kept in one place so the mapping
+ * cannot drift between the per-slot colours and the link-down flash.
+ */
+static inline int led_for_slot(int slot)
+{
+    return (LED_STRIP_COUNT - 1) - slot;
+}
+
+/*
  * True while a flash pattern is in its lit portion.
  *
  * `tick` counts refreshes, so the periods stay in real time regardless of
@@ -219,7 +231,12 @@ static void render(uint32_t tick)
         } else {
             c = colour_for(&snap.channel[i], tick);
         }
-        encode_pixel(&s_frame[i * LED_BYTES_PER_LED], c);
+        /*
+         * The strip is wired with its first LED at slot 8, so slot i drives
+         * pixel (COUNT - 1 - i): LED 1 shows slot 8 and LED 8 shows slot 1.
+         * The first pixel in the frame is the one nearest DIN.
+         */
+        encode_pixel(&s_frame[led_for_slot(i) * LED_BYTES_PER_LED], c);
     }
 
     spi_transaction_t tx = {

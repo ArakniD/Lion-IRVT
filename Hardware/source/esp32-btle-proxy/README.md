@@ -18,8 +18,8 @@ a GATT service (for a Web Bluetooth UI) and a JSON HTTP API.
 | Flash | 4 MB |
 | Programming port | COM6 (Silicon Labs CP210x) |
 | BTS link | I2C controller, SDA = GPIO21, SCL = GPIO22, **50 kHz** (see below) |
-| Status panel | ST7789 on SPI2/HSPI, MOSI = GPIO23, SCK = GPIO18, CS = GPIO19 (external 10 k pull-up), DC = GPIO16, RST = GPIO17, BL = GPIO4 |
-| Slot LEDs | 8x WS2812B on SPI3/VSPI, DIN = GPIO13 |
+| Status panel | ST7789 240x320, run as 320x240 landscape (rotated 90 degrees CCW), on SPI2/HSPI, MOSI = GPIO23, SCK = GPIO18, CS = GPIO19 (external 10 k pull-up), DC = GPIO16, RST = GPIO17, BL = GPIO4 |
+| Slot LEDs | 8x WS2812B on SPI3/VSPI, DIN = GPIO13, chained in reverse (LED 1 = slot 8) |
 | Encoder | A = GPIO32, B = GPIO27, switch = GPIO33 |
 | KEY0 button | GPIO34 (input only, pulled up on the LCD board) |
 | BTS address | `0x50` |
@@ -271,6 +271,34 @@ timeout, or a run restored from F-RAM at boot. That is not a fault and not an
 idle slot: starting or reconfiguring it is refused until an operator resumes
 or aborts it.
 
+### Direct runs
+
+`test_engine_run_direct()` starts a bare charge or discharge with no test
+sequence - what the front panel's Run mode > Charge / Discharge does. The slot
+goes to `DIRECT` (state 11), and the engine supervises it exactly as it does a
+test phase: temperature, over-current, trips, the unit's input window and the
+time limit all fault it. That supervision is not optional - **the C2000
+enforces no temperature limit of its own**, it treats cell temperature as
+advisory - so a run that bypassed the engine would have none.
+
+A direct run ends when the BTS terminates it, at the voltage limit, or on a
+stop (`test_engine_abort()`), and goes back to `IDLE` without recording a
+result. It is refused on a slot that is unconfigured, busy, faulted, tripped,
+paused, disabled, a group follower or calibrating. A paused slot is refused
+because writing RUN to it would be a resume, and resuming is an operator's
+decision with its own command.
+
+### Cell overrides
+
+`slot_config_t` carries direct overrides for the charge and cutoff voltages,
+the three currents and the temperature limit, set from the front panel. 0
+means "use the chemistry or model value". They can only be **more
+conservative** than the cell: `test_engine_resolve()` bounds the charge
+voltage and temperature limit by the cell's own, and the cutoff from below.
+`test_engine_configure()` drops them whenever the chemistry or model changes,
+whichever interface made the change. BLE configuration writes zero them; HTTP
+keeps them, since it starts from the stored config.
+
 The recharge target is a percentage of **what this test actually removed**,
 not of the datasheet capacity, so an aged cell still lands at the right state
 of charge. It terminates on coulomb count rather than voltage, because
@@ -326,9 +354,37 @@ a site can retune a cutoff without a firmware build.
 
 ---
 
+## Front panel
+
+A 320x240 landscape ST7789 and the rotary encoder make the tester usable with
+no client at all. `components/display/display.c` describes the screens: the
+slot table, the menu pane, the settings editor and the fault dialog. The
+operator's guide is [`Docs/README.md`](../Docs/README.md) "Reading the
+display".
+
+**Rotation is done by the controller**, through MADCTL
+(`esp_lcd_panel_swap_xy()` and `esp_lcd_panel_mirror()`), so every coordinate
+in the UI is plain landscape. `rotation` in `main.c` is quarter turns
+counter-clockwise; the boot self-test puts a white square in the top-left
+corner and "DISPLAY OK" along the long edge, so a wrong value is obvious.
+Upside down: use 3 instead of 1. Back to front: set `mirror`.
+
+**Drawing is band by band**, 26 rows at a time: a 320x240 framebuffer is
+150 kB against about 89 kB free with BLE and WiFi up. Two band buffers
+alternate, because `esp_lcd_panel_draw_bitmap()` returns before the DMA has
+read the pixels; the colour-transfer callback releases a buffer before it is
+drawn into again. 33 kB of DMA-capable RAM in all.
+
+**Encoder acceleration** comes from `input.c`, which reports a smoothed
+detents-per-second rate with every rotation. Slow turns step 1 mV or 1 mA;
+faster turns step 10, 100 and 1000. A pause of 300 ms resets it, so every new
+turn starts fine.
+
 ## Slot indicators
 
-Eight WS2812B pixels, one per BTS slot, are driven from this firmware —
+Eight WS2812B pixels, one per BTS slot, chained in reverse - LED 1, the first
+after DIN, is slot 8 (`led_for_slot()` in `led_strip.c`) - are driven from
+this firmware —
 `components/led_strip/`, one `SPI3_HOST` transfer every 25 ms from a FreeRTOS
 task at priority 4. Colour comes from `bts_link_get_snapshot()`, so the
 indicators ride on the poll that was already running and there is nothing to

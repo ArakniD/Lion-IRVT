@@ -188,10 +188,16 @@ void app_main(void)
         .reset_gpio     = LCD_RESET_GPIO,
         .dc_gpio        = LCD_DC_GPIO,
         .backlight_gpio = LCD_BACKLIGHT_GPIO,
-        .width          = 240,
+        /*
+         * 320x240 landscape: the 240x320 panel turned 90 degrees CCW by the
+         * controller. If it comes up upside down, use rotation 3.
+         */
+        .width          = 320,
         .height         = 240,
         .x_offset       = 0,
         .y_offset       = 0,
+        .rotation       = 1,
+        .mirror         = false,
         .invert_colour  = true,
         /*
          * Mode 2 and a slow clock while the panel is being brought up.

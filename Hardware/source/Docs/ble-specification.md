@@ -474,11 +474,19 @@ must not either.
 
 | Value | Name | | Value | Name |
 |---|---|---|---|---|
-| 0 | `IDLE` | | 5 | `DISCHARGE_REST` |
-| 1 | `CHECK_REST` | | 6 | `RECHARGE` |
-| 2 | `CHARGE` | | 7 | `COMPLETE` |
-| 3 | `REST` | | 8 | `FAULT` |
-| 4 | `DISCHARGE` | | 9 | `ABORTED` |
+| 0 | `IDLE` | | 6 | `RECHARGE` |
+| 1 | `CHECK_REST` | | 7 | `COMPLETE` |
+| 2 | `CHARGE` | | 8 | `FAULT` |
+| 3 | `REST` | | 9 | `ABORTED` |
+| 4 | `DISCHARGE` | | 10 | `BTS_PAUSED` |
+| 5 | `DISCHARGE_REST` | | 11 | `DIRECT` |
+
+`BTS_PAUSED` (10) is a run the unit is holding paused that the engine did not
+start or lost with a reset. `DIRECT` (11) is a bare charge or discharge from
+the front panel's Run mode, supervised by the engine but with no test
+sequence; the status word's `CHARGING`/`DISCHARGING` bit gives the direction.
+A client that does not know a value should treat it as `IDLE` rather than
+reject the record - both are appended, never inserted.
 
 #### 3.9.2 `slot_fault_t`
 

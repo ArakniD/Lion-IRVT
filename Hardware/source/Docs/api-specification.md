@@ -180,7 +180,7 @@ Each element of `slots`:
 | Key | Type | Meaning |
 |---|---|---|
 | `slot` | 0–7 | Slot index |
-| `state` | string | `IDLE`, `CHECK_REST`, `CHARGE`, `REST`, `DISCHARGE`, `DISCHARGE_REST`, `RECHARGE`, `COMPLETE`, `FAULT`, `ABORTED` |
+| `state` | string | `IDLE`, `CHECK_REST`, `CHARGE`, `REST`, `DISCHARGE`, `DISCHARGE_REST`, `RECHARGE`, `COMPLETE`, `FAULT`, `ABORTED`, `BTS_PAUSED`, `DIRECT`. `DIRECT` is a bare charge or discharge started from the front panel, supervised but with no test sequence |
 | `fault` | string | `NONE`, `OVER_TEMP`, `UNDER_TEMP`, `OVER_CURRENT`, `CMPSS_TRIP`, `GPIO_TRIP`, `TIMEOUT`, `BTS_OFFLINE`, `UNIT_STATE`, `NO_CELL`, `CELL_REVERSED`, `COMMS` |
 | `configured` | bool | A cell profile has been applied |
 | `voltage_v` | float, 3 dp | Cell volts, **12-bit internal ADC** (register `eChX_CellVoltage`) |

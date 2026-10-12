@@ -87,6 +87,15 @@ typedef enum {
      * slot is parked, visible, and resumable only by an operator.
      */
     SLOT_STATE_BTS_PAUSED,
+    /*
+     * A bare charge or discharge started with test_engine_run_direct(), not
+     * a test. The engine supervises it exactly as it does a test phase -
+     * temperature, over-current, trips, unit state and the time limit - and
+     * ends it when the BTS terminates or the voltage limit is reached, but it
+     * records no result. Appended rather than inserted so every existing
+     * state keeps its number on the wire.
+     */
+    SLOT_STATE_DIRECT,
     SLOT_STATE_COUNT,
 } slot_state_t;
 
@@ -117,6 +126,32 @@ typedef struct {
     bool             auto_recharge_to_shipping;
     float            shipping_pct;             /* default 60 */
     uint32_t         max_duration_minutes;     /* 0 => built-in default */
+
+    /*
+     * Direct overrides, set from the front panel. Each is 0 to inherit the
+     * chemistry/model value, and a non-zero one replaces it after resolution.
+     * They are clamped to the unit envelope and, for the two currents, to the
+     * model's own continuous rating - so an operator who dials in more than
+     * the cell is rated for gets the rating, and sees it read back.
+     *
+     * A current override wins over the matching C rate.
+     *
+     * They are bounded by the cell, not only by the unit: the charge voltage
+     * cannot be raised above the chemistry/model ceiling, the temperature
+     * limit cannot be raised above the chemistry's, and the cutoff cannot
+     * go below the chemistry's floor. Overrides exist to be more
+     * conservative than the defaults, never less.
+     *
+     * test_engine_configure() drops every override whenever the chemistry or
+     * model changes - whichever interface asked - because a voltage that was
+     * right for one chemistry is wrong for another.
+     */
+    float            charge_v_max;
+    float            discharge_v_min;
+    float            charge_current_a;
+    float            discharge_current_a;
+    float            charge_term_current_a;
+    float            temp_max_c;
 } slot_config_t;
 
 /* Recorded result of a completed test. */
@@ -229,6 +264,35 @@ esp_err_t test_engine_clear_fault(uint8_t slot);
  */
 esp_err_t test_engine_pause(uint8_t slot);
 esp_err_t test_engine_resume(uint8_t slot);
+
+/*
+ * Runs a bare charge or discharge on a slot, outside the test sequence.
+ *
+ * Pushes the slot's resolved limits and writes the BTS mode register, then
+ * holds the slot in SLOT_STATE_DIRECT so the engine supervises it like any
+ * test phase: over- and under-temperature, over-current, trips, the unit's
+ * input window and the time limit all fault it. That supervision is not
+ * optional - the C2000 treats cell temperature as advisory and enforces no
+ * temperature limit of its own. The run ends when the BTS terminates it, or
+ * at the voltage limit; test_engine_abort() stops it early.
+ *
+ * Refused (ESP_ERR_INVALID_STATE) on an unconfigured slot, while a test or a
+ * held pause owns it, and on a faulted slot; and (ESP_ERR_NOT_ALLOWED) while
+ * the unit latches a trip or a group disconnect on it, holds it paused, or
+ * it is disabled, a group follower or calibrating. A RUN written to a paused
+ * slot is a resume on the BTS, and resuming is an operator decision with its
+ * own command.
+ */
+esp_err_t test_engine_run_direct(uint8_t slot, bool charge);
+
+/*
+ * Resolves a configuration into the profile the engine would use: chemistry
+ * and model defaults, then the overrides above, clamped. What
+ * test_engine_configure() stores, without storing it - so a UI can show the
+ * effective value before committing.
+ */
+esp_err_t test_engine_resolve(const slot_config_t *config,
+                              cell_resolved_profile_t *out);
 
 /*
  * Assigns a barcode/serial to a slot. Allowed at any point up to the moment

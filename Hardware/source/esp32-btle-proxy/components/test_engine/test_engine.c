@@ -93,6 +93,9 @@ typedef struct {
 
     float                   recharge_target_mah;
 
+    /* SLOT_STATE_DIRECT only: which way the bare run goes. */
+    bool                    direct_charge;
+
     bool                    changed;     /* pending notification */
 
     slot_result_t           result;
@@ -110,7 +113,7 @@ static bool              s_ready;
 static const char *k_state_names[SLOT_STATE_COUNT] = {
     "IDLE", "CHECK_REST", "CHARGE", "REST", "DISCHARGE",
     "DISCHARGE_REST", "RECHARGE", "COMPLETE", "FAULT", "ABORTED",
-    "BTS_PAUSED",
+    "BTS_PAUSED", "DIRECT",
 };
 
 static const char *k_fault_names[SLOT_FAULT_COUNT] = {
@@ -143,7 +146,8 @@ static inline bool state_is_powered(slot_state_t s)
 {
     return s == SLOT_STATE_CHARGE ||
            s == SLOT_STATE_DISCHARGE ||
-           s == SLOT_STATE_RECHARGE;
+           s == SLOT_STATE_RECHARGE ||
+           s == SLOT_STATE_DIRECT;
 }
 
 static void enter_state(uint8_t slot, slot_state_t state)
@@ -265,9 +269,10 @@ static slot_fault_t check_safety(uint8_t slot, const bts_snapshot_t *snap)
     }
 
     if (state_is_powered(c->state) && c->power_started) {
-        const float setpoint = (c->state == SLOT_STATE_DISCHARGE)
-                                   ? c->profile.discharge_current_a
-                                   : c->profile.charge_current_a;
+        const bool discharging = (c->state == SLOT_STATE_DISCHARGE) ||
+                                 (c->state == SLOT_STATE_DIRECT && !c->direct_charge);
+        const float setpoint = discharging ? c->profile.discharge_current_a
+                                           : c->profile.charge_current_a;
         /* Skip the first couple of seconds: the loop is still ramping. */
         if (seconds_since(c->mode_issued_us) > 2 &&
             fabsf(ch->cell_current_a) > setpoint * OVER_CURRENT_MARGIN) {
@@ -279,12 +284,10 @@ static slot_fault_t check_safety(uint8_t slot, const bts_snapshot_t *snap)
          * window. Treat the disabled states as a fault so the operator sees
          * why the test stalled rather than watching it sit at 0 A.
          */
-        if (snap->unit.unit_state == BTS_UNIT_INPUT_LOW_CHARGE_DISABLED &&
-            (c->state == SLOT_STATE_CHARGE || c->state == SLOT_STATE_RECHARGE)) {
+        if (snap->unit.unit_state == BTS_UNIT_INPUT_LOW_CHARGE_DISABLED && !discharging) {
             return SLOT_FAULT_UNIT_STATE;
         }
-        if (snap->unit.unit_state == BTS_UNIT_INPUT_HIGH_DISCHARGE_DISABLED &&
-            c->state == SLOT_STATE_DISCHARGE) {
+        if (snap->unit.unit_state == BTS_UNIT_INPUT_HIGH_DISCHARGE_DISABLED && discharging) {
             return SLOT_FAULT_UNIT_STATE;
         }
     }
@@ -642,6 +645,41 @@ static void enter_bts_paused(uint8_t slot, const bts_channel_state_t *ch)
     enter_state(slot, SLOT_STATE_BTS_PAUSED);
 }
 
+/*
+ * A bare charge or discharge from test_engine_run_direct().
+ *
+ * Supervised like a test phase - tick_slot() runs check_safety() before this
+ * - but with no sequence to advance: it ends when the BTS terminates it, at
+ * the voltage limit, or on an operator stop, and returns to IDLE. No result
+ * is recorded; the BTS's per-direction counters hold the figures.
+ */
+static void tick_direct(uint8_t slot, const bts_channel_state_t *ch)
+{
+    slot_ctx_t *c = &s_slot[slot];
+
+    if (!ch->valid) {
+        return;
+    }
+
+    bool done = bts_says_done(c, ch);
+    if (c->direct_charge) {
+        /* The BTS ends a charge on its own CV taper; this is the fallback. */
+        done = done || (ch->const_voltage &&
+                        fabsf(ch->cell_current_a) <= c->profile.charge_term_current_a);
+    } else {
+        const bool under_load = fabsf(ch->cell_current_a) > 0.05f;
+        done = done || (under_load && ch->cell_voltage_v <= c->profile.discharge_v_min);
+    }
+
+    if (done) {
+        bts_link_stop_channel(slot);
+        ESP_LOGI(TAG, "slot %u: direct %s ended at %.3f V", slot,
+                 c->direct_charge ? "charge" : "discharge", ch->cell_voltage_v);
+        c->test_started_us = 0;
+        enter_state(slot, SLOT_STATE_IDLE);
+    }
+}
+
 static void tick_slot(uint8_t slot, const bts_snapshot_t *snap)
 {
     slot_ctx_t                *c  = &s_slot[slot];
@@ -697,6 +735,7 @@ static void tick_slot(uint8_t slot, const bts_snapshot_t *snap)
     case SLOT_STATE_DISCHARGE:      tick_discharge(slot, ch);            break;
     case SLOT_STATE_DISCHARGE_REST: tick_discharge_rest(slot, ch, snap); break;
     case SLOT_STATE_RECHARGE:       tick_recharge(slot, ch, snap);       break;
+    case SLOT_STATE_DIRECT:         tick_direct(slot, ch);               break;
     default:                                                             break;
     }
 }
@@ -885,6 +924,90 @@ static void engine_task(void *arg)
 /* Control                                                            */
 /* ------------------------------------------------------------------ */
 
+static float clamp_override(float v, float lo, float hi)
+{
+    return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+esp_err_t test_engine_resolve(const slot_config_t *config,
+                              cell_resolved_profile_t *out)
+{
+    if (config == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = cell_profile_resolve(config->chemistry,
+                                         config->model_name,
+                                         config->capacity_mah,
+                                         config->charge_c,
+                                         config->discharge_c,
+                                         out);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /*
+     * Overrides last, then the same envelope cell_profile_resolve() applies.
+     * A model's continuous rating is a ceiling an override cannot lift: the
+     * front panel makes a big number easy to dial in by accident.
+     */
+    const cell_model_t *model = cell_model_find(config->model_name);
+    const float chg_cap = (model && model->charge_current_max_a > 0.0f)
+                              ? fminf(model->charge_current_max_a, BTS_UNIT_MAX_CURRENT_A)
+                              : BTS_UNIT_MAX_CURRENT_A;
+    const float dis_cap = (model && model->discharge_current_max_a > 0.0f)
+                              ? fminf(model->discharge_current_max_a, BTS_UNIT_MAX_CURRENT_A)
+                              : BTS_UNIT_MAX_CURRENT_A;
+
+    /*
+     * Voltage and temperature overrides may only be more conservative than
+     * the cell's own limits: a lower charge target, a higher cutoff, a lower
+     * temperature ceiling. The resolved defaults ARE those limits, so they
+     * bound the overrides. An encoder spin that would have walked a 4.2 V
+     * target to 5 V stops at 4.2 V.
+     */
+    const float v_ceiling = out->charge_v_max;
+    const float v_floor   = out->discharge_v_min;
+    const float t_ceiling = out->temp_max_c;
+    if (config->charge_v_max > 0.0f) {
+        out->charge_v_max = clamp_override(config->charge_v_max, 0.0f, v_ceiling);
+    }
+    if (config->discharge_v_min > 0.0f) {
+        out->discharge_v_min = clamp_override(config->discharge_v_min, v_floor,
+                                              BTS_UNIT_MAX_VOLTAGE_V);
+    }
+    if (config->charge_current_a > 0.0f) {
+        out->charge_current_a = clamp_override(config->charge_current_a, 0.0f, chg_cap);
+    }
+    if (config->discharge_current_a > 0.0f) {
+        out->discharge_current_a = clamp_override(config->discharge_current_a, 0.0f,
+                                                  dis_cap);
+    }
+    if (config->charge_term_current_a > 0.0f) {
+        out->charge_term_current_a = config->charge_term_current_a;
+    }
+    /*
+     * Always, not only when the term current is overridden: a charge current
+     * dialled below the default taper threshold would otherwise end every
+     * charge the moment it entered CV.
+     */
+    if (out->charge_term_current_a > out->charge_current_a) {
+        out->charge_term_current_a = out->charge_current_a;
+    }
+    if (config->temp_max_c > 0.0f) {
+        out->temp_max_c = clamp_override(config->temp_max_c, 0.0f, t_ceiling);
+    }
+
+    /*
+     * A cutoff at or above the CV target leaves no window to run in, and the
+     * BTS would end a discharge the instant it started. Refuse it rather than
+     * hand the unit a profile it cannot honour.
+     */
+    if (out->discharge_v_min >= out->charge_v_max) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
 esp_err_t test_engine_configure(uint8_t slot, const slot_config_t *config)
 {
     if (!s_ready || slot >= SLOT_COUNT || config == NULL) {
@@ -892,12 +1015,7 @@ esp_err_t test_engine_configure(uint8_t slot, const slot_config_t *config)
     }
 
     cell_resolved_profile_t profile;
-    esp_err_t err = cell_profile_resolve(config->chemistry,
-                                         config->model_name,
-                                         config->capacity_mah,
-                                         config->charge_c,
-                                         config->discharge_c,
-                                         &profile);
+    esp_err_t err = test_engine_resolve(config, &profile);
     if (err != ESP_OK) {
         return err;
     }
@@ -915,7 +1033,34 @@ esp_err_t test_engine_configure(uint8_t slot, const slot_config_t *config)
         return ESP_ERR_INVALID_STATE;
     }
 
-    c->config     = *config;
+    /*
+     * A voltage or current override was chosen for one cell. If the
+     * chemistry or the model has changed - from any interface, HTTP
+     * included, which starts from the stored config - it no longer applies,
+     * and keeping it would lay a 4.2 V charge target over an LFP cell. Drop
+     * them and resolve again from the new cell's own defaults.
+     */
+    slot_config_t next = *config;
+    if (c->configured &&
+        (next.chemistry != c->config.chemistry ||
+         strcasecmp(next.model_name, c->config.model_name) != 0)) {
+        const bool had = next.charge_v_max > 0.0f || next.discharge_v_min > 0.0f ||
+                         next.charge_current_a > 0.0f || next.discharge_current_a > 0.0f ||
+                         next.charge_term_current_a > 0.0f || next.temp_max_c > 0.0f;
+        if (had) {
+            next.charge_v_max = next.discharge_v_min = 0.0f;
+            next.charge_current_a = next.discharge_current_a = 0.0f;
+            next.charge_term_current_a = 0.0f;
+            next.temp_max_c = 0.0f;
+            ESP_LOGW(TAG, "slot %u: cell changed, overrides dropped", slot);
+            if (test_engine_resolve(&next, &profile) != ESP_OK) {
+                xSemaphoreGive(s_lock);
+                return ESP_ERR_INVALID_ARG;
+            }
+        }
+    }
+
+    c->config     = next;
     c->profile    = profile;
     c->configured = true;
     c->changed    = true;
@@ -1005,7 +1150,11 @@ esp_err_t test_engine_abort(uint8_t slot)
     coulomb_stop(&c->discharge_cc);
     coulomb_stop(&c->charge_cc);
 
-    if (c->state != SLOT_STATE_IDLE && c->state != SLOT_STATE_COMPLETE) {
+    if (c->state == SLOT_STATE_DIRECT) {
+        /* Stopping a bare run is the normal way to end it, not an abort. */
+        c->test_started_us = 0;
+        enter_state(slot, SLOT_STATE_IDLE);
+    } else if (c->state != SLOT_STATE_IDLE && c->state != SLOT_STATE_COMPLETE) {
         enter_state(slot, SLOT_STATE_ABORTED);
     }
     xSemaphoreGive(s_lock);
@@ -1034,17 +1183,40 @@ esp_err_t test_engine_clear_fault(uint8_t slot)
         return ESP_ERR_TIMEOUT;
     }
     slot_ctx_t *c = &s_slot[slot];
-    if (c->state == SLOT_STATE_FAULT || c->state == SLOT_STATE_ABORTED) {
+    const bool engine_fault = (c->state == SLOT_STATE_FAULT ||
+                               c->state == SLOT_STATE_ABORTED);
+    if (engine_fault) {
         c->fault = SLOT_FAULT_NONE;
         enter_state(slot, SLOT_STATE_IDLE);
-        /*
-         * Clear the unit's indication too. It latches the over-current and
-         * group-disconnect bits until told otherwise, and check_safety()
-         * refuses to run a slot whose trip bit is still set - so without
-         * this, a tripped slot could never be started again. Best effort:
-         * an unreachable unit leaves the bit set, and the next start then
-         * faults again with the same reason, which is the honest outcome.
-         */
+    }
+
+    /*
+     * Clear the unit's indication too. It latches the over-current and
+     * group-disconnect bits until told otherwise, and check_safety() refuses
+     * to run a slot whose trip bit is still set - so without this, a tripped
+     * slot could never be started again.
+     *
+     * Also sent when the engine itself is idle but the unit shows a latch: a
+     * direct run from the panel or a host trips without the engine ever
+     * having owned the slot, and the operator still has to be able to clear
+     * it. The unit ignores the command on a channel that is driving.
+     *
+     * Best effort: an unreachable unit leaves the bit set, and the next start
+     * then faults again with the same reason, which is the honest outcome.
+     */
+    /*
+     * The unit-only case is limited to an idle engine. A host clear landing
+     * mid-test, between a trip and the engine's next tick, would otherwise
+     * wipe the trip bits before check_safety() saw them, and the tripped
+     * phase would be taken for one that ended normally.
+     */
+    bts_snapshot_t snap;
+    bts_link_get_snapshot(&snap);
+    const bts_channel_state_t *ch = &snap.channel[slot];
+    const bool unit_latched = ch->valid &&
+        ((ch->status_bits & (BTS_STATUS_OVERCURRENT | BTS_STATUS_GROUP_DISCONNECT)) ||
+         ch->cmpss_trip || ch->gpio_trip);
+    if (engine_fault || (unit_latched && c->state == SLOT_STATE_IDLE)) {
         (void)bts_link_clear_fault_channel(slot);
     }
     xSemaphoreGive(s_lock);
@@ -1100,6 +1272,90 @@ esp_err_t test_engine_resume(uint8_t slot)
              : snap.channel[slot].wd_tripped ? "watchdog"
                                              : "commanded");
     return bts_link_resume_channel(slot);
+}
+
+esp_err_t test_engine_run_direct(uint8_t slot, bool charge)
+{
+    if (!s_ready || slot >= SLOT_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bts_snapshot_t snap;
+    bts_link_get_snapshot(&snap);
+    const bts_channel_state_t *ch = &snap.channel[slot];
+    if (!snap.unit.online || !ch->valid) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /*
+     * The unit refuses most of these itself, silently, and leaves the slot
+     * stopped. Refusing here instead means the panel can say why.
+     */
+    if (ch->status_bits & (BTS_STATUS_OVERCURRENT | BTS_STATUS_GROUP_DISCONNECT |
+                           BTS_STATUS_SLOT_DISABLED | BTS_STATUS_SLAVE_MODE |
+                           BTS_STATUS_CALIBRATING)) {
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    /*
+     * RUN on a paused slot is a resume on the BTS, which would sidestep the
+     * rule that a restored or watchdog pause is resumed only by an operator,
+     * on purpose, with the resume command.
+     */
+    if (ch->paused) {
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    if (ch->cmpss_trip || ch->gpio_trip) {
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    slot_ctx_t *c = &s_slot[slot];
+    esp_err_t err = ESP_OK;
+
+    if (!c->configured) {
+        err = ESP_ERR_INVALID_STATE;
+    } else if (c->state != SLOT_STATE_IDLE && c->state != SLOT_STATE_COMPLETE &&
+               c->state != SLOT_STATE_ABORTED) {
+        /* A test, a held pause or a fault owns the slot. */
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        /*
+         * The same path the engine uses to start a phase: the slot's limits
+         * first, then the mode word. Then SLOT_STATE_DIRECT, so tick_slot()
+         * supervises the run - check_safety() is the only temperature limit
+         * there is, because the C2000 treats cell temperature as advisory.
+         * The time limit runs from here, as it would for a test.
+         */
+        c->fault           = SLOT_FAULT_NONE;
+        c->direct_charge   = charge;
+        c->test_started_us = esp_timer_get_time();
+        err = start_power(slot, charge ? BTS_MODE_RUN_CHARGE : BTS_MODE_RUN_DISCHARGE);
+        if (err == ESP_OK) {
+            const int64_t issued = c->mode_issued_us;
+            enter_state(slot, SLOT_STATE_DIRECT);
+            /*
+             * enter_state() clears power_started, but the stage is already
+             * commanded: restore it so the over-current check and
+             * bts_says_done() are armed from the first tick.
+             */
+            c->power_started  = true;
+            c->mode_issued_us = issued;
+        } else {
+            c->test_started_us = 0;
+            bts_link_stop_channel(slot);
+        }
+    }
+    xSemaphoreGive(s_lock);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "slot %u: direct %s from the panel", slot,
+                 charge ? "charge" : "discharge");
+    } else {
+        ESP_LOGW(TAG, "slot %u: direct %s refused (%s)", slot,
+                 charge ? "charge" : "discharge", esp_err_to_name(err));
+    }
+    return err;
 }
 
 esp_err_t test_engine_set_serial(uint8_t slot, const char *serial)

@@ -69,6 +69,13 @@ typedef struct {
     input_event_type_t type;
     /* Detents in this event; always 1 for presses. */
     int32_t            steps;
+    /*
+     * How fast the knob is turning, in detents per second, smoothed over the
+     * last few detents. 0 for presses. A value editor uses it to accelerate:
+     * a slow turn steps the last digit, a spin steps tens, hundreds or
+     * thousands. Smoothed so one quick flick does not jump a decade.
+     */
+    float              rate_dps;
 } input_event_t;
 
 typedef struct {

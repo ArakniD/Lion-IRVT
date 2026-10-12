@@ -352,6 +352,100 @@ The script shows you 1-based numbers and converts.
 
 ## Reading the display
 
+The panel is 320x240, landscape. Normally it shows every slot at once, with a
+menu pane on the right that the rotary encoder drives:
+
+```
++--------------------------------------------------------------------+
+| BTS LINK OK   Vin 14.32                                   (wifi)(bt)|
+| # MODE    VOLTS     AMPS   mAh  C/m |  SLOT 3 MENU               |
+| 1 CHG    4.105    1.50    1234 23.1 |  > Run mode   >            |
+|   CC                       4.6k   12 |    Settings   >            |
+| 2 IDL    0.003    0.00       0   --  |    Clear fault             |
+| 3 FLT    3.712    0.00     812 24.0 |    < Back                  |
+|  ...                                 |                            |
++--------------------------------------------------------------------+
+```
+
+### The slot table
+
+One row per slot. **Volts and amps are large** - they are what you read from
+across the bench. Everything else is small:
+
+- **Mode**, a three-letter code:
+
+  | Code | Meaning |
+  |---|---|
+  | `IDL` | Idle |
+  | `CHG` / `DSG` | Charging / discharging - a test phase, or a bare run from the menu or a host |
+  | `CHK` | Measuring the open-circuit voltage before a test |
+  | `RST` | Resting between test phases |
+  | `RCH` | Recharging to shipping charge after a test |
+  | `END` | Finished |
+  | `FLT` | Faulted - see the fault dialog below |
+  | `ABT` | Aborted |
+  | `PSE` | Paused by a command |
+  | `PWD` | Paused because the host link was lost (the unit's watchdog) |
+  | `PRS` | Paused because the unit reset mid-run - **check the cell before resuming** |
+  | `BAL` / `SS` / `RDY` | Pre-charge: balancing, soft start, ready for a cell |
+  | `OFF` | Disabled by the ENABLE strap |
+
+- **CC / CV** under the mode, while a slot is regulating: which half of the
+  charge law is in control. CV means the taper has started.
+- **mAh over mWh**, then **temperature over minutes**. Temperature turns red
+  at the slot's limit, and reads `--` with no sensor.
+
+### The menu
+
+Everything is the encoder: **turn to move, press to choose.**
+
+1. Turn to pick a slot - it is highlighted with a `>` - and press.
+2. The slot's menu opens in the right-hand pane:
+   - **Run mode** - Idle, Auto-test, Discharge, Charge. A tick marks what the
+     slot is doing now. Idle stops whatever is running.
+   - **Settings** - every cell setting (below).
+   - **Clear fault**, **Pause**, **Resume** - only when they apply.
+3. **Long press goes back one level.** KEY0 goes straight back to the slot
+   list from anywhere. After a minute with no input the panel returns to the
+   slot list by itself and drops anything not saved.
+
+Refusals appear in the pane's top line for a few seconds - "Clear fault 1st",
+"Busy or not set", "Tripped/paused" - so the reason is never only in a log.
+
+### Slot settings
+
+Chemistry, model, capacity, charge voltage, cutoff voltage, charge, discharge
+and termination current, temperature limit, time limit, recharge-to-shipping
+and its percentage. Press a setting to edit it, turn to change it, press to
+accept. **"< Save" at the bottom writes them**; backing out with a long press
+also saves.
+
+- **Turning speed sets the step.** Slow, deliberate turns move 1 mV or 1 mA.
+  Turning faster moves 10, then 100, then 1000 (voltages stop at 100 mV a
+  step - the whole range is only 5 V).
+- **Each value starts from what the slot will actually use**, so you adjust
+  from the real number, not from zero.
+- **Settings can only be made more conservative than the cell allows.** The
+  charge voltage cannot go above the chemistry or model's limit, the cutoff
+  cannot go below it, and the temperature limit cannot be raised. Spinning
+  past the limit stops at the limit.
+- **Changing the chemistry or model resets the voltages and currents** to the
+  new cell's defaults. A 4.2 V target is wrong for an LFP cell.
+- **A slot has to be set up before it will run.** Auto-test, Charge and
+  Discharge are refused on a slot with no settings saved.
+
+### Faults
+
+When a slot faults, a large red dialog opens over everything, naming the slot
+and the reason. Turn to choose:
+
+- **CLEAR** acknowledges the fault on the ESP32 and on the unit, including a
+  latched over-current trip.
+- **IGNORE** closes the dialog. The slot stays faulted and **cannot be
+  started until it is cleared** - from the slot's menu, or over BLE or HTTP.
+
+### Calibration
+
 While a slot is calibrating, the panel switches to the calibration screen and
 shows only that slot:
 
@@ -392,8 +486,14 @@ shows only that slot:
   It also means the strip has two failure modes of its own — all eight amber,
   and frozen — both in the troubleshooting table below.
 
-The encoder does nothing during calibration. Press and long-press only write
-to the log; the procedure is driven over BLE or HTTP.
+The encoder does nothing during calibration, or while the panel is waiting
+for the unit: input is discarded rather than acted on behind a screen that
+hides the menus. The calibration procedure is driven over BLE or HTTP.
+
+### The slot LEDs run in reverse
+
+The LED strip is chained from slot 8: **LED 1 shows slot 8 and LED 8 shows
+slot 1**, so each LED sits above its own slot.
 
 ---
 

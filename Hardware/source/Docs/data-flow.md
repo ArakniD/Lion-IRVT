@@ -868,6 +868,14 @@ arrow there carries a command inbound to a control surface; this one carries
 nothing but indication outbound, has no client at either end, and reaches no
 register.
 
+The panel is no longer outbound only. Its encoder menu reaches the test
+engine directly - start, stop, a supervised bare charge or discharge, cell
+settings, fault clear, pause and resume - through the same
+`test_engine_*` calls the BLE and HTTP handlers use, so it is subject to the
+same refusals and the same supervision. It never writes a register itself.
+
+The strip is chained in reverse: LED 1 is slot 8.
+
 ### Why the strip hangs off the proxy rather than the core that owns the slots
 
 The C2000 drove this string for most of the project’s life and **never lit a

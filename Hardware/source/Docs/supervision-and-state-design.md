@@ -543,6 +543,10 @@ and only bits 22 and 23 now remain below the float32 ceiling.
 Eight WS2812B pixels, one per slot, driven by the **ESP32 proxy** over SPI3
 and refreshed every 25 ms. The C2000 no longer touches them.
 
+The chain runs in reverse: **LED 1, the first after DIN, is slot 8**, and LED 8
+is slot 1, so each pixel sits above its own slot. `led_for_slot()` in
+`led_strip.c` is the one place the mapping lives.
+
 #### The C2000 version never lit a pixel
 
 This is not a regression that was repaired — the function moved because it

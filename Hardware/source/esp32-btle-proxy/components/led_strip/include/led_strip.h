@@ -23,6 +23,9 @@
  * ------
  *   DIN   GPIO13     WS2812B data in, via SPI3 (VSPI) MOSI
  *
+ * The chain runs in reverse slot order: LED 1, the first after DIN, shows
+ * slot 8, and LED 8 shows slot 1. led_strip.c maps this in one place.
+ *
  * GPIO13 has no strapping or JTAG role, so it is safe to drive at reset.
  * It was the encoder's B channel until this driver took it; B moved to
  * GPIO27, which is equally free. SPI3 is otherwise unused - the ST7789

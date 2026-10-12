@@ -70,15 +70,49 @@ bool input_wait_event(input_event_t *out, uint32_t timeout_ms)
     return xQueueReceive(s_queue, out, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
-static void post(input_event_type_t type, int32_t steps)
+static void post_rate(input_event_type_t type, int32_t steps, float rate_dps)
 {
-    const input_event_t ev = { .type = type, .steps = steps };
+    const input_event_t ev = { .type = type, .steps = steps, .rate_dps = rate_dps };
     /*
      * Drop rather than block: the UI is the only consumer and a full queue
      * means it is busy redrawing. Losing a detent is better than stalling
      * the input task, which would make the encoder feel dead.
      */
     (void)xQueueSend(s_queue, &ev, 0);
+}
+
+static void post(input_event_type_t type, int32_t steps)
+{
+    post_rate(type, steps, 0.0f);
+}
+
+/*
+ * Detent rate, for value acceleration.
+ *
+ * An exponential average of the instantaneous rate, so a burst of detents
+ * builds speed over a few clicks rather than on the first one - a single
+ * accidental flick then cannot jump an edited value by a decade. A pause
+ * longer than RATE_IDLE_MS resets it, so the next turn always starts fine.
+ */
+#define RATE_IDLE_MS        300
+#define RATE_ALPHA          0.4f
+
+static float   s_rate_dps;
+static int64_t s_last_detent_us;
+
+static float update_rate(int32_t detents, int64_t now_us)
+{
+    const int64_t gap_us = now_us - s_last_detent_us;
+    s_last_detent_us = now_us;
+
+    if (gap_us <= 0 || gap_us > (int64_t)RATE_IDLE_MS * 1000) {
+        s_rate_dps = 0.0f;
+        return 0.0f;
+    }
+    const float inst = (float)detents * 1e6f / (float)gap_us;
+    s_rate_dps = (s_rate_dps == 0.0f) ? inst
+                                      : s_rate_dps + RATE_ALPHA * (inst - s_rate_dps);
+    return s_rate_dps;
 }
 
 /*
@@ -120,9 +154,10 @@ static void input_task(void *arg)
                 const int32_t detents = carry / INPUT_COUNTS_PER_DETENT;
                 if (detents != 0) {
                     carry -= detents * INPUT_COUNTS_PER_DETENT;
-                    post(detents > 0 ? INPUT_EVENT_ROTATE_CW
-                                     : INPUT_EVENT_ROTATE_CCW,
-                         detents > 0 ? detents : -detents);
+                    const int32_t mag = detents > 0 ? detents : -detents;
+                    post_rate(detents > 0 ? INPUT_EVENT_ROTATE_CW
+                                          : INPUT_EVENT_ROTATE_CCW,
+                              mag, update_rate(mag, esp_timer_get_time()));
                 }
             }
         }

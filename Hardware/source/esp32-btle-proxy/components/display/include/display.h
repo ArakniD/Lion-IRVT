@@ -3,6 +3,9 @@
  *
  * ST7789 status display.
  *
+ * Landscape, 320x240, driven from the rotary encoder: a slot table, a menu
+ * pane and a fault dialog. display.c describes the screens.
+ *
  * WIRING
  * ------
  * SPI2 (HSPI) in its hardware-default pin arrangement, so the SPI peripheral
@@ -23,11 +26,20 @@
  *
  * MEMORY
  * ------
- * A full 240x240 RGB565 framebuffer is 115 kB, against roughly 89 kB of
+ * A full 320x240 RGB565 framebuffer is 150 kB, against roughly 89 kB of
  * free heap once NimBLE and WiFi are up. So the UI renders one horizontal
  * band at a time into a small scratch buffer and pushes each band as it is
  * finished. UI_BAND_H sets the band height; the buffer is
- * 240 * UI_BAND_H * 2 bytes.
+ * width * UI_BAND_H * 2 bytes, and two of them alternate so the next band is
+ * drawn while the last is still on the bus.
+ *
+ * ORIENTATION
+ * -----------
+ * `width` and `height` are the LOGICAL size, after rotation. The panel is a
+ * 240x320 portrait part mounted on its side, so the UI asks for 320x240 and
+ * `rotation` turns it: the controller's MADCTL swaps and mirrors the axes,
+ * so everything above this driver - every coordinate in display.c - is plain
+ * landscape and never sees the rotation.
  *
  * The display task owns the panel entirely - nothing else touches it - and
  * pulls its data from test_engine_get_status() and bts_link_get_snapshot(),
@@ -54,12 +66,22 @@ typedef struct {
     int width;
     int height;
     /*
-     * Many 240x240 ST7789 boards map the visible area partway into the
-     * controller's 240x320 memory. These shift the drawn window to suit;
-     * 0/0 is correct for the common 1.3" module.
+     * Where the visible area sits in the controller's 240x320 memory, in
+     * PANEL coordinates (before rotation). 0/0 for a full 240x320 module;
+     * 240x240 boards often need an offset here.
      */
     int x_offset;
     int y_offset;
+    /*
+     * Rotation applied by the controller, as quarter turns counter-clockwise
+     * from the panel's native portrait orientation: 0, 1 (90 CCW), 2 or 3.
+     * With 1 or 3, `width`/`height` must already be the swapped, landscape
+     * size. If the picture comes out upside down, use 3 instead of 1; if it
+     * is mirrored, the module wires its scan direction the other way and
+     * `mirror` corrects it.
+     */
+    int rotation;
+    bool mirror;
     bool invert_colour;     /* most IPS ST7789 panels need this true */
     /*
      * Set when red and blue come out transposed - some modules wire the
