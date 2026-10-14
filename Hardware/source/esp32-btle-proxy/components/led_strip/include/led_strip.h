@@ -95,16 +95,18 @@ extern "C" {
 #define LED_STRIP_COUNT     8
 
 /*
- * Hard brightness ceiling, 127/255 (49.8%).
+ * Hard brightness ceiling, 26/255 (10%).
  *
- * A WS2812B draws about 20 mA per colour channel, so about 60 mA at full white
- * and about 480 mA for all eight. Capping the scale at half holds the whole
- * strip to roughly 240 mA even if every pixel went white at once, which is what
- * the supply - the USB or backup-cell 5V rail - has to be sized for. The cap
- * is in the driver, not the caller, so no configuration can exceed it:
- * led_strip_init() clamps `brightness` to this and says so in the log.
+ * These are indicators, not lighting. A WS2812B draws about 20 mA per colour
+ * channel, so about 60 mA at full white and about 480 mA for all eight;
+ * capping the scale at 10% holds the whole strip to roughly 50 mA even if
+ * every pixel went white at once. That matters on this board: an OTA update
+ * browned the ESP32 out on the backup cell, so the 5V rail has little to
+ * spare. The cap is in the driver, not the caller, so no configuration can
+ * exceed it: led_strip_init() clamps `brightness` to this and says so in the
+ * log.
  */
-#define LED_STRIP_MAX_BRIGHTNESS    127
+#define LED_STRIP_MAX_BRIGHTNESS    26
 
 typedef struct {
     int      data_gpio;     /* WS2812B DIN */

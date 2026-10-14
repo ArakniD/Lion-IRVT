@@ -593,7 +593,7 @@ from [`main.c`](../esp32-btle-proxy/main/main.c).
 | Encoding | four SPI bits per WS2812B bit: `1000` = 0, `1100` = 1 |
 | Frame | 12 bytes per LED, **96 bytes for all eight in one DMA transfer**, 307 us |
 | Refresh | FreeRTOS task `led_strip`, priority 4, 3072-byte stack, every 25 ms |
-| Brightness | 64/255 (25%), scaled linearly per channel, hard-capped at 127/255 (50%) in the driver to bound the current |
+| Brightness | 26/255 (10%), scaled linearly per channel, and the driver's hard cap - indicators only, about 50 mA for the strip worst case. Off during a WiFi firmware update |
 
 **Neither SCLK nor CS is routed.** The WS2812B is a one-wire part and its
 clock is implicit in the bit pattern, so routing either would burn a pin to

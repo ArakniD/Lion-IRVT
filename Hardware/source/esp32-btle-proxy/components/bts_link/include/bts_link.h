@@ -274,7 +274,32 @@ typedef struct {
     float max_cell_temp;
 } bts_channel_limits_t;
 
-esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *limits);
+/*
+ * Which direction the unit's single current pair is written for.
+ *
+ * The unit has ONE current pair per slot - I_MAX is the setpoint the
+ * converter regulates to and I_MIN the charge-termination taper - shared by
+ * both directions, latched by CPU1 when a mode word starts the slot. These are
+ * setpoints, not ceilings, so they have to be written for the direction that is
+ * about to run, not as a combined window of both:
+ *
+ *   BTS_LIMITS_CHARGE     I_MAX = charge_current_max, I_MIN = charge_current_min
+ *   BTS_LIMITS_DISCHARGE  I_MAX = discharge_current_max, I_MIN = 0
+ *   BTS_LIMITS_NEUTRAL    the currents are NOT written - for provisioning a
+ *                         slot that is not starting, so whatever was last
+ *                         written for a run stays until the next start
+ *
+ * Voltages are written in every case: V_MAX is the charge target and V_MIN the
+ * discharge cutoff, and each direction uses only its own one.
+ */
+typedef enum {
+    BTS_LIMITS_NEUTRAL = 0,
+    BTS_LIMITS_CHARGE,
+    BTS_LIMITS_DISCHARGE,
+} bts_limits_dir_t;
+
+esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *limits,
+                              bts_limits_dir_t dir);
 
 /*
  * Calibration commands.

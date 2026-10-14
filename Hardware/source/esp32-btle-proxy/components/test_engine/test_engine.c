@@ -96,6 +96,10 @@ typedef struct {
     /* SLOT_STATE_DIRECT only: which way the bare run goes. */
     bool                    direct_charge;
 
+    /* The last mode start_power() sent, and whether it has been re-sent. */
+    uint32_t                start_mode;
+    bool                    start_retried;
+
     bool                    changed;     /* pending notification */
 
     slot_result_t           result;
@@ -192,11 +196,25 @@ static esp_err_t start_power(uint8_t slot, uint32_t mode)
 
     cell_profile_to_bts_limits(&c->profile, &limits);
 
-    esp_err_t err = bts_link_set_limits(slot, &limits);
+    /*
+     * The unit has one current setpoint for both directions, so it is written
+     * for the direction starting now: a charge regulates to the charge current
+     * and tapers out at the termination current, a discharge to the discharge
+     * current.
+     */
+    const bts_limits_dir_t dir = (mode & BTS_MODE_CHARGE) ? BTS_LIMITS_CHARGE
+                                                          : BTS_LIMITS_DISCHARGE;
+    esp_err_t err = bts_link_set_limits(slot, &limits, dir);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "slot %u limit write failed: %s", slot, esp_err_to_name(err));
         return err;
     }
+    ESP_LOGI(TAG, "slot %u: %s at %.3f A (taper %.3f A), %.3f-%.3f V", slot,
+             dir == BTS_LIMITS_CHARGE ? "charge" : "discharge",
+             dir == BTS_LIMITS_CHARGE ? limits.charge_current_max
+                                      : limits.discharge_current_max,
+             dir == BTS_LIMITS_CHARGE ? limits.charge_current_min : 0.0f,
+             limits.discharge_voltage_min, limits.charge_voltage_max);
 
     err = bts_link_set_mode(slot, mode);
     if (err != ESP_OK) {
@@ -206,7 +224,41 @@ static esp_err_t start_power(uint8_t slot, uint32_t mode)
 
     c->mode_issued_us = esp_timer_get_time();
     c->power_started  = true;
+    c->start_retried  = false;
+    c->start_mode     = mode;
     return ESP_OK;
+}
+
+/*
+ * Re-sends a start the unit has not acted on.
+ *
+ * The write pacing in bts_link should stop the C2000 dropping a mode write,
+ * but the mode register reads back whatever was written even when CPU1 never
+ * saw it, so the only proof a start landed is the RUNNING bit. If it is still
+ * clear a second after the mode went out - well past the 250 ms poll - the
+ * mode is written once more. Only once: a slot that refuses twice is refusing
+ * for a reason (the unit's input window, a latched trip), and the engine's own
+ * checks will say which.
+ */
+static void retry_unstarted(uint8_t slot, const bts_channel_state_t *ch)
+{
+    slot_ctx_t *c = &s_slot[slot];
+    if (!c->power_started || c->start_retried || !ch->valid) {
+        return;
+    }
+    if (ch->status_bits & (BTS_STATUS_RUNNING | BTS_STATUS_ENDED_MASK)) {
+        c->start_retried = true;    /* it landed; nothing to do */
+        return;
+    }
+    if ((esp_timer_get_time() - c->mode_issued_us) < 1000000LL) {
+        return;
+    }
+    c->start_retried = true;
+    ESP_LOGW(TAG, "slot %u: start not seen by the unit after 1 s; re-sending "
+                  "mode 0x%02X", slot, (unsigned)c->start_mode);
+    if (bts_link_set_mode(slot, c->start_mode) == ESP_OK) {
+        c->mode_issued_us = esp_timer_get_time();
+    }
 }
 
 /*
@@ -728,6 +780,10 @@ static void tick_slot(uint8_t slot, const bts_snapshot_t *snap)
         return;
     }
 
+    if (state_is_powered(c->state)) {
+        retry_unstarted(slot, ch);
+    }
+
     switch (c->state) {
     case SLOT_STATE_CHECK_REST:     tick_check_rest(slot, ch);           break;
     case SLOT_STATE_CHARGE:         tick_charge(slot, ch);               break;
@@ -1083,7 +1139,9 @@ esp_err_t test_engine_configure(uint8_t slot, const slot_config_t *config)
      */
     bts_channel_limits_t limits;
     cell_profile_to_bts_limits(&profile, &limits);
-    esp_err_t lim_err = bts_link_set_limits(slot, &limits);
+    /* Voltages and temperature only: the current setpoint belongs to the
+     * direction that starts, and is written then. */
+    esp_err_t lim_err = bts_link_set_limits(slot, &limits, BTS_LIMITS_NEUTRAL);
     if (lim_err != ESP_OK) {
         ESP_LOGW(TAG, "slot %u: limits not pushed (%s); will retry at start",
                  slot, esp_err_to_name(lim_err));

@@ -236,12 +236,13 @@ at the strip end and a 100 to 470 uF capacitor across the strip supply.
 full white, so the strip would draw about 480 mA if every pixel went white at
 full brightness. The firmware limits that two ways:
 
-- It runs the strip at brightness **64 of 255 (25%)**, roughly 120 mA worst
-  case.
-- The driver enforces a **hard ceiling of 50%** (127 of 255,
-  `LED_STRIP_MAX_BRIGHTNESS` in `led_strip.h`), roughly 240 mA worst case. It is
-  in the driver, not the caller, so no setting can exceed it: a larger value is
-  clamped and logged. Size the 5V supply for 240 mA plus margin.
+- It runs the strip at **10% brightness** (26 of 255), roughly 50 mA worst
+  case. These are indicators, not lighting.
+- That is also the driver's **hard ceiling** (`LED_STRIP_MAX_BRIGHTNESS` in
+  `led_strip.h`). It is in the driver, not the caller, so no setting can exceed
+  it: a larger value is clamped and logged.
+- During a WiFi firmware update the strip is switched off entirely, and every
+  slot is stopped, to keep the 5V rail up - see "Firmware updates" below.
 
 **Check.** On a LOLIN32 the 5V0 pin is normally the USB supply rather than a
 regulated rail, so confirm the strip still has power when the board runs from
@@ -356,6 +357,19 @@ complements of what they should be, flip that flag.
 targets. If a datasheet or order page says ST7798, that is a transposition.
 
 ---
+
+## Firmware updates and the power supply
+
+**An OTA update browns the ESP32 out when the board runs on its backup cell
+alone.** Measured on the bench, 2026-10-14: every upload reset the board about
+4 s in, and the reset reason it kept was `BROWNOUT`. With USB connected, the
+same upload completed. The radio transmits continuously and the flash is
+erased and written throughout, which is the heaviest load this board sees.
+
+So the firmware now sheds what load it can before an upload starts: the slot
+LEDs are blanked and **every slot is stopped**. Both come back with the restart.
+That helps; it does not fix a weak rail. Until the power path is strengthened,
+**update with USB or a solid 5V supply connected.**
 
 ## Bring-up aids still in the firmware
 

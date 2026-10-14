@@ -25,6 +25,7 @@
 #include "cell_profiles.h"
 #include "bts_link.h"
 #include "ota.h"
+#include "led_strip.h"
 
 static const char *TAG = "web_api";
 
@@ -1038,7 +1039,25 @@ static esp_err_t h_ota_post(httpd_req_t *req)
         return send_error(req, "409 Conflict", msg);
     }
 
+    /*
+     * Shed every load this board controls before the radio and the flash
+     * start working hard. An upload browned the ESP32 out on its backup cell;
+     * the strip and the slots are the two things it can switch off. All slots
+     * are stopped - the restart at the end would stop the unheld ones anyway,
+     * and a slot already refused above as running cannot reach here without
+     * ?force=1. The LEDs stay dark for the rest of the update; the restart
+     * brings them back.
+     */
+    led_strip_blank();
+    (void)test_engine_abort_all();
+    ESP_LOGW(TAG, "firmware upload: all slots stopped and slot LEDs blanked "
+                  "to conserve power");
+
     esp_err_t err = ota_begin((size_t)req->content_len);
+    if (err != ESP_OK) {
+        /* No update after all: give the indicators back. */
+        led_strip_resume();
+    }
     if (err == ESP_ERR_INVALID_STATE) {
         return send_error(req, "409 Conflict", "an update is already running");
     }
@@ -1062,6 +1081,7 @@ static esp_err_t h_ota_post(httpd_req_t *req)
         }
         if (got <= 0) {
             ota_abort();
+            led_strip_resume();
             ESP_LOGE(TAG, "upload socket failed with %u bytes to go",
                      (unsigned)remaining);
             return send_error(req, "400 Bad Request", "upload interrupted");
@@ -1070,6 +1090,7 @@ static esp_err_t h_ota_post(httpd_req_t *req)
         err = ota_write(chunk, (size_t)got);
         if (err != ESP_OK) {
             ota_abort();
+            led_strip_resume();
             return send_error(req,
                               err == OTA_ERR_BAD_IMAGE
                                   ? "400 Bad Request"
@@ -1084,6 +1105,7 @@ static esp_err_t h_ota_post(httpd_req_t *req)
 
     err = ota_finish();
     if (err != ESP_OK) {
+        led_strip_resume();
         return send_error(req, "400 Bad Request",
                           err == OTA_ERR_BAD_IMAGE
                               ? "image failed verification"

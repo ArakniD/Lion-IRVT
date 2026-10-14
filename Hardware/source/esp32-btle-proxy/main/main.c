@@ -255,14 +255,13 @@ void app_main(void)
          */
         .refresh_ms = 25,
         /*
-         * These sit in an operator's eyeline on a bench. Full brightness on
-         * eight WS2812Bs is both hard to look at and 480 mA if every pixel
-         * ever went white at once. 64/255 is 25%, about 120 mA worst case.
-         * The driver also enforces a hard ceiling of 50%
-         * (LED_STRIP_MAX_BRIGHTNESS, about 240 mA), so raising this past 127
-         * does nothing.
+         * 10%: these are indicators in an operator's eyeline, and the 5V rail
+         * has little to spare. Full brightness on eight WS2812Bs is about
+         * 480 mA if every pixel went white at once; 26/255 is about 50 mA.
+         * This is also the driver's hard ceiling (LED_STRIP_MAX_BRIGHTNESS),
+         * so raising it here does nothing.
          */
-        .brightness = 64,
+        .brightness = 26,
     };
     err = led_strip_init(&led_cfg);
     if (err != ESP_OK) {

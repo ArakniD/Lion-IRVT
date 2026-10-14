@@ -19,6 +19,24 @@
 static const char *TAG = "bts_link";
 
 #define BTS_XFER_TIMEOUT_MS     100
+
+/*
+ * Minimum gap between two register WRITES to the unit.
+ *
+ * The C2000 hands each I2C write from CPU2 to CPU1 through a one-slot IPC
+ * mailbox, and CPU1 empties it only from task B3, about every 15 ms. A write
+ * that arrives while the mailbox is still full has its hand-off DROPPED - the
+ * value lands in registers[] but CPU1 never acts on it. CPU1 acts on the mode
+ * from the mailbox, so a start sent straight after the five limit writes was
+ * the one dropped: the mode register read 3 and the slot never ran.
+ *
+ * 30 ms is two B3 periods, so the mailbox has always drained before the next
+ * write. Reads are not paced - they never reach the mailbox. This is a
+ * workaround for the C2000 side; see ToDo 09.
+ */
+#define BTS_WRITE_GAP_MS        30
+
+static int64_t s_last_write_us;
 #define BTS_POLL_TASK_STACK     4096
 #define BTS_POLL_TASK_PRIO      6
 
@@ -128,12 +146,24 @@ static esp_err_t bus_read_block(uint16_t reg_addr, float *out, size_t count)
 
 static esp_err_t bus_write_reg(uint16_t reg_addr, float value)
 {
+    /*
+     * Called with the bus mutex held, so every write path - limits, mode,
+     * calibration, the raw register API - is paced against every other. See
+     * BTS_WRITE_GAP_MS.
+     */
+    const int64_t since_us = esp_timer_get_time() - s_last_write_us;
+    if (since_us < (int64_t)BTS_WRITE_GAP_MS * 1000) {
+        const int64_t wait_ms = BTS_WRITE_GAP_MS - since_us / 1000;
+        vTaskDelay(pdMS_TO_TICKS(wait_ms > 0 ? wait_ms : 1) + 1);
+    }
+
     uint8_t buf[2 + BTS_REGISTER_SIZE];
     buf[0] = (uint8_t)((reg_addr >> 8) & 0xFFu);
     buf[1] = (uint8_t)(reg_addr & 0xFFu);
     bts_f32_to_wire(value, &buf[2]);
 
     esp_err_t err = i2c_master_transmit(s_dev, buf, sizeof(buf), BTS_XFER_TIMEOUT_MS);
+    s_last_write_us = esp_timer_get_time();
     if (err != ESP_OK) {
         bus_recover();
     }
@@ -228,7 +258,8 @@ static float clampf(float v, float lo, float hi)
     return v;
 }
 
-esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim)
+esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim,
+                              bts_limits_dir_t dir)
 {
     if (channel >= BTS_NUM_CHANNELS || lim == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -252,20 +283,23 @@ esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim)
      * The unit's limits became direction-agnostic in the 2026-09-22 register
      * compression: one VoltageMin/VoltageMax and one CurrentMin/CurrentMax
      * pair per slot, because the mode register already selects charge or
-     * discharge.
+     * discharge. bts_channel_limits_t keeps the four-way split because the
+     * cell profiles think in directions.
      *
-     * bts_slot_limits_t keeps the four-way split because the HTTP API, BLE
-     * and the cell profiles all expose it, so the two sides are reconciled
-     * here rather than forcing a host-visible change:
+     * VOLTAGES are combined as a window, which is right for them: V_MAX is the
+     * charge target, V_MIN the discharge cutoff, and each direction reads only
+     * its own one.
      *
      *   VoltageMin = min(charge_voltage_min, discharge_voltage_min)
      *   VoltageMax = max(charge_voltage_max, discharge_voltage_max)
-     *   CurrentMin = min(charge_current_min, discharge_current_min)
-     *   CurrentMax = max(charge_current_max, discharge_current_max)
      *
-     * Widest-window semantics: the unit must permit whichever direction the
-     * caller selects, and the per-direction envelope is enforced by the test
-     * sequencer here on the ESP32 rather than by the converter.
+     * CURRENTS are NOT combined. They used to be, as max() / min() of the two
+     * directions, and that was wrong: I_MAX is the SETPOINT the converter
+     * regulates to, not a ceiling. A charge set to 1 A ran at the discharge
+     * current whenever that was higher, and a charge's termination taper was
+     * written as the discharge's 0, so the unit never ended a charge on it.
+     * They are written for the direction about to start - see
+     * bts_limits_dir_t - and not at all when nothing is starting.
      *
      * min_cell_temp no longer exists on the unit - only a maximum is
      * enforced - so it is accepted and dropped.
@@ -274,25 +308,33 @@ esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim)
                               clampf(lim->discharge_voltage_min, 0.0f, vmax));
     const float v_max = fmaxf(clampf(lim->charge_voltage_max, 0.0f, vmax),
                               clampf(lim->discharge_voltage_max, 0.0f, vmax));
-    const float i_min = fminf(clampf(lim->charge_current_min, 0.0f, imax),
-                              clampf(lim->discharge_current_min, 0.0f, imax));
-    const float i_max = fmaxf(clampf(lim->charge_current_max, 0.0f, imax),
-                              clampf(lim->discharge_current_max, 0.0f, imax));
 
-    struct { uint16_t addr; float value; } writes[] = {
-        { BTS_SET_ADDR(channel, BTS_SET_V_MIN), v_min },
-        { BTS_SET_ADDR(channel, BTS_SET_V_MAX), v_max },
-        { BTS_SET_ADDR(channel, BTS_SET_I_MIN), i_min },
-        { BTS_SET_ADDR(channel, BTS_SET_I_MAX), i_max },
-        { BTS_SET_ADDR(channel, BTS_SET_MAX_CELL_TEMP), lim->max_cell_temp },
-    };
+    float i_min = 0.0f;
+    float i_max = 0.0f;
+    if (dir == BTS_LIMITS_CHARGE) {
+        i_max = clampf(lim->charge_current_max, 0.0f, imax);
+        i_min = clampf(lim->charge_current_min, 0.0f, i_max);
+    } else if (dir == BTS_LIMITS_DISCHARGE) {
+        i_max = clampf(lim->discharge_current_max, 0.0f, imax);
+        i_min = 0.0f;
+    }
+
+    struct { uint16_t addr; float value; } writes[5];
+    size_t n = 0;
+    writes[n].addr = BTS_SET_ADDR(channel, BTS_SET_V_MIN);         writes[n++].value = v_min;
+    writes[n].addr = BTS_SET_ADDR(channel, BTS_SET_V_MAX);         writes[n++].value = v_max;
+    if (dir != BTS_LIMITS_NEUTRAL) {
+        writes[n].addr = BTS_SET_ADDR(channel, BTS_SET_I_MIN);     writes[n++].value = i_min;
+        writes[n].addr = BTS_SET_ADDR(channel, BTS_SET_I_MAX);     writes[n++].value = i_max;
+    }
+    writes[n].addr = BTS_SET_ADDR(channel, BTS_SET_MAX_CELL_TEMP); writes[n++].value = lim->max_cell_temp;
 
     if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
 
     esp_err_t err = ESP_OK;
-    for (size_t i = 0; i < sizeof(writes) / sizeof(writes[0]); i++) {
+    for (size_t i = 0; i < n; i++) {
         /*
          * Deliberately one transaction per register rather than a burst.
          * Each RW write raises an IPC flag to CPU1, and these land in the

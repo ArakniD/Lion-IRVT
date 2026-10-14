@@ -627,6 +627,17 @@ another ESP-IDF project, or not an app at all (a bootloader or partition table
 posted by mistake) is refused from its first 288 bytes, before a megabyte goes
 over the air. The whole image is then hash-checked before the boot slot moves.
 
+**Power: update with USB or a solid 5V supply connected.** On the backup cell
+alone an upload browns the ESP32 out a few seconds in. Before writing anything
+the update blanks the slot LEDs and stops every slot to shed load; both come
+back with the restart.
+
+**Register writes to the unit are paced 30 ms apart** (`BTS_WRITE_GAP_MS` in
+`bts_link.c`). The C2000 drops a host write that arrives while CPU1 is still
+handling the previous one, and a slot start written straight after its limits
+was the one lost - the slot never ran. See `ToDo/09`. A start the unit still
+has not acted on after a second is re-sent once.
+
 **An update is refused while any slot is running** (`409`). The restart stops
 every slot that is not paused — `test_engine_init()` has to, since a freshly
 booted proxy cannot know what an unheld channel is doing — so an update in the
