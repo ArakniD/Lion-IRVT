@@ -40,6 +40,14 @@ typedef enum {
     CELL_CHEM_LFP,       /* LiFePO4           */
     CELL_CHEM_NMC,       /* LiNiMnCoO2        */
     CELL_CHEM_NCA,       /* LiNiCoAlO2        */
+    /*
+     * No chemistry: the whole unit envelope, 0-5 V, with the currents set
+     * directly. For bench work that no cell profile fits - a shorted-socket
+     * test at a 0 V cutoff, a supply, a load. Nothing about a cell protects
+     * it, so it is only ever as safe as the numbers dialled in. Appended so
+     * every existing chemistry keeps its number on the wire.
+     */
+    CELL_CHEM_NONE,
     CELL_CHEM_COUNT,
 } cell_chemistry_t;
 

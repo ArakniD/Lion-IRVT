@@ -62,6 +62,21 @@ bool input_switch_is_down(void)
     return s_switch_down;
 }
 
+void input_debug_state(int *a, int *b, int *sw, int *key0, int *count)
+{
+    if (a)    *a    = (s_cfg.encoder_a_gpio >= 0) ? gpio_get_level(s_cfg.encoder_a_gpio) : -1;
+    if (b)    *b    = (s_cfg.encoder_b_gpio >= 0) ? gpio_get_level(s_cfg.encoder_b_gpio) : -1;
+    if (sw)   *sw   = (s_cfg.switch_gpio >= 0)    ? gpio_get_level(s_cfg.switch_gpio) : -1;
+    if (key0) *key0 = (s_cfg.key0_gpio >= 0)      ? gpio_get_level(s_cfg.key0_gpio) : -1;
+    if (count) {
+        int c = 0;
+        if (s_pcnt != NULL) {
+            (void)pcnt_unit_get_count(s_pcnt, &c);
+        }
+        *count = c;
+    }
+}
+
 bool input_wait_event(input_event_t *out, uint32_t timeout_ms)
 {
     if (out == NULL || s_queue == NULL) {
@@ -138,6 +153,8 @@ static void input_task(void *arg)
     bool    key0_stable  = false;    /* KEY0 debounced state          */
     bool    key0_raw     = false;
     int64_t key0_since_us = 0;
+    int64_t key0_press_us = 0;
+    bool    key0_long_fired = false;
     for (;;) {
         /* ---- rotation ---- */
         int count = 0;
@@ -212,7 +229,18 @@ static void input_task(void *arg)
                        (now - key0_since_us) >= (DEBOUNCE_MS * 1000LL)) {
                 key0_stable = raw_down;
                 if (raw_down) {
+                    key0_press_us = now;
+                    key0_long_fired = false;
                     post(INPUT_EVENT_KEY0_PRESS, 1);
+                }
+            }
+
+            if (key0_stable && !key0_long_fired) {
+                const uint32_t threshold = s_cfg.long_press_ms ? s_cfg.long_press_ms
+                                                               : DEFAULT_LONG_MS;
+                if ((now - key0_press_us) >= (int64_t)threshold * 1000LL) {
+                    key0_long_fired = true;
+                    post(INPUT_EVENT_KEY0_LONG_PRESS, 1);
                 }
             }
         }

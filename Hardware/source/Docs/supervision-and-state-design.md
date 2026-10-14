@@ -588,12 +588,12 @@ from [`main.c`](../esp32-btle-proxy/main/main.c).
 
 | | |
 |---|---|
-| Bus | `SPI3_HOST` (VSPI), MOSI on **GPIO13** |
+| Bus | `SPI3_HOST` (VSPI), MOSI on **GPIO25** (no boot or JTAG role) |
 | Clock | **2.5 MHz** — 80 MHz / 32 |
 | Encoding | four SPI bits per WS2812B bit: `1000` = 0, `1100` = 1 |
 | Frame | 12 bytes per LED, **96 bytes for all eight in one DMA transfer**, 307 us |
 | Refresh | FreeRTOS task `led_strip`, priority 4, 3072-byte stack, every 25 ms |
-| Brightness | 64/255, scaled linearly per channel |
+| Brightness | 64/255 (25%), scaled linearly per channel, hard-capped at 127/255 (50%) in the driver to bound the current |
 
 **Neither SCLK nor CS is routed.** The WS2812B is a one-wire part and its
 clock is implicit in the bit pattern, so routing either would burn a pin to

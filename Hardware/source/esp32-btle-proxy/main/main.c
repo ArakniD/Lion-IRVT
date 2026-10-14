@@ -72,15 +72,15 @@ static const char *TAG = "main";
  * is a strapping or JTAG pin; see input.h.
  *
  * A and the switch were on GPIO15 and GPIO2, both strapping pins, and moved
- * to GPIO32 and GPIO33. B moved off GPIO13 earlier, when the WS2812B driver
- * took that pin for SPI3 MOSI. GPIO14 was not used for B: it is MTMS, and a
- * JTAG pin on the encoder would make the box awkward to debug over JTAG later.
+ * to GPIO32 and GPIO33. B has been on GPIO13 and GPIO27 and is now on GPIO26:
+ * on the bench the GPIO27 pad never saw an edge, so B moved to a pin that
+ * toggled when probed.
  *
  * KEY0 is on GPIO34, which is input only with no internal pull. The LCD board
  * pulls KEY0 up to 3V3, so it needs none.
  */
 #define ENC_A_GPIO          32
-#define ENC_B_GPIO          27
+#define ENC_B_GPIO          26
 #define ENC_SW_GPIO         33
 #define KEY0_GPIO           34
 
@@ -94,8 +94,15 @@ static const char *TAG = "main";
  *
  * See led_strip.h for the bitstream encoding and for why this is on the
  * ESP32 at all rather than on the C2000 that owns the slots.
+ *
+ * GPIO25, not 13: a PCB layout error put the 5V pin one position off, and
+ * moving this line is what puts it back in line. GPIO25 is an ordinary
+ * output-capable pin with no boot or JTAG role. GPIO12 (MTDI, a strapping
+ * pin) and GPIO14 (MTMS) were tried first; a scope saw nothing on GPIO14
+ * even when it was driven as a plain GPIO. GPIO35 is input-only and cannot
+ * drive an output at all. See led_strip.h.
  */
-#define LED_DATA_GPIO       13
+#define LED_DATA_GPIO       25
 
 #define BLE_DEVICE_NAME     "BTS-Tester"
 #define AP_SSID             "BTS-Tester"
@@ -198,15 +205,22 @@ void app_main(void)
         .y_offset       = 0,
         .rotation       = 1,
         .mirror         = false,
-        .invert_colour  = true,
         /*
-         * Mode 2 and a slow clock while the panel is being brought up.
-         * Mode 0 is the ST7789 datasheet default, but several breakout
-         * boards latch on the opposite edge; the bus is write-only so a
-         * mismatch is silent. Once the self-test pattern is confirmed,
-         * raise pclk_hz and, if it still works, try mode 0.
+         * Off for this panel. The 240x240 module it replaced needed true;
+         * this one shows black as white and yellow as blue with it on, which
+         * is exactly a colour inversion. If a future panel looks like a
+         * photographic negative, flip this.
          */
-        .spi_mode       = 2,
+        .invert_colour  = false,
+        /*
+         * Mode 0, the ST7789 datasheet default. On the 320x240 panel the
+         * bring-up test cycle (display.h, DISPLAY_TEST_CYCLE) showed modes 0
+         * and 3 working at both 10 MHz and 2 MHz and modes 1 and 2 not at
+         * all: the controller samples on the rising clock edge, which only
+         * modes 0 and 3 give. The bus is write-only, so a wrong mode fails
+         * silently as a dark or speckled panel.
+         */
+        .spi_mode       = 0,
         .pclk_hz        = 10 * 1000 * 1000,
         .self_test      = true,
         .refresh_ms     = 500,
@@ -243,7 +257,10 @@ void app_main(void)
         /*
          * These sit in an operator's eyeline on a bench. Full brightness on
          * eight WS2812Bs is both hard to look at and 480 mA if every pixel
-         * ever went white at once.
+         * ever went white at once. 64/255 is 25%, about 120 mA worst case.
+         * The driver also enforces a hard ceiling of 50%
+         * (LED_STRIP_MAX_BRIGHTNESS, about 240 mA), so raising this past 127
+         * does nothing.
          */
         .brightness = 64,
     };

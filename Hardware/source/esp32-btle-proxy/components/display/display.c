@@ -104,6 +104,17 @@ static const char *TAG = "display";
 /* The menu gives up and returns to the slot list after this much idling. */
 #define MENU_IDLE_MS        60000
 
+/*
+ * Panel re-sync interval. The table is redrawn twice a second already, so a
+ * panel that goes blank while that continues has lost its CONFIGURATION, not
+ * its pixels - a supply dip or ESD on the ribbon can knock the ST7789 back to
+ * sleep or reset its registers, and no amount of pixel data brings it back.
+ * So once a minute the controller is re-initialised (sleep-out, pixel format,
+ * orientation, inversion, display on) and the backlight re-asserted, then the
+ * whole screen redrawn. On a healthy panel this is invisible.
+ */
+#define PANEL_RESYNC_MS     60000
+
 #define TASK_STACK          6144
 #define TASK_PRIO           3
 
@@ -181,6 +192,7 @@ static const char *TAG = "display";
 /* ------------------------------------------------------------------ */
 
 static esp_lcd_panel_handle_t s_panel;
+static esp_lcd_panel_io_handle_t s_io;
 static display_config_t       s_cfg;
 static bool                   s_ble_connected;
 
@@ -444,7 +456,9 @@ static const char *mode_code(const slot_status_t *st, uint16_t *colour)
         if (st->bts_paused) {
             *colour = C_CYAN;   return "PSE";
         }
-        if (st->status_bits & BTS_STATUS_CHARGING) {
+        /* The commanded direction, not the status bits: those are one poll
+         * behind and read as discharge on a slot that has just been stopped. */
+        if (st->direct_charge) {
             *colour = C_YELLOW; return "CHG";
         }
         *colour = C_ORANGE; return "DSG";
@@ -526,7 +540,11 @@ static void slot_figures(const slot_status_t *st, float *mah, float *mwh,
         *mins = st->elapsed_s / 60u;
         return;
     }
-    const bool charging = (st->status_bits & BTS_STATUS_CHARGING) != 0;
+    /* A direct run's direction is what was commanded; the status bits are one
+     * poll behind it. Everything else reads the bits. */
+    const bool charging = (st->state == SLOT_STATE_DIRECT)
+                              ? st->direct_charge
+                              : (st->status_bits & BTS_STATUS_CHARGING) != 0;
     *mah  = charging ? st->bts_charge_mah : st->bts_discharge_mah;
     *mwh  = charging ? st->bts_charge_mwh : st->bts_discharge_mwh;
     *mins = (uint32_t)((charging ? st->bts_charge_seconds
@@ -669,6 +687,14 @@ static struct {
     int64_t       last_input_us;
 } s_ui;
 
+/* The unit's grouping, from the latest snapshot. 1 when ungrouped. */
+static bts_unit_status_t ui_unit(void)
+{
+    bts_snapshot_t snap;
+    bts_link_get_snapshot(&snap);
+    return snap.unit;
+}
+
 static void set_note(const char *text, uint16_t colour)
 {
     snprintf(s_ui.note, sizeof(s_ui.note), "%s", text);
@@ -772,7 +798,7 @@ static run_item_t current_run(const slot_status_t *st)
     case SLOT_STATE_RECHARGE:
         return RUN_AUTO;
     case SLOT_STATE_DIRECT:
-        return (st->status_bits & BTS_STATUS_CHARGING) ? RUN_CHARGE : RUN_DISCHARGE;
+        return st->direct_charge ? RUN_CHARGE : RUN_DISCHARGE;
     default:
         break;
     }
@@ -814,7 +840,7 @@ static int32_t setting_value(set_item_t item)
 {
     const slot_config_t *c = &s_ui.edit_cfg;
     cell_resolved_profile_t p;
-    const bool ok = (test_engine_resolve(c, &p) == ESP_OK);
+    const bool ok = (test_engine_resolve((uint8_t)s_ui.slot, c, &p) == ESP_OK);
     /* If the profile does not resolve, show what is stored rather than a
      * row of zeros that would read as real settings. */
 #define EFFECTIVE(field, override, scale) \
@@ -923,6 +949,15 @@ static int32_t setting_max(set_item_t item)
     if (item == SET_MODEL) {
         return (int32_t)cell_model_count();
     }
+    /*
+     * In a group the leader's currents are the GROUP TOTAL: 10 A per enabled
+     * member, so a group of 4 dials up to 40 A and a group of 8 up to 80 A.
+     * Voltages are not scaled - parallel slots share one voltage.
+     */
+    if (item == SET_CHG_I || item == SET_DIS_I || item == SET_TERM_I) {
+        const bts_unit_status_t u = ui_unit();
+        return k_set_defs[item].max * (int32_t)bts_group_members(&u, (uint8_t)s_ui.slot);
+    }
     return k_set_defs[item].max;
 }
 
@@ -992,7 +1027,7 @@ static int32_t accel_step(set_item_t item, float rate_dps)
      * 1000 mA / 1000 mAh per detent, voltages top out at 100 mV - the whole
      * range is only 5 V - and percentages at 10.
      */
-    const int32_t span = k_set_defs[item].max - k_set_defs[item].min;
+    const int32_t span = setting_max(item) - k_set_defs[item].min;
     while (step > 1 && step * 8 > span) {
         step /= 10;
     }
@@ -1183,6 +1218,21 @@ static void on_rotate(int32_t delta, float rate_dps)
         return;
     }
 
+    if (s_ui.view == VIEW_SLOTS) {
+        /*
+         * In a group only the leader is a slot you can pick: the followers
+         * have no control loop and the unit ignores commands sent to them.
+         * So the cursor moves a whole group per detent.
+         */
+        const bts_unit_status_t u = ui_unit();
+        const int gs = bts_group_size(&u);
+        int c = s_ui.cursor - (s_ui.cursor % gs) + delta * gs;
+        c = (c < 0) ? 0 : (c > SLOT_COUNT - gs) ? SLOT_COUNT - gs : c;
+        s_ui.cursor = c;
+        s_ui.slot   = c;
+        return;
+    }
+
     slot_status_t st;
     test_engine_get_status((uint8_t)s_ui.slot, &st);
     const int n = view_count(&st);
@@ -1298,8 +1348,15 @@ static void check_faults(void)
     if (s_ui.fault_open) {
         return;
     }
+    const bts_unit_status_t u = ui_unit();
     for (int i = 0; i < SLOT_COUNT; i++) {
         const int slot = (s_ui.slot + i) % SLOT_COUNT;
+        /* A group faults as one, on its leader, which already carries every
+         * member's trips - a dialog per follower would be noise. */
+        if (bts_slot_is_follower(&u, (uint8_t)slot)) {
+            s_ui.fault_seen[slot] = false;
+            continue;
+        }
         slot_status_t st;
         test_engine_get_status((uint8_t)slot, &st);
         const bool faulted = slot_is_faulted(&st);
@@ -1332,10 +1389,31 @@ static void draw_header(const bts_snapshot_t *snap)
         char vin[20];
         snprintf(vin, sizeof(vin), "Vin %.2f", (double)snap->unit.input_voltage_v);
         band_text(84, 4, 0, vin, C_GREY, 1);
+        const int gs = bts_group_size(&snap->unit);
+        if (gs > 1) {
+            char grp[16];
+            snprintf(grp, sizeof(grp), "GROUPS OF %d", gs);
+            band_text(156, 4, 0, grp, C_CYAN, 1);
+        }
     } else {
         band_text(4, 4, 0, "WAITING FOR BTS", C_RED, 1);
     }
 
+#if DISPLAY_INPUT_HUD
+    /*
+     * Live encoder pins and the raw PCNT count. A and B idle at 1; turning
+     * the shaft should make them flicker and n move; a press takes S to 0 and
+     * KEY0 takes K to 0. If the levels move and n does not, the pads work and
+     * PCNT is not decoding them; if the levels never move, it is the wiring.
+     */
+    {
+        int a, b, sw, k, n;
+        input_debug_state(&a, &b, &sw, &k, &n);
+        char hud[28];
+        snprintf(hud, sizeof(hud), "A%d B%d S%d K%d n%d", a, b, sw, k, n);
+        band_text(150, 4, 0, hud, C_YELLOW, 1);
+    }
+#endif
     draw_wifi_icon(284, 2, 0, web_api_sta_connected());
     draw_ble_icon(304, 2, 0, s_ble_connected);
 
@@ -1470,8 +1548,8 @@ static void draw_titles(void)
     band_clear(C_BLACK);
     const int ty = band_y + 2;
     band_text(COL_SLOT_X, ty, band_y, "# MODE", C_GREY, 1);
-    band_text_right(COL_V_R, ty, band_y, "VOLTS", C_GREY, 1);
-    band_text_right(COL_A_R, ty, band_y, "AMPS", C_GREY, 1);
+    band_text_right(COL_V_R, ty, band_y, "ADS V", C_GREY, 1);
+    band_text_right(COL_A_R, ty, band_y, "ADS A", C_GREY, 1);
     band_text_right(COL_MAH_R, ty, band_y, "mAh", C_GREY, 1);
     band_text_right(COL_TEMP_R, ty, band_y, "C/m", C_GREY, 1);
 
@@ -1506,12 +1584,43 @@ static void draw_slot_row(uint8_t slot, const slot_status_t *sel)
     const int y_small_bot = y + 15;             /* lower small line */
     const int y_big       = y + (ROW_H - FONT_H * 2) / 2;
 
-    /* Slot number, 1-based for the operator, with a caret when picked. */
+    /*
+     * A GROUP is shown once, on its leader's row, with the whole group's
+     * current (and the voltage the members share). A follower's row only
+     * says which group it belongs to: its own share of the current is not a
+     * figure anyone should be reading, and showing it would invite adding
+     * the rows up by eye.
+     */
+    const bts_unit_status_t u = ui_unit();
+    const int gs = bts_group_size(&u);
+    if (gs > 1 && bts_slot_is_follower(&u, slot)) {
+        char num[4];
+        snprintf(num, sizeof(num), "%u", (unsigned)(slot + 1));
+        band_text(COL_SLOT_X, y_small_top, y, num, C_DIM, 1);
+        const unsigned leader = bts_group_leader(&u, slot);
+        char line[24];
+        snprintf(line, sizeof(line), "part of group %u-%u",
+                 leader + 1, (unsigned)(leader + gs));
+        band_text(COL_MODE_X + 12, y + (ROW_H - FONT_H) / 2, y, line, C_DIM, 1);
+        band_fill_rect(0, y + ROW_H - 1, TABLE_W, 1, y, C_RULE);
+        draw_pane_line(slot, y, y, sel);
+        draw_dialog_part(y);
+        push_band(y);
+        return;
+    }
+
+    /* Slot number, 1-based for the operator, with a caret when picked. In
+     * a group the leader's row stands for the group, marked with its size. */
     char num[4];
     snprintf(num, sizeof(num), "%u", (unsigned)(slot + 1));
     band_text(COL_SLOT_X, y_small_top, y, num, selected ? C_YELLOW : C_WHITE, 1);
     if (selected) {
         band_text(COL_SLOT_X, y_small_bot, y, ">", C_YELLOW, 1);
+    }
+    if (gs > 1) {
+        char g[8];
+        snprintf(g, sizeof(g), "x%u", (unsigned)bts_group_members(&u, slot));
+        band_text(COL_MODE_X + 18, y_small_bot, y, g, C_CYAN, 1);
     }
 
     /* Mode badge, small. */
@@ -1529,12 +1638,16 @@ static void draw_slot_row(uint8_t slot, const slot_status_t *sel)
     const uint16_t big = disabled ? C_DIM : C_WHITE;
 
     char v[16];
-    fmt_value(v, sizeof(v), st.voltage_v, 3);
+    /* The ADS131M08, not the 12-bit internal ADC: it is what the BTS
+     * regulates against and integrates. */
+    fmt_value(v, sizeof(v), st.sense_voltage_v, 3);
     band_text_right(COL_V_R, y_big, y, v, big, 2);
 
-    /* One decimal from 10 A, so "-10.0" stays five characters wide and
-     * cannot run into the volts. */
-    fmt_value(v, sizeof(v), st.current_a, fabsf(st.current_a) >= 9.995f ? 1 : 2);
+    /* One decimal from 10 A and none from 100 A, so the figure stays five
+     * characters wide and cannot run into the volts - a group of eight
+     * reaches 80 A. */
+    const float ia = fabsf(st.sense_current_a);
+    fmt_value(v, sizeof(v), st.sense_current_a, ia >= 99.95f ? 0 : ia >= 9.995f ? 1 : 2);
     band_text_right(COL_A_R, y_big, y, v, big, 2);
 
     /* The right-hand stack: mAh over mWh, deg C over minutes. */
@@ -1752,12 +1865,17 @@ static void draw_waiting_screen(const bts_snapshot_t *snap)
  * whether pixels are actually landing. If these bars appear, the wiring,
  * SPI mode, clock and the ST7789 init sequence are all good, and any
  * remaining problem is in the UI drawing. If the panel stays blank, the
- * problem is below the UI - try spi_mode 2 and a lower pclk_hz.
+ * problem is below the UI - run the bring-up test cycle (DISPLAY_TEST_CYCLE
+ * in display.h) to find the SPI mode and clock that work.
  *
  * It also proves the rotation: "DISPLAY OK" must read left to right along
  * the long edge. Upside down means rotation 3 instead of 1; back to front
  * means the module needs `mirror`.
  */
+#if DISPLAY_TEST_CYCLE
+static char s_test_label[48];
+#endif
+
 static void draw_self_test(void)
 {
     static const uint16_t bars[] = {
@@ -1783,6 +1901,9 @@ static void draw_self_test(void)
         band_text(10, 140, band_y, "DISPLAY OK", C_WHITE, 3);
         band_text(10, 172, band_y, "abcdefg 0123456789", C_GREEN, 1);
         band_text(10, 192, band_y, line, C_GREY, 1);
+#if DISPLAY_TEST_CYCLE
+        band_text(10, 212, band_y, s_test_label, C_YELLOW, 1);
+#endif
         /* A marker in the top-left corner, so the orientation is never in
          * doubt even with the text unreadable. */
         band_fill_rect(0, 0, 12, 12, band_y, C_WHITE);
@@ -1812,6 +1933,36 @@ static void draw_table(void)
     }
 }
 
+#if DISPLAY_TEST_CYCLE
+__attribute__((unused))
+#endif
+static esp_err_t apply_rotation(void);
+
+/*
+ * Re-sends the controller's configuration without resetting it, so the
+ * picture never flickers. See PANEL_RESYNC_MS for why this exists.
+ */
+static void panel_resync(void)
+{
+    flush_wait(0);
+    esp_err_t err = esp_lcd_panel_init(s_panel);
+    if (err == ESP_OK) {
+        err = esp_lcd_panel_invert_color(s_panel, s_cfg.invert_colour);
+    }
+    if (err == ESP_OK) {
+        err = apply_rotation();
+    }
+    if (err == ESP_OK) {
+        err = esp_lcd_panel_disp_on_off(s_panel, true);
+    }
+    if (s_cfg.backlight_gpio >= 0) {
+        gpio_set_level(s_cfg.backlight_gpio, 1);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "panel re-sync failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void display_task(void *arg)
 {
     (void)arg;
@@ -1831,6 +1982,7 @@ static void display_task(void *arg)
      * refresh_ms, which is often enough for the numbers.
      */
     int64_t next_refresh_us = 0;
+    int64_t next_resync_us  = esp_timer_get_time() + (int64_t)PANEL_RESYNC_MS * 1000;
     s_ui.last_input_us = esp_timer_get_time();
 
     for (;;) {
@@ -1850,7 +2002,13 @@ static void display_task(void *arg)
         input_event_t ev;
         while (input_wait_event(&ev, 0)) {
             s_ui.last_input_us = esp_timer_get_time();
-            if (!menus_visible) {
+            /*
+             * The e-stop is the one input that must work with the menus
+             * hidden: it is exactly what you reach for when something is
+             * wrong, and the waiting and calibration screens are not a reason
+             * to ignore it.
+             */
+            if (!menus_visible && ev.type != INPUT_EVENT_KEY0_LONG_PRESS) {
                 continue;
             }
             switch (ev.type) {
@@ -1871,6 +2029,28 @@ static void display_task(void *arg)
                     set_note("Fault ignored", C_ORANGE);
                 } else {
                     go_back();
+                }
+                break;
+            case INPUT_EVENT_KEY0_LONG_PRESS:
+                /*
+                 * E-STOP. Hold KEY0 and every slot is stopped: the converter
+                 * is switched off on the unit and any test or direct run on
+                 * the engine is ended. The short press that began this hold
+                 * has already taken the panel back to the slot list, so this
+                 * works from any menu.
+                 *
+                 * It stops everything, not just the selected slot, and it does
+                 * not clear faults - a faulted slot stays faulted and visible.
+                 */
+                {
+                    const esp_err_t err = test_engine_abort_all();
+                    ESP_LOGW(TAG, "KEY0 long press: E-STOP, all slots stopped (%s)",
+                             esp_err_to_name(err));
+                    s_ui.view   = VIEW_SLOTS;
+                    s_ui.cursor = s_ui.slot;
+                    s_ui.fault_open = false;
+                    set_note(err == ESP_OK ? "ALL STOPPED" : "STOP FAILED",
+                             err == ESP_OK ? C_ORANGE : C_RED);
                 }
                 break;
             case INPUT_EVENT_KEY0_PRESS:
@@ -1904,6 +2084,11 @@ static void display_task(void *arg)
             continue;
         }
         next_refresh_us = esp_timer_get_time() + (int64_t)s_cfg.refresh_ms * 1000;
+
+        if (esp_timer_get_time() >= next_resync_us) {
+            next_resync_us = esp_timer_get_time() + (int64_t)PANEL_RESYNC_MS * 1000;
+            panel_resync();
+        }
 
         bts_snapshot_t snap;
         bts_link_get_snapshot(&snap);
@@ -1964,6 +2149,164 @@ static esp_err_t apply_rotation(void)
     return esp_lcd_panel_set_gap(s_panel, s_cfg.x_offset, s_cfg.y_offset);
 }
 
+/*
+ * Creates the SPI panel device and brings the controller up.
+ *
+ * Split from display_init() so the bring-up test mode can repeat it with a
+ * different SPI mode. The SPI bus itself is initialised once and survives;
+ * only the device on it, which is where the mode and clock live, and the
+ * panel on top of that are rebuilt.
+ */
+static esp_err_t panel_bringup(void)
+{
+    const esp_lcd_panel_io_spi_config_t io_cfg = {
+        /*
+         * The panel is alone on this bus, but this module has no tie from CS
+         * to ground, so the driver asserts it around each transaction. -1
+         * remains valid for a module that does tie it low.
+         */
+        .cs_gpio_num = s_cfg.cs_gpio,
+        .dc_gpio_num = s_cfg.dc_gpio,
+        .spi_mode = s_cfg.spi_mode,
+        .pclk_hz = s_cfg.pclk_hz,
+        .trans_queue_depth = 10,
+        .on_color_trans_done = on_flush_done,
+        .lcd_cmd_bits = LCD_CMD_BITS,
+        .lcd_param_bits = LCD_PARAM_BITS,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
+                                                 &io_cfg, &s_io),
+                        TAG, "panel io");
+
+    const esp_lcd_panel_dev_config_t panel_cfg = {
+        .reset_gpio_num = s_cfg.reset_gpio,
+        .rgb_ele_order = s_cfg.bgr_order ? LCD_RGB_ELEMENT_ORDER_BGR
+                                         : LCD_RGB_ELEMENT_ORDER_RGB,
+        /*
+         * Byte order is handled by RGB565() at the colour definitions, not
+         * here: this driver's data_endian only sets a RAMCTRL bit that the
+         * ST7789 applies to its parallel interface, not to SPI.
+         */
+        .bits_per_pixel = 16,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(s_io, &panel_cfg, &s_panel),
+                        TAG, "st7789");
+
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "reset");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init");
+    /* Most IPS ST7789 modules are wired such that the controller's idea of
+     * colour polarity is inverted relative to the glass. */
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_panel, s_cfg.invert_colour),
+                        TAG, "invert");
+    ESP_RETURN_ON_ERROR(apply_rotation(), TAG, "rotation");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "disp on");
+    return ESP_OK;
+}
+
+#if DISPLAY_TEST_CYCLE
+/* Releases the panel and its SPI device, leaving the bus ready to be reused. */
+static void panel_teardown(void)
+{
+    flush_wait(0);
+    s_inflight = 0;
+    xQueueReset(s_flush_sem);
+    if (s_panel != NULL) {
+        esp_lcd_panel_del(s_panel);
+        s_panel = NULL;
+    }
+    if (s_io != NULL) {
+        esp_lcd_panel_io_del(s_io);
+        s_io = NULL;
+    }
+}
+
+/*
+ * The combinations the test mode steps through. The first four are the four
+ * SPI modes at the normal clock; the second four repeat them at a clock slow
+ * enough to rule out a marginal wire, which on a write-only bus fails silently.
+ */
+static const struct {
+    int      mode;
+    uint32_t hz;
+} k_test_cfgs[] = {
+    { 0, 10 * 1000 * 1000 }, { 1, 10 * 1000 * 1000 },
+    { 2, 10 * 1000 * 1000 }, { 3, 10 * 1000 * 1000 },
+    { 0,  2 * 1000 * 1000 }, { 1,  2 * 1000 * 1000 },
+    { 2,  2 * 1000 * 1000 }, { 3,  2 * 1000 * 1000 },
+};
+#define TEST_CFG_COUNT ((int)(sizeof(k_test_cfgs) / sizeof(k_test_cfgs[0])))
+
+static void test_apply(int idx)
+{
+    panel_teardown();
+    s_cfg.spi_mode = k_test_cfgs[idx].mode;
+    s_cfg.pclk_hz  = k_test_cfgs[idx].hz;
+
+    snprintf(s_test_label, sizeof(s_test_label), "TEST %d/%d  KEY0 = next",
+             idx + 1, TEST_CFG_COUNT);
+
+    /* Backlight on first and unconditionally, so a dark panel cannot be put
+     * down to the backlight logic. */
+    if (s_cfg.backlight_gpio >= 0) {
+        gpio_set_level(s_cfg.backlight_gpio, 1);
+    }
+
+    const esp_err_t err = panel_bringup();
+    ESP_LOGW(TAG, "TEST %d/%d: SPI mode %d at %lu kHz -> bring-up %s; "
+                  "BLK(GPIO%d)=%d RES(GPIO%d)=%d CS(GPIO%d)=%d",
+             idx + 1, TEST_CFG_COUNT, s_cfg.spi_mode,
+             (unsigned long)(s_cfg.pclk_hz / 1000), esp_err_to_name(err),
+             s_cfg.backlight_gpio, gpio_get_level(s_cfg.backlight_gpio),
+             s_cfg.reset_gpio, gpio_get_level(s_cfg.reset_gpio),
+             s_cfg.cs_gpio, gpio_get_level(s_cfg.cs_gpio));
+    if (err != ESP_OK) {
+        return;
+    }
+    draw_self_test();
+    flush_wait(0);
+}
+
+/*
+ * The whole display task in test mode: show the pattern, and on each KEY0
+ * press move to the next SPI mode and bring the panel up again.
+ */
+static void display_test_task(void *arg)
+{
+    (void)arg;
+
+    /* Start on whatever main.c configured, so the first picture is the
+     * normal one. */
+    int idx = 0;
+    for (int i = 0; i < TEST_CFG_COUNT; i++) {
+        if (k_test_cfgs[i].mode == s_cfg.spi_mode && k_test_cfgs[i].hz == s_cfg.pclk_hz) {
+            idx = i;
+            break;
+        }
+    }
+    snprintf(s_test_label, sizeof(s_test_label), "TEST %d/%d  KEY0 = next",
+             idx + 1, TEST_CFG_COUNT);
+    ESP_LOGW(TAG, "DISPLAY TEST MODE: KEY0 steps SPI mode/clock; starting at %d/%d",
+             idx + 1, TEST_CFG_COUNT);
+    draw_self_test();
+    flush_wait(0);
+
+    /* KEY0 reads low at boot on this board, which posts a press at start-up.
+     * Let it pass and drain it, so the first press the operator makes is the
+     * first one counted. */
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    input_event_t ev;
+    while (input_wait_event(&ev, 0)) {
+    }
+
+    for (;;) {
+        if (input_wait_event(&ev, 100) && ev.type == INPUT_EVENT_KEY0_PRESS) {
+            idx = (idx + 1) % TEST_CFG_COUNT;
+            test_apply(idx);
+        }
+    }
+}
+#endif /* DISPLAY_TEST_CYCLE */
+
 esp_err_t display_init(const display_config_t *config)
 {
     if (config == NULL) {
@@ -2013,48 +2356,22 @@ esp_err_t display_init(const display_config_t *config)
     ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &bus, SPI_DMA_CH_AUTO),
                         TAG, "spi bus");
 
-    const esp_lcd_panel_io_spi_config_t io_cfg = {
-        /*
-         * The panel is alone on this bus, but this module has no tie from CS
-         * to ground, so the driver asserts it around each transaction. -1
-         * remains valid for a module that does tie it low.
-         */
-        .cs_gpio_num = s_cfg.cs_gpio,
-        .dc_gpio_num = s_cfg.dc_gpio,
-        .spi_mode = s_cfg.spi_mode,
-        .pclk_hz = s_cfg.pclk_hz,
-        .trans_queue_depth = 10,
-        .on_color_trans_done = on_flush_done,
-        .lcd_cmd_bits = LCD_CMD_BITS,
-        .lcd_param_bits = LCD_PARAM_BITS,
-    };
-    esp_lcd_panel_io_handle_t io = NULL;
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
-                                                 &io_cfg, &io),
-                        TAG, "panel io");
-
-    const esp_lcd_panel_dev_config_t panel_cfg = {
-        .reset_gpio_num = s_cfg.reset_gpio,
-        .rgb_ele_order = s_cfg.bgr_order ? LCD_RGB_ELEMENT_ORDER_BGR
-                                         : LCD_RGB_ELEMENT_ORDER_RGB,
-        /*
-         * Byte order is handled by RGB565() at the colour definitions, not
-         * here: this driver's data_endian only sets a RAMCTRL bit that the
-         * ST7789 applies to its parallel interface, not to SPI.
-         */
-        .bits_per_pixel = 16,
-    };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io, &panel_cfg, &s_panel),
-                        TAG, "st7789");
-
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "reset");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init");
-    /* Most IPS ST7789 modules are wired such that the controller's idea of
-     * colour polarity is inverted relative to the glass. */
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_panel, s_cfg.invert_colour),
-                        TAG, "invert");
-    ESP_RETURN_ON_ERROR(apply_rotation(), TAG, "rotation");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "disp on");
+    /*
+     * In test mode a bring-up failure must not leave the backlight off and
+     * the board silent: log it, light the backlight, and carry on into the
+     * test task, where a KEY0 press retries with another mode.
+     */
+    const esp_err_t up = panel_bringup();
+    if (up != ESP_OK) {
+        ESP_LOGE(TAG, "panel bring-up failed: %s", esp_err_to_name(up));
+#if DISPLAY_TEST_CYCLE
+        if (s_cfg.backlight_gpio >= 0) {
+            gpio_set_level(s_cfg.backlight_gpio, 1);
+        }
+#else
+        return up;
+#endif
+    }
 
     for (int i = 0; i < 2; i++) {
         s_bufs[i] = heap_caps_malloc(band_bytes, MALLOC_CAP_DMA);
@@ -2078,7 +2395,12 @@ esp_err_t display_init(const display_config_t *config)
         gpio_set_level(s_cfg.backlight_gpio, 1);
     }
 
-    if (xTaskCreate(display_task, "display", TASK_STACK, NULL, TASK_PRIO, NULL)
+#if DISPLAY_TEST_CYCLE
+    TaskFunction_t entry = display_test_task;
+#else
+    TaskFunction_t entry = display_task;
+#endif
+    if (xTaskCreate(entry, "display", TASK_STACK, NULL, TASK_PRIO, NULL)
             != pdPASS) {
         return ESP_ERR_NO_MEM;
     }

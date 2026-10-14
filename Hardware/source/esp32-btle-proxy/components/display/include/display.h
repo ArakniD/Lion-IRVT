@@ -49,6 +49,32 @@
 #ifndef DISPLAY_H
 #define DISPLAY_H
 
+/*
+ * BRING-UP TEST MODE
+ * ------------------
+ * With this set to 1 the display runs ONLY the boot test pattern, and every
+ * press of KEY0 tears the panel down and brings it up again on the next SPI
+ * mode / clock combination: modes 0..3 at 10 MHz, then 0..3 at 2 MHz. The
+ * pattern shows which combination is active, and the log prints each step, so
+ * "which one lights the panel" is a read-off. The backlight is forced on the
+ * moment the test starts, so a dark panel means the panel, not the backlight
+ * logic. Set to 0 for the normal UI.
+ *
+ * Nothing else is reachable from the encoder while this is on.
+ */
+#ifndef DISPLAY_TEST_CYCLE
+#define DISPLAY_TEST_CYCLE 0
+#endif
+
+/*
+ * Draws the encoder's live pin levels and raw count in the header, e.g.
+ * "A1 B1 S1 K1 n0". For bring-up of the encoder and its wiring; set to 0 for
+ * the finished unit.
+ */
+#ifndef DISPLAY_INPUT_HUD
+#define DISPLAY_INPUT_HUD 0
+#endif
+
 #include <stdbool.h>
 #include "esp_err.h"
 
@@ -82,7 +108,15 @@ typedef struct {
      */
     int rotation;
     bool mirror;
-    bool invert_colour;     /* most IPS ST7789 panels need this true */
+    /*
+     * Many IPS ST7789 modules need this true, but not all: the 320x240 panel
+     * needs false. The symptom of the wrong value is a photographic negative -
+     * black background shown as white, every colour replaced by its
+     * complement (yellow reads blue, red reads cyan) - and nothing else is
+     * wrong, so it is the first thing to flip when the picture is there but
+     * the colours are not.
+     */
+    bool invert_colour;
     /*
      * Set when red and blue come out transposed - some modules wire the
      * panel's colour filter in BGR order. This is a hue swap only; text
@@ -92,10 +126,11 @@ typedef struct {
     bool bgr_order;
     /*
      * SPI mode 0 (CPOL=0, CPHA=0) is what the ST7789 datasheet specifies and
-     * what most modules want. Some breakout boards latch on the opposite
-     * clock edge and need mode 2 (CPOL=1, CPHA=0); a mismatch shows as a
-     * blank or speckled panel rather than an error, because the bus is
-     * write-only and nothing can report the failure.
+     * what this panel wants. The controller samples on the rising clock edge,
+     * so mode 3 (CPOL=1, CPHA=1) works too; modes 1 and 2 sample on the wrong
+     * edge and do not. A mismatch shows as a blank or speckled panel rather
+     * than an error, because the bus is write-only and nothing can report the
+     * failure - DISPLAY_TEST_CYCLE above finds the right one by trying all.
      */
     int spi_mode;           /* 0..3, default 0 */
     uint32_t pclk_hz;       /* 0 => 10 MHz */

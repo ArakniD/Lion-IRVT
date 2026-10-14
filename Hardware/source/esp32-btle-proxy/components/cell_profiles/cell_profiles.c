@@ -103,6 +103,26 @@ static const cell_chemistry_profile_t k_chemistry[CELL_CHEM_COUNT] = {
         .rest_tolerance_pct = 5.0f,
         .rest_minutes = 30,
     },
+    [CELL_CHEM_NONE] = {
+        /*
+         * The unit envelope and nothing narrower: 0 V to 5 V, so a 0 V
+         * cutoff is allowed. The 1C rates against the 1000 mAh nominal
+         * capacity below give 1 A defaults, and every current is meant to be
+         * set directly. The temperature window is the sensor's, not a cell's.
+         */
+        .name = "NONE",
+        .nominal_v = 0.0f,
+        .charge_v_max = BTS_UNIT_MAX_VOLTAGE_V,
+        .discharge_v_min = 0.0f,
+        .storage_v = 0.0f,
+        .default_charge_c = 1.0f,
+        .default_discharge_c = 1.0f,
+        .charge_term_c = 0.05f,
+        .temp_min_c = -20.0f,
+        .temp_max_c = 60.0f,
+        .rest_tolerance_pct = 5.0f,
+        .rest_minutes = 0,
+    },
     [CELL_CHEM_NCA] = {
         .name = "NCA",
         .nominal_v = 3.60f,
@@ -272,6 +292,14 @@ esp_err_t cell_profile_resolve(cell_chemistry_t chem,
     /* A user-entered capacity always wins: aged cells are the normal case. */
     if (capacity_mah_override > 0.0f) {
         out->capacity_mah = capacity_mah_override;
+    }
+    /*
+     * NONE has no cell to take a capacity from. 1000 mAh is a nominal figure
+     * that makes the 1C defaults 1 A; it only sets defaults and the progress
+     * figure, never a limit.
+     */
+    if (chem == CELL_CHEM_NONE && out->capacity_mah <= 0.0f) {
+        out->capacity_mah = 1000.0f;
     }
     if (out->capacity_mah <= 0.0f) {
         ESP_LOGE(TAG, "no capacity for chem=%s model=%s",

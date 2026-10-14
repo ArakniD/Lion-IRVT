@@ -199,8 +199,16 @@ typedef struct {
     slot_config_t    config;
     cell_resolved_profile_t profile;
 
-    float            voltage_v;
-    float            current_a;
+    float            voltage_v;      /* 12-bit internal ADC (eChX_CellVoltage) */
+    float            current_a;      /* 12-bit internal ADC (eChX_CellCurrent) */
+    /*
+     * The 16-bit ADS131M08 pair (eChX_SenseVoltage / eChX_SenseCurrent): what
+     * the CC loop regulates against and the BTS's own counters integrate. The
+     * front panel shows these; BLE and HTTP still report the 12-bit pair, so
+     * a client and the panel can differ by the two converters' disagreement.
+     */
+    float            sense_voltage_v;
+    float            sense_current_a;
     float            temp_c;
     uint32_t         status_bits;
 
@@ -214,6 +222,17 @@ typedef struct {
     bool             bts_wd_tripped;
     bool             bts_restored;
     bool             bts_ended;
+    /*
+     * SLOT_STATE_DIRECT only: the direction the engine COMMANDED, which is
+     * known the instant the run starts. The status word's CHARGING and
+     * DISCHARGING bits come from the BTS on the next 250 ms poll, and until
+     * then they still describe the slot's previous state - a slot that has
+     * just been stopped has neither set. A reader that took the direction
+     * from the bits would show a charge as a discharge for up to a poll. Use
+     * this for a DIRECT run; the bits are for everything the engine did not
+     * start.
+     */
+    bool             direct_charge;
     /*
      * Which half of the BTS's CCCV law is regulating. A charge crosses from
      * CC to CV at the voltage limit and then tapers, so CV is the signal
@@ -290,8 +309,11 @@ esp_err_t test_engine_run_direct(uint8_t slot, bool charge);
  * and model defaults, then the overrides above, clamped. What
  * test_engine_configure() stores, without storing it - so a UI can show the
  * effective value before committing.
+ *
+ * `slot` sets the current ceiling: 10 A per slot, times the enabled members
+ * of its group, because a group leader's currents are the group's total.
  */
-esp_err_t test_engine_resolve(const slot_config_t *config,
+esp_err_t test_engine_resolve(uint8_t slot, const slot_config_t *config,
                               cell_resolved_profile_t *out);
 
 /*

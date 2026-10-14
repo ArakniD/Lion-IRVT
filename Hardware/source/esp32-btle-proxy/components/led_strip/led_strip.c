@@ -11,6 +11,7 @@
 
 #include "bts_link.h"
 #include "bts_regs.h"
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -224,6 +225,12 @@ static void render(uint32_t tick)
     for (int i = 0; i < LED_STRIP_COUNT; i++) {
         rgb_t c;
 
+#if LED_STRIP_TEST_MODE == 2
+        c = (rgb_t){ 255, 255, 255 };
+        (void)lit; (void)offline; (void)snap;
+        encode_pixel(&s_frame[led_for_slot(i) * LED_BYTES_PER_LED], c);
+        continue;
+#endif
         if (s_blanked) {
             c = C_OFF;
         } else if (offline || !snap.channel[i].valid) {
@@ -277,6 +284,74 @@ void led_strip_resume(void)
     s_blanked = false;
 }
 
+/*
+ * Logs what the pad is actually doing, read back from the GPIO matrix and
+ * IO_MUX rather than from what was asked for. An SPI MOSI that never reaches
+ * the pin shows up here as the wrong function or as an input-only pad.
+ */
+static void report_pad(const char *when)
+{
+    gpio_io_config_t io = { 0 };
+    if (gpio_get_io_config((gpio_num_t)s_cfg.data_gpio, &io) != ESP_OK) {
+        ESP_LOGW(TAG, "%s: cannot read GPIO%d configuration", when, s_cfg.data_gpio);
+        return;
+    }
+    ESP_LOGW(TAG, "%s: GPIO%d level=%d  ie=%d oe=%d oe_by_periph=%d od=%d  "
+                  "pu=%d pd=%d  drive=%d  fun_sel=%d  sig_out=%d",
+             when, s_cfg.data_gpio, gpio_get_level((gpio_num_t)s_cfg.data_gpio),
+             (int)io.ie, (int)io.oe, (int)io.oe_ctrl_by_periph, (int)io.od,
+             (int)io.pu, (int)io.pd, (int)io.drv, (int)io.fun_sel, (int)io.sig_out);
+    /* sig_out 65 is VSPID, the SPI3 MOSI signal; 256 is plain GPIO output. */
+}
+
+#if LED_STRIP_TEST_MODE == 1
+/*
+ * Pin finder. The configured data pin toggles at about 1 Hz, and three other
+ * output-capable pins that nothing in the firmware uses toggle faster, so a
+ * scope or meter on the header can say which physical pin is which:
+ *
+ *   the data pin (GPIO25)   ~1 Hz
+ *   GPIO14                  ~2 Hz
+ *   GPIO26                  ~4 Hz
+ *   GPIO13                  ~8 Hz
+ *
+ * A pin that is silent while the others toggle points at that pin or its
+ * wiring, not at the firmware.
+ */
+static void pin_toggle_task(void *arg)
+{
+    (void)arg;
+    const struct { gpio_num_t pin; int every; } probe[] = {
+        { (gpio_num_t)s_cfg.data_gpio, 8 },   /* ~1 Hz  */
+        { GPIO_NUM_14,                 4 },   /* ~2 Hz  */
+        { GPIO_NUM_26,                 2 },   /* ~4 Hz  */
+        { GPIO_NUM_13,                 1 },   /* ~8 Hz  */
+    };
+    const int n = (int)(sizeof(probe) / sizeof(probe[0]));
+    int level[4] = { 0, 0, 0, 0 };
+
+    for (int i = 0; i < n; i++) {
+        gpio_reset_pin(probe[i].pin);
+        gpio_set_direction(probe[i].pin, GPIO_MODE_OUTPUT);
+        gpio_set_drive_capability(probe[i].pin, GPIO_DRIVE_CAP_3);
+        gpio_set_level(probe[i].pin, 0);
+    }
+    report_pad("pin finder, before first edge");
+    ESP_LOGW(TAG, "pin finder: GPIO%d ~1Hz, GPIO14 ~2Hz, GPIO26 ~4Hz, GPIO13 ~8Hz",
+             s_cfg.data_gpio);
+
+    for (uint32_t t = 1;; t++) {
+        for (int i = 0; i < n; i++) {
+            if ((t % (uint32_t)probe[i].every) == 0) {
+                level[i] ^= 1;
+                gpio_set_level(probe[i].pin, level[i]);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(60));
+    }
+}
+#endif
+
 esp_err_t led_strip_init(const led_strip_config_t *config)
 {
     ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG, "null config");
@@ -286,6 +361,19 @@ esp_err_t led_strip_init(const led_strip_config_t *config)
     if (s_cfg.refresh_ms == 0) {
         s_cfg.refresh_ms = 25;
     }
+    if (s_cfg.brightness > LED_STRIP_MAX_BRIGHTNESS) {
+        ESP_LOGW(TAG, "brightness %u exceeds the %u/255 current limit; clamped",
+                 (unsigned)s_cfg.brightness, (unsigned)LED_STRIP_MAX_BRIGHTNESS);
+        s_cfg.brightness = LED_STRIP_MAX_BRIGHTNESS;
+    }
+
+#if LED_STRIP_TEST_MODE == 1
+    ESP_LOGW(TAG, "LED TEST MODE 1: GPIO%d toggled at 1 Hz, SPI NOT started",
+             s_cfg.data_gpio);
+    s_ready = true;
+    return (xTaskCreate(pin_toggle_task, "led_toggle", 3072, NULL, 4, NULL) == pdPASS)
+               ? ESP_OK : ESP_ERR_NO_MEM;
+#endif
 
     /*
      * DMA-capable: spi_device_transmit() on a buffer in regular heap would
@@ -328,6 +416,7 @@ esp_err_t led_strip_init(const led_strip_config_t *config)
         spi_bus_free(LED_SPI_HOST);
         goto fail;
     }
+    report_pad("after SPI3 add_device");
 
     /*
      * One frame of darkness before the task starts. A WS2812B powers up with

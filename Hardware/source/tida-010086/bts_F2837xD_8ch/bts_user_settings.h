@@ -50,7 +50,7 @@
 //
 // BTS_LED_DRIVER_ENABLED IS FALSE IN BOTH ARMS AND SHOULD STAY THAT WAY.
 //
-// The WS2812B string is driven by the ESP32 now, over SPI3 on its GPIO13.
+// The WS2812B string is driven by the ESP32 now, over SPI3 on its GPIO25.
 // The C2000 driver that used to do it could never have worked: it clocked
 // raw colour bytes out of SCIA at 800 kbaud, but a WS2812B decodes pulse
 // WIDTHS - 400 ns high is a 0, 800 ns high is a 1 - and a UART cannot
@@ -956,10 +956,25 @@
 #define BTS_MODE_GPIO_PIN_2                     ((uint16_t)56)
 
 // ENABLE OPTIONS
-#define BTS_EN_GPIO_CFG_0                       GPIO_57_GPIO57
+//
+// EN_A (U26 A0) is on GPIO46, NOT GPIO57 - a TEMPORARY HARDWARE FIX.
+// GPIO57 never saw U26's A0 (it read floating with ENABLE DIP 8 on,
+// 2026-10-09), so the line is jumpered on the board to the spare GPIO46.
+// A board revision that routes A0 to GPIO57 again must put these two lines
+// back to GPIO_57_GPIO57 / 57. EN_B and EN_C are unchanged.
+//
+// GPIO46 is also BTS_TRP_PIN_GPIO_CH8, slot 8's GPIO trip input. That trip
+// is compiled out (and has no Input X-BAR input to land on), so the pin is
+// free - the guard below stops it being turned on while the jumper is fitted.
+//
+#define BTS_EN_GPIO_CFG_0                       GPIO_46_GPIO46
 #define BTS_EN_GPIO_CFG_1                       GPIO_58_GPIO58
 #define BTS_EN_GPIO_CFG_2                       GPIO_59_GPIO59
-#define BTS_EN_GPIO_PIN_0                       ((uint16_t)57)
+#define BTS_EN_GPIO_PIN_0                       ((uint16_t)46)
+
+#if (BTS_TRIP_GPIO_CH8_ENABLED == true)
+#error "GPIO46 carries the EN_A jumper (temporary hardware fix) - it cannot also be slot 8's GPIO trip"
+#endif
 #define BTS_EN_GPIO_PIN_1                       ((uint16_t)58)
 #define BTS_EN_GPIO_PIN_2                       ((uint16_t)59)
 

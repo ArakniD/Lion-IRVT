@@ -24,7 +24,7 @@ so the strip saw framing noise and latched nothing. **No pixel ever lit from
 the C2000.** Nor could it be fixed there: driving a WS2812B needs a peripheral
 that emits a free-running bit pattern, which means SPI, and GPIO29 — the wire
 that physically exists — has no SPI mux option at all. The string moved to the
-ESP32, which drives it from SPI3 MOSI on its GPIO13; see
+ESP32, which drives it from SPI3 MOSI on its GPIO25; see
 [`led_strip.h`](../esp32-btle-proxy/components/led_strip/include/led_strip.h)
 and
 [`supervision-and-state-design.md` §2.5.1](supervision-and-state-design.md#251-slot-indication--the-ws2812b-string).

@@ -33,7 +33,7 @@ WS2812B decodes pulse *widths*; a UART forces a start bit before every byte
 and holds each bit for a full bit time. No pixel ever lit from that core.
 
 The C2000 cannot drive one: GPIO29 has no SPI mux option and both usable SPI
-ports belong to the ADS131M08 pair. The ESP32 does it on SPI3/GPIO13 at
+ports belong to the ADS131M08 pair. The ESP32 does it on SPI3/GPIO25 at
 2.5 MHz, four SPI bits per WS2812B bit, deriving colour from the I2C slot
 status it already polls. `BTS_LED_DRIVER_ENABLED` is now `false` in both arms
 and **CPU Timer 2 on CPU2 is free again**.

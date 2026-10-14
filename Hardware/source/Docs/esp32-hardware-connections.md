@@ -7,10 +7,26 @@ for.
 
 **Source of truth is the firmware.** Every GPIO below is taken from
 `esp32-btle-proxy/main/main.c` (the `#define`s and the `display_config_t`,
-`input_config_t` and `led_strip_config_t` it builds). LCD CS on GPIO19, KEY0
-on GPIO34 and the encoder's A and PUSH on GPIO32 and GPIO33 were proposals in
-an earlier revision of this page; all four are in the firmware and were
-verified at boot on 2026-10-09.
+`input_config_t` and `led_strip_config_t` it builds), and **every one of them
+has been verified on the bench**: the LCD, the encoder's A, B and PUSH, KEY0
+and the slot LED strip all work on the pins shown.
+
+### The pin map at a glance
+
+| Function | GPIO | Header | Notes |
+|---|---|---|---|
+| LCD SCLK / MOSI | 18 / 23 | P3.11 / P3.10 | SPI2 (HSPI) |
+| LCD CS / RES / DC / BLK | 19 / 17 / 16 / 4 | P3.9 / P3.14 / P3.15 / P3.16 | CS has an external 10 k pull-up |
+| Encoder A / B / PUSH | 32 / **26** / 33 | P2.5 / P2.10 / P2.6 | B moved off GPIO27 |
+| KEY0 | 34 | P2.7 | Input only. Press: back to the slot list. **Hold: e-stop, every slot off** |
+| Slot LED data (WS2812B DIN) | **25** | P2.9 | SPI3 MOSI, 5V strip |
+| BTS I2C SDA / SCL | 21 / 22 | P3.6 / P3.5 | |
+| Console UART0 TX / RX | 1 / 3 | P3.2 / P3.3 | |
+
+**Pins to stay away from on this board.** GPIO27, GPIO14 and GPIO13 gave no
+usable signal on the bench (details under each function below). They may be
+broken traces, damaged pads, or loaded by something on the board - nobody has
+found out which - so treat them as suspect, not free.
 
 The header positions (P2/P3) and the LCD board pin names come from the board
 and the AliExpress module, not from the code, so they are the part to check
@@ -34,10 +50,10 @@ flowchart LR
         P316["GPIO4 · P3.16"]
         P39["GPIO19 · P3.9"]
         P25["GPIO32 · P2.5"]
-        P211["GPIO27 · P2.11"]
+        P210["GPIO26 · P2.10"]
         P26["GPIO33 · P2.6"]
         P27["GPIO34 · P2.7"]
-        P214["GPIO13 · P2.14"]
+        P29["GPIO25 · P2.9"]
         P215["5V0 · P2.15"]
         P216["GND · P2.16"]
         P313["3V3 · P3.13"]
@@ -79,12 +95,12 @@ flowchart LR
     P39 -- "chip select, active low" --> L7
     P316 -- "backlight, active high" --> L8
     L9 -- "quadrature A" --> P25
-    L10 -- "quadrature B" --> P211
+    L10 -- "quadrature B" --> P210
     L11 -- "switch to GND" --> P26
     L12 -- "active low, board pull-up" --> P27
     P215 -- "5 V supply" --> WS
     P216 --- WS
-    P214 -- "SPI3 MOSI, via level shifter" --> WS
+    P29 -- "SPI3 MOSI, via level shifter" --> WS
     P36 <-- "SDA" --> I2C
     P35 -- "SCL" --> I2C
 ```
@@ -115,7 +131,7 @@ controller (`rotation = 1` in `main.c`), so the UI is drawn as 320 wide by
 | 7 | CS | P3.9 | **GPIO19** | Chip select, active low, driven by the SPI driver. External 10 k pull-up to 3V3 installed |
 | 8 | BLK | P3.16 | **GPIO4** | Backlight, active high. Held off until the first frame is drawn |
 | 9 | A | P2.5 | **GPIO32** | Encoder channel A, decoded by PCNT |
-| 10 | B | P2.11 | **GPIO27** | Encoder channel B, decoded by PCNT |
+| 10 | B | P2.10 | **GPIO26** | Encoder channel B, decoded by PCNT |
 | 11 | PUSH | P2.6 | **GPIO33** | Encoder push switch, active low. Press selects, 800 ms long press goes back one menu level |
 | 12 | KEY0 | P2.7 | **GPIO34** | Extra push button, active low. Returns the front panel to the slot list from any menu |
 
@@ -138,13 +154,19 @@ none is a boot strapping pin (the straps are GPIO0, 2, 5, 12 and 15).
   and GPIO2, which are both strapping pins. Neither new pin has a boot or JTAG
   role, and both have internal pull-ups, which PUSH needs because it has no
   external one. They sit next to each other and next to KEY0 on P2.
+- **Encoder B = GPIO26 (P2.10).** An ordinary pin with a pull-up, and one that
+  was seen toggling when probed. It replaces GPIO27, which never saw an edge on
+  the bench.
+- **Slot LED data = GPIO25 (P2.9).** An output-capable pin with no boot or JTAG
+  role, verified by scope as a plain 1 Hz GPIO and then as SPI3 MOSI.
 
   Moving them does not change how the encoder is clocked. PCNT routes every
   input through the GPIO matrix, so no pin is faster than another. The
   decoding limits are the glitch filter in `input.c` and the contact bounce.
 
-Rejected: GPIO0, 5 and 12 are strapping pins. GPIO14 has no strap role but is
-MTMS, which the firmware keeps clear for JTAG.
+Rejected: GPIO0, 5 and 12 are strapping pins. GPIO14 and GPIO13 are JTAG pins
+that gave no drive on the bench, and GPIO27 never saw an edge as an input; see
+the notes under Encoder B and Slot LEDs.
 
 ### Pull-ups
 
@@ -179,7 +201,23 @@ over.
 |---|---|---|---|
 | WS2812B VDD | P2.15 | — | **5V0** |
 | WS2812B GND | P2.16 | — | GND, shared with the ESP32 |
-| WS2812B DIN | P2.14 | **GPIO13** | SPI3 (VSPI) MOSI. One data line, eight LEDs in series, one LED per BTS slot, in reverse order (see below) |
+| WS2812B DIN | P2.9 | **GPIO25** | SPI3 (VSPI) MOSI. One data line, eight LEDs in series, one LED per BTS slot, in reverse order (see below) |
+
+**Why GPIO25.** A PCB layout error put the 5V pin one position off, and moving
+DIN is what lines it up again. GPIO25 is an ordinary output-capable pin with no
+boot or JTAG role, and it is **verified on the bench**: a scope saw it toggle at
+1 Hz as a plain GPIO and then carry SPI3 MOSI bursts, and the strip lit.
+
+The pins tried first, and why they were dropped:
+
+- **GPIO13** was the original pin, and the one the layout error put out of line.
+- **GPIO12** is MTDI, a boot strapping pin that picks the flash voltage (low is
+  3.3 V, high is 1.8 V), so a level shifter that idles high would stop this
+  board's 3.3 V module booting.
+- **GPIO14** (MTMS) gave no drive on the bench: a scope saw nothing even with the
+  pin driven as a plain GPIO. The pad may be damaged, or loaded by something on
+  the board; it is worth a closer look before relying on it for anything.
+- **GPIO35** cannot be an output at all - it is input-only.
 
 **LED order is reversed.** LED 1, the first after DIN, shows slot 8, and
 LED 8 shows slot 1. `led_for_slot()` in `led_strip.c` holds the mapping.
@@ -194,9 +232,16 @@ batch. Put a 5 V-powered buffer in the DIN line, such as a 74AHCT125 or
 74HCT125 (one gate is enough) or a 74AHCT1G125, with a 330 ohm series resistor
 at the strip end and a 100 to 470 uF capacitor across the strip supply.
 
-**Current.** The firmware runs the strip at brightness 64 of 255, which is
-roughly 120 mA for eight LEDs. At full white the strip would draw about 480
-mA, as noted in `main.c`.
+**Current.** A WS2812B draws about 20 mA per colour channel, about 60 mA at
+full white, so the strip would draw about 480 mA if every pixel went white at
+full brightness. The firmware limits that two ways:
+
+- It runs the strip at brightness **64 of 255 (25%)**, roughly 120 mA worst
+  case.
+- The driver enforces a **hard ceiling of 50%** (127 of 255,
+  `LED_STRIP_MAX_BRIGHTNESS` in `led_strip.h`), roughly 240 mA worst case. It is
+  in the driver, not the caller, so no setting can exceed it: a larger value is
+  clamped and logged. Size the 5V supply for 240 mA plus margin.
 
 **Check.** On a LOLIN32 the 5V0 pin is normally the USB supply rather than a
 regulated rail, so confirm the strip still has power when the board runs from
@@ -221,12 +266,12 @@ assigned and the pin is free.
 | 6 | GPIO33 | **Encoder PUSH** (LCD board pin 11) |
 | 7 | GPIO34 | **KEY0** (LCD board pin 12). Input only, no internal pull |
 | 8 | GPIO35 | — (input only) |
-| 9 | GPIO25 | — |
-| 10 | GPIO26 | — |
-| 11 | GPIO27 | **Encoder B** (LCD board pin 10) |
-| 12 | GPIO14 | — (MTMS, kept clear for JTAG) |
+| 9 | GPIO25 | **WS2812B DIN**, SPI3 MOSI |
+| 10 | GPIO26 | **Encoder B** (LCD board pin 10) |
+| 11 | GPIO27 | — (encoder B was here; no edges seen on the bench) |
+| 12 | GPIO14 | — (MTMS, JTAG. **No drive seen on the bench**) |
 | 13 | GPIO12 | — (MTDI, strapping pin) |
-| 14 | GPIO13 | **WS2812B DIN**, SPI3 MOSI |
+| 14 | GPIO13 | — (JTAG MTCK. Inaccessible on the bench) |
 | 15 | 5V0 | **WS2812B VDD** |
 | 16 | GND | **WS2812B GND** |
 
@@ -261,20 +306,21 @@ assigned and the pin is free.
 |---|---|---|
 | ST7789 LCD, SPI2 (HSPI) | SCLK, MOSI, RES, DC, BLK | 18, 23, 17, 16, 4 |
 | ST7789 LCD chip select | CS | 19 |
-| Rotary encoder + switch, PCNT | A, B, PUSH | 32, 27, 33 |
+| Rotary encoder + switch, PCNT | A, B, PUSH | 32, 26, 33 |
 | KEY0 button | KEY0 | 34 |
-| Slot LEDs, SPI3 (VSPI) | DIN | 13 |
+| Slot LEDs, SPI3 (VSPI) | DIN | 25 |
 | BTS link, I2C controller | SDA, SCL | 21, 22 |
 | Console, UART0 | TX, RX | 1, 3 |
-| **Free** | | 25, 26, 35, VP (36), VN (39) |
-| **Free, but strapping or JTAG** | | 0, 2, 5, 12, 14, 15 |
+| **Free** | | 35 (input only, no internal pull), VP (36), VN (39) |
+| **Not free: strapping** | | 0, 2, 5, 12, 15 |
+| **Not free: suspect on this board** | | 13, 14 (JTAG pins, no drive seen on the bench); 27 (no edges seen as an input) |
 
 ---
 
 ## Things worth knowing
 
 **Strapping pins.** None of the pins in use on the LCD, encoder, KEY0 or LED
-connections is a strapping or JTAG pin: GPIO4, 13, 19, 27, 32, 33 and 34 have
+connections is a strapping or JTAG pin: GPIO4, 19, 25, 26, 32, 33 and 34 have
 no boot role. Encoder A and PUSH used to be on GPIO15 and GPIO2, both
 strapping pins; moving them took the encoder out of the boot path.
 
@@ -283,22 +329,50 @@ IO_MUX defaults for SPI3 (VSPI), but the LCD uses SPI2 (HSPI) and reaches them
 through the GPIO matrix. That keeps SPI3 free for the LEDs, so an LED frame
 cannot stall a panel repaint. Do not "fix" the host back to VSPI.
 
-**Encoder B moved.** B was on GPIO13 until the WS2812B driver took that pin
-for SPI3 MOSI. It is on GPIO27 now. GPIO14 would also have worked, but it is
-MTMS, so it was left clear for JTAG debugging.
+**Encoder B moved twice.** B was on GPIO13 until the WS2812B driver took that
+pin, then on GPIO27, and is now on **GPIO26**. On the bench the GPIO27 pad never
+saw an edge - A, the switch and KEY0 all did, so the decoder was fine - and
+GPIO26 was seen toggling when probed. Whether GPIO27 is a broken trace or a
+damaged pad is not known.
 
 **The panel is a write-only bus.** A wrong SPI mode or clock shows as a blank
-or speckled panel, not an error. The current settings are SPI mode 2 at
+or speckled panel, not an error. The current settings are SPI mode 0 at
 10 MHz with a boot-time colour-bar self-test; `display_config_t` in `main.c`
 holds them.
+
+On the 320x240 panel the bring-up test cycle (`DISPLAY_TEST_CYCLE` in
+`display.h`, where KEY0 steps through every mode and clock) showed **modes 0
+and 3 working at both 10 MHz and 2 MHz, and modes 1 and 2 not at all**. That is
+the ST7789 sampling on the rising clock edge, which only modes 0 and 3 give.
+The 240x240 panel this board had before needed mode 2, so a panel swap can
+change the answer - rerun the cycle if the new panel is ever dark.
+
+**Colour inversion is off** (`invert_colour = false`). The old panel needed it
+on. With it on, the 320x240 panel showed black as white and yellow as blue - a
+photographic negative. If the picture is present but the colours are
+complements of what they should be, flip that flag.
 
 **The part number.** The module is an ST7789, which is what the driver
 targets. If a datasheet or order page says ST7798, that is a transposition.
 
 ---
 
+## Bring-up aids still in the firmware
+
+All off by default or switchable, and kept because the pin map above came from
+using them:
+
+| Switch | File | What it does |
+|---|---|---|
+| `DISPLAY_TEST_CYCLE` | `display.h` | KEY0 steps the LCD through every SPI mode and clock, showing which one works |
+| `DISPLAY_INPUT_HUD` | `display.h` | Draws `A1 B1 S1 K1 n0` (encoder pin levels, raw count) in the panel header. **Off** |
+| `LED_STRIP_TEST_MODE` | `led_strip.h` | 1: toggles the data pin and three others at 1, 2, 4 and 8 Hz as a pin finder; 2: all white over SPI |
+
 ## Unconfirmed against the hardware
 
 - **5V0 with the backup cell.** See the check under Slot LEDs.
-- **Level shifter.** The strip may work without one on the bench. It is
-  recommended because it is marginal, not because it has been seen to fail.
+- **Level shifter.** The strip lit on the bench. Whether it has a level shifter
+  in the path is not recorded here, and a 3.3 V data line into a 5 V strip is
+  still marginal on some parts, so keep one in the design.
+- **Why GPIO13, GPIO14 and GPIO27 failed.** Not investigated. If the board has
+  had a short or a hot-plug accident, check those pads before reusing them.

@@ -21,15 +21,24 @@
  *
  * WIRING
  * ------
- *   DIN   GPIO13     WS2812B data in, via SPI3 (VSPI) MOSI
+ *   DIN   GPIO25     WS2812B data in, via SPI3 (VSPI) MOSI
  *
  * The chain runs in reverse slot order: LED 1, the first after DIN, shows
  * slot 8, and LED 8 shows slot 1. led_strip.c maps this in one place.
  *
- * GPIO13 has no strapping or JTAG role, so it is safe to drive at reset.
- * It was the encoder's B channel until this driver took it; B moved to
- * GPIO27, which is equally free. SPI3 is otherwise unused - the ST7789
- * panel is on SPI2 (HSPI), despite sitting on the VSPI-default pads.
+ * GPIO25 is an ordinary output-capable pin with no boot or JTAG role, so
+ * nothing on this line can stop the board booting or entering the bootloader.
+ *
+ * It was GPIO13 until a PCB layout error put the 5V pin out of line. GPIO12
+ * was tried next and rejected: it is MTDI, a boot strapping pin that picks the
+ * flash voltage, and a level shifter that idles high would stop a 3.3 V module
+ * booting. GPIO14 was tried after that and gave no drive on the bench - a
+ * scope saw nothing even with the pin driven as a plain GPIO - and GPIO13 was
+ * inaccessible. GPIO35 cannot be used at all: it is input-only. GPIO25 was
+ * verified by scope, first as a plain 1 Hz GPIO and then as SPI3 MOSI.
+ *
+ * SPI3 is otherwise unused - the ST7789 panel is on SPI2 (HSPI), despite
+ * sitting on the VSPI-default pads.
  *
  * HOW THE BITSTREAM IS BUILT
  * --------------------------
@@ -52,6 +61,28 @@
 #ifndef LED_STRIP_H
 #define LED_STRIP_H
 
+/*
+ * BRING-UP TEST MODE
+ * ------------------
+ * 0  normal: the strip shows slot state.
+ * 1  PIN TOGGLE: SPI is not used at all. The data pin is driven as a plain
+ *    GPIO, high 500 ms / low 500 ms, forever. This separates "the firmware or
+ *    the pin is wrong" from "the SPI peripheral is not reaching the pad": if a
+ *    meter or scope sees 1 Hz on the pin, the pin and the wiring are good and
+ *    the fault is in the SPI path. If it does not, the pad is not being
+ *    driven - check the pin number, the level shifter, and whether something
+ *    else is holding the line.
+ * 2  SPI, ALL WHITE at full brightness, repeated every 25 ms. Every bit of
+ *    colour is a 1 (1100), so the scope sees a dense burst of 800 ns pulses
+ *    rather than the mostly-low frame the amber or off states give.
+ *
+ * Either mode, and the normal one, log the pad's actual state from the GPIO
+ * matrix at start-up: direction, pull, and which peripheral signal drives it.
+ */
+#ifndef LED_STRIP_TEST_MODE
+#define LED_STRIP_TEST_MODE 0
+#endif
+
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
@@ -63,10 +94,22 @@ extern "C" {
 /* One indicator per slot. */
 #define LED_STRIP_COUNT     8
 
+/*
+ * Hard brightness ceiling, 127/255 (49.8%).
+ *
+ * A WS2812B draws about 20 mA per colour channel, so about 60 mA at full white
+ * and about 480 mA for all eight. Capping the scale at half holds the whole
+ * strip to roughly 240 mA even if every pixel went white at once, which is what
+ * the supply - the USB or backup-cell 5V rail - has to be sized for. The cap
+ * is in the driver, not the caller, so no configuration can exceed it:
+ * led_strip_init() clamps `brightness` to this and says so in the log.
+ */
+#define LED_STRIP_MAX_BRIGHTNESS    127
+
 typedef struct {
     int      data_gpio;     /* WS2812B DIN */
     uint16_t refresh_ms;    /* frame interval; sets the flash timebase */
-    uint8_t  brightness;    /* 0-255, scales every channel linearly */
+    uint8_t  brightness;    /* 0-LED_STRIP_MAX_BRIGHTNESS, scales every channel linearly */
 } led_strip_config_t;
 
 /*

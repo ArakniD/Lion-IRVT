@@ -1033,7 +1033,7 @@ eCAP APWM reached through OUTPUTXBAR6 would have worked electrically but needs
 starvation that had just been fixed.
 
 The driver therefore moved to the **ESP32 proxy**, which has a free SPI host
-and a free pin: SPI3 (VSPI) MOSI on its GPIO13, four SPI bits per WS2812B bit
+and a free pin: SPI3 (VSPI) MOSI on its GPIO25, four SPI bits per WS2812B bit
 at 2.5 MHz, 96 bytes per frame in one DMA transfer from a FreeRTOS task. That
 is off-device and so outside this file's scope; it is documented in
 [`esp32-btle-proxy/components/led_strip/include/led_strip.h`](../esp32-btle-proxy/components/led_strip/include/led_strip.h)
@@ -1586,8 +1586,18 @@ The encoder's A0–A2 reach the controlCARD through 0-ohm links:
 
 | Strap | A0 | A1 | A2 | Links | `J5` pins |
 |---|---|---|---|---|---|
-| ENABLE | GPIO57 | GPIO58 | GPIO59 | R276, R283, R281 | 15, 13, 11 |
+| ENABLE | **GPIO46** *(jumpered; was GPIO57)* | GPIO58 | GPIO59 | R276, R283, R281 | 15, 13, 11 |
 | MODE | GPIO54 | GPIO55 | GPIO56 | R257, R270, R278 | 21, 19, 17 |
+
+> **Temporary hardware fix (2026-10-12): ENABLE A0 (EN_A) is jumpered to
+> GPIO46.** GPIO57 never saw U26's A0 — it read floating with ENABLE DIP 8
+> on (read-back below) — so the line is wired on the board to the spare
+> GPIO46, and `BTS_EN_GPIO_PIN_0` / `BTS_EN_GPIO_CFG_0` follow it. GPIO46
+> is otherwise slot 8's GPIO trip input (`BTS_TRP_PIN_GPIO_CH8`), which is
+> compiled out and has no Input X-BAR input to land on (§4); an `#error`
+> stops `BTS_TRIP_GPIO_CH8_ENABLED` being set while the jumper is in use.
+> **A board revision that routes A0 to GPIO57 again must put both defines
+> back.**
 
 CPU1 samples them once, in `BTS_HAL_setupGPIO()`, and decodes the 3-bit code
 `A2 A1 A0` through `truth_table[]`.
@@ -1635,7 +1645,8 @@ higher-numbered input, and nothing downstream can tell.
 > initialised variable that relies on its initialiser is wrong in a
 > standalone boot**: make it `const`, or assign it at runtime.
 
-**Read back, 2026-10-09**, both cores loaded, with ENABLE DIP 8 reported on:
+**Read back, 2026-10-09** (before the GPIO46 jumper), both cores loaded,
+with ENABLE DIP 8 reported on:
 GPIO54–56 (MODE A0–A2) read `1, 1, 1` — index 7, setting 3: no MODE switch
 on, or DIP 4. GPIO57–59 (ENABLE A0–A2) read `0, 1, 1` — index 6, setting 2,
 which is the code for DIP **3**. DIP 8 would read `0, 0, 0`. CPU1 latched

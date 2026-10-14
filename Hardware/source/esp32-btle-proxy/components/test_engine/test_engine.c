@@ -753,6 +753,7 @@ static void fill_status_locked(uint8_t slot, const bts_snapshot_t *snap,
 
     if (snap == NULL) {
         bts_link_get_snapshot(&local);
+        bts_snapshot_group_totals(&local);
         snap = &local;
     }
     const bts_channel_state_t *ch = &snap->channel[slot];
@@ -765,10 +766,13 @@ static void fill_status_locked(uint8_t slot, const bts_snapshot_t *snap,
     out->profile     = c->profile;
     out->voltage_v   = ch->cell_voltage_v;
     out->current_a   = ch->cell_current_a;
+    out->sense_voltage_v = ch->sense_voltage_v;
+    out->sense_current_a = ch->sense_current_a;
     out->temp_c      = ch->cell_temp_c;
     out->status_bits = ch->status_bits;
     out->last_result = c->result;
 
+    out->direct_charge         = c->direct_charge;
     out->bts_paused            = ch->paused;
     out->bts_wd_tripped        = ch->wd_tripped;
     out->bts_restored          = ch->restored;
@@ -892,6 +896,9 @@ static void engine_task(void *arg)
 
     for (;;) {
         bts_link_get_snapshot(&snap);
+        /* A group is supervised as one slot on its leader: the whole group's
+         * current against the group's setpoint, every member's trips. */
+        bts_snapshot_group_totals(&snap);
         memset(fire, 0, sizeof(fire));
 
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -929,10 +936,10 @@ static float clamp_override(float v, float lo, float hi)
     return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
-esp_err_t test_engine_resolve(const slot_config_t *config,
+esp_err_t test_engine_resolve(uint8_t slot, const slot_config_t *config,
                               cell_resolved_profile_t *out)
 {
-    if (config == NULL || out == NULL) {
+    if (config == NULL || out == NULL || slot >= SLOT_COUNT) {
         return ESP_ERR_INVALID_ARG;
     }
     esp_err_t err = cell_profile_resolve(config->chemistry,
@@ -951,12 +958,14 @@ esp_err_t test_engine_resolve(const slot_config_t *config,
      * front panel makes a big number easy to dial in by accident.
      */
     const cell_model_t *model = cell_model_find(config->model_name);
+    /* Per slot, times the slots in a group: the leader's current is a total. */
+    const float unit_imax = BTS_UNIT_MAX_CURRENT_A * (float)bts_link_group_members(slot);
     const float chg_cap = (model && model->charge_current_max_a > 0.0f)
-                              ? fminf(model->charge_current_max_a, BTS_UNIT_MAX_CURRENT_A)
-                              : BTS_UNIT_MAX_CURRENT_A;
+                              ? fminf(model->charge_current_max_a, unit_imax)
+                              : unit_imax;
     const float dis_cap = (model && model->discharge_current_max_a > 0.0f)
-                              ? fminf(model->discharge_current_max_a, BTS_UNIT_MAX_CURRENT_A)
-                              : BTS_UNIT_MAX_CURRENT_A;
+                              ? fminf(model->discharge_current_max_a, unit_imax)
+                              : unit_imax;
 
     /*
      * Voltage and temperature overrides may only be more conservative than
@@ -1015,7 +1024,7 @@ esp_err_t test_engine_configure(uint8_t slot, const slot_config_t *config)
     }
 
     cell_resolved_profile_t profile;
-    esp_err_t err = test_engine_resolve(config, &profile);
+    esp_err_t err = test_engine_resolve(slot, config, &profile);
     if (err != ESP_OK) {
         return err;
     }
@@ -1053,7 +1062,7 @@ esp_err_t test_engine_configure(uint8_t slot, const slot_config_t *config)
             next.charge_term_current_a = 0.0f;
             next.temp_max_c = 0.0f;
             ESP_LOGW(TAG, "slot %u: cell changed, overrides dropped", slot);
-            if (test_engine_resolve(&next, &profile) != ESP_OK) {
+            if (test_engine_resolve(slot, &next, &profile) != ESP_OK) {
                 xSemaphoreGive(s_lock);
                 return ESP_ERR_INVALID_ARG;
             }
@@ -1095,6 +1104,15 @@ esp_err_t test_engine_start(uint8_t slot)
 {
     if (!s_ready || slot >= SLOT_COUNT) {
         return ESP_ERR_INVALID_ARG;
+    }
+    {
+        /* A follower has no control loop, and the unit ignores a start sent
+         * to one; the group runs from its leader. */
+        bts_snapshot_t snap;
+        bts_link_get_snapshot(&snap);
+        if (bts_slot_is_follower(&snap.unit, slot)) {
+            return ESP_ERR_NOT_ALLOWED;
+        }
     }
     if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
@@ -1170,8 +1188,15 @@ esp_err_t test_engine_abort_all(void)
             err = one;
         }
     }
-    bts_link_stop_all();
-    return err;
+    /*
+     * The converter stop is what actually makes the slots safe, and it is
+     * written again here after the per-slot aborts. Its result is reported:
+     * the engine's own bookkeeping cannot fail on a dead I2C link, so an
+     * abort_all that said OK while the stop never reached the unit would be an
+     * e-stop that lies.
+     */
+    const esp_err_t stop = bts_link_stop_all();
+    return (stop != ESP_OK) ? stop : err;
 }
 
 esp_err_t test_engine_clear_fault(uint8_t slot)
@@ -1212,12 +1237,15 @@ esp_err_t test_engine_clear_fault(uint8_t slot)
      */
     bts_snapshot_t snap;
     bts_link_get_snapshot(&snap);
+    bts_snapshot_group_totals(&snap);
     const bts_channel_state_t *ch = &snap.channel[slot];
     const bool unit_latched = ch->valid &&
         ((ch->status_bits & (BTS_STATUS_OVERCURRENT | BTS_STATUS_GROUP_DISCONNECT)) ||
          ch->cmpss_trip || ch->gpio_trip);
     if (engine_fault || (unit_latched && c->state == SLOT_STATE_IDLE)) {
-        (void)bts_link_clear_fault_channel(slot);
+        /* To the group's leader: the C2000 carries a clear across the group
+         * from there, and ignores a command addressed to a follower. */
+        (void)bts_link_clear_fault_channel(bts_group_leader(&snap.unit, slot));
     }
     xSemaphoreGive(s_lock);
     return ESP_OK;
@@ -1282,6 +1310,7 @@ esp_err_t test_engine_run_direct(uint8_t slot, bool charge)
 
     bts_snapshot_t snap;
     bts_link_get_snapshot(&snap);
+    bts_snapshot_group_totals(&snap);
     const bts_channel_state_t *ch = &snap.channel[slot];
     if (!snap.unit.online || !ch->valid) {
         return ESP_ERR_INVALID_STATE;

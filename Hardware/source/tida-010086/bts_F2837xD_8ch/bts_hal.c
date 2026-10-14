@@ -516,8 +516,9 @@ extern volatile uint32_t startup_enable;
 // U26 for ENABLE, S5 -> U27 for MODE; schematic XTIDA-010086E3 sheet 13).
 // Every encoder input has a 10k pull-up and a switch to ground, so an ON
 // switch drives its input LOW. EI is tied low and GS is not connected. The
-// three outputs A0..A2 arrive on GPIO57..59 (ENABLE) and GPIO54..56 (MODE),
-// and that 3-bit code, A2 A1 A0, is the index here.
+// three outputs A0..A2 arrive on GPIO46/58/59 (ENABLE) and GPIO54..56 (MODE),
+// and that 3-bit code, A2 A1 A0, is the index here. ENABLE A0 is on GPIO46
+// by a temporary jumper - GPIO57 never saw it; see BTS_EN_GPIO_PIN_0.
 //
 // The switches are not wired to the encoder in order: DIP 1-4 reach inputs
 // 3-0, reversed, and DIP 5-8 reach inputs 4-7. With the 148's inverted

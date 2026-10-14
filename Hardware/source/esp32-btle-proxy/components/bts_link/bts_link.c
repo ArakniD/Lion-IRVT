@@ -239,8 +239,14 @@ esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim)
      * already clamped, but this function is reachable from the web API with
      * caller-supplied numbers, so clamp again here.
      */
+    /*
+     * The current ceiling is per SLOT, so a group's leader - whose current
+     * register is the group total, divided across the members by the C2000 -
+     * may hold up to that many slots' worth. Voltage is not scaled: parallel
+     * slots share one voltage.
+     */
     const float vmax = BTS_UNIT_MAX_VOLTAGE_V;
-    const float imax = BTS_UNIT_MAX_CURRENT_A;
+    const float imax = BTS_UNIT_MAX_CURRENT_A * (float)bts_link_group_members(channel);
 
     /*
      * The unit's limits became direction-agnostic in the 2026-09-22 register
@@ -689,6 +695,91 @@ void bts_link_get_snapshot(bts_snapshot_t *out)
         xSemaphoreGive(s_snap_mutex);
     } else {
         memset(out, 0, sizeof(*out));
+    }
+}
+
+uint8_t bts_group_size(const bts_unit_status_t *unit)
+{
+    if (unit == NULL) {
+        return 1;
+    }
+    const uint8_t gs = unit->group_size;
+    return (gs == 2 || gs == 4 || gs == 8) ? gs : 1;
+}
+
+uint8_t bts_group_leader(const bts_unit_status_t *unit, uint8_t slot)
+{
+    const uint8_t gs = bts_group_size(unit);
+    return (uint8_t)(slot & (uint8_t)~(uint8_t)(gs - 1u));
+}
+
+uint8_t bts_group_members(const bts_unit_status_t *unit, uint8_t slot)
+{
+    if (unit == NULL) {
+        return 1;
+    }
+    const uint8_t gs     = bts_group_size(unit);
+    const uint8_t leader = bts_group_leader(unit, slot);
+    uint8_t n = 0;
+    for (uint8_t m = leader; m < leader + gs && m < BTS_NUM_CHANNELS; m++) {
+        if (m <= unit->slot_enable) {
+            n++;
+        }
+    }
+    return n ? n : 1;
+}
+
+bool bts_slot_is_follower(const bts_unit_status_t *unit, uint8_t slot)
+{
+    return bts_group_leader(unit, slot) != slot;
+}
+
+uint8_t bts_link_group_members(uint8_t slot)
+{
+    bts_unit_status_t u;
+    memset(&u, 0, sizeof(u));
+    if (s_snap_mutex != NULL &&
+        xSemaphoreTake(s_snap_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        u = s_snapshot.unit;
+        xSemaphoreGive(s_snap_mutex);
+    }
+    return bts_group_members(&u, slot);
+}
+
+void bts_snapshot_group_totals(bts_snapshot_t *snap)
+{
+    if (snap == NULL) {
+        return;
+    }
+    const uint8_t gs = bts_group_size(&snap->unit);
+    if (gs <= 1) {
+        return;
+    }
+    for (uint8_t leader = 0; leader < BTS_NUM_CHANNELS; leader += gs) {
+        bts_channel_state_t *L = &snap->channel[leader];
+        if (!L->valid || leader > snap->unit.slot_enable) {
+            continue;
+        }
+        for (uint8_t m = leader + 1; m < leader + gs && m < BTS_NUM_CHANNELS; m++) {
+            const bts_channel_state_t *M = &snap->channel[m];
+            if (m > snap->unit.slot_enable) {
+                continue;
+            }
+            if (!M->valid) {
+                L->valid = false;
+                break;
+            }
+            L->cell_current_a  += M->cell_current_a;
+            L->sense_current_a += M->sense_current_a;
+            L->charge_mah      += M->charge_mah;
+            L->charge_mwh      += M->charge_mwh;
+            L->discharge_mah   += M->discharge_mah;
+            L->discharge_mwh   += M->discharge_mwh;
+            L->status_bits     |= M->status_bits & (BTS_STATUS_OVERCURRENT |
+                                                    BTS_STATUS_GROUP_DISCONNECT);
+            L->cmpss_trip      |= M->cmpss_trip;
+            L->gpio_trip       |= M->gpio_trip;
+        }
     }
 }
 

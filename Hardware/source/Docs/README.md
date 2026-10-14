@@ -370,7 +370,11 @@ menu pane on the right that the rotary encoder drives:
 ### The slot table
 
 One row per slot. **Volts and amps are large** - they are what you read from
-across the bench. Everything else is small:
+across the bench - and come from the **16-bit ADS131M08**, the converter the
+BTS regulates against and integrates its counters from, not the 12-bit
+internal ADC. (BLE and HTTP still report the 12-bit pair, so a client and the
+panel can differ by the two converters' disagreement; the calibration screen
+shows both side by side.) Everything else is small:
 
 - **Mode**, a three-letter code:
 
@@ -408,6 +412,25 @@ Everything is the encoder: **turn to move, press to choose.**
 3. **Long press goes back one level.** KEY0 goes straight back to the slot
    list from anywhere. After a minute with no input the panel returns to the
    slot list by itself and drops anything not saved.
+
+### Emergency stop
+
+**Hold KEY0 for about a second to stop every slot.** It switches the converter
+off on all eight slots and ends any test or direct run, from any menu, and also
+while the panel is waiting for the unit or showing the calibration screen.
+The panel shows "ALL STOPPED".
+
+- It stops **everything**, not just the selected slot.
+- It does **not clear faults.** A faulted slot stays faulted and visible, and
+  still cannot be started until you clear it.
+- It stops the converters, so a slot that was PAUSED by the unit stays paused
+  with its counters kept - resuming is still your decision.
+- If the stop cannot reach the unit - the I2C link is down - the panel shows
+  "STOP FAILED". **Do not trust it in that case:** the BTS's own watchdog will
+  pause running slots after 30 s without a host, and the hardware over-current
+  trips remain, but remove power if you need the slots off now.
+- It is a software stop over a bus. It is not a hardware e-stop and does not
+  replace one.
 
 Refusals appear in the pane's top line for a few seconds - "Clear fault 1st",
 "Busy or not set", "Tripped/paused" - so the reason is never only in a log.

@@ -179,6 +179,44 @@ esp_err_t bts_link_init(const bts_link_config_t *config);
 void bts_link_get_snapshot(bts_snapshot_t *out);
 
 /* Single-register access. Both serialise on the bus mutex. */
+/*
+ * SLOT GROUPS
+ * -----------
+ * The MODE strap can tie slots together in groups of 2, 4 or 8, wired in
+ * parallel. Only the group's leader - its lowest slot - has a control loop
+ * and accepts commands; the others follow it. The leader's current settings
+ * are the GROUP TOTAL, which the C2000 divides by the number of ENABLED
+ * members, while voltages pass through undivided (parallel slots share one
+ * voltage).
+ *
+ * These helpers give the same answers the C2000 uses. A unit that has not
+ * answered yet reads as ungrouped, which is the conservative case: 1 member,
+ * so a current limit is never scaled up on a guess.
+ */
+uint8_t bts_group_size(const bts_unit_status_t *unit);
+uint8_t bts_group_leader(const bts_unit_status_t *unit, uint8_t slot);
+/* Enabled slots in `slot`'s group, never 0 - it is a divisor and a multiplier. */
+uint8_t bts_group_members(const bts_unit_status_t *unit, uint8_t slot);
+bool    bts_slot_is_follower(const bts_unit_status_t *unit, uint8_t slot);
+/* The same, from the latest snapshot. */
+uint8_t bts_link_group_members(uint8_t slot);
+
+/*
+ * Rewrites each group leader's channel in `snap` as the WHOLE GROUP: currents
+ * and the four charge/energy counters summed over the enabled members, and
+ * every member's latched trip (over-current, group disconnect, comparator)
+ * carried onto the leader. Voltage and temperature stay the leader's own.
+ *
+ * If any enabled member's read failed this cycle the leader is marked
+ * invalid rather than summed short: a total missing a member would read as a
+ * taper and could end a charge early.
+ *
+ * Followers are left as they are. bts_link_get_snapshot() never applies this;
+ * the test engine does, so every consumer of a slot's status - the panel,
+ * BLE, HTTP - sees a group as one slot on its leader.
+ */
+void bts_snapshot_group_totals(bts_snapshot_t *snap);
+
 esp_err_t bts_link_read_reg(uint16_t reg_addr, float *out_value);
 esp_err_t bts_link_write_reg(uint16_t reg_addr, float value);
 

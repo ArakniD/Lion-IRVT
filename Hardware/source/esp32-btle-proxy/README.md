@@ -19,8 +19,8 @@ a GATT service (for a Web Bluetooth UI) and a JSON HTTP API.
 | Programming port | COM6 (Silicon Labs CP210x) |
 | BTS link | I2C controller, SDA = GPIO21, SCL = GPIO22, **50 kHz** (see below) |
 | Status panel | ST7789 240x320, run as 320x240 landscape (rotated 90 degrees CCW), on SPI2/HSPI, MOSI = GPIO23, SCK = GPIO18, CS = GPIO19 (external 10 k pull-up), DC = GPIO16, RST = GPIO17, BL = GPIO4 |
-| Slot LEDs | 8x WS2812B on SPI3/VSPI, DIN = GPIO13, chained in reverse (LED 1 = slot 8) |
-| Encoder | A = GPIO32, B = GPIO27, switch = GPIO33 |
+| Slot LEDs | 8x WS2812B on SPI3/VSPI, DIN = GPIO25 (no boot or JTAG role), chained in reverse (LED 1 = slot 8) |
+| Encoder | A = GPIO32, B = GPIO26, switch = GPIO33 |
 | KEY0 button | GPIO34 (input only, pulled up on the LCD board) |
 | BTS address | `0x50` |
 | Unit envelope | 0–5 V and ±10 A per channel, 8 channels |
@@ -375,6 +375,15 @@ alternate, because `esp_lcd_panel_draw_bitmap()` returns before the DMA has
 read the pixels; the colour-transfer callback releases a buffer before it is
 drawn into again. 33 kB of DMA-capable RAM in all.
 
+**KEY0 is also the e-stop.** A short press returns to the slot list; holding it
+posts `INPUT_EVENT_KEY0_LONG_PRESS`, which calls `test_engine_abort_all()`: every
+channel is stopped on the unit and every engine test or direct run is ended. It
+works from any menu and while the panel is on the waiting or calibration screen,
+which otherwise discard input. It stops everything, does not clear faults, and
+reports "STOP FAILED" if the converter stop could not reach the unit - which is
+why `abort_all` returns the stop's result rather than the engine's bookkeeping.
+It is a software stop over I2C, not a hardware one.
+
 **Encoder acceleration** comes from `input.c`, which reports a smoothed
 detents-per-second rate with every rotation. Slow turns step 1 mV or 1 mA;
 faster turns step 10, 100 and 1000. A pause of 300 ms resets it, so every new
@@ -418,12 +427,13 @@ T1H = 600 ns, *below* the 650 ns minimum for a logic 1. That works on some
 strips and fails on others, which on a safety indicator is the worst failure
 mode available.
 
-**The encoder's B channel moved from GPIO13 to GPIO27** to free the MOSI pin.
-GPIO14 was the other candidate and was rejected: it is MTMS, and a JTAG pin on
-the encoder would make the box awkward to debug later. GPIO27 carries no
-strapping or JTAG role. A and the switch have since moved off GPIO15 and GPIO2,
-which are strapping pins, to GPIO32 and GPIO33. Full pin map:
-[`Docs/esp32-hardware-connections.md`](../Docs/esp32-hardware-connections.md).
+**The pins have moved several times, for bench reasons.** The encoder's B channel
+went from GPIO13 to GPIO27 to free the MOSI pin, then to GPIO26 because the
+GPIO27 pad never saw an edge. The LED strip's DIN went from GPIO13 to GPIO12,
+GPIO14 and finally GPIO25: a PCB layout error forced the first move, GPIO12 is a
+boot strapping pin, and GPIO14 gave no drive on the bench. A and the switch
+moved off GPIO15 and GPIO2, which are strapping pins, to GPIO32 and GPIO33. Full
+pin map and the reasons: [`Docs/esp32-hardware-connections.md`](../Docs/esp32-hardware-connections.md).
 
 ### What it costs
 

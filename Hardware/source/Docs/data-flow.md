@@ -849,8 +849,8 @@ flowchart LR
     LINK["bts_link poll<br/>9 bursts / 250 ms"]
     SNAP["bts_snapshot_t<br/>status_bits + decoded flags"]
     TASK["led_strip task<br/>FreeRTOS, priority 4,<br/>every 25 ms"]
-    ENC["encode_pixel()<br/>RGB to GRB, brightness 64/255,<br/>4 SPI bits per WS2812B bit"]
-    SPI["SPI3 / VSPI MOSI, GPIO13<br/>2.5 MHz, 96 bytes, one DMA transfer"]
+    ENC["encode_pixel()<br/>RGB to GRB, brightness 64/255 (capped 127),<br/>4 SPI bits per WS2812B bit"]
+    SPI["SPI3 / VSPI MOSI, GPIO25<br/>2.5 MHz, 96 bytes, one DMA transfer"]
     STRIP["8 x WS2812B<br/>one pixel per slot"]
     EYE["Operator"]
 

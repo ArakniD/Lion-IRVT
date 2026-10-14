@@ -6,7 +6,7 @@
  * WIRING
  * ------
  *   A     GPIO32      quadrature channel A
- *   B     GPIO27      quadrature channel B
+ *   B     GPIO26      quadrature channel B
  *   SW    GPIO33      push switch to ground, internal pull-up
  *   KEY0  GPIO34      extra button to ground, pulled up on the LCD board
  *
@@ -18,10 +18,9 @@
  * A and SW used to be on GPIO15 and GPIO2, both strapping pins: GPIO15 (MTDO)
  * silences the ROM boot log if held low at reset, and GPIO2 must not be high
  * while GPIO0 is low or download mode fails. They moved to GPIO32 and GPIO33
- * to take the encoder out of the boot path altogether. B was on GPIO13 until
- * the WS2812B driver claimed that pin for SPI3 MOSI (see led_strip.h), and
- * went to GPIO27. GPIO14 would also have worked, but it is MTMS: a JTAG pin on
- * the encoder would make the board awkward to debug over JTAG.
+ * to take the encoder out of the boot path altogether. B was on GPIO13, then
+ * GPIO27, and is now on GPIO26: the GPIO27 pad never saw an edge on the
+ * bench, so B moved to a pin that was seen toggling.
  *
  * GPIO34 is input only and has NO internal pull-up or pull-down. That is fine
  * for KEY0, which the LCD board pulls up to 3V3, but it means the driver must
@@ -63,6 +62,12 @@ typedef enum {
     INPUT_EVENT_PRESS,        /* released before the long-press threshold */
     INPUT_EVENT_LONG_PRESS,   /* fires once, while still held             */
     INPUT_EVENT_KEY0_PRESS,   /* KEY0 pressed; fires on the debounced edge */
+    /*
+     * KEY0 still held after long_press_ms. Fires once, while held, and the
+     * press event for the same push has already been posted - a long press is
+     * a press first, so a handler for the short press runs too.
+     */
+    INPUT_EVENT_KEY0_LONG_PRESS,
 } input_event_type_t;
 
 typedef struct {
@@ -111,6 +116,14 @@ bool input_switch_is_down(void);
 
 /* Logs A/B/SW/KEY0 levels and the raw PCNT count. See input.c for how to read it. */
 void input_log_pin_state(const char *when);
+
+/*
+ * Live pin levels and the raw PCNT count, for an on-screen readout. Needed
+ * because the AT console owns the serial port once it starts, so the log
+ * lines that show the encoder's pins go quiet exactly when you want them.
+ * Any argument may be NULL. Cheap enough for a 2 Hz display refresh.
+ */
+void input_debug_state(int *a, int *b, int *sw, int *key0, int *count);
 
 #ifdef __cplusplus
 }
