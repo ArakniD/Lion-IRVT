@@ -110,6 +110,7 @@ static void calHandleCommand(uint16_t opcode, float32_t argument);
 static void calServiceDeadMan(void);
 static void calPublishTelemetry(void);
 static uint16_t calSlotIsCalibrating(uint16_t ch);
+static void BTS_seedConverterDuty(uint16_t ch);
 
 //
 // State Machine function prototypes
@@ -654,8 +655,19 @@ static uint16_t calIdlePasses = 0U;
 #define BTS_CAL_IOUT_GAIN_PU_MAX ((float32_t)0.20)
 #define BTS_CAL_VOUT_GAIN_PU_MIN ((float32_t)0.10)
 #define BTS_CAL_VOUT_GAIN_PU_MAX ((float32_t)0.40)
-#define BTS_CAL_F28_GAIN_MIN     ((float32_t)0.5)
-#define BTS_CAL_F28_GAIN_MAX     ((float32_t)2.0)
+//
+// The internal-ADC gains, which are NOT near unity: the voltage path undoes a
+// divider (nominal 2.412, BTS_F28V_GAIN_DEFAULT) and the current path a
+// +/-10 A span on 1.25 V (nominal 9.66, BTS_F28I_GAIN_DEFAULT). These match
+// the bands CPU2's validateCalibration() applies when it reloads a record, so
+// anything accepted here also survives a power cycle. They used to share one
+// 0.5..2.0 window, which rejected the nominal value of BOTH paths and so
+// failed every runtime calibration at compute.
+//
+#define BTS_CAL_F28V_GAIN_MIN    ((float32_t)2.0)
+#define BTS_CAL_F28V_GAIN_MAX    ((float32_t)3.0)
+#define BTS_CAL_F28I_GAIN_MIN    ((float32_t)0.5)
+#define BTS_CAL_F28I_GAIN_MAX    ((float32_t)20.0)
 #define BTS_CAL_F28V_OFFSET_ABS  ((float32_t)1.0)
 #define BTS_CAL_F28I_OFFSET_ABS  ((float32_t)2.0)
 
@@ -677,16 +689,25 @@ static float32_t calAdsCurrentPu(const BTS_measValue *m)
     return (float32_t)m->Sum_I / ((float32_t)BTS_senseAverageFactor * 32768.0f);
 }
 
-static float32_t calF28VoltagePu(const BTS_measValue *m)
+//
+// The internal-ADC pair, volts-at-the-pin, from CLA1's 20 Hz filters - the
+// same source CellVoltageFilt_V / CellCurrentFilt_I are derived from, so a
+// capture agrees with the telemetry an operator is watching.
+//
+// They used to read Sum_CellV / Sum_CellI, the 8-deep ring adcCellVoltageISR
+// filled. That ISR is masked now (see BTS_monitor_Iout_Vout), so the ring
+// never changes: every capture read the same frozen number, both points of a
+// fit were identical, the internal-ADC gain came out as zero, and compute
+// failed validation on every runtime calibration (bench, 2026-10-15).
+//
+static float32_t calF28VoltagePu(uint16_t ch)
 {
-    return ((float32_t)m->Sum_CellV /
-            ((float32_t)BTS_f28AverageFactor * 4096.0f)) * 2.5f;
+    return (BTS_claCellVoltageFilt[ch] / 4096.0f) * 2.5f;
 }
 
-static float32_t calF28CurrentPu(const BTS_measValue *m)
+static float32_t calF28CurrentPu(uint16_t ch)
 {
-    return ((float32_t)m->Sum_CellI /
-            ((float32_t)BTS_f28AverageFactor * 4096.0f)) * 2.5f;
+    return (BTS_claCellCurrentFilt[ch] / 4096.0f) * 2.5f;
 }
 
 //
@@ -807,7 +828,7 @@ static uint32_t calComputeAndSave(void)
         if ((gPu < BTS_CAL_VOUT_GAIN_PU_MIN) || (gPu > BTS_CAL_VOUT_GAIN_PU_MAX)) {
             return (uint32_t)eCalErrValidate;
         }
-        if ((gF28 < BTS_CAL_F28_GAIN_MIN) || (gF28 > BTS_CAL_F28_GAIN_MAX)) {
+        if ((gF28 < BTS_CAL_F28V_GAIN_MIN) || (gF28 > BTS_CAL_F28V_GAIN_MAX)) {
             return (uint32_t)eCalErrValidate;
         }
 
@@ -830,11 +851,15 @@ static uint32_t calComputeAndSave(void)
 
     if (haveI) {
         //
-        // The operator supplies a magnitude; calibration current always flows
-        // in discharge, so the sign is applied here. Entering a signed value
-        // would otherwise invert the slot's whole current reading.
+        // The operator supplies a magnitude; the sign comes from the slot's
+        // own reading, so the fit is right whichever way the bench drives
+        // current. It used to be hard-wired to discharge (-I). With fixed-
+        // current sourcing out of the slot into a short, the ADS read +0.25 pu
+        // against -2.5 A, the gain came out -0.100, and the 0.05..0.20 window
+        // rejected a perfectly good capture (bench, 2026-10-15).
         //
-        float32_t iHi  = -calI_hi_A;
+        float32_t dAds = calI_hi_adsPu - calI_zero_adsPu;
+        float32_t iHi  = (dAds < 0.0f) ? -calI_hi_A : calI_hi_A;
         float32_t dF28 = calI_hi_f28 - calI_zero_f28;
         float32_t gPu;
         float32_t gF28;
@@ -844,7 +869,7 @@ static uint32_t calComputeAndSave(void)
             return (uint32_t)eCalErrPuRange;
         }
 
-        gPu  = (calI_hi_adsPu - calI_zero_adsPu) / iHi;
+        gPu  = dAds / iHi;
         gF28 = dF28 != 0.0f ? (iHi / dF28) : 0.0f;
 
         if (!calGainUsable(gPu) || !calGainUsable(gF28)) {
@@ -853,7 +878,7 @@ static uint32_t calComputeAndSave(void)
         if ((gPu < BTS_CAL_IOUT_GAIN_PU_MIN) || (gPu > BTS_CAL_IOUT_GAIN_PU_MAX)) {
             return (uint32_t)eCalErrValidate;
         }
-        if ((gF28 < BTS_CAL_F28_GAIN_MIN) || (gF28 > BTS_CAL_F28_GAIN_MAX)) {
+        if ((gF28 < BTS_CAL_F28I_GAIN_MIN) || (gF28 > BTS_CAL_F28I_GAIN_MAX)) {
             return (uint32_t)eCalErrValidate;
         }
 
@@ -906,7 +931,21 @@ static void calHandleCommand(uint16_t opcode, float32_t argument)
 
     switch (opcode) {
     case eCalCmdEnter: {
-        uint16_t slot = (uint16_t)registers[BTS_REG_IDX(eCalSlot)];
+        //
+        // The slot travels in the ARGUMENT, not eCalSlot. eCalSlot is a
+        // status mirror: CPU2's 8 Hz timerISR rewrites it with
+        // cpu1Status.calActiveSlot (255 while nothing is calibrating) on
+        // every tick, so a host's write there was routinely overwritten
+        // before this ran and ENTER failed with eCalErrArg - slot 1 only got
+        // through on timing (bench, 2026-10-15). eCalArgument is written by
+        // the host alone and travels with this very command.
+        //
+        // A negative argument means "not supplied": fall back to eCalSlot
+        // for the mode-word entry point and any older host.
+        //
+        uint16_t slot = (argument >= (float32_t)0.0)
+                            ? (uint16_t)argument
+                            : (uint16_t)registers[BTS_REG_IDX(eCalSlot)];
 
         if (slot >= NUM_CHANNELS) {
             result = (uint32_t)eCalErrArg;
@@ -980,12 +1019,12 @@ static void calHandleCommand(uint16_t opcode, float32_t argument)
 
         if (adsPu < BTS_CAL_V_LO_MAX_PU) {
             calV_lo_adsPu = adsPu;
-            calV_lo_f28   = calF28VoltagePu(&BTS_measValues[calSlot]);
+            calV_lo_f28   = calF28VoltagePu(calSlot);
             calV_lo_V     = argument;
             calStatusBits |= (1UL << BTS_CAL_ST_V_LO);
         } else if (adsPu > BTS_CAL_V_HI_MIN_PU) {
             calV_hi_adsPu = adsPu;
-            calV_hi_f28   = calF28VoltagePu(&BTS_measValues[calSlot]);
+            calV_hi_f28   = calF28VoltagePu(calSlot);
             calV_hi_V     = argument;
             calStatusBits |= (1UL << BTS_CAL_ST_V_HI);
         } else {
@@ -1009,7 +1048,7 @@ static void calHandleCommand(uint16_t opcode, float32_t argument)
         calStatusBits &= ~(1UL << BTS_CAL_ST_DRIVING);
 
         calI_zero_adsPu = calAdsCurrentPu(&BTS_measValues[calSlot]);
-        calI_zero_f28   = calF28CurrentPu(&BTS_measValues[calSlot]);
+        calI_zero_f28   = calF28CurrentPu(calSlot);
         calStatusBits |= (1UL << BTS_CAL_ST_I_ZERO);
         break;
 
@@ -1024,6 +1063,13 @@ static void calHandleCommand(uint16_t opcode, float32_t argument)
         }
         BTS_userInputs[calSlot].ioutCal_pu   = argument;
         BTS_userInputs[calSlot].calState     = BTS_CAL_STATE_FIXED_I;
+        //
+        // Seed the duty BEFORE enable_logic goes high, exactly as a normal
+        // start does, so the first edge is Vout/Vin and not a stale value.
+        // Fixed-current is a charge out into the bench short (see
+        // BTS_updateReference), where Vout is ~0 and the seed is ~0 too.
+        //
+        BTS_seedConverterDuty(calSlot);
         BTS_userInputs[calSlot].enable_logic = 1;
         BTS_ctrlLoopVariables[calSlot].tripFlag = 0;
         calStatusBits |= (1UL << BTS_CAL_ST_DRIVING);
@@ -1035,7 +1081,7 @@ static void calHandleCommand(uint16_t opcode, float32_t argument)
             break;
         }
         calI_hi_adsPu = calAdsCurrentPu(&BTS_measValues[calSlot]);
-        calI_hi_f28   = calF28CurrentPu(&BTS_measValues[calSlot]);
+        calI_hi_f28   = calF28CurrentPu(calSlot);
         calI_hi_A     = (argument < 0.0f) ? -argument : argument;
         calStatusBits |= (1UL << BTS_CAL_ST_I_LOADED);
         break;
@@ -1108,8 +1154,8 @@ static void calPublishTelemetry(void)
         cpu1Status.calTelemetry[1] = calAdsCurrentPu(m);
         cpu1Status.calTelemetry[2] = m->Vsense_V;
         cpu1Status.calTelemetry[3] = m->Isense_A;
-        cpu1Status.calTelemetry[4] = calF28VoltagePu(m);
-        cpu1Status.calTelemetry[5] = calF28CurrentPu(m);
+        cpu1Status.calTelemetry[4] = calF28VoltagePu(calSlot);
+        cpu1Status.calTelemetry[5] = calF28CurrentPu(calSlot);
         cpu1Status.calTelemetry[6] = m->CellVoltageFilt_V;
         cpu1Status.calTelemetry[7] = m->CellCurrentFilt_I;
     }
@@ -2131,7 +2177,7 @@ void modeCallback(float value, uint16_t channel)
 
         if (mode & BTS_MODE_CALIBRATE) {
             registers[BTS_REG_IDX(eCalSlot)] = (float32_t)channel;
-            calHandleCommand((uint16_t)eCalCmdEnter, (float32_t)0.0);
+            calHandleCommand((uint16_t)eCalCmdEnter, (float32_t)channel);
             return;
         }
 

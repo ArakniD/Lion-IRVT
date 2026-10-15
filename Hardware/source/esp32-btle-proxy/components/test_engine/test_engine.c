@@ -1303,7 +1303,10 @@ esp_err_t test_engine_clear_fault(uint8_t slot)
     if (engine_fault || (unit_latched && c->state == SLOT_STATE_IDLE)) {
         /* To the group's leader: the C2000 carries a clear across the group
          * from there, and ignores a command addressed to a follower. */
-        (void)bts_link_clear_fault_channel(bts_group_leader(&snap.unit, slot));
+        const uint8_t leader = bts_group_leader(&snap.unit, slot);
+        (void)bts_link_clear_fault_channel(leader);
+        ESP_LOGI(TAG, "slot %u: fault clear sent to leader %u (status 0x%08lx)",
+                 slot, leader, (unsigned long)ch->status_bits);
     }
     xSemaphoreGive(s_lock);
     return ESP_OK;

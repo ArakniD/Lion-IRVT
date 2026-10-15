@@ -105,6 +105,14 @@ static const char *TAG = "display";
 #define MENU_IDLE_MS        60000
 
 /*
+ * The unit's latched fault indications. Each holds the slot off until it is
+ * cleared, and the engine refuses to start a slot carrying any of them - so
+ * the panel has to treat every one as a fault, not just the over-current, or
+ * a slot can be held off with no way to clear it from here.
+ */
+#define UNIT_LATCH_BITS     (BTS_STATUS_OVERCURRENT | BTS_STATUS_GROUP_DISCONNECT)
+
+/*
  * Panel re-sync interval. The table is redrawn twice a second already, so a
  * panel that goes blank while that continues has lost its CONFIGURATION, not
  * its pixels - a supply dip or ESD on the ribbon can knock the ST7789 back to
@@ -491,7 +499,7 @@ static const char *mode_code(const slot_status_t *st, uint16_t *colour)
     if (b & BTS_STATUS_SLOT_DISABLED) {
         *colour = C_DIM;    return "OFF";
     }
-    if (b & BTS_STATUS_OVERCURRENT) {
+    if (b & UNIT_LATCH_BITS) {
         *colour = C_RED;    return "FLT";
     }
     if (st->bts_paused) {
@@ -709,21 +717,22 @@ static bool slot_is_faulted(const slot_status_t *st)
         return true;
     }
     /*
-     * The unit latches an over-current trip until it is cleared, and will
-     * not run the slot meanwhile - whether or not the engine owned the run
-     * that tripped. So any slot the engine is not actively running counts as
-     * faulted while the latch is up.
+     * The unit latches these until they are cleared, and will not run the
+     * slot meanwhile - whether or not the engine owned the run that tripped.
+     * So any slot the engine is not actively running counts as faulted while
+     * a latch is up.
      */
     const bool engine_idle = st->state == SLOT_STATE_IDLE ||
                              st->state == SLOT_STATE_COMPLETE ||
                              st->state == SLOT_STATE_ABORTED;
-    return engine_idle && (st->status_bits & BTS_STATUS_OVERCURRENT) != 0;
+    return engine_idle && (st->status_bits & UNIT_LATCH_BITS) != 0;
 }
 
 static const char *fault_text(const slot_status_t *st)
 {
     if (st->state != SLOT_STATE_FAULT) {
-        return "Over-current trip";
+        return (st->status_bits & BTS_STATUS_OVERCURRENT) ? "Over-current trip"
+                                                          : "Group disconnect";
     }
     switch (st->fault) {
     case SLOT_FAULT_OVER_TEMP:     return "Over temperature";
@@ -1274,6 +1283,18 @@ static void on_press(void)
         const menu_item_t item = items[(s_ui.cursor < n) ? s_ui.cursor : n - 1];
         switch (item) {
         case MENU_RUN:
+            /*
+             * A latched slot cannot run, so Run mode is not offered until the
+             * operator has seen why and cleared it: the fault dialog opens in
+             * its place, with Clear selected.
+             */
+            if (slot_is_faulted(&st)) {
+                s_ui.fault_seen[s_ui.slot] = true;
+                s_ui.fault_open   = true;
+                s_ui.fault_slot   = s_ui.slot;
+                s_ui.fault_cursor = 0;
+                break;
+            }
             s_ui.view   = VIEW_RUN;
             s_ui.cursor = current_run(&st);
             break;

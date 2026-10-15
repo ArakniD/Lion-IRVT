@@ -1041,8 +1041,27 @@ void BTS_HAL_setupSyncBuckPwm(uint32_t EPWM_BASE)
     // Configure ePWM for count-up operation
     //
     EPWM_setTimeBaseCounter(EPWM_BASE, 0);
+    //
+    // The period is written to BOTH the active and the shadow register.
+    //
+    // In shadow mode a write lands only in the shadow, and the active TBPRD
+    // (reset value 0) picks it up when TBCTR passes zero. Slot 1 starts at
+    // zero, so it got its period at once. Slots 2-8 start at their phase
+    // offset (BTS_HAL_setupGroupPhase), and the master's sync reloads them
+    // there every period - so they never passed zero, their active period
+    // stayed 0, CTR=PRD never fired and the CMPA shadow never loaded. The loop
+    // wound up to 55% while the gates sat at the init compare. Seen on the
+    // bench 2026-10-15: EPWM2 TBCTR 1120 and 1194 against a 902 period,
+    // CMPCTL 0x0305 with both shadows full; slots 3-5 identical.
+    //
+    // Both registers, not just the active one: a direct write leaves the
+    // shadow at 0, and the next zero crossing copies that 0 back over the
+    // active period - which stopped every counter, slot 1 included.
+    //
+    EPWM_setPeriodLoadMode(EPWM_BASE, EPWM_PERIOD_DIRECT_LOAD);
     EPWM_setTimeBasePeriod(EPWM_BASE, BTS_DRV_EPWM_TBPRD);
     EPWM_setPeriodLoadMode(EPWM_BASE, EPWM_PERIOD_SHADOW_LOAD);
+    EPWM_setTimeBasePeriod(EPWM_BASE, BTS_DRV_EPWM_TBPRD);
     EPWM_setTimeBaseCounterMode(EPWM_BASE, EPWM_COUNTER_MODE_UP);
     EPWM_disablePhaseShiftLoad(EPWM_BASE);
 

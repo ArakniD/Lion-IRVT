@@ -65,6 +65,14 @@ typedef struct {
  * Written as RGB and reordered when encoded, unlike the C2000 tables which
  * were stored pre-swapped into GRB and needed a comment on every line
  * explaining that yellow only looked right by coincidence.
+ *
+ * These are HUES at full scale, not drive levels. Every one of them, and
+ * every pixel written for any state, passes through scale() in
+ * encode_pixel() - the single point where the brightness limit is applied -
+ * so at the 10% cap white drives 26/26/26 and amber 26/10/0. Keeping the
+ * table full-scale preserves each colour's channel ratios exactly; scaling
+ * the table by hand instead would round amber's green to nothing and make
+ * the limit something every new colour had to remember.
  */
 static const rgb_t C_OFF    = {   0,   0,   0 };
 static const rgb_t C_RED    = { 255,   0,   0 };
@@ -91,9 +99,25 @@ static const uint8_t k_pair[4] = {
     0xCC,   /* 11 -> 1100 1100 */
 };
 
+/*
+ * Full-scale channel value -> drive level. The ONLY place brightness is
+ * applied, and every pixel goes through it.
+ *
+ * The hard ceiling is enforced here as well as in led_strip_init(): this is
+ * the line between a colour and the wire, so nothing that reaches the strip -
+ * a new state colour, a test pattern, a config that skipped init's clamp -
+ * can drive a channel above LED_STRIP_MAX_BRIGHTNESS.
+ *
+ * Rounded rather than truncated, so a non-zero component of a mixed colour
+ * does not vanish at low brightness and shift the hue.
+ */
 static inline uint8_t scale(uint8_t value)
 {
-    return (uint8_t)(((uint16_t)value * (uint16_t)s_cfg.brightness) / 255u);
+    uint16_t level = s_cfg.brightness;
+    if (level > LED_STRIP_MAX_BRIGHTNESS) {
+        level = LED_STRIP_MAX_BRIGHTNESS;
+    }
+    return (uint8_t)(((uint16_t)value * level + 127u) / 255u);
 }
 
 /* Encodes one pixel in WS2812B wire order: green, red, blue. */

@@ -1,0 +1,38 @@
+{
+  "tool": "calibrate.py",
+  "note": "Reconstructed: the original slot 1 success report was overwritten by the next run's single calibration-report.json. Gains read back from the unit over BLE on 2026-10-15; captures from the run were not kept.",
+  "read_back_utc": "2026-10-14T23:49:52.188263+00:00",
+  "ble": {
+    "address": "E4:65:B8:10:D9:3A",
+    "device_name": "BTS-Tester"
+  },
+  "slots": [
+    {
+      "slot": 1,
+      "cal_slot_index": 0,
+      "status": "ok",
+      "error": null,
+      "voltage_tick": true,
+      "current_tick": true,
+      "gains_after": {
+        "F28V_Gain": 2.4131243228912354,
+        "F28V_Offset": 0.006230413913726807,
+        "F28I_Gain": 10.165403366088867,
+        "F28I_Offset": -0.002966378116980195,
+        "IoutGain_pu": 0.10026904195547104,
+        "IoutOffset_pu": -0.000537872314453125,
+        "IoutGain_A": 9.97316837310791,
+        "IoutOffset_A": 0.005364290904253721,
+        "VoutGain_pu": 0.2029796987771988,
+        "VoutOffset_pu": -0.0009690672159194946,
+        "VoutGain_V": 4.926600933074951,
+        "VoutOffset_V": 0.004774207249283791
+      }
+    }
+  ],
+  "summary": {
+    "ok": 1,
+    "failed": 0,
+    "skipped": 0
+  }
+}

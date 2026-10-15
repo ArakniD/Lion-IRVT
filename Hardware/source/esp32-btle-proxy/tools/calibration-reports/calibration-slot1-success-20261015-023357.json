@@ -1,0 +1,74 @@
+{
+  "tool": "calibrate.py",
+  "tool_version": "1.0",
+  "dry_run": false,
+  "started_utc": "2026-10-15T02:33:57.211803+00:00",
+  "finished_utc": "2026-10-15T02:35:00.591253+00:00",
+  "dmm": {
+    "idn": "Agilent Technologies,34410A,MY47012237,2.43-2.35-0.09-46-09",
+    "host": "10.1.1.142",
+    "port": 5025
+  },
+  "ble": {
+    "address": "E4:65:B8:10:D9:3A",
+    "device_name": "BTS-Tester"
+  },
+  "slots": [
+    {
+      "slot": 1,
+      "cal_slot_index": 0,
+      "status": "ok",
+      "error": null,
+      "captures": {
+        "v_low_v": 0.954364,
+        "v_low_pu": 0.192755,
+        "v_low_f28_pu": 0.398537,
+        "v_high_v": 4.283443,
+        "v_high_pu": 0.86848,
+        "v_high_f28_pu": 1.780089,
+        "i_zero_pu": -0.000478,
+        "i_zero_f28_pu": 0.00013,
+        "i_high_a": 2.503812,
+        "i_high_pu": 0.250437,
+        "i_high_f28_pu": 0.24607
+      },
+      "cal_status_bits": 511,
+      "cal_status": "active,v_low_captured,v_high_captured,i_zero_captured,i_loaded_captured,v_computed,i_computed,written_to_fram,driving_current",
+      "voltage_tick": true,
+      "current_tick": true,
+      "gains_before": {
+        "F28V_Gain": 2.4131243228912354,
+        "F28V_Offset": 0.006230413913726807,
+        "F28I_Gain": 10.165403366088867,
+        "F28I_Offset": -0.002966378116980195,
+        "IoutGain_pu": 0.10026904195547104,
+        "IoutOffset_pu": -0.000537872314453125,
+        "IoutGain_A": 9.97316837310791,
+        "IoutOffset_A": 0.005364290904253721,
+        "VoutGain_pu": 0.2029796987771988,
+        "VoutOffset_pu": -0.0009690672159194946,
+        "VoutGain_V": 4.926600933074951,
+        "VoutOffset_V": 0.004774207249283791
+      },
+      "gains_after": {
+        "F28V_Gain": 2.40952467918396,
+        "F28V_Offset": -0.005848348140716553,
+        "F28I_Gain": 10.202739715576172,
+        "F28I_Offset": -0.001430683652870357,
+        "IoutGain_pu": 0.10029034316539764,
+        "IoutOffset_pu": -0.0005025863647460938,
+        "IoutGain_A": 9.971049308776855,
+        "IoutOffset_A": 0.00501131359487772,
+        "VoutGain_pu": 0.2030048966407776,
+        "VoutOffset_pu": -0.0009924769401550293,
+        "VoutGain_V": 4.925989627838135,
+        "VoutOffset_V": 0.004888930823653936
+      }
+    }
+  ],
+  "summary": {
+    "ok": 1,
+    "failed": 0,
+    "skipped": 0
+  }
+}

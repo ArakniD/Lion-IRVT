@@ -358,12 +358,25 @@ esp_err_t bts_link_set_limits(uint8_t channel, const bts_channel_limits_t *lim,
 /* ------------------------------------------------------------------ */
 
 /*
+ * How long the unit takes to publish a calibration command's result.
+ *
+ * eCalResult is not written by the I2C write: CPU1 acts on the opcode from
+ * task B3 (about every 15 ms), and CPU2 copies CPU1's result into registers[]
+ * from its 8 Hz timer - up to 125 ms later. Reading it straight after the
+ * opcode returned the PREVIOUS command's result, so a refusal surfaced one
+ * command late, against the wrong step. 250 ms is two CPU2 ticks.
+ */
+#define BTS_CAL_RESULT_SETTLE_MS    250
+
+/*
  * One calibration command, as the three-step sequence the design requires:
  * argument, opcode, result.
  *
- * All three run under one take of the bus mutex. The opcode is consumed on
- * write and self-clears, so an argument that lands after it - which is what
- * an interleaved caller would produce - would be applied to nothing.
+ * The argument and the opcode go out under one take of the bus mutex. The
+ * opcode is consumed on write and self-clears, so an argument that lands after
+ * it - which is what an interleaved caller would produce - would be applied to
+ * nothing. The mutex is released while the result settles so the poll loop is
+ * not stalled for it.
  */
 static esp_err_t cal_command(uint8_t opcode, float argument, uint32_t *out_result)
 {
@@ -376,12 +389,18 @@ static esp_err_t cal_command(uint8_t opcode, float argument, uint32_t *out_resul
         err = bus_write_reg(BTS_REG_CAL_COMMAND, (float)opcode);
     }
 
+    xSemaphoreGive(s_bus_mutex);
+
     float result = 0.0f;
     if (err == ESP_OK) {
-        err = bus_read_block(BTS_REG_CAL_RESULT, &result, 1);
+        vTaskDelay(pdMS_TO_TICKS(BTS_CAL_RESULT_SETTLE_MS));
+        if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            err = ESP_ERR_TIMEOUT;
+        } else {
+            err = bus_read_block(BTS_REG_CAL_RESULT, &result, 1);
+            xSemaphoreGive(s_bus_mutex);
+        }
     }
-
-    xSemaphoreGive(s_bus_mutex);
 
     if (out_result != NULL) {
         *out_result = (err == ESP_OK) ? (uint32_t)result : 0u;
@@ -407,13 +426,17 @@ esp_err_t bts_link_cal_enter(uint8_t slot, uint32_t *out_result)
     if (slot >= BTS_NUM_CHANNELS) {
         return ESP_ERR_INVALID_ARG;
     }
-    /* eCalSlot is a separate register from the argument, so it is set before
-     * the opcode rather than carried in it. */
+    /*
+     * The slot rides in the ARGUMENT of the ENTER command. eCalSlot is also
+     * written, for older C2000 firmware that still reads it, but it is a
+     * status mirror that CPU2 rewrites at 8 Hz - on its own it was overwritten
+     * before CPU1 read it, and ENTER failed with "argument out of range".
+     */
     esp_err_t err = bts_link_write_reg(BTS_REG_CAL_SLOT, (float)slot);
     if (err != ESP_OK) {
         return err;
     }
-    return cal_command(BTS_CAL_CMD_ENTER, 0.0f, out_result);
+    return cal_command(BTS_CAL_CMD_ENTER, (float)slot, out_result);
 }
 
 esp_err_t bts_link_cal_exit(uint32_t *out_result)

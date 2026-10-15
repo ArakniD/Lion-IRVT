@@ -12,15 +12,16 @@ first run and persisted to calibrate.ini next to this file.
 
 SAFETY
 ------
-The BTS hardware over-current trips are disabled in this firmware build
-(bts_user_settings.h:113-120), so the bench supply's own current limit is the
-backstop. Do not leave a run unattended. Every exit path from this script -
-normal, Ctrl-C, or an unhandled exception - issues CAL_CMD_EXIT so a slot is
-never left driving current.
+The slot's CMPSS over-current comparator trips at 9.5 A, well above the 2.5 A
+capture, so it is a backstop for a fault rather than for the procedure. Do
+not leave a run unattended. Every exit path from this script - normal,
+Ctrl-C, or an unhandled exception - issues CAL_CMD_EXIT so a slot is never
+left driving current.
 
-The DMM current reading is entered as a MAGNITUDE. The firmware applies the
-discharge sign itself; passing a signed value inverts that slot's current
-calibration.
+The DMM current reading is entered as a MAGNITUDE. The firmware takes the
+sign from the slot's own reading. For the loaded current point the slot
+sources current out through a short, with the DMM in series and the bench
+supply disconnected.
 
 REGISTER MAP
 ------------
@@ -305,8 +306,26 @@ class ScpiDmm:
         self.write("CONF:VOLT:DC AUTO")
         return float(self.query("READ?"))
 
+    def prepare_current(self) -> None:
+        """Switch to DC current on the fixed 3 A range ahead of the reading.
+
+        Configuring inside read_current() left the meter switching function
+        and autoranging while the slot was already driving, and on a 34410A
+        that took long enough to be the slowest step of the procedure. Done
+        before the output is turned on, the meter is settled when the current
+        arrives, and a fixed range cannot hunt.
+
+        3 A because that is the top DC current range on the 34410A - it has no
+        10 A range, and asking for one raised a SCPI error and left the meter
+        on volts. The ~2.5 A capture fits, and so does the supply's 3 A limit.
+        """
+        self.write("CONF:CURR:DC 3")
+        self.query("*OPC?")
+        err = self.query("SYST:ERR?")
+        if not err.startswith(("+0", "0")):
+            raise CalibrationError(f"DMM refused the 3 A current range: {err}")
+
     def read_current(self) -> float:
-        self.write("CONF:CURR:DC AUTO")
         return float(self.query("READ?"))
 
     def close(self) -> None:
@@ -329,6 +348,9 @@ class SimDmm:
 
     def read_voltage(self) -> float:
         return self.bench.true_voltage_v()
+
+    def prepare_current(self) -> None:
+        pass
 
     def read_current(self) -> float:
         return self.bench.true_current_a()
@@ -451,7 +473,19 @@ class BleTransport(Transport):
 
     async def send(self, opcode: int, slot: int, arg: float = 0.0) -> CalState:
         payload = struct.pack(CAL_CMD_FMT, opcode, slot, 0, float(arg))
-        await self._client.write_gatt_char(CAL_CONTROL, payload, response=True)
+        try:
+            await self._client.write_gatt_char(CAL_CONTROL, payload, response=True)
+        except Exception as exc:
+            # The proxy answers a refused command with a bare ATT error
+            # ("Unlikely Error"), which says nothing. The unit's own reason is
+            # in eCalResult - read it back so the operator sees that instead.
+            if "Protocol Error" not in str(exc):
+                raise
+            await asyncio.sleep(CMD_LATENCY_S)
+            state = await self.read_cal()
+            if state.result == 0:
+                raise
+            return state
         await asyncio.sleep(CMD_LATENCY_S)
         return await self.read_cal()
 
@@ -679,7 +713,9 @@ class SimTransport(Transport):
 
         if "i_zero" in b.captures and "i_hi" in b.captures:
             (pu_zero, _), (pu_hi, i_hi) = b.captures["i_zero"], b.captures["i_hi"]
-            gain_pu = (abs(pu_hi) - abs(pu_zero)) / i_hi
+            # Mirrors calComputeAndSave(): the sign comes from the reading.
+            d_pu = pu_hi - pu_zero
+            gain_pu = d_pu / (i_hi if d_pu >= 0.0 else -i_hi)
             block["IoutGain_pu"] = gain_pu
             block["IoutOffset_pu"] = pu_zero
             block["IoutGain_A"] = 1.0 / gain_pu
@@ -902,6 +938,7 @@ class Calibrator:
             st = await self.command(CAL_CMD_CAPTURE_VOLTAGE, idx, v_lo)
             rep.captures["v_low_v"] = v_lo
             rep.captures["v_low_pu"] = st.ads_v_pu
+            rep.captures["v_low_f28_pu"] = st.f28_v_pu
 
             # --- voltage, high point ---
             self.prompt("v_high", f"raise the supply to about {SUGGEST_V_HIGH:.2f} V")
@@ -911,30 +948,53 @@ class Calibrator:
             st = await self.command(CAL_CMD_CAPTURE_VOLTAGE, idx, v_hi)
             rep.captures["v_high_v"] = v_hi
             rep.captures["v_high_pu"] = st.ads_v_pu
+            rep.captures["v_high_f28_pu"] = st.f28_v_pu
 
             # --- current, zero point ---
             self.prompt("i_zero",
                         "turn the supply output OFF and break the slot current path")
             st = await self.command(CAL_CMD_ZERO_CURRENT, idx)
             rep.captures["i_zero_pu"] = st.ads_i_pu
+            rep.captures["i_zero_f28_pu"] = st.f28_i_pu
             print(f"          zero captured at pu {st.ads_i_pu:.5f}")
 
             # --- current, loaded point ---
+            # Meter onto the 3 A current range now, before anything flows, so
+            # it is not switching function and autoranging mid-measurement.
+            self.dmm.prepare_current()
+            # No supply for this point: the slot sources the current itself,
+            # out through a short, and the DMM in series measures it. The
+            # firmware takes the sign from its own reading, so the operator
+            # still enters only the magnitude.
             self.prompt(
                 "i_load",
-                "move the DMM into SERIES with the slot, set the supply to about "
-                "3.7 V, and set ITS current limit to 3 A as the backstop, then "
-                "turn the output on",
+                "Now short the slot's current path through the DMM in series "
+                "(DMM on its current terminals, supply disconnected)",
             )
             await self.command(CAL_CMD_SET_FIXED_CURRENT, idx, FIXED_CURRENT_PU)
-            print(f"  driving {FIXED_CURRENT_PU} pu discharge, settling {SETTLE_S:.0f} s ...")
+            print(f"  driving {FIXED_CURRENT_PU} pu out of the slot, settling {SETTLE_S:.0f} s ...")
             await asyncio.sleep(0.0 if self.dry_run else SETTLE_S)
+
+            # Still driving? A trip drops the slot out of fixed-current and
+            # clears this bit; capturing then would fit the gain to 0 A.
+            st = await self.t.read_cal()
+            if not st.bit(8):
+                raise CalibrationError(
+                    "the slot stopped driving before the current capture - "
+                    "check the screen for an over-current trip and the short "
+                    "through the DMM")
 
             i_hi = abs(self.dmm.read_current())   # MAGNITUDE - the firmware signs it
             print(f"          DMM: {i_hi:.5f} A (entered as a magnitude)")
+            if i_hi < 0.5:
+                raise CalibrationError(
+                    f"the DMM read only {i_hi:.4f} A with the slot driving - "
+                    "check the slot is shorted through the DMM's current "
+                    "terminals")
             st = await self.command(CAL_CMD_CAPTURE_CURRENT, idx, i_hi)
             rep.captures["i_high_a"] = i_hi
             rep.captures["i_high_pu"] = st.ads_i_pu
+            rep.captures["i_high_f28_pu"] = st.f28_i_pu
 
             # --- compute, validate, persist ---
             st = await self.command(CAL_CMD_COMPUTE_SAVE, idx)
@@ -1001,6 +1061,19 @@ def print_gain_table(rep: SlotReport) -> None:
         else:
             delta = "-"
         print(f"    {name:<16} {b_txt:>14} {a_txt:>14} {delta:>10}")
+
+
+def report_path(directory: Path, rep: "SlotReport", started: datetime) -> Path:
+    """One file per slot per run: slot, outcome, then the run's start time.
+
+    The outcome is in the name so a glance at the folder shows which slots
+    have a good calibration on record, and the timestamp means a later run -
+    a failed retry above all - can never overwrite a successful one.
+    """
+    outcome = "success" if rep.status == "ok" else (
+        "skipped" if rep.status == "skipped" else "fail")
+    stamp = started.strftime("%Y%m%d-%H%M%S")
+    return directory / f"calibration-slot{rep.slot}-{outcome}-{stamp}.json"
 
 
 def write_report(path: Path, cfg: Config, dmm_idn: str, dry_run: bool,
@@ -1085,8 +1158,7 @@ async def run(args: argparse.Namespace) -> int:
         cfg.save(CONFIG_PATH)
 
     print("\n" + "=" * 68)
-    print("  HARDWARE OVER-CURRENT TRIPS ARE DISABLED IN THIS FIRMWARE BUILD.")
-    print("  The bench supply's own current limit is the only fast backstop.")
+    print("  The current point drives ~2.5 A out of the slot into a short.")
     print("  Do not leave this run unattended. Enter DMM currents as MAGNITUDES.")
     print("=" * 68)
 
@@ -1109,7 +1181,11 @@ async def run(args: argparse.Namespace) -> int:
         await transport.close()
         dmm.close()
 
-    write_report(Path(args.report), cfg, idn, args.dry_run, started, reports)
+    report_dir = Path(args.report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    for r in reports:
+        write_report(report_path(report_dir, r, started), cfg, idn,
+                     args.dry_run, started, [r])
 
     ok = sum(1 for r in reports if r.status == "ok")
     print(f"\n{ok}/{len(reports)} slots calibrated")
@@ -1130,8 +1206,10 @@ def main() -> int:
                     help="re-prompt for the DMM, BLE and HTTP settings")
     ap.add_argument("--allow-unknown-dmm", action="store_true",
                     help="continue even if *IDN? reports an unrecognised model")
-    ap.add_argument("--report", default="calibration-report.json",
-                    help="path for the JSON report (default calibration-report.json)")
+    ap.add_argument("--report-dir", default="calibration-reports",
+                    help="folder for the JSON reports, one per slot, named "
+                         "calibration-slot<N>-<success|fail>-<time>.json "
+                         "(default calibration-reports)")
     args = ap.parse_args()
 
     try:

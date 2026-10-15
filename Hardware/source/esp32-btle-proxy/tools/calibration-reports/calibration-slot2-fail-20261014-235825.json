@@ -1,0 +1,58 @@
+{
+  "tool": "calibrate.py",
+  "tool_version": "1.0",
+  "dry_run": false,
+  "started_utc": "2026-10-14T23:58:25.511126+00:00",
+  "finished_utc": "2026-10-14T23:59:20.266562+00:00",
+  "dmm": {
+    "idn": "Agilent Technologies,34410A,MY47012237,2.43-2.35-0.09-46-09",
+    "host": "10.1.1.142",
+    "port": 5025
+  },
+  "ble": {
+    "address": "E4:65:B8:10:D9:3A",
+    "device_name": "BTS-Tester"
+  },
+  "slots": [
+    {
+      "slot": 2,
+      "cal_slot_index": 1,
+      "status": "failed",
+      "error": "the DMM read only 0.0000 A with the slot driving - check the slot is shorted through the DMM's current terminals",
+      "captures": {
+        "v_low_v": 0.897168,
+        "v_low_pu": 0.180935,
+        "v_low_f28_pu": 0.369729,
+        "v_high_v": 4.249634,
+        "v_high_pu": 0.86238,
+        "v_high_f28_pu": 1.761532,
+        "i_zero_pu": -0.001282,
+        "i_zero_f28_pu": -0.001611
+      },
+      "cal_status_bits": 0,
+      "cal_status": "-",
+      "voltage_tick": false,
+      "current_tick": false,
+      "gains_before": {
+        "F28V_Gain": 2.412100076675415,
+        "F28V_Offset": 0.0,
+        "F28I_Gain": 9.65999984741211,
+        "F28I_Offset": 0.0,
+        "IoutGain_pu": 0.099732406437397,
+        "IoutOffset_pu": 3.725290298461914e-09,
+        "IoutGain_A": 10.02683162689209,
+        "IoutOffset_A": -3.735285858397219e-08,
+        "VoutGain_pu": 0.20232677459716797,
+        "VoutOffset_pu": -1.4901161193847656e-08,
+        "VoutGain_V": 4.94249963760376,
+        "VoutOffset_V": 7.364898380046725e-08
+      },
+      "gains_after": null
+    }
+  ],
+  "summary": {
+    "ok": 0,
+    "failed": 1,
+    "skipped": 0
+  }
+}

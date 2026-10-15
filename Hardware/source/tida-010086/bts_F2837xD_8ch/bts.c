@@ -691,8 +691,16 @@ void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoo
     //
     if (userInput->calState != BTS_CAL_STATE_NORMAL) {
         if (userInput->calState == BTS_CAL_STATE_FIXED_I) {
+            //
+            // A CHARGE: positive current sourced out of the slot into the
+            // bench short, measured by the DMM in series. The voltage limit
+            // is a ceiling at 0.95 pu, just under full scale, so the node of
+            // a shorted slot sits far below it, the CCCV loop's error stays
+            // large and positive, and the loop stays in CC at +ioutCal_pu -
+            // exporting power rather than regulating a voltage.
+            //
             ctrlLoopVariable->ioutRef_pu = userInput->ioutCal_pu;
-            ctrlLoopVariable->voutRef_pu = (float32_t)1.0;
+            ctrlLoopVariable->voutRef_pu = (float32_t)0.95;
         } else {
             //
             // Calibration idle. The converter is held off but the ADCs keep
@@ -704,11 +712,21 @@ void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoo
         }
 
         //
-        // Calibration current always flows in discharge, which the loop
-        // represents with a negative direction coefficient.
+        // The feed-forward duty seeded when fixed-current started, so the
+        // release edge seeds the biquad from Vout/Vin rather than a stale
+        // value - the same thing BTS_seedConverterDuty() does on a normal
+        // start.
         //
-        ctrlLoopVariable->direction_coeff = -1.0;
-        ctrlLoopVariable->direction_logic = 0U;
+        ctrlLoopVariable->dutySetRef_pu = userInput->dutyRef_pu;
+
+        //
+        // Calibration current flows in CHARGE: out of the slot, positive,
+        // with the synchronous rectifier managed as for any charge. It used
+        // to be discharge (-1), which only worked against a held-up node; into
+        // the bench short the loop went to CV and nothing was exported.
+        //
+        ctrlLoopVariable->direction_coeff = 1.0;
+        ctrlLoopVariable->direction_logic = 1U;
 
 #if(BTS_TRIP_CODE)
         ctrlLoopVariable->tripFlag = userInput->enable_logic ? 0U : 1U;
