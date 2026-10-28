@@ -22,11 +22,12 @@
 static const char *TAG = "led_strip";
 
 /*
- * 2.5 MHz: four SPI bits per WS2812B bit gives T0H = 400 ns and T1H = 800 ns,
- * both exactly nominal. See the header for why 3.333 MHz is not used.
+ * 3.2 MHz: four SPI bits per WS2812B bit, 312.5 ns each, 1.25 us per bit.
+ * APB 80 MHz / 25, so the rate is exact. See the header for why 2.5 MHz was
+ * replaced: its 400 ns zero-pulse read as a one on these parts.
  */
 #define LED_SPI_HOST        SPI3_HOST
-#define LED_SPI_HZ          (2500000)
+#define LED_SPI_HZ          (3200000)
 
 /* Two WS2812B bits per SPI byte; 24 bits of colour per LED. */
 #define LED_BYTES_PER_LED   12
@@ -89,14 +90,17 @@ static volatile bool       s_blanked;
 static bool                s_ready;
 
 /*
- * One SPI byte carries two WS2812B bits: 0 -> 1000, 1 -> 1100.
+ * One SPI byte carries two WS2812B bits: 0 -> 1000, 1 -> 1110.
  * Indexed by those two bits, high bit first.
+ *
+ *   0: 312 ns high, 938 ns low
+ *   1: 938 ns high, 312 ns low
  */
 static const uint8_t k_pair[4] = {
     0x88,   /* 00 -> 1000 1000 */
-    0x8C,   /* 01 -> 1000 1100 */
-    0xC8,   /* 10 -> 1100 1000 */
-    0xCC,   /* 11 -> 1100 1100 */
+    0x8E,   /* 01 -> 1000 1110 */
+    0xE8,   /* 10 -> 1110 1000 */
+    0xEE,   /* 11 -> 1110 1110 */
 };
 
 /*
@@ -276,7 +280,7 @@ static void render(uint32_t tick)
     };
 
     /*
-     * Blocking, and deliberately so: at 2.5 MHz the frame takes 307 us and
+     * Blocking, and deliberately so: at 3.2 MHz the frame takes 240 us and
      * this task has nothing else to do. The reset latch needs MOSI low for
      * >50 us afterwards, which comes free - every symbol ends in a 0 bit, so
      * the line rests low between frames and the next refresh is 25 ms away.

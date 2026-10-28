@@ -416,16 +416,20 @@ GPIO23/GPIO18 — VSPI's IO_MUX default pads — but reaches them through the GP
 matrix, so SPI3 was the genuinely free host. Sharing one would let an LED frame
 stall a panel repaint and vice versa.
 
-**Four SPI bits per WS2812B bit at 2.5 MHz** (80 MHz / 32, so one SPI bit is
-400 ns): `1000` is a 0, `1100` is a 1, landing both symbols on the part's exact
-nominal widths with a 1600 ns slot well inside the 650–1850 ns it tolerates.
-Two WS2812B bits pack into one SPI byte, so the whole eight-LED frame is 96
-bytes in a single 307 us DMA transfer, and MOSI rests low afterwards — which
-covers the 50 us reset latch for free. The rate is a deliberate departure from
-the commonly-cited **3.333 MHz**, where the same `1100` symbol gives
-T1H = 600 ns, *below* the 650 ns minimum for a logic 1. That works on some
-strips and fails on others, which on a safety indicator is the worst failure
-mode available.
+**Four SPI bits per WS2812B bit at 3.2 MHz** (80 MHz / 25, so one SPI bit is
+312.5 ns and a WS2812B bit is 1.25 us): `1000` is a 0 at 312 ns high, `1110`
+is a 1 at 938 ns high - clearly either side of the part's ~450-600 ns sample
+point. Two WS2812B bits pack into one SPI byte, so the whole eight-LED frame
+is 96 bytes in a single 240 us DMA transfer, and MOSI rests low afterwards,
+which covers the reset latch for free.
+
+The rate was **2.5 MHz** with `1000`/`1100` (T0H 400 ns, T1H 800 ns) until
+2026-10-15. On the bench every colour byte then decoded as 0xFF - each LED
+full white or a saturated primary, whatever the frame asked for, with the
+byte order and LED index still right. A WS2812B samples DIN roughly
+450-600 ns after the rising edge; a 400 ns zero, slowed further by the
+level shifter, was still high at that point and read as a one. The newer
+parts specify T0H at 220-380 ns for exactly this reason.
 
 **The pins have moved several times, for bench reasons.** The encoder's B channel
 went from GPIO13 to GPIO27 to free the MOSI pin, then to GPIO26 because the

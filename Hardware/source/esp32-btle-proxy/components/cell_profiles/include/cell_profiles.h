@@ -34,6 +34,19 @@ extern "C" {
 #define CELL_MAX_MODELS     32
 #define CELL_MAX_CHEMISTRY  8
 
+/*
+ * User-defined models, stored in NVS alongside the built-ins.
+ *
+ * Twelve is the operator's ceiling, and short names only ("VTC6A" is about
+ * the longest), so the name is capped well under CELL_NAME_MAX. Each model is
+ * one ~80-byte blob in the 24 KB nvs partition, a negligible share of it.
+ *
+ * A custom model may not reuse a built-in model's name: the built-ins are the
+ * reference set, and a slot naming "VTC6" must always mean Sony's figures.
+ */
+#define CELL_CUSTOM_MAX         12
+#define CELL_CUSTOM_NAME_MAX    8   /* incl. NUL: 7 characters */
+
 typedef enum {
     CELL_CHEM_LCO = 0,   /* LiCoO2            */
     CELL_CHEM_LTO,       /* Li4Ti5O12         */
@@ -124,6 +137,23 @@ bool cell_chemistry_from_name(const char *name, cell_chemistry_t *out);
 size_t cell_model_count(void);
 const cell_model_t *cell_model_at(size_t index);
 const cell_model_t *cell_model_find(const char *name);
+
+/*
+ * Custom models.
+ *
+ * cell_model_count()/cell_model_at() cover built-ins first, then the custom
+ * models in slot order, so every catalog reader - BLE, HTTP, the panel -
+ * lists them without knowing they are different.
+ *
+ * save() adds the model, or replaces the custom model of the same name. It
+ * fails with ESP_ERR_INVALID_ARG for a bad name or figures, ESP_ERR_NOT_ALLOWED
+ * for a built-in's name, and ESP_ERR_NO_MEM when all CELL_CUSTOM_MAX are used.
+ * delete() returns ESP_ERR_NOT_FOUND for a name that is not a custom model.
+ */
+size_t    cell_model_builtin_count(void);
+bool      cell_model_is_custom(const cell_model_t *model);
+esp_err_t cell_model_custom_save(const cell_model_t *model);
+esp_err_t cell_model_custom_delete(const char *name);
 
 /*
  * Resolves a slot configuration into a concrete parameter set.

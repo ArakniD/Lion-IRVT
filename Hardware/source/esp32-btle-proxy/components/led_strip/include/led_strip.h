@@ -42,20 +42,30 @@
  *
  * HOW THE BITSTREAM IS BUILT
  * --------------------------
- * Each WS2812B bit becomes four SPI bits at 2.5 MHz (400 ns each):
+ * Each WS2812B bit becomes four SPI bits at 3.2 MHz (312.5 ns each), giving
+ * the part's own 1.25 us bit period:
  *
- *   0  ->  1000     400 ns high, 1200 ns low
- *   1  ->  1100     800 ns high,  800 ns low
+ *   0  ->  1000     312 ns high, 938 ns low
+ *   1  ->  1110     938 ns high, 312 ns low
  *
- * Both land on the WS2812B's nominal widths exactly, and the 1600 ns slot is
- * well inside the 650-1850 ns the part tolerates. 3.333 MHz - the rate the
- * commonly-cited article uses - would give a 600 ns T1H, which is below the
- * 650 ns minimum for a 1; it works on many strips and fails on others, so it
- * is not used here.
+ * The WS2812B samples DIN roughly 450-600 ns after each rising edge: a line
+ * still high then is a 1, already low is a 0. So what has to be right is that
+ * a 0 is well SHORT of that point and a 1 well PAST it. 312 ns and 938 ns sit
+ * on either side of it with margin, and both are inside the datasheet's
+ * T0H 220-380 ns / T1H 580-1000 ns windows (the "V5" WS2812B / WS2813 table).
+ *
+ * WHY NOT THE 2.5 MHz 1000/1100 THAT WAS HERE BEFORE. It gave T0H = 400 ns
+ * and T1H = 800 ns, the figures in the oldest WS2812 datasheet. On these
+ * parts, through the level shifter's added rise time, a 400 ns zero was still
+ * high at the sample point and read as a ONE - every colour byte decoded as
+ * 0xFF, so each LED showed full white or a saturated primary whatever the
+ * frame asked for, while the byte order and the LED index were right. The
+ * newer parts specify T0H at 220-380 ns precisely because 400 ns is marginal.
  *
  * Two WS2812B bits pack into one SPI byte, so 24 bits of colour become 12
- * bytes and the whole 8-LED frame is 96 bytes in a single DMA transfer. MOSI
- * idles low between transfers, which is what the >50 us reset latch needs.
+ * bytes and the whole 8-LED frame is 96 bytes in a single DMA transfer, 240 us
+ * long. MOSI idles low between transfers, which is what the >280 us reset
+ * latch of the newer parts needs - the next frame is 25 ms away.
  */
 
 #ifndef LED_STRIP_H

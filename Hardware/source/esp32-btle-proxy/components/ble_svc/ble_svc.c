@@ -45,6 +45,7 @@ static const ble_uuid128_t s_uuid_slot_status  = TESTER_UUID128(0x00, 0x0a);
 static const ble_uuid128_t s_uuid_cal_cmd      = TESTER_UUID128(0x00, 0x0b);
 static const ble_uuid128_t s_uuid_cal_status   = TESTER_UUID128(0x00, 0x0c);
 static const ble_uuid128_t s_uuid_register     = TESTER_UUID128(0x00, 0x0d);
+static const ble_uuid128_t s_uuid_model        = TESTER_UUID128(0x00, 0x0e);
 
 static uint16_t s_unit_status_handle;
 static uint16_t s_slot_status_handle;
@@ -216,7 +217,8 @@ static void build_catalog_entry(uint8_t index, ble_catalog_entry_t *out)
     }
     const cell_chemistry_profile_t *cp = cell_chemistry_get(m->chemistry);
 
-    out->kind                    = BLE_CATALOG_KIND_MODEL;
+    out->kind                    = cell_model_is_custom(m) ? BLE_CATALOG_KIND_CUSTOM_MODEL
+                                                           : BLE_CATALOG_KIND_MODEL;
     out->chemistry               = (uint8_t)m->chemistry;
     out->capacity_mah            = m->capacity_mah;
     out->charge_current_max_a    = m->charge_current_max_a;
@@ -423,6 +425,50 @@ static int handle_serial_write(struct os_mbuf *om)
     return 0;
 }
 
+/*
+ * Custom model save/delete, characteristic 000e. See ble_model_cmd_t.
+ */
+static int handle_model_write(struct os_mbuf *om)
+{
+    ble_model_cmd_t cmd;
+    int rc = read_flat(om, &cmd, sizeof(cmd));
+    if (rc != 0) {
+        return rc;
+    }
+
+    char name[sizeof(cmd.name) + 1];
+    memcpy(name, cmd.name, sizeof(cmd.name));
+    name[sizeof(cmd.name)] = '\0';
+
+    esp_err_t err;
+    if (cmd.op == BLE_MODEL_OP_DELETE) {
+        err = cell_model_custom_delete(name);
+    } else if (cmd.op == BLE_MODEL_OP_SAVE) {
+        cell_model_t m;
+        memset(&m, 0, sizeof(m));
+        snprintf(m.name, sizeof(m.name), "%s", name);
+        memcpy(m.manufacturer, cmd.manufacturer,
+               sizeof(cmd.manufacturer) < sizeof(m.manufacturer)
+                   ? sizeof(cmd.manufacturer) : sizeof(m.manufacturer) - 1);
+        m.manufacturer[sizeof(m.manufacturer) - 1] = '\0';
+        m.chemistry               = (cell_chemistry_t)cmd.chemistry;
+        m.capacity_mah            = cmd.capacity_mah;
+        m.charge_current_max_a    = cmd.charge_current_max_a;
+        m.discharge_current_max_a = cmd.discharge_current_max_a;
+        m.charge_v_max            = cmd.charge_v_max;
+        m.discharge_v_min         = cmd.discharge_v_min;
+        err = cell_model_custom_save(&m);
+    } else {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "model %s op %u refused: %s", name, cmd.op, esp_err_to_name(err));
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* GATT access                                                        */
 /* ------------------------------------------------------------------ */
@@ -569,6 +615,9 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
         if (ble_uuid_cmp(uuid, &s_uuid_slot_serial.u) == 0) {
             return handle_serial_write(ctxt->om);
         }
+        if (ble_uuid_cmp(uuid, &s_uuid_model.u) == 0) {
+            return handle_model_write(ctxt->om);
+        }
         if (ble_uuid_cmp(uuid, &s_uuid_slot_select.u) == 0) {
             uint8_t v;
             int rc = read_flat(ctxt->om, &v, 1);
@@ -658,6 +707,11 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                 .uuid = &s_uuid_register.u,
                 .access_cb = gatt_access,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+            }, {
+                /* Appended for BLE_PROTO_VERSION 8: custom model upload. */
+                .uuid = &s_uuid_model.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_WRITE,
             }, {
                 0,
             },

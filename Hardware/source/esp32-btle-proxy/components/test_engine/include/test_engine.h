@@ -199,14 +199,21 @@ typedef struct {
     slot_config_t    config;
     cell_resolved_profile_t profile;
 
-    float            voltage_v;      /* 12-bit internal ADC (eChX_CellVoltage) */
-    float            current_a;      /* 12-bit internal ADC (eChX_CellCurrent) */
     /*
-     * The 16-bit ADS131M08 pair (eChX_SenseVoltage / eChX_SenseCurrent): what
-     * the CC loop regulates against and the BTS's own counters integrate. The
-     * front panel shows these; BLE and HTTP still report the 12-bit pair, so
-     * a client and the panel can differ by the two converters' disagreement.
+     * voltage_v / current_a are the 16-bit ADS131M08 pair
+     * (eChX_SenseVoltage / eChX_SenseCurrent): what the CC loop regulates
+     * against and the BTS's own counters integrate. BLE, HTTP, the panel and
+     * the engine's own checks and coulomb counting all use these, so every
+     * host reports the same figure. sense_voltage_v / sense_current_a carry
+     * the same values and are kept for the callers that name them.
+     *
+     * They used to be the 12-bit internal-ADC pair (eChX_CellVoltage /
+     * eChX_CellCurrent), which runs a few percent off the ADS131M08 before
+     * calibration - ~10% low in current on slot 1 - so Home Assistant and the
+     * panel disagreed.
      */
+    float            voltage_v;
+    float            current_a;
     float            sense_voltage_v;
     float            sense_current_a;
     float            temp_c;

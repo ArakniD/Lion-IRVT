@@ -589,9 +589,9 @@ from [`main.c`](../esp32-btle-proxy/main/main.c).
 | | |
 |---|---|
 | Bus | `SPI3_HOST` (VSPI), MOSI on **GPIO25** (no boot or JTAG role) |
-| Clock | **2.5 MHz** — 80 MHz / 32 |
-| Encoding | four SPI bits per WS2812B bit: `1000` = 0, `1100` = 1 |
-| Frame | 12 bytes per LED, **96 bytes for all eight in one DMA transfer**, 307 us |
+| Clock | **3.2 MHz** — 80 MHz / 25, 312.5 ns per SPI bit |
+| Encoding | four SPI bits per WS2812B bit: `1000` = 0 (312 ns high), `1110` = 1 (938 ns high) |
+| Frame | 12 bytes per LED, **96 bytes for all eight in one DMA transfer**, 240 us |
 | Refresh | FreeRTOS task `led_strip`, priority 4, 3072-byte stack, every 25 ms |
 | Brightness | 26/255 (10%), scaled linearly per channel, and the driver's hard cap - indicators only, about 50 mA for the strip worst case. Off during a WiFi firmware update |
 
@@ -604,14 +604,17 @@ on GPIO23/GPIO18 — VSPI's IO_MUX default pads — but reaches them through the
 GPIO matrix, so SPI3 was the genuinely free host. Sharing one host would let
 an LED frame stall a panel repaint and vice versa.
 
-**2.5 MHz, not the 3.333 MHz the commonly-cited article uses.** At 2.5 MHz an
-SPI bit is 400 ns, so `1000` gives T0H = 400 ns and `1100` gives T1H = 800 ns
-— both *exactly* the WS2812B's nominal widths, with the resulting 1600 ns slot
-well inside the 650–1850 ns the part tolerates. At 3.333 MHz the same `1100`
-symbol gives **T1H = 600 ns, under the 650 ns minimum for a logic 1**. That
-works on some strips and fails on others, which is the worst failure mode
-available here: intermittently wrong colours on a safety indicator. The
-deviation from the article is deliberate.
+**Why 3.2 MHz with `1000`/`1110`.** The two pulse widths sit clearly either
+side of the WS2812B's 450-600 ns sample point, and inside the datasheet's
+T0H 220-380 ns / T1H 580-1000 ns windows.
+
+The rate was **2.5 MHz** with `1000`/`1100` (T0H 400 ns, T1H 800 ns) until
+2026-10-15. On the bench every colour byte then decoded as 0xFF - each LED
+full white or a saturated primary, whatever the frame asked for, with the
+byte order and LED index still right. A WS2812B samples DIN roughly
+450-600 ns after the rising edge; a 400 ns zero, slowed further by the
+level shifter, was still high at that point and read as a one. The newer
+parts specify T0H at 220-380 ns for exactly this reason.
 
 **The reset latch comes free.** Every symbol ends in a 0 bit, so MOSI rests
 low between frames and the >50 us the part needs to latch is covered many

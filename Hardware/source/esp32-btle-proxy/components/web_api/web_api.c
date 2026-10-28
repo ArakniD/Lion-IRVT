@@ -706,6 +706,9 @@ static esp_err_t h_catalog(httpd_req_t *req)
         json_kv_f(&j, "capacity_mah", m->capacity_mah, 0);
         json_kv_f(&j, "charge_current_max_a", m->charge_current_max_a, 2);
         json_kv_f(&j, "discharge_current_max_a", m->discharge_current_max_a, 2);
+        json_kv_f(&j, "charge_v_max", m->charge_v_max, 3);
+        json_kv_f(&j, "discharge_v_min", m->discharge_v_min, 3);
+        json_kv_bool(&j, "custom", cell_model_is_custom(m));
         json_obj_close(&j);
         if (chunk_flush(req, &j) != ESP_OK) {
             return httpd_resp_send_chunk(req, NULL, 0);
@@ -780,6 +783,106 @@ static esp_err_t h_chemistry_post(httpd_req_t *req)
         return send_error(req, "500 Internal Server Error", esp_err_to_name(err));
     }
     ESP_LOGI(TAG, "chemistry %s overridden", p.name);
+    return send_ok(req);
+}
+
+/*
+ * Custom cell models, stored in NVS beside the built-ins.
+ *
+ *   POST   /api/model/<name>   add, or replace the custom model of that name
+ *   DELETE /api/model/<name>   remove it
+ *
+ * The name comes from the URI and is the model's identity; the body carries
+ * the figures. Required: chemistry and capacity_mah. Optional, 0 to inherit
+ * the chemistry: charge_current_max_a, discharge_current_max_a, charge_v_max,
+ * discharge_v_min; manufacturer is free text.
+ *
+ * Refusals say why, so a host uploading a profile file can report the bad
+ * entry: 400 for a bad name or figures, 409 for a built-in's name, 507 when
+ * all CELL_CUSTOM_MAX are in use, 404 deleting a model that is not custom.
+ * The catalog (GET /api/catalog, and BLE 0008/0009) lists the custom models
+ * after the built-ins and marks them "custom": true.
+ */
+static const char *model_name_from_uri(httpd_req_t *req)
+{
+    const char *name = strrchr(req->uri, '/');
+    if (name == NULL || name[1] == '\0') {
+        return NULL;
+    }
+    return name + 1;
+}
+
+static esp_err_t h_model_post(httpd_req_t *req)
+{
+    const char *name = model_name_from_uri(req);
+    if (name == NULL) {
+        return send_error(req, "404 Not Found", "missing model name");
+    }
+
+    char body[REQ_BUF];
+    const int len = read_body(req, body, sizeof(body));
+    if (len <= 0) {
+        return send_error(req, "400 Bad Request", "missing body");
+    }
+
+    cell_model_t m;
+    memset(&m, 0, sizeof(m));
+    if (strlen(name) >= CELL_CUSTOM_NAME_MAX) {
+        return send_error(req, "400 Bad Request", "model name too long (7 max)");
+    }
+    snprintf(m.name, sizeof(m.name), "%s", name);
+
+    char sbuf[CELL_NAME_MAX * 2];
+    if (!json_get_str(body, (size_t)len, "chemistry", sbuf, sizeof(sbuf)) ||
+        !cell_chemistry_from_name(sbuf, &m.chemistry)) {
+        return send_error(req, "400 Bad Request", "missing or unknown chemistry");
+    }
+    if (json_get_str(body, (size_t)len, "manufacturer", sbuf, sizeof(sbuf))) {
+        if (!copy_field(m.manufacturer, sizeof(m.manufacturer), sbuf)) {
+            return send_error(req, "400 Bad Request", "manufacturer too long");
+        }
+    }
+
+    double num;
+    if (!json_get_num(body, (size_t)len, "capacity_mah", &num)) {
+        return send_error(req, "400 Bad Request", "missing capacity_mah");
+    }
+    m.capacity_mah = (float)num;
+    if (json_get_num(body, (size_t)len, "charge_current_max_a", &num))    m.charge_current_max_a = (float)num;
+    if (json_get_num(body, (size_t)len, "discharge_current_max_a", &num)) m.discharge_current_max_a = (float)num;
+    if (json_get_num(body, (size_t)len, "charge_v_max", &num))            m.charge_v_max = (float)num;
+    if (json_get_num(body, (size_t)len, "discharge_v_min", &num))         m.discharge_v_min = (float)num;
+
+    const esp_err_t err = cell_model_custom_save(&m);
+    switch (err) {
+    case ESP_OK:
+        return send_ok(req);
+    case ESP_ERR_INVALID_ARG:
+        return send_error(req, "400 Bad Request",
+                          "model fails validation (name A-Z 0-9 - _, 7 max; "
+                          "capacity > 0; figures inside the unit envelope)");
+    case ESP_ERR_NOT_ALLOWED:
+        return send_error(req, "409 Conflict", "name is a built-in model");
+    case ESP_ERR_NO_MEM:
+        return send_error(req, "507 Insufficient Storage", "custom model store is full");
+    default:
+        return send_error(req, "500 Internal Server Error", esp_err_to_name(err));
+    }
+}
+
+static esp_err_t h_model_delete(httpd_req_t *req)
+{
+    const char *name = model_name_from_uri(req);
+    if (name == NULL) {
+        return send_error(req, "404 Not Found", "missing model name");
+    }
+    const esp_err_t err = cell_model_custom_delete(name);
+    if (err == ESP_ERR_NOT_FOUND) {
+        return send_error(req, "404 Not Found", "no custom model of that name");
+    }
+    if (err != ESP_OK) {
+        return send_error(req, "500 Internal Server Error", esp_err_to_name(err));
+    }
     return send_ok(req);
 }
 
@@ -1463,7 +1566,7 @@ static esp_err_t h_i2c_diag(httpd_req_t *req)
 static esp_err_t h_options(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
     httpd_resp_set_status(req, "204 No Content");
     return httpd_resp_send(req, NULL, 0);
@@ -1557,6 +1660,8 @@ static const httpd_uri_t s_routes[] = {
     { .uri = "/api/ota",             .method = HTTP_POST, .handler = h_ota_post     },
     { .uri = "/api/ota/key",         .method = HTTP_POST, .handler = h_ota_key_post },
     { .uri = "/api/chemistry/*",     .method = HTTP_POST, .handler = h_chemistry_post },
+    { .uri = "/api/model/*",         .method = HTTP_POST,   .handler = h_model_post   },
+    { .uri = "/api/model/*",         .method = HTTP_DELETE, .handler = h_model_delete },
     /*
      * One entry per method; the action is dispatched from the trailing
      * segment above. These must stay after the exact paths, because the

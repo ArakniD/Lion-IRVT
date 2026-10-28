@@ -223,7 +223,7 @@ The pins tried first, and why they were dropped:
 LED 8 shows slot 1. `led_for_slot()` in `led_strip.c` holds the mapping.
 
 The strip is not on the LCD board. It has no clock line; the SPI3 bit
-pattern at 2.5 MHz forms the WS2812B pulses (see `led_strip.h`).
+pattern at 3.2 MHz forms the WS2812B pulses (see `led_strip.h`).
 
 **Level shifting.** The strip runs from 5 V, so its data input wants a high of
 at least 0.7 x VDD, which is 3.5 V. The ESP32 drives 3.3 V, which is below

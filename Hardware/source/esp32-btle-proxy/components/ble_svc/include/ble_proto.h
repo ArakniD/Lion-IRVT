@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define BLE_PROTO_VERSION       7
+#define BLE_PROTO_VERSION       8
 
 /* Attribute value sizes are bounded by the negotiated MTU (247 - 3). */
 #define BLE_PROTO_MAX_PAYLOAD   244
@@ -226,6 +226,12 @@ typedef struct __attribute__((packed)) {
 
 #define BLE_CATALOG_KIND_CHEMISTRY  0
 #define BLE_CATALOG_KIND_MODEL      1
+/*
+ * A user-defined model from NVS, listed after the built-ins. Laid out exactly
+ * as KIND_MODEL - only the kind differs - so a client that does not know 2
+ * can still treat it as a model. Added with BLE_PROTO_VERSION 8.
+ */
+#define BLE_CATALOG_KIND_CUSTOM_MODEL 2
 
 /*
  * Calibration control, characteristic 000b.
@@ -300,6 +306,42 @@ typedef struct __attribute__((packed)) {
     uint8_t  count;         /* reserved for burst reads; must be 1   */
     float    value;         /* value to write, or the value read back */
 } ble_register_cmd_t;
+
+/*
+ * Custom cell model write, characteristic 000e. Added in BLE_PROTO_VERSION 8.
+ *
+ * Adds, replaces or deletes one user-defined model in the proxy's NVS model
+ * store, so a BLE-only host can upload profiles the same way HTTP does with
+ * POST/DELETE /api/model/<name>. The models then appear in the catalog
+ * (0008/0009) as BLE_CATALOG_KIND_CUSTOM_MODEL.
+ *
+ *   op 1  save:   `name` and every figure; the figures follow cell_model_t,
+ *                 with 0 meaning "inherit the chemistry" for the currents
+ *                 and voltages. Capacity is required.
+ *   op 2  delete: `name` only.
+ *
+ * The name is 1-7 characters from A-Z a-z 0-9 - _, and may not be a built-in
+ * model's. A refusal returns BLE_ATT_ERR_UNLIKELY like every other write; the
+ * HTTP endpoint gives the reason.
+ */
+#define BLE_MODEL_OP_SAVE    1
+#define BLE_MODEL_OP_DELETE  2
+
+typedef struct __attribute__((packed)) {
+    uint8_t  op;
+    uint8_t  chemistry;     /* cell_chemistry_t                      */
+    uint16_t reserved;
+    float    capacity_mah;
+    float    charge_current_max_a;
+    float    discharge_current_max_a;
+    float    charge_v_max;
+    float    discharge_v_min;
+    char     name[8];
+    char     manufacturer[24];
+} ble_model_cmd_t;
+
+/* 4 + 5*4 + 8 + 24. The integration packs "<BBHfffff8s24s" against this. */
+_Static_assert(sizeof(ble_model_cmd_t) == 56, "ble_model_cmd_t is 56 bytes on the wire");
 
 #ifdef __cplusplus
 }

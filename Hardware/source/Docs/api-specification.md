@@ -183,8 +183,8 @@ Each element of `slots`:
 | `state` | string | `IDLE`, `CHECK_REST`, `CHARGE`, `REST`, `DISCHARGE`, `DISCHARGE_REST`, `RECHARGE`, `COMPLETE`, `FAULT`, `ABORTED`, `BTS_PAUSED`, `DIRECT`. `DIRECT` is a bare charge or discharge started from the front panel, supervised but with no test sequence |
 | `fault` | string | `NONE`, `OVER_TEMP`, `UNDER_TEMP`, `OVER_CURRENT`, `CMPSS_TRIP`, `GPIO_TRIP`, `TIMEOUT`, `BTS_OFFLINE`, `UNIT_STATE`, `NO_CELL`, `CELL_REVERSED`, `COMMS` |
 | `configured` | bool | A cell profile has been applied |
-| `voltage_v` | float, 3 dp | Cell volts, **12-bit internal ADC** (register `eChX_CellVoltage`) |
-| `current_a` | float, 3 dp | Cell amps, same path. Negative = discharge |
+| `voltage_v` | float, 3 dp | Cell volts, **16-bit ADS131M08** (register `eChX_SenseVoltage`) |
+| `current_a` | float, 3 dp | Cell amps, same path (`eChX_SenseCurrent`). Negative = discharge |
 | `temp_c` | float, 1 dp | Cell temperature, from the ADS1119 converters |
 | `live_mah` / `live_mwh` | float, 1 dp | ESP32-integrated charge and energy for the current phase |
 | `progress` | float, 3 dp | 0..1 and beyond |
@@ -1516,9 +1516,10 @@ Channel 0 occupies 0–44, channel 7 occupies 336–380.
 > **`eChX_CellVoltage` / `eChX_CellCurrent` are the 12-bit on-chip ADC,
 > despite the naming.** The 16-bit ADS131M08's engineering values are the
 > *sense* pair two registers along. Every host interface — HTTP, BLE, the
-> panel — shows the 12-bit path unless it explicitly reads the sense pair.
-> The sense pair is what the CC loop regulates against and what the
-> accumulators integrate.
+> panel and the test engine — reports the **sense pair** as the slot's
+> voltage and current (since v0.2.x): it is what the CC loop regulates
+> against and what the accumulators integrate. The 12-bit pair is still
+> published here for comparison and calibration.
 
 `eChX_CellTemp` is the **measurement**, written directly by CPU2 from the two
 ADS1119 converters on I2CB. The configured min/max window is a separate pair

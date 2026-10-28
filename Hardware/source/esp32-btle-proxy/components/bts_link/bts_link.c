@@ -727,8 +727,8 @@ static void bts_poll_task(void *arg)
                 ESP_LOGI(TAG,
                     "BTS ok: state=%d Vin=%.2f ch0 V=%.3f I=%.3f T=%.1f",
                     (int)local.unit.unit_state, local.unit.input_voltage_v,
-                    local.channel[0].cell_voltage_v,
-                    local.channel[0].cell_current_a,
+                    local.channel[0].sense_voltage_v,
+                    local.channel[0].sense_current_a,
                     local.channel[0].cell_temp_c);
             }
             local.unit.consecutive_errors = 0;

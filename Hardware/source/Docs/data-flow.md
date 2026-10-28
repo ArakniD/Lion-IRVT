@@ -850,7 +850,7 @@ flowchart LR
     SNAP["bts_snapshot_t<br/>status_bits + decoded flags"]
     TASK["led_strip task<br/>FreeRTOS, priority 4,<br/>every 25 ms"]
     ENC["encode_pixel()<br/>RGB to GRB, brightness 26/255 (10%, capped),<br/>4 SPI bits per WS2812B bit"]
-    SPI["SPI3 / VSPI MOSI, GPIO25<br/>2.5 MHz, 96 bytes, one DMA transfer"]
+    SPI["SPI3 / VSPI MOSI, GPIO25<br/>3.2 MHz, 96 bytes, one DMA transfer"]
     STRIP["8 x WS2812B<br/>one pixel per slot"]
     EYE["Operator"]
 
@@ -906,19 +906,22 @@ pin, and already held a decoded copy of every slot’s state.
 
 ### What the encoding costs, and the one number that is not the obvious one
 
-Each WS2812B bit becomes four SPI bits at **2.5 MHz** (80 MHz / 32): `1000`
-is a 0 at 400 ns high, `1100` is a 1 at 800 ns high. Both sit on the part’s
-exact nominal widths and the resulting 1600 ns slot is inside the 650–1850 ns
-it tolerates. Two WS2812B bits pack into one SPI byte, so 24 bits of colour
-is 12 bytes and the whole eight-pixel frame is **96 bytes in a single DMA
-transfer, 307 us**. MOSI rests low between frames, so the reset latch — which
-needs the line held low for at least 50 us — costs nothing.
+Each WS2812B bit becomes four SPI bits at **3.2 MHz** (80 MHz / 25, 312.5 ns
+each, a 1.25 us bit period): `1000` is a 0 at 312 ns high, `1110` is a 1 at
+938 ns high. A WS2812B samples DIN roughly 450-600 ns after each rising edge,
+and the two widths sit clearly either side of that, inside the datasheet's
+T0H 220-380 ns and T1H 580-1000 ns. Two WS2812B bits pack into one SPI byte,
+so 24 bits of colour is 12 bytes and the whole eight-pixel frame is **96
+bytes in a single DMA transfer, 240 us**. MOSI rests low between frames, so
+the reset latch costs nothing.
 
-**2.5 MHz and not 3.333 MHz** — the rate the commonly-cited write-up of this
-technique uses — because at 3.333 MHz the `1100` symbol gives a 600 ns T1H,
-**below the 650 ns minimum for a logic 1**. It works on many strips and fails
-on others, which on a safety indicator means intermittently wrong colours. The
-deviation is deliberate.
+The rate was **2.5 MHz** with `1000`/`1100` (T0H 400 ns, T1H 800 ns) until
+2026-10-15. On the bench every colour byte then decoded as 0xFF - each LED
+full white or a saturated primary, whatever the frame asked for, with the
+byte order and LED index still right. A WS2812B samples DIN roughly
+450-600 ns after the rising edge; a 400 ns zero, slowed further by the
+level shifter, was still high at that point and read as a one. The newer
+parts specify T0H at 220-380 ns for exactly this reason.
 
 Refresh is a **FreeRTOS task** (`led_strip`, priority 4, 3072-byte stack) at
 25 ms, not a timer ISR. That is the structural difference from the C2000

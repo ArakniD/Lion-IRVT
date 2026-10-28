@@ -27,6 +27,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "test_engine.h"
 #include "result_store.h"
 
@@ -327,7 +328,7 @@ static slot_fault_t check_safety(uint8_t slot, const bts_snapshot_t *snap)
                                            : c->profile.charge_current_a;
         /* Skip the first couple of seconds: the loop is still ramping. */
         if (seconds_since(c->mode_issued_us) > 2 &&
-            fabsf(ch->cell_current_a) > setpoint * OVER_CURRENT_MARGIN) {
+            fabsf(ch->sense_current_a) > setpoint * OVER_CURRENT_MARGIN) {
             return SLOT_FAULT_OVER_CURRENT;
         }
 
@@ -436,7 +437,7 @@ static void tick_check_rest(uint8_t slot, const bts_channel_state_t *ch)
         return;
     }
 
-    const float v = ch->cell_voltage_v;
+    const float v = ch->sense_voltage_v;
 
     if (v < REVERSED_VOLTAGE_V) {
         fail(slot, SLOT_FAULT_CELL_REVERSED);
@@ -485,7 +486,7 @@ static void tick_charge(uint8_t slot, const bts_channel_state_t *ch)
         return;
     }
 
-    coulomb_update(&c->charge_cc, ch->cell_voltage_v, ch->cell_current_a,
+    coulomb_update(&c->charge_cc, ch->sense_voltage_v, ch->sense_current_a,
                    ch->cell_temp_c, esp_timer_get_time());
 
     /*
@@ -502,8 +503,8 @@ static void tick_charge(uint8_t slot, const bts_channel_state_t *ch)
      * host-side check.
      */
     const bool in_cv      = ch->const_voltage;
-    const bool tapered    = fabsf(ch->cell_current_a) <= c->profile.charge_term_current_a;
-    const bool at_voltage = ch->cell_voltage_v >= c->profile.charge_v_max - 0.005f;
+    const bool tapered    = fabsf(ch->sense_current_a) <= c->profile.charge_term_current_a;
+    const bool at_voltage = ch->sense_voltage_v >= c->profile.charge_v_max - 0.005f;
 
     if ((in_cv && tapered) ||
         (at_voltage && tapered && seconds_since(c->mode_issued_us) > 30) ||
@@ -525,7 +526,7 @@ static void tick_rest(uint8_t slot, const bts_channel_state_t *ch)
     }
     if (ch->valid) {
         /* The rested voltage after the charge is the discharge's true start. */
-        c->result.start_voltage_v = ch->cell_voltage_v;
+        c->result.start_voltage_v = ch->sense_voltage_v;
     }
     enter_state(slot, SLOT_STATE_DISCHARGE);
 }
@@ -551,7 +552,7 @@ static void tick_discharge(uint8_t slot, const bts_channel_state_t *ch)
         return;
     }
 
-    coulomb_update(&c->discharge_cc, ch->cell_voltage_v, ch->cell_current_a,
+    coulomb_update(&c->discharge_cc, ch->sense_voltage_v, ch->sense_current_a,
                    ch->cell_temp_c, esp_timer_get_time());
 
     /*
@@ -560,15 +561,15 @@ static void tick_discharge(uint8_t slot, const bts_channel_state_t *ch)
      * while the power stage is still ramping - can read below the cutoff on
      * a sagging cell and end the test immediately.
      */
-    const bool under_load = fabsf(ch->cell_current_a) > 0.05f;
-    const bool at_cutoff  = ch->cell_voltage_v <= c->profile.discharge_v_min;
+    const bool under_load = fabsf(ch->sense_current_a) > 0.05f;
+    const bool at_cutoff  = ch->sense_voltage_v <= c->profile.discharge_v_min;
 
     if ((under_load && at_cutoff) || bts_says_done(c, ch)) {
         bts_link_stop_channel(slot);
         coulomb_stop(&c->discharge_cc);
 
         slot_result_t *r = &c->result;
-        r->end_voltage_v     = ch->cell_voltage_v;
+        r->end_voltage_v     = ch->sense_voltage_v;
         r->discharge_mah     = (float)c->discharge_cc.mah;
         r->discharge_mwh     = (float)c->discharge_cc.mwh;
         r->max_temp_c        = c->discharge_cc.peak_temp_c;
@@ -595,7 +596,7 @@ static void tick_discharge_rest(uint8_t slot, const bts_channel_state_t *ch,
         return;
     }
     if (ch->valid) {
-        c->result.rested_voltage_v = ch->cell_voltage_v;
+        c->result.rested_voltage_v = ch->sense_voltage_v;
     }
 
     if (c->config.auto_recharge_to_shipping && c->result.discharge_mah > 0.0f) {
@@ -631,7 +632,7 @@ static void tick_recharge(uint8_t slot, const bts_channel_state_t *ch,
         return;
     }
 
-    coulomb_update(&c->charge_cc, ch->cell_voltage_v, ch->cell_current_a,
+    coulomb_update(&c->charge_cc, ch->sense_voltage_v, ch->sense_current_a,
                    ch->cell_temp_c, esp_timer_get_time());
 
     /*
@@ -641,7 +642,7 @@ static void tick_recharge(uint8_t slot, const bts_channel_state_t *ch,
      * hard backstop in case the target is unreachable.
      */
     const bool at_target  = c->charge_cc.mah >= (double)c->recharge_target_mah;
-    const bool at_ceiling = ch->cell_voltage_v >= c->profile.charge_v_max;
+    const bool at_ceiling = ch->sense_voltage_v >= c->profile.charge_v_max;
 
     if (at_target || at_ceiling || bts_says_done(c, ch)) {
         bts_link_stop_channel(slot);
@@ -649,11 +650,11 @@ static void tick_recharge(uint8_t slot, const bts_channel_state_t *ch,
 
         c->result.recharged          = true;
         c->result.recharge_mah       = (float)c->charge_cc.mah;
-        c->result.shipping_voltage_v = ch->cell_voltage_v;
+        c->result.shipping_voltage_v = ch->sense_voltage_v;
 
         if (at_ceiling && !at_target) {
             ESP_LOGW(TAG, "slot %u: recharge hit the %.3f V ceiling at %.0f of "
-                          "%.0f mAh", slot, ch->cell_voltage_v,
+                          "%.0f mAh", slot, ch->sense_voltage_v,
                      c->result.recharge_mah, c->recharge_target_mah);
         }
         /* The recharge can be the hottest part of the cycle on a high C rate. */
@@ -717,16 +718,16 @@ static void tick_direct(uint8_t slot, const bts_channel_state_t *ch)
     if (c->direct_charge) {
         /* The BTS ends a charge on its own CV taper; this is the fallback. */
         done = done || (ch->const_voltage &&
-                        fabsf(ch->cell_current_a) <= c->profile.charge_term_current_a);
+                        fabsf(ch->sense_current_a) <= c->profile.charge_term_current_a);
     } else {
-        const bool under_load = fabsf(ch->cell_current_a) > 0.05f;
-        done = done || (under_load && ch->cell_voltage_v <= c->profile.discharge_v_min);
+        const bool under_load = fabsf(ch->sense_current_a) > 0.05f;
+        done = done || (under_load && ch->sense_voltage_v <= c->profile.discharge_v_min);
     }
 
     if (done) {
         bts_link_stop_channel(slot);
         ESP_LOGI(TAG, "slot %u: direct %s ended at %.3f V", slot,
-                 c->direct_charge ? "charge" : "discharge", ch->cell_voltage_v);
+                 c->direct_charge ? "charge" : "discharge", ch->sense_voltage_v);
         c->test_started_us = 0;
         enter_state(slot, SLOT_STATE_IDLE);
     }
@@ -820,8 +821,10 @@ static void fill_status_locked(uint8_t slot, const bts_snapshot_t *snap,
     out->configured  = c->configured;
     out->config      = c->config;
     out->profile     = c->profile;
-    out->voltage_v   = ch->cell_voltage_v;
-    out->current_a   = ch->cell_current_a;
+    /* The ADS131M08 pair: what the BTS regulates against and integrates,
+     * and what every host now reports as the slot's voltage and current. */
+    out->voltage_v   = ch->sense_voltage_v;
+    out->current_a   = ch->sense_current_a;
     out->sense_voltage_v = ch->sense_voltage_v;
     out->sense_current_a = ch->sense_current_a;
     out->temp_c      = ch->cell_temp_c;
@@ -1073,7 +1076,98 @@ esp_err_t test_engine_resolve(uint8_t slot, const slot_config_t *config,
     return ESP_OK;
 }
 
+static esp_err_t configure_slot(uint8_t slot, const slot_config_t *config, bool persist);
+
 esp_err_t test_engine_configure(uint8_t slot, const slot_config_t *config)
+{
+    return configure_slot(slot, config, true);
+}
+
+/*
+ * Per-slot configuration persistence.
+ *
+ * A slot's profile used to live in RAM only, so every reboot or OTA update
+ * left all eight slots unconfigured - the panel, BLE, HTTP and Home Assistant
+ * then had nothing to show or pre-load. One blob per slot in the "slotcfg"
+ * namespace; ~120 B each, under 1 KB for the unit.
+ *
+ * The SERIAL IS NOT KEPT. It identifies the cell in the slot today, and the
+ * slot outlives the cell; restoring yesterday's barcode onto a new cell would
+ * file its result under the wrong serial.
+ *
+ * A version word guards against a layout change across firmware builds: a
+ * blob of another size or version is ignored, and the slot simply comes up
+ * unconfigured, as it always used to.
+ */
+#define SLOTCFG_NAMESPACE   "slotcfg"
+#define SLOTCFG_VERSION     1u
+
+typedef struct {
+    uint32_t      version;
+    slot_config_t config;
+} slotcfg_blob_t;
+
+static void slotcfg_key(uint8_t slot, char *buf, size_t len)
+{
+    snprintf(buf, len, "slot%u", (unsigned)slot);
+}
+
+static void slotcfg_save(uint8_t slot, const slot_config_t *config)
+{
+    slotcfg_blob_t blob;
+    memset(&blob, 0, sizeof(blob));
+    blob.version = SLOTCFG_VERSION;
+    blob.config  = *config;
+    blob.config.serial[0] = '\0';
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SLOTCFG_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        char key[12];
+        slotcfg_key(slot, key, sizeof(key));
+        err = nvs_set_blob(h, key, &blob, sizeof(blob));
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "slot %u: config not persisted (%s)", slot, esp_err_to_name(err));
+    }
+}
+
+/*
+ * Restores each slot's saved configuration at boot. A profile that no longer
+ * resolves - a custom model since deleted, say - is dropped and the slot left
+ * unconfigured, rather than configured from figures that no longer exist.
+ */
+static void slotcfg_restore_all(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(SLOTCFG_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    for (uint8_t slot = 0; slot < SLOT_COUNT; slot++) {
+        char key[12];
+        slotcfg_key(slot, key, sizeof(key));
+        slotcfg_blob_t blob;
+        size_t len = sizeof(blob);
+        if (nvs_get_blob(h, key, &blob, &len) != ESP_OK ||
+            len != sizeof(blob) || blob.version != SLOTCFG_VERSION) {
+            continue;
+        }
+        blob.config.model_name[CELL_NAME_MAX - 1] = '\0';
+        blob.config.serial[0] = '\0';
+        if (configure_slot(slot, &blob.config, false) == ESP_OK) {
+            ESP_LOGI(TAG, "slot %u: restored saved profile", slot);
+        } else {
+            ESP_LOGW(TAG, "slot %u: saved profile no longer resolves, ignored", slot);
+        }
+    }
+    nvs_close(h);
+}
+
+static esp_err_t configure_slot(uint8_t slot, const slot_config_t *config, bool persist)
 {
     if (!s_ready || slot >= SLOT_COUNT || config == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -1131,6 +1225,10 @@ esp_err_t test_engine_configure(uint8_t slot, const slot_config_t *config)
     c->changed    = true;
 
     xSemaphoreGive(s_lock);
+
+    if (persist) {
+        slotcfg_save(slot, &next);
+    }
 
     /*
      * Push the limits now rather than waiting for the start, so the slot is
@@ -1554,6 +1652,13 @@ esp_err_t test_engine_init(void)
     stop_unheld_channels();
 
     s_ready = true;
+
+    /*
+     * After s_ready (configure_slot checks it) and before the engine task
+     * runs, so no tick ever sees a slot half-restored. cell_profiles_init()
+     * has already loaded the custom models a saved profile may name.
+     */
+    slotcfg_restore_all();
 
     BaseType_t ok = xTaskCreate(engine_task, "test_engine", TASK_STACK,
                                 NULL, TASK_PRIO, NULL);
