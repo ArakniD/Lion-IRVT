@@ -199,7 +199,7 @@
 // current never rewrites the calibration image.
 //
 // Deliberately conservative: a single lithium-ion cell's usual 3.0 - 4.2 V
-// window, and 1 A against a hardware over-current trip at +/-8 A. A slot
+// window, and 1 A against a software over-current trip at +/-9 A. A slot
 // that has never been configured should do something safe and unremarkable,
 // not run at the hardware's limit. Zero is NOT an acceptable fallback - it
 // presents as a dead slot and hides the missing record.
@@ -1651,11 +1651,25 @@ static bool validateGlobalVoltages(void)
 //
 static void notifyCpu1RegisterWrite(uint16_t regIdx, float32_t value)
 {
-    if (IPC_isFlagBusyLtoR(IPC_CPU2_L_CPU1_R, BTS_IPC_FLAG_REG_WRITE)) {
-        return;
+    //
+    // Queued, never skipped - see BTS_ipcMessage. A full ring is the only
+    // way a write is lost now, and it is counted so it cannot be silent.
+    //
+    uint16_t head = ipcMsg.head;
+    uint16_t next = (uint16_t)((head + 1U) % BTS_IPC_QUEUE_LEN);
+
+    if (next == ipcAck.tail) {
+        ipcMsg.dropped++;
+    } else {
+        ipcMsg.entries[head].regAddr = regIdx;
+        ipcMsg.entries[head].value   = value;
+        //
+        // The entry is complete before head moves past it, so CPU1 never
+        // reads a half-written one. Message RAM is uncached and the C28x
+        // does not reorder stores, so program order is enough.
+        //
+        ipcMsg.head = next;
     }
-    ipcMsg.regAddr = regIdx;
-    ipcMsg.value = value;
     IPC_setFlagLtoR(IPC_CPU2_L_CPU1_R, BTS_IPC_FLAG_REG_WRITE);
 }
 
@@ -3989,6 +4003,68 @@ static uint16_t readBuffer[4] = {0};
 static volatile uint16_t bufferValid = 0;
 
 //
+// THE BYTE A WRITE LEAVES BEHIND.
+//
+// Every register address is followed by a byte staged into the transmit FIFO
+// (the eI2cAddrLo case), because a READ starts clocking out the instant the
+// repeated start is acknowledged. But a WRITE is addressed the same way and
+// never sends it, so the byte stayed queued - and the next read then went out
+// one byte late: the host's lead-in discard took the real pad, and the first
+// register it decoded was spliced from the written register's first byte and
+// three bytes of the one it asked for.
+//
+// Seen on hardware 2026-11-11. The ESP32's first read after any write is its
+// unit block, so eTripStatus decoded as 2.0, 4.0, 8.0 - a trip bit on some
+// slot - and the test engine faulted running slots with a "cmpss_trip" the
+// C2000 had never raised. Every auto-test start writes limits and a mode, so
+// starting slot 2 faulted itself, and starting slot 1 then faulted slot 2
+// while it was discharging. Reproduced from the console: "AT+WD=30" followed
+// by "AT+TRIPS?" read 8.00, the read after that 0.00.
+//
+// txStagedUnsent marks a staged byte that no read has started sending, and
+// txFifoBeforeStage is the FIFO level it was put on top of. A write's first
+// data byte - or a stop with the byte still unsent - restores the FIFO to that
+// level, so whatever was queued before (the one lead-in byte every reply has
+// always carried) stays exactly as it was.
+//
+static volatile uint16_t txStagedUnsent    = 0U;
+static volatile uint16_t txFifoBeforeStage = 0U;
+
+static void i2cTargetDropStaged(void)
+{
+    uint16_t n;
+
+    if (txStagedUnsent == 0U) {
+        return;
+    }
+    txStagedUnsent = 0U;
+
+    //
+    // Only while the staged byte is still IN the FIFO, above the level it was
+    // put on. If the module has already moved it on toward the shift
+    // register there is no entry left to take back, and resetting the FIFO
+    // would discard bytes queued before it instead.
+    //
+    if ((uint16_t)I2C_getTxFIFOStatus(I2CA_BASE) <= txFifoBeforeStage) {
+        return;
+    }
+
+    //
+    // The TX FIFO cannot pop one entry, so its pointer is reset and it is
+    // refilled to the level it held before the stage. Only TXFFRST is pulsed:
+    // I2CFFEN gates the receive FIFO as well, and this runs from the receive
+    // handler with bytes possibly still waiting there. The bytes put back are
+    // padding - their value is never decoded, only their count matters.
+    //
+    HWREGH(I2CA_BASE + I2C_O_FFTX) &= ~I2C_FFTX_TXFFRST;
+    HWREGH(I2CA_BASE + I2C_O_FFTX) |=  I2C_FFTX_TXFFRST;
+    for (n = 0U; n < txFifoBeforeStage; n++) {
+        I2C_putData(I2CA_BASE, 0x00U);
+    }
+    I2C_clearInterruptStatus(I2CA_BASE, I2C_INT_TXFF);
+}
+
+//
 // Applies a host register write from any interface (I2C, UART or CAN).
 // Writes the register file, notifies CPU1, and handles the eCalibrationMode
 // commit trigger.
@@ -4413,6 +4489,13 @@ __interrupt void i2cSlaveISR(void)
     // has just supplied.
     //
     if (intSource & I2C_INT_STOP_CONDITION) {
+        //
+        // A transaction that addressed a register and stopped without
+        // reading it - an address-only write - also leaves its staged byte
+        // behind. A read clears txStagedUnsent as it starts sending, so
+        // this only ever drops a byte nobody asked for.
+        //
+        i2cTargetDropStaged();
         i2cTargetResetCommand();
         aasPrev = 0U;
     }
@@ -4470,6 +4553,9 @@ __interrupt void i2cSlaveFifoISR(void)
                 // what put a stale byte in front of every reply and left
                 // the four real bytes one place late.
                 //
+                // A write takes this byte back out again - see the first
+                // data byte below, and txStagedUnsent.
+                //
                 {
                     uint16_t  regIdx = currentRegAddr / 4U;
                     float32_t v      = (regIdx < TOTAL_REGISTERS)
@@ -4481,12 +4567,22 @@ __interrupt void i2cSlaveFifoISR(void)
                     }
                     bufferValid = 1;
                     txCount     = 1U;
+                    i2cTargetDropStaged();      // never stack a second stage
+                    txFifoBeforeStage =
+                        (uint16_t)I2C_getTxFIFOStatus(I2CA_BASE);
                     I2C_putData(I2CA_BASE, readBuffer[0]);
+                    txStagedUnsent = 1U;
                 }
                 break;
 
             case eI2cData:
             default:
+                //
+                // A data byte means this transaction is a WRITE, so the byte
+                // staged at the address phase will never be sent. Take it
+                // back out before it can lead the next read.
+                //
+                i2cTargetDropStaged();
                 floatPutWireByte(&tempData, rxDataIdx, rxData);
                 rxDataIdx++;
 
@@ -4525,6 +4621,9 @@ __interrupt void i2cSlaveFifoISR(void)
     if (intSource & I2C_INT_TXFF) {
         if ((I2C_getStatus(I2CA_BASE) & I2C_STS_TARGET_DIR) != 0U) {
             dbgSlaveTx++;
+
+            // A read is under way: the staged byte is going out as intended.
+            txStagedUnsent = 0U;
 
             //
             // The I2C read reload hook - the fourth and last of them, and the
@@ -4816,6 +4915,18 @@ void main(void)
     Device_initGPIO();
     Interrupt_initModule();
     Interrupt_initVectorTable();
+
+    //
+    // The register-write ring is NOT reset here. CPU1 matches its tail to
+    // this head before it boots CPU2, and a CPU2 that zeroed head afterwards
+    // left the two out of step - the ring then looked full of stale entries
+    // or, after a wrap, empty while writes were waiting. Only an out-of-range
+    // head is repaired; CPU1 sees that as an empty ring too.
+    //
+    if (ipcMsg.head >= BTS_IPC_QUEUE_LEN) {
+        ipcMsg.head = 0U;
+    }
+    ipcMsg.dropped = 0U;
 
     initI2C_Master();
 

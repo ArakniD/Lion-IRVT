@@ -353,7 +353,7 @@ the deadband took its two delays from two independent sources (`DBCTL`
 IN_MODE 2). Both now come from EPWMA (IN_MODE 0), and 1 A charge, 1 A
 discharge and 100 mA discharge all start and run with no latch. So the trip
 path is proven end to end - comparator, ePWM X-BAR, Digital Compare, one-shot
-- but only by a fault. **The ±9.5 A level itself has not been tested against
+- but only by a fault. **The ±9.75 A level itself has not been tested against
 a real over-current.**
 
 The CMPSS comparators do **not** go through the Input X-BAR. They reach the
@@ -441,7 +441,7 @@ Three things the table settles:
 - **The voltage net lands on the same comparator's negative pin**, on every
   slot. Nothing reads it there: both the high and the low comparator take
   their negative input from the internal DAC (`CMPSS_INSRC_DAC`), which is
-  what sets the ±9.5 A threshold. Switching either to `CMPSS_INSRC_PIN` would
+  what sets the ±9.75 A threshold. Switching either to `CMPSS_INSRC_PIN` would
   compare a slot's current against its own voltage.
 - **`J5` is the controlCARD socket.** TI's controlCARD pinout numbers the same
   pins 121 − *n* (`J5` 106 is its pin 15, `ADC-A2`), so check which numbering
@@ -458,8 +458,8 @@ Three things the table settles:
 | Pairs (1, 5) | The first pair's output was `CMPSS1` \| `CMPSS2`, which is slot 1 \| slot **3**; the third was slot 8 \| slot 6, the fourth slot 5 \| slot 7 |
 | Quads, octet (2, 3) | **Unaffected.** Each group's OR covered the same set of comparators either way |
 
-The software trip (±8 A, each slot's own ADS131M08 current) was never
-affected and remains the first line; only the ±9.5 A backstop was mis-aimed.
+The software trip (±8 A then, ±9 A now; each slot's own ADS131M08 current) was never
+affected and remains the first line; only the ±9.5 A backstop (now ±9.75 A) was mis-aimed.
 
 > `XBAR_TRIP6` is skipped: `INPUT6` feeds ePWM TRIP6 directly, and `INPUT6` is
 > XINT3's input (CPU1's SPI ADC1 DRDY). Do not route a CMPSS to TRIP6.
@@ -515,9 +515,15 @@ Corrected to `count(I) = (1.25 + I × 0.125) / 3.019 × 4095`:
 
 | | Level | Acts within | Counts |
 |---|---|---|---|
-| Software, `BTS_tripEpwm()` | **±8.0 A** | a control period (~150 µs) | — |
-| Hardware, CMPSS | **±9.5 A** | a switching cycle (<1 µs) | 3306 / 84 |
+| Highest setpoint, `BTS_SETPOINT_MAX_A` | **8.0 A** | clamped at mode write, and on the ESP32 | — |
+| Software, `BTS_tripEpwm()` | **±9.0 A** | a control period (~150 µs) | — |
+| Hardware, CMPSS | **±9.75 A** | a switching cycle (<1 µs) | 3348 / 42 |
 | Sense chain full scale | ±10.0 A | — | 3391 / 0 |
+
+The software trip was ±8.0 A until 2026-11-07, while the ESP32 allowed a 10 A
+setpoint: an 8 A run regulated with its own trip on the regulation point, and
+the trip - tested on the raw, unaveraged sample - fired on ripple. It is now
+9.0 A, 1 A above the highest setpoint either core will accept.
 
 The two are **layered, not duplicated**. In normal operation the software trip
 catches an over-current first and the comparator never fires; the comparator
@@ -1338,7 +1344,35 @@ session.
 ## 10. I2C buses
 
 Two buses, both on CPU2, both with **10 kΩ pull-ups on the board** — which
-sets their speed.
+sets their speed. **I2CA has since had extra pull-ups added (§10.0).**
+
+### 10.0 Hardware change, 2026-11-12: I2CA pull-ups stiffened to 3.2 kΩ
+
+A **4.7 kΩ resistor was fitted in parallel with each existing 10 kΩ pull-up**
+on the host bus — SDA and SCL, the lines between the ESP32 and the C2000
+(GPIO32/GPIO33). Each line now pulls up through **3.2 kΩ** (10 k ∥ 4.7 k).
+I2CB, the F-RAM and ADS1119 bus, is unchanged at 10 kΩ.
+
+Why. With cells fitted and converters switching, the ESP32's reads came back
+corrupt: values from neighbouring registers in the wrong fields (a slot 1
+current of 1262.15, which is slot 8's charge in mAh), status flags flickering,
+and modes appearing that nobody set. It cleared the instant the cells were
+pulled, and slowing the bus from 50 kHz to 20 kHz did not cure it. A 10 kΩ
+pull-up over the ribbon is both slow (~850 ns rise at 100 pF) and easy for
+coupled switching noise to move. 3.2 kΩ rises in ~270 ns at 100 pF and needs
+three times the injected current to disturb.
+
+Result: reads stable with three slots charging, and the ESP32 now runs the bus
+at **150 kHz** (`BTS_I2C_SCL_HZ` in `bts_link.c`).
+
+**A board without this modification must not run I2CA above 50 kHz.** Fit
+4.7 kΩ (or anything giving ≤ 3.3 kΩ total) from each of SDA and SCL to 3.3 V
+before flashing an ESP32 build at 150 kHz. The schematic still shows the
+original 10 kΩ and is being revised alongside the ESP32 IO changes.
+
+The same day the CMPSS trip inputs were given a **2nd-order RC filter with a
+corner near 25 kHz and a 1 nF capacitor at the C2000 pin**, to keep switching
+noise off the over-current comparators.
 
 | | I2CA — host | I2CB — peripherals |
 |---|---|---|
@@ -1346,7 +1380,7 @@ sets their speed.
 | Pad config (by CPU1, `BTS_HAL_setupCpu2Pins()`) | open drain + internal pull-up, async qualification | same |
 | Role | **target** at 0x50 | **controller** |
 | Devices | the ESP32 clocks it | FM24V10 F-RAM 0x50; ADS1119 0x40 (slots 1–4), 0x41 (slots 5–8) |
-| Speed | **50 kHz**, set by the ESP32 (`bts_link.c`) | **100 kHz** (`I2C_initController(I2CB_BASE, …)`) |
+| Speed | **150 kHz**, set by the ESP32 (`bts_link.c`) — needs the §10.0 pull-ups | **100 kHz** (`I2C_initController(I2CB_BASE, …)`) |
 | Interrupts | `INT_I2CA` 8.1 and `INT_I2CA_FIFO` 8.2 (§1.2) | **none** — bounded polled loops from CPU2's idle loop |
 | Stuck-bus recovery | `serviceI2CTargetWatchdog()` resets the target after `BTS_I2C_TARGET_STUCK_PASSES` busy passes | `i2cRecoverBus()`: nine SCL pulses with SDA released, then a stop, then a module reset |
 
@@ -1473,7 +1507,8 @@ rises.
 
 ### 10.7 Rules
 
-1. **Do not raise either bus above 100 kHz** without stiffer pull-ups.
+1. **Do not raise either bus above 100 kHz** without stiffer pull-ups. I2CA
+   has them (§10.0, 3.2 kΩ) and runs 150 kHz; I2CB does not.
 2. **Do not halt CPU2 mid-transfer** (§9 rule 5) — the I2CA target wedges
    with SCL low, and its recovery runs on the core you halted.
 3. **Write `I2CMDR` whole.** Never build a start on a read-modify-write of it.

@@ -160,8 +160,8 @@
 // actually feed. DCAEVT1 is a one-shot, so the latching behaviour is the
 // same; only the route differs. INPUT1/INPUT2 are left alone.
 //
-// TRIP LEVEL is BTS_CMPSS_TRIP_A (9.5 A), deliberately ABOVE the software
-// limit of 8 A - see the layering note at that definition. The software trip
+// TRIP LEVEL is BTS_CMPSS_TRIP_A (9.75 A), deliberately ABOVE the software
+// limit of 9 A - see the layering note at that definition. The software trip
 // in BTS_tripEpwm() remains the first line and still requires BTS_OCP_TRIGGER.
 //
 // ARMING IS DEFERRED, and this matters. An unpowered current-sense chain
@@ -293,8 +293,8 @@
 // against ioutTrip_16b / ioutTrip_n_16b (+/-BTS_USER_DEFAULT_TRIP_A).
 //
 // This is the FIRST line of over-current defence, not a fallback. It fires at
-// BTS_USER_DEFAULT_TRIP_A (8 A) while the CMPSS comparator sits above it at
-// BTS_CMPSS_TRIP_A (9.5 A), so in normal operation this catches the fault and
+// BTS_USER_DEFAULT_TRIP_A (9 A) while the CMPSS comparator sits above it at
+// BTS_CMPSS_TRIP_A (9.75 A), so in normal operation this catches the fault and
 // the hardware trip never fires. The comparator is there for what a control
 // period is too slow for - a genuine short.
 //
@@ -307,7 +307,39 @@
 // slot is never armed at all, so this is the only protection those slots have.
 //
 #define BTS_OCP_TRIGGER (true)
-#define BTS_USER_DEFAULT_TRIP_A           ((float32_t)8)
+//
+// THE TRIP SITS ABOVE THE HIGHEST SETPOINT, NOT AT IT.
+//
+// It was 8.0 A, and the ESP32 allowed a setpoint of 10 A, so an 8 A discharge
+// ran with its own trip exactly on the regulation point. This test is on the
+// RAW DRDY sample (currentRaw_16b), unaveraged, so ripple and the CC loop's
+// step overshoot fired it on a healthy run. Seen on hardware 2026-11-07: an
+// 8 A discharge faulted over and over.
+//
+// A software trip is only a blink - BTS_updateReference() releases it within
+// a millisecond while enable_logic holds - but each release re-seeds the CC
+// biquad from dutySetRef_pu, and that was the feed-forward duty taken at the
+// START of the run. By late in a discharge it no longer matched the cell, so
+// the restart was a current step, and the likeliest thing to have stopped
+// the slot is that step reaching the comparator. C1() now keeps the
+// seed current; see serviceSeedRefresh().
+//
+// The layering is now:
+//
+//   BTS_SETPOINT_MAX_A       8.0 A   highest current any slot is asked for
+//   BTS_USER_DEFAULT_TRIP_A  9.0 A   software, raw sample, a control period
+//   BTS_CMPSS_TRIP_A         9.75 A  hardware, a switching cycle
+//   BTS_CMPSS_FULLSCALE_A   10.0 A   sense chain full scale
+//
+// 1 A, 12.5%, between the highest setpoint and the software trip, which
+// still sits below the comparator: an ordinary over-current is caught in
+// software and the comparator is kept for a genuine short.
+//
+// The ESP32 clamps to the same 8 A (BTS_UNIT_MAX_CURRENT_A in bts_regs.h) -
+// change the two together.
+//
+#define BTS_USER_DEFAULT_TRIP_A           ((float32_t)9.0)
+#define BTS_SETPOINT_MAX_A                ((float32_t)8.0)
 
 //
 //=============================================================================
@@ -388,22 +420,33 @@
 //
 // The two protections are layered rather than duplicated:
 //
-//   BTS_USER_DEFAULT_TRIP_A  8.0 A   software, acts within a control period
-//   BTS_CMPSS_TRIP_A         9.5 A   hardware, acts within a switching cycle
+//   BTS_SETPOINT_MAX_A       8.0 A   highest regulated current
+//   BTS_USER_DEFAULT_TRIP_A  9.0 A   software, acts within a control period
+//   BTS_CMPSS_TRIP_A         9.75 A  hardware, acts within a switching cycle
 //   BTS_CMPSS_FULLSCALE_A   10.0 A   sense chain full scale
 //
 // In normal operation BTS_tripEpwm() catches an over-current first and the
 // comparator never fires. The comparator exists for what software is too slow
-// for - a genuine short, where the current is past 9.5 A long before the next
+// for - a genuine short, where the current is past 9.75 A long before the next
 // control pass. Setting the two equal would let the hardware win every race
 // and leave the software path, and its diagnostics, untested.
 //
-// 0.5 A of headroom remains below full scale, so the threshold is reachable
-// with margin for sense-chain and DAC tolerance.
+// RAISED FROM 9.5 A TO 9.75 A on 2026-11-11, at the operator's request, to
+// sit nearer the outer limit of the sense chain. 0.25 A remains below full
+// scale. The high side is comfortably reachable (2.47 V against a 3.019 V
+// reference); the low side is now 31 mV above ground, so it relies on the
+// current-sense amplifier swinging to within that of its negative rail. An
+// unpowered chain reads ~0 V and still trips it, which is the deferred-arming
+// case above. The software trip at 9 A is unaffected and remains the first
+// line in both directions.
 //
-#define BTS_CMPSS_TRIP_A                  ((float32_t)9.5)
+// The start-up "hardware trips" that prompted the request were NOT this
+// comparator: the C2000 never raised one. They were a misaligned I2C read on
+// the ESP32 side - see txStagedUnsent in com_cpu2.c.
+//
+#define BTS_CMPSS_TRIP_A                  ((float32_t)9.75)
 
-// +9.5 A -> 2.4375 V -> 3306 counts;  -9.5 A -> 0.0625 V -> 84 counts.
+// +9.75 A -> 2.46875 V -> 3348 counts;  -9.75 A -> 0.03125 V -> 42 counts.
 #define BTS_CMPSS_TRIP_HIGH               BTS_CMPSS_DAC_HIGH_COUNT(BTS_CMPSS_TRIP_A)
 #define BTS_CMPSS_TRIP_LOW                BTS_CMPSS_DAC_LOW_COUNT(BTS_CMPSS_TRIP_A)
 

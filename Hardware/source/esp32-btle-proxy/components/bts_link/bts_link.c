@@ -18,7 +18,39 @@
 
 static const char *TAG = "bts_link";
 
-#define BTS_XFER_TIMEOUT_MS     100
+/*
+ * Per-transfer timeout. The longest transfer is a 32-register HTTP read,
+ * 2 + 1 + 128 bytes - ~1.2 k bit times, ~8 ms at 150 kHz, and still well
+ * inside this if the bus is ever run slower again.
+ */
+#define BTS_XFER_TIMEOUT_MS     200
+
+/*
+ * Bus clock: 150 kHz since 2026-11-12.
+ *
+ * HISTORY. It ran at 50 kHz against the BTS board's 10 kOhm pull-ups, which
+ * over the ribbon rise in ~850 ns at 100 pF - too slow for anything faster.
+ * With cells fitted and converters switching, reads came back with values
+ * from the wrong registers (a slot 1 "current" of 1262.15, which is slot 8's
+ * charge mAh) and status flags flickering, so it was dropped to 20 kHz. That
+ * did not cure it.
+ *
+ * THE HARDWARE FIX. A 4.7 kOhm resistor was added in parallel with each
+ * 10 kOhm pull-up on SDA and SCL, ESP32 to C2000: 3.2 kOhm per line. At the
+ * same 100 pF that rises in ~270 ns, a third of the time, and a stiffer
+ * pull-up is three times harder for coupled switching noise to move. With
+ * it, 150 kHz has the rise time to spare - inside standard mode's 1000 ns and
+ * fast mode's 300 ns at up to ~110 pF - and the I2C reads were stable with
+ * slots charging.
+ *
+ * Do NOT run this fast on a board without the extra pull-ups: at 10 kOhm the
+ * edges miss the bit period and every transfer becomes a gamble. See
+ * Docs/hardware-resources.md section 10.
+ *
+ * Cost of the speed: none. A poll cycle (9 reads, ~460 bytes) takes ~30 ms,
+ * so readings refresh about every 280 ms.
+ */
+#define BTS_I2C_SCL_HZ          150000
 
 /*
  * Minimum gap between two register WRITES to the unit.
@@ -166,8 +198,42 @@ static esp_err_t bus_write_reg(uint16_t reg_addr, float value)
     s_last_write_us = esp_timer_get_time();
     if (err != ESP_OK) {
         bus_recover();
+        return err;
     }
-    return err;
+
+    /*
+     * REALIGN THE READ STREAM.
+     *
+     * The C2000 stages a reply byte as soon as a register address arrives,
+     * because it cannot know yet whether a read will follow. A write never
+     * sends it, and C2000 builds before 2026-11-11 left it queued - so the
+     * first read after any write came back one byte late and decoded as
+     * garbage. That read is the next cycle's unit block, and a garbage
+     * eTripStatus is what faulted slots 1 and 2 with a "cmpss_trip" the unit
+     * never raised, stopping a slot that was running happily.
+     *
+     * One throwaway read of the register just written absorbs the stray byte
+     * whatever the C2000 build, and costs nothing against a 30 ms write gap.
+     * On a fixed C2000 it is simply a correct read that is discarded.
+     *
+     * NOT through bus_read_block(): that keeps a whole-map receive buffer,
+     * 1121 bytes, on the caller's stack, and writes come from the NimBLE host
+     * task too, whose stack is 4 KB. A resume sent over BLE overflowed it and
+     * panicked the proxy (2026-11-12). Five bytes are all this needs.
+     */
+    {
+        const uint8_t addr_buf[2] = {
+            (uint8_t)((reg_addr >> 8) & 0xFFu),
+            (uint8_t)(reg_addr & 0xFFu),
+        };
+        uint8_t discard[1 + BTS_REGISTER_SIZE];
+        if (i2c_master_transmit_receive(s_dev, addr_buf, sizeof(addr_buf),
+                                        discard, sizeof(discard),
+                                        BTS_XFER_TIMEOUT_MS) != ESP_OK) {
+            bus_recover();
+        }
+    }
+    return ESP_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -547,8 +613,19 @@ static void poll_one_channel(uint8_t ch, bts_channel_state_t *st, uint32_t trip_
     st->balancing     = (status & BTS_STATUS_BALANCING) != 0;
     st->ready         = (status & BTS_STATUS_READY) != 0;
     st->soft_start    = (status & BTS_STATUS_SOFT_START) != 0;
-    st->cmpss_trip = (trip_bits & BTS_TRIP_CMPSS(ch)) != 0;
-    st->gpio_trip  = (trip_bits & BTS_TRIP_GPIO(ch)) != 0;
+    /*
+     * A trip bit is believed only alongside the slot's own over-current bit.
+     *
+     * The C2000 sets both together - epwmTripISR() raises status bit 3 and
+     * the slot's eTripStatus pair in the same pass, and slotClearOverCurrent()
+     * clears both together - but they arrive here in two different
+     * transactions. Requiring both means a single bad read of the unit block
+     * can no longer fault a healthy, running slot, which is exactly what one
+     * misaligned read did on 2026-11-11.
+     */
+    const bool oc = (status & BTS_STATUS_OVERCURRENT) != 0;
+    st->cmpss_trip = oc && (trip_bits & BTS_TRIP_CMPSS(ch)) != 0;
+    st->gpio_trip  = oc && (trip_bits & BTS_TRIP_GPIO(ch)) != 0;
     st->valid      = true;
 }
 
@@ -644,6 +721,30 @@ static void bts_poll_task(void *arg)
                 }
             }
             if (unit_err == ESP_OK) {
+                /*
+                 * The unit state is a small enum and the input voltage a
+                 * bounded figure. A misread unit block - see bus_write_reg()
+                 * on the stray byte older C2000 builds left behind - decodes
+                 * as nonsense in both, and acting on it faulted slot 1 on
+                 * 2026-11-11 with "unit_state" while Vin sat at 14.0 V
+                 * throughout. So a block whose state is not one of the five
+                 * values, or whose Vin is not a plausible supply, is dropped
+                 * and the last good one kept - one bad read never decides.
+                 */
+                const float state_f = unit[1];
+                const float vin_f   = unit[2];
+                const bool plausible =
+                    state_f >= 0.0f && state_f <= (float)BTS_UNIT_INPUT_HIGH_DISCHARGE_DISABLED &&
+                    state_f == (float)(uint32_t)state_f &&
+                    vin_f >= 0.0f && vin_f < 60.0f;
+                if (!plausible) {
+                    static uint32_t bad_log;
+                    if ((bad_log++ % 20u) == 0u) {
+                        ESP_LOGW(TAG, "unit block implausible (state %.3g, Vin %.3g); kept last",
+                                 (double)state_f, (double)vin_f);
+                    }
+                    goto unit_done;
+                }
                 local.unit.unit_state         = (bts_unit_state_t)(uint32_t)unit[1];
                 local.unit.input_voltage_v    = unit[2];
                 local.unit.trip_status        = (uint32_t)unit[3];
@@ -683,6 +784,7 @@ static void bts_poll_task(void *arg)
                              s_scl_gpio, gpio_get_level(scl));
                 }
             }
+unit_done:
 
             for (uint8_t ch = 0; ch < BTS_NUM_CHANNELS; ch++) {
                 poll_one_channel(ch, &local.channel[ch], local.unit.trip_status);
@@ -923,9 +1025,9 @@ esp_err_t bts_link_init(const bts_link_config_t *config)
         int scl;
         uint32_t hz;
     } attempts[] = {
-        { config->sda_gpio, config->scl_gpio, 50000 },
+        { config->sda_gpio, config->scl_gpio, BTS_I2C_SCL_HZ },
         { config->sda_gpio, config->scl_gpio, 10000 },
-        { config->scl_gpio, config->sda_gpio, 50000 },
+        { config->scl_gpio, config->sda_gpio, BTS_I2C_SCL_HZ },
         { config->scl_gpio, config->sda_gpio, 10000 },
         { config->sda_gpio, config->scl_gpio,
           config->scl_speed_hz ? config->scl_speed_hz : 100000 },
@@ -979,14 +1081,14 @@ esp_err_t bts_link_init(const bts_link_config_t *config)
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = BTS_I2C_ADDRESS,
         /*
-         * 50 kHz, deliberately overriding config->scl_speed_hz (main.c asks
-         * for 100 kHz, which reaches only the bring-up probe list). The C2000
-         * target ISR does a fair amount of work per byte, the bus runs over a
-         * ribbon to the BTS board, and the board's 10k pull-ups are weak, so
-         * rise time - not bandwidth - is the binding constraint. Nothing here
-         * needs the throughput.
+         * BTS_I2C_SCL_HZ, deliberately overriding config->scl_speed_hz
+         * (main.c asks for 100 kHz, which reaches only the bring-up probe
+         * list). The C2000 target ISR does a fair amount of work per byte,
+         * the bus runs over a ribbon to the BTS board, and the board's 10k
+         * pull-ups are weak, so rise time and noise margin - not bandwidth -
+         * are the binding constraints. See BTS_I2C_SCL_HZ.
          */
-        .scl_speed_hz = 50000,
+        .scl_speed_hz = BTS_I2C_SCL_HZ,
     };
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev), TAG, "i2c dev");
 

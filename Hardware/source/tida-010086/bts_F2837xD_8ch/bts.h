@@ -416,11 +416,36 @@ static inline void BTS_tripEpwm(uint32_t EPWM_BASE, BTS_DCL_CTRL_TYPE* ctrl_cc, 
         EPWM_forceTripZoneEvent(EPWM_BASE,EPWM_TZ_FORCE_EVENT_OST);
         EPWM_setTripZoneAction(EPWM_BASE,  EPWM_TZ_ACTION_EVENT_TZA,EPWM_TZ_ACTION_LOW);
 
-        EPWM_setCounterCompareValue(EPWM_BASE,EPWM_COUNTER_COMPARE_A, 0U);
-        EPWM_setCounterCompareValue(EPWM_BASE, EPWM_COUNTER_COMPARE_B, BTS_DRV_EPWM_TBPRD);
-
-        HRPWM_setHiResCounterCompareValueOnly(EPWM_BASE,HRPWM_COUNTER_COMPARE_A,0U);
-        HRPWM_setHiResCounterCompareValueOnly(EPWM_BASE,HRPWM_COUNTER_COMPARE_B,0U);
+        //
+        // HOLD THE COMPARES AT THE SEED DUTY, NOT AT ZERO.
+        //
+        // The trip zone holds both gates low whatever the compares say, so
+        // their value only matters at the release - and there it matters a
+        // great deal. CMPA is shadow-loaded at the period, so for the rest of
+        // the period in which the release lands the ACTIVE value is whatever
+        // was written here. It used to be 0, and with CMPA = 0 the up-count
+        // CMPA event outranks the zero event, so EPWMA stays low for that
+        // whole period: the low side conducts alone, the cell drives current
+        // backwards through the inductor for up to 10 us, and the low
+        // comparator latches. Seen on hardware 2026-11-12, slot 2, four times
+        // in eight starts: COMPSTS LO latched at the release with the ADS
+        // reading ~0 A - a spike far too short for its 1 ms mean to see.
+        //
+        // Holding the compares at dutySetRef_pu, the feed-forward Vout/Vin,
+        // makes the release period run at the seed duty like every period
+        // after it. BTS_updateReference() keeps a starting slot tripped for
+        // one extra pass so this has written the new seed before the release.
+        //
+        {
+            float32_t d = ctrlLoopVariable->dutySetRef_pu;
+            if (d > BTS_DUTY_SET_MAX_PU) {
+                d = BTS_DUTY_SET_MAX_PU;
+            }
+            if (d < BTS_DUTY_SET_MIN_PU) {
+                d = BTS_DUTY_SET_MIN_PU;
+            }
+            BTS_HAL_updateDuty(EPWM_BASE, d, d);
+        }
 
         ctrl_cc->x1=0.0;
         ctrl_cc->x2=0.0;
@@ -764,40 +789,97 @@ static inline void BTS_ctrlISR(BTS_DCL_CTRL_TYPE* ctrl_cc, BTS_DCL_CTRL_TYPE* ct
     ctrlLoopVariable->ek_cv_pu = ctrlLoopVariable->direction_coeff *(ctrlLoopVariable->voutSet_pu - ctrlLoopVariable->voutSense_pu);
     ctrlLoopVariable->uk_cv_pu = BTS_DCL_RUN_IMMEDIATE(ctrl_cv, ctrlLoopVariable->ek_cv_pu);
 
-    //only update when current is in limit
-    if (BTS_DCL_RUN_CLAMP(&(ctrlLoopVariable->uk_cv_pu),ctrlLoopVariable->ioutRef_pu, -1.0*ctrlLoopVariable->ioutRef_pu) ==0){
-        //record current command
-        ctrlLoopVariable->ioutSet_pu = ctrlLoopVariable->uk_cv_pu;
-
-         BTS_DCL_RUN_PARTIAL(ctrl_cv,
-                              ctrlLoopVariable->ek_cv_pu,
-                              ctrlLoopVariable->uk_cv_pu);
-     }
-     else{
-         if(ctrlLoopVariable->uk_cv_pu <= BTS_ISET_MIN_PU)
-             {
-             ctrlLoopVariable->ioutSet_pu = BTS_ISET_MIN_PU;
-             }
-             if(ctrlLoopVariable->uk_cv_pu >= BTS_ISET_MAX_PU)
-             {
-                 ctrlLoopVariable->ioutSet_pu = BTS_ISET_MAX_PU;
-             }
-     }
+    //
+    // The CV output is a MAGNITUDE in the slot's own direction, clamped to
+    // 0 .. ioutRef_pu. It can taper the current toward zero; it can never
+    // reverse it. The CCCV block below applies the sign.
+    //
+    // Two faults here made a discharge charge its own cell:
+    //
+    //   1. When uk_cv was inside the clamp it was written straight to
+    //      ioutSet_pu with NO direction_coeff. The CCCV block only rewrote
+    //      ioutSet_pu outside its hysteresis band, so for a discharge with
+    //      the cell between V_MIN and V_MIN + 0.1 pu that unsigned value
+    //      stood - and above the floor the error is positive, so uk_cv was
+    //      positive: a CHARGING setpoint. Charging raised the voltage, which
+    //      grew the error, which grew the charge.
+    //
+    //   2. The clamp was symmetric, +/-ioutRef_pu, so even the signed path
+    //      could command the opposite direction at full setpoint.
+    //
+    // Seen on hardware 2026-11-07, 8 A discharge to 2.5 V: at the floor the
+    // slot charged at ~2-2.8 A until the cell reached the band's upper edge
+    // (0.1 pu is ~0.49 V, so ~3.0 V), dropped back to CC at -8 A, sagged to
+    // the floor in a few seconds, and charged again, indefinitely. The cell
+    // never stayed under V_MIN for serviceTermination()'s five passes, so
+    // the discharge never ended and the ESP32 never reached its recharge.
+    //
+    // The same faults would let a charge past V_MAX discharge the cell back
+    // down at full setpoint; it is now held at zero instead.
+    //
+    if (BTS_DCL_RUN_CLAMP(&(ctrlLoopVariable->uk_cv_pu),
+                          ctrlLoopVariable->ioutRef_pu, (float32_t)0.0) == 0) {
+        BTS_DCL_RUN_PARTIAL(ctrl_cv,
+                            ctrlLoopVariable->ek_cv_pu,
+                            ctrlLoopVariable->uk_cv_pu);
+    }
 
 #endif
 
 #if(BTS_ISR_CL_MODE == BTS_ISR_CL_MODE_CCCV)
-    if(ctrlLoopVariable->ek_cv_pu<-0.001){
-        ctrlLoopVariable->ioutSet_pu = ctrlLoopVariable->direction_coeff*ctrlLoopVariable->uk_cv_pu;
-        ctrlLoopVariable->ctrlMode_logic=1;
+    //
+    // A DISCHARGE IS CONSTANT CURRENT TO THE FLOOR. serviceTermination() ends
+    // it at V_MIN with no CV requirement, and that is the design: a CV phase
+    // at the floor would hold the cell at V_MIN instead of letting it cross,
+    // so the termination test would be a coin-toss on noise. Only a charge
+    // has a CV phase - the taper to I_MIN that ends it.
+    //
+    // For a charge the hysteresis is unchanged: into CV once the cell is
+    // above V_MAX, back to CC only once it is 0.1 pu below. What changed is
+    // that the output is derived from the MODE on every pass, so the band
+    // can no longer hold a stale or unsigned value.
+    //
+    //
+    // A held-off stage (tripFlag, which BTS_updateReference() sets whenever
+    // enable_logic is clear) is in CC too, so the CV state below is pinned
+    // all the time a slot is idle: a start then decides CC or CV afresh from
+    // the hysteresis, rather than resuming a CV phase from a previous run.
+    //
+    if ((ctrlLoopVariable->direction_logic == 0U) ||
+        (ctrlLoopVariable->tripFlag != 0U)) {
+        ctrlLoopVariable->ctrlMode_logic = 0;
+    } else if (ctrlLoopVariable->ek_cv_pu < -0.001) {
+        ctrlLoopVariable->ctrlMode_logic = 1;
+    } else if (ctrlLoopVariable->ek_cv_pu > 0.1) {
+        ctrlLoopVariable->ctrlMode_logic = 0;
     }
-    else if(ctrlLoopVariable->ek_cv_pu>0.1)
-    {
-        ctrlLoopVariable->ioutSet_pu = ctrlLoopVariable->direction_coeff* ctrlLoopVariable->ioutRef_pu;
-//        ctrlLoopVariable->ioutSet_pu=  BUCK_SFRA_INJECT(ctrlLoopVariable->ioutRef_pu);
-        ctrlLoopVariable->ctrlMode_logic=0;
+
+    //
+    // WHILE CC IS IN CONTROL, THE CV CONTROLLER TRACKS IT.
+    //
+    // Its state is pinned to the equilibrium that outputs exactly the CC
+    // setpoint - x1 = I, x2 = -I*a2, which holds because the CV biquad is an
+    // integrator (1 + a1 + a2 == 0, the same identity the CC seed relies on
+    // in BTS_tripEpwm()). So the pass on which the cell crosses V_MAX starts
+    // CV from the current the slot is actually carrying, and the taper is
+    // bumpless.
+    //
+    // Without this the CV state was never reset - not on a start, not on a
+    // direction change, not while idle - and the 0..ioutRef clamp above froze
+    // it wherever it last saturated. Seen on hardware 2026-11-09, slot 8: a
+    // 2.5 A charge after an 8 A discharge held 2.5 A straight through 4.20 V
+    // to 4.445 V, because the integrator still held most of the discharge's
+    // 8 A and the error had to wind it down first. The CV output finally came
+    // off the clamp as a step, and the CMPSS tripped.
+    //
+    if (ctrlLoopVariable->ctrlMode_logic == 0U) {
+        ctrl_cv->x1 = ctrlLoopVariable->ioutRef_pu;
+        ctrl_cv->x2 = -(ctrlLoopVariable->ioutRef_pu * ctrl_cv->a2);
     }
-//    ctrlLoopVariable->ioutSet_pu=  BUCK_SFRA_INJECT(ctrlLoopVariable->ioutRef_pu);
+
+    ctrlLoopVariable->ioutSet_pu = ctrlLoopVariable->direction_coeff *
+        ((ctrlLoopVariable->ctrlMode_logic != 0U) ? ctrlLoopVariable->uk_cv_pu
+                                                  : ctrlLoopVariable->ioutRef_pu);
 
 #elif(BTS_ISR_CL_MODE == BTS_ISR_CL_MODE_CV)
     ctrlLoopVariable->ioutSet_pu = ctrlLoopVariable->direction_coeff*ctrlLoopVariable->uk_cv_pu;

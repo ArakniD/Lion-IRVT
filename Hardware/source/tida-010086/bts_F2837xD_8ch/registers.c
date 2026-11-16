@@ -64,6 +64,9 @@ volatile uint32_t startup_mode;
 #pragma DATA_SECTION(startup_enable, "CPU1TOCPU2RAM")
 volatile uint32_t startup_enable;
 
+#pragma DATA_SECTION(ipcAck, "CPU1TOCPU2RAM")
+volatile BTS_ipcAck ipcAck;
+
 const RegisterConfig regConfig[TOTAL_REGISTERS] = {
 
     // Channel 0 runtime

@@ -44,6 +44,12 @@ static void updateInputVoltage(void);
 static void checkGroupIntegrity(void);
 static void publishStatusToCpu2(void);
 static void serviceTermination(void);
+static void serviceSeedRefresh(void);
+static void serviceSoftStop(void);
+static void serviceSoftStart(void);
+static void slotSoftStartArm(uint16_t ch);
+static void slotFinish(uint16_t ch);
+static void slotStop(uint16_t ch);
 static void servicePreChargeBalance(void);
 static void serviceDivergenceFault(void);
 
@@ -294,11 +300,62 @@ static void slotPause(uint16_t ch, uint16_t wdTripped, uint16_t restored)
 // Leaves PAUSED back into whichever direction the slot held. Resets nothing:
 // the counters picking up where they stopped is the point of the state.
 //
+// THE LIMITS ARE RE-LATCHED HERE, from the settings registers, exactly as a
+// fresh start latches them - only the counters are left alone.
+//
+// They were not, and that was a real overrun. The run-time copies in
+// BTS_userInputs[] are written by a start and nothing else, and a boot sets
+// them to the bts.c defaults: 3.7 V / 0.5 V / 1 A. A slot RESTORED from F-RAM
+// after a reset therefore resumed with V_MIN = 0.5 V, and serviceTermination()
+// let the discharge run straight past the cell's real 2.5 V floor. Seen on
+// hardware 2026-11-09, slot 8, after the reload that restored it paused.
+//
+// Re-latching is also what makes a settings change during a pause take
+// effect: the host writes the new limits while the slot is held, and the
+// resume picks them up.
+//
+static void slotLatchLimits(uint16_t ch)
+{
+    uint16_t  regBase    = BTS_SET_BASE(ch);
+    float32_t groupShare = (float32_t)1.0 / (float32_t)btsGroupMembers[ch];
+
+    BTS_userInputs[ch].vref_charge_V    = registers[regBase + BTS_SET_V_MAX];
+    BTS_userInputs[ch].vref_discharge_V = registers[regBase + BTS_SET_V_MIN];
+    BTS_userInputs[ch].iref_A           = registers[regBase + BTS_SET_I_MAX] * groupShare;
+    BTS_userInputs[ch].iref_cuttout_A   = registers[regBase + BTS_SET_I_MIN] * groupShare;
+
+    //
+    // Per slot, after the group division: never regulate onto the software
+    // trip. Any host can write I_MAX - the AT console and CAN as well as the
+    // ESP32 - so the ceiling is enforced where the setpoint is latched. See
+    // BTS_SETPOINT_MAX_A.
+    //
+    if (BTS_userInputs[ch].iref_A > BTS_SETPOINT_MAX_A) {
+        BTS_userInputs[ch].iref_A = BTS_SETPOINT_MAX_A;
+    }
+}
+
 static void slotResume(uint16_t ch)
 {
     if (!status[ch].paused) {
         return;
     }
+
+    //
+    // Limits before enable, the same order a start uses: the next control
+    // pass acts on enable_logic, and must already see the right references.
+    // A group's leader latches for itself; modeCallback() copies its values
+    // to the members after this returns.
+    //
+    if (btsSlotIsLeader[ch] != 0U) {
+        slotLatchLimits(ch);
+    }
+
+    //
+    // The feed-forward duty for the cell as it is NOW, not as it was when
+    // the run first started - the release edge seeds the CC loop from it.
+    //
+    BTS_seedConverterDuty(ch);
 
     status[ch].paused    = 0;
     status[ch].wdTripped = 0;
@@ -307,6 +364,7 @@ static void slotResume(uint16_t ch)
     status[ch].stopped   = 0;
 
     BTS_userInputs[ch].direction_logic = status[ch].charging;
+    slotSoftStartArm(ch);
     BTS_userInputs[ch].enable_logic    = 1;
 }
 
@@ -367,6 +425,8 @@ static void slotStop(uint16_t ch)
     BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
     BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
     BTS_userInputs[ch].enable_logic = 0;
+    BTS_userInputs[ch].stopPending  = 0U;
+    BTS_userInputs[ch].stopRamp_pu  = (float32_t)1.0;
 
     status[ch].running   = 0;
     status[ch].stopped   = 1;
@@ -484,6 +544,235 @@ static void slotReady(uint16_t ch)
 }
 
 //
+// ==================== Soft stop ====================
+//
+// A PLANNED stop does not cut the gates while the converter carries current.
+//
+// Cutting a synchronous converter that is regulating - at 4.2 V in CV, or at
+// 8 A - collapses the inductor current through the body diodes in one step.
+// That edge is what the CMPSS comparator saw at the end of a clean CV charge
+// on 2026-11-10: the termination at 4.200 V / 0.125 A reported cmpss_trip
+// half a second later. So a planned stop instead:
+//
+//   1. ramps the current reference to zero over BTS_SOFT_STOP_RAMP_MS,
+//   2. holds there until |I| <= BTS_SOFT_STOP_ZERO_A for
+//      BTS_SOFT_STOP_SETTLE_MS - the converter idling in CCM at ~0 A average
+//      with the synchronous rectifier still commutating,
+//   3. and only then drops enable_logic, through the same slotFinish() /
+//      slotStop() as before.
+//
+// A hard ceiling (BTS_SOFT_STOP_TIMEOUT_MS) cuts anyway if the current never
+// settles, so a soft stop cannot hold a slot on indefinitely.
+//
+// FAULTS STILL CUT AT ONCE. A trip, a divergence, a group fault, reverse
+// polarity or the input bus leaving its window all call slotStop() directly:
+// ramping into a fault would keep driving it.
+//
+// While ramping the slot still reports RUNNING, so the host sees one clean
+// transition at the end - the same one it saw before - rather than a slot
+// that says it has stopped while current is still flowing.
+//
+#define BTS_SOFT_STOP_PASS_MS      3U        // serviceSoftStop() runs in A1: one of three A tasks off a 1 kHz timer
+#define BTS_SOFT_STOP_RAMP_MS      50U
+#define BTS_SOFT_STOP_SETTLE_MS    20U
+#define BTS_SOFT_STOP_TIMEOUT_MS   250U
+#define BTS_SOFT_STOP_ZERO_A       ((float32_t)0.10)
+
+#define BTS_SOFT_STOP_FINISH       1U        // end as END   (slotFinish)
+#define BTS_SOFT_STOP_STOP         2U        // end as STOP  (slotStop)
+
+static uint16_t softStopElapsed[NUM_CHANNELS];
+
+//
+// ==================== Soft start ====================
+//
+// The mirror of the soft stop: every start and every resume begins at ZERO
+// current and climbs to the setpoint over BTS_SOFT_START_RAMP_MS.
+//
+// Before this the CC reference stepped straight from 0 to the setpoint on the
+// first control pass after release, 8 A in one step. The feed-forward seed
+// (BTS_seedConverterDuty) puts the first PWM edge at the 0 A duty, Vout/Vin,
+// and the loop then had to slew the whole 8 A out of that in a few switching
+// periods - the step most likely to overshoot onto the software trip or the
+// comparator. Now the release edge and the reference agree: both are 0 A, and
+// the reference rises at about 0.16 A/ms for an 8 A setpoint, slowly enough
+// for the CC loop to follow and still fast enough to be a fraction of a
+// second at most.
+//
+// startRamp_pu scales ioutRef_pu in BTS_updateReference(), next to the soft
+// stop's stopRamp_pu. It is held at 0 while the stage is off, so the release
+// always starts the ramp from zero whatever path enabled it.
+//
+#define BTS_SOFT_START_RAMP_MS     50U
+
+static void slotSoftStartArm(uint16_t ch)
+{
+    uint32_t epwmBase = EPWM1_BASE + (uint32_t)ch * (EPWM2_BASE - EPWM1_BASE);
+
+    BTS_userInputs[ch].startRamp_pu = (float32_t)0.0;
+
+    //
+    // DROP ANY STALE COMPARATOR LATCH BEFORE THE STAGE IS RELEASED.
+    //
+    // The hardware trips are armed for every slot as soon as ANY slot runs,
+    // so an idle slot sits armed while a neighbour switches. A coupled spike
+    // latches its DCAEVT1 one-shot (TZOSTFLG bit 6), and epwmTripISR()'s
+    // off-stage path used to clear only OST1/OST2 - so the latch stayed. The
+    // next start then released straight into it and the ISR, now seeing a
+    // RUNNING slot, reported an over-current that had happened, if at all,
+    // seconds earlier on an idle stage. Seen on hardware 2026-11-11: slot 1
+    // started cleanly (trips still disarmed at its release), slot 2 started
+    // 30 s later with them armed and tripped instantly with no current
+    // flowing; slots 3, 4, 5, 7 and 8 - all empty - held the same latch.
+    //
+    // A comparator that is genuinely asserting at this instant re-latches at
+    // once, so this cannot clear a real fault - only a spent one.
+    //
+    EPWM_clearOneShotTripZoneFlag(epwmBase,
+                                  EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2 |
+                                  EPWM_TZ_OST_FLAG_DCAEVT1);
+    EPWM_clearTripZoneFlag(epwmBase, EPWM_TZ_FLAG_DCAEVT1 | EPWM_TZ_INTERRUPT);
+}
+
+//
+// Called every BTS_SOFT_STOP_PASS_MS from A1, after the references update.
+//
+static void serviceSoftStart(void)
+{
+    uint16_t ch;
+    const float32_t step = (float32_t)BTS_SOFT_STOP_PASS_MS /
+                           (float32_t)BTS_SOFT_START_RAMP_MS;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        BTS_userInput *u = &BTS_userInputs[ch];
+
+        //
+        // Stage off: hold the ramp at zero, so the next release - a start, a
+        // resume, a soft-start retry, a trip that released - begins there.
+        // A calibrating slot is not ramped: its reference is the cal drive.
+        //
+        if ((u->enable_logic == 0U) || (u->calState != BTS_CAL_STATE_NORMAL)) {
+            u->startRamp_pu = (u->calState != BTS_CAL_STATE_NORMAL)
+                            ? (float32_t)1.0 : (float32_t)0.0;
+            continue;
+        }
+
+        if (u->startRamp_pu < (float32_t)1.0) {
+            u->startRamp_pu += step;
+            if (u->startRamp_pu > (float32_t)1.0) {
+                u->startRamp_pu = (float32_t)1.0;
+            }
+        }
+    }
+}
+
+//
+// Requests a soft stop. If the stage is not actually driving there is
+// nothing to ramp, so the stop happens at once.
+//
+static void slotSoftStop(uint16_t ch, uint16_t how)
+{
+    if ((BTS_userInputs[ch].enable_logic == 0U) ||
+        (BTS_ctrlLoopVariables[ch].tripFlag != 0U) ||
+        (BTS_userInputs[ch].calState != BTS_CAL_STATE_NORMAL)) {
+        if (how == BTS_SOFT_STOP_FINISH) {
+            slotFinish(ch);
+        } else {
+            slotStop(ch);
+        }
+        return;
+    }
+    if (BTS_userInputs[ch].stopPending == 0U) {
+        BTS_userInputs[ch].stopDwell = 0U;
+        softStopElapsed[ch] = 0U;
+    }
+    //
+    // A FINISH request is not downgraded by a later STOP: a termination
+    // already under way stays a termination.
+    //
+    if (BTS_userInputs[ch].stopPending != BTS_SOFT_STOP_FINISH) {
+        BTS_userInputs[ch].stopPending = how;
+    }
+}
+
+static uint16_t slotSoftStopping(uint16_t ch)
+{
+    return (BTS_userInputs[ch].stopPending != 0U) ? 1U : 0U;
+}
+
+//
+// Called every BTS_SOFT_STOP_PASS_MS from A1, after the references update.
+//
+static void serviceSoftStop(void)
+{
+    uint16_t ch;
+    const float32_t step = (float32_t)BTS_SOFT_STOP_PASS_MS /
+                           (float32_t)BTS_SOFT_STOP_RAMP_MS;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        BTS_userInput *u = &BTS_userInputs[ch];
+        uint16_t       how = u->stopPending;
+        uint16_t       done = 0U;
+
+        if (how == 0U) {
+            u->stopRamp_pu = (float32_t)1.0;
+            continue;
+        }
+
+        //
+        // Something else stopped the slot meanwhile - a trip, a host stop.
+        // The request is moot; just clear it.
+        //
+        if ((u->enable_logic == 0U) || (status[ch].running == 0U) ||
+            (status[ch].paused != 0U)) {
+            u->stopPending = 0U;
+            u->stopRamp_pu = (float32_t)1.0;
+            continue;
+        }
+
+        if (u->stopRamp_pu > step) {
+            u->stopRamp_pu -= step;
+        } else {
+            u->stopRamp_pu = (float32_t)0.0;
+            if (fabsf(BTS_measValues[ch].Isense_A) <= BTS_SOFT_STOP_ZERO_A) {
+                if (++u->stopDwell >= (BTS_SOFT_STOP_SETTLE_MS / BTS_SOFT_STOP_PASS_MS)) {
+                    done = 1U;
+                }
+            } else {
+                u->stopDwell = 0U;
+            }
+        }
+
+        if (++softStopElapsed[ch] >= (BTS_SOFT_STOP_TIMEOUT_MS / BTS_SOFT_STOP_PASS_MS)) {
+            done = 1U;
+        }
+
+        if (done != 0U) {
+            //
+            // Cut, and carry the group with it - only a leader is ever asked
+            // to stop, and its members share its stage.
+            //
+            uint16_t m;
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if ((m != ch) && (btsSlotLeader[m] == ch) && (btsSlotEnabled[m] != 0U)) {
+                    if (how == BTS_SOFT_STOP_FINISH) {
+                        slotFinish(m);
+                    } else {
+                        slotStop(m);
+                    }
+                }
+            }
+            if (how == BTS_SOFT_STOP_FINISH) {
+                slotFinish(ch);
+            } else {
+                slotStop(ch);
+            }
+            updateStatusRegisters();
+        }
+    }
+}
+
+//
 // Ends one slot because its test COMPLETED, as distinct from slotStop()'s
 // "something halted it".
 //
@@ -503,6 +792,8 @@ static void slotFinish(uint16_t ch)
     BTS_ctrlLoopVariables[ch].ioutRef_pu = (float32_t)0.0;
     BTS_ctrlLoopVariables[ch].voutRef_pu = (float32_t)0.0;
     BTS_userInputs[ch].enable_logic = 0;
+    BTS_userInputs[ch].stopPending  = 0U;
+    BTS_userInputs[ch].stopRamp_pu  = (float32_t)1.0;
 
     status[ch].running   = 0;
     status[ch].stopped   = 0;
@@ -1549,6 +1840,28 @@ void main(void)
                                  MEMCFG_GSRAMCONTROLLER_CPU2);
 
     //
+    // NO TRIP CARRIES ACROSS A START-UP.
+    //
+    // cpu1Status lives in message RAM, which the C runtime does not
+    // initialise and a debugger load does not clear. epwmTripISR() builds
+    // the trip word by read-modify-write from whatever is there, and
+    // slotClearOverCurrent() clears only the slot it is asked about - so a
+    // trip bit left by the previous run came straight back after a reload
+    // and was published as a live fault. Seen 2026-11-11: slot 2 read
+    // eTripStatus 4.0 after a reload with its over-current bit clear and
+    // the stage idle. Zeroed here, before CPU2 can mirror it.
+    //
+    cpu1Status.tripStatus = 0UL;
+
+    //
+    // Start the register-write ring empty from CPU1's side: whatever CPU2 has
+    // already queued is from before this boot - or from a previous image -
+    // and acting on it now would replay stale host writes. CPU2 resets head
+    // to 0 when it starts, and nothing is posted before then.
+    //
+    ipcAck.tail = (ipcMsg.head < BTS_IPC_QUEUE_LEN) ? ipcMsg.head : 0U;
+
+    //
     // Release CPU2.
     //
     // Standalone builds only. Under CCS the debugger loads and starts CPU2
@@ -2213,6 +2526,20 @@ void modeCallback(float value, uint16_t channel)
                     slotResume(m);
                 }
             }
+            //
+            // The leader re-latched its limits from the settings registers;
+            // its members take the leader's values, as they do on a start.
+            //
+            for (m = 0; m < NUM_CHANNELS; m++) {
+                if ((m == channel) || (btsSlotLeader[m] != channel) ||
+                    (btsSlotEnabled[m] == 0U)) {
+                    continue;
+                }
+                BTS_userInputs[m].vref_charge_V    = BTS_userInputs[channel].vref_charge_V;
+                BTS_userInputs[m].vref_discharge_V = BTS_userInputs[channel].vref_discharge_V;
+                BTS_userInputs[m].iref_A           = BTS_userInputs[channel].iref_A;
+                BTS_userInputs[m].iref_cuttout_A   = BTS_userInputs[channel].iref_cuttout_A;
+            }
             updateStatusRegisters();
             return;
         }
@@ -2240,6 +2567,19 @@ void modeCallback(float value, uint16_t channel)
             return;
         }
 
+        //
+        // A STOP of a slot that is driving is a soft stop: ramp to zero,
+        // settle, then cut - see serviceSoftStop(), which also carries the
+        // group. Handled before the direction bits below are rewritten from
+        // the mode word, because a stop is 0x00 and would otherwise flip a
+        // charging slot to "discharging" while its current is still ramping.
+        //
+        if (!(mode & BTS_MODE_RUN) && slotIsRunning(channel)) {
+            slotSoftStop(channel, BTS_SOFT_STOP_STOP);
+            updateStatusRegisters();
+            return;
+        }
+
         status[channel].charging = (mode & BTS_MODE_CHARGE) >> 1;
         status[channel].discharging = !((mode & BTS_MODE_CHARGE) >> 1);
         if (mode & BTS_MODE_RUN) {
@@ -2249,8 +2589,6 @@ void modeCallback(float value, uint16_t channel)
             // discharge, so one voltage pair and one current pair serves
             // both and there is nothing to choose between here.
             //
-            uint16_t regBase = BTS_SET_BASE(channel);
-
             //
             // THE CURRENT SETTINGS BELONG TO THE GROUP, NOT TO THE SLOT.
             //
@@ -2270,21 +2608,23 @@ void modeCallback(float value, uint16_t channel)
             // over-divided reference under-delivers current, it does not
             // over-deliver it.
             //
-            // btsGroupMembers is never zero, so this cannot divide by zero.
+            // btsGroupMembers is never zero, so slotLatchLimits() cannot
+            // divide by zero.
             //
-            float32_t groupShare = (float32_t)1.0 /
-                                   (float32_t)btsGroupMembers[channel];
-
             status[channel].running   = 1;
             status[channel].stopped   = 0;
             status[channel].paused    = 0;
             status[channel].wdTripped = 0;
             status[channel].restored  = 0;
 
-            BTS_userInputs[channel].vref_charge_V    = registers[regBase + BTS_SET_V_MAX];
-            BTS_userInputs[channel].vref_discharge_V = registers[regBase + BTS_SET_V_MIN];
-            BTS_userInputs[channel].iref_A           = registers[regBase + BTS_SET_I_MAX] * groupShare;
-            BTS_userInputs[channel].iref_cuttout_A   = registers[regBase + BTS_SET_I_MIN] * groupShare;
+            //
+            // A start cancels a soft stop still in progress, or the ramp
+            // would go on and cut the run just begun.
+            //
+            BTS_userInputs[channel].stopPending = 0U;
+            BTS_userInputs[channel].stopRamp_pu = (float32_t)1.0;
+
+            slotLatchLimits(channel);
             BTS_userInputs[channel].direction_logic  = status[channel].charging;
 
             //
@@ -2293,6 +2633,7 @@ void modeCallback(float value, uint16_t channel)
             // a pass late and the first PWM edge has gone out at 0%.
             //
             BTS_seedConverterDuty(channel);
+            slotSoftStartArm(channel);
 
             BTS_userInputs[channel].enable_logic     = 1;
 
@@ -2353,6 +2694,20 @@ void modeCallback(float value, uint16_t channel)
                 BTS_userInputs[m].iref_A           = BTS_userInputs[channel].iref_A;
                 BTS_userInputs[m].iref_cuttout_A   = BTS_userInputs[channel].iref_cuttout_A;
                 BTS_userInputs[m].direction_logic  = BTS_userInputs[channel].direction_logic;
+                //
+                // The member's compares are held at ITS OWN seed while it is
+                // tripped (BTS_tripEpwm), and only the leader computed one -
+                // parallel slots share Vout and Vin, so the leader's is right.
+                //
+                BTS_userInputs[m].dutyRef_pu       = BTS_userInputs[channel].dutyRef_pu;
+                //
+                // A member's stage releases with the leader's, so it drops
+                // its own stale comparator latch first, exactly as the
+                // leader did - see slotSoftStartArm().
+                //
+                if (BTS_userInputs[channel].enable_logic != 0U) {
+                    slotSoftStartArm(m);
+                }
                 BTS_userInputs[m].enable_logic     = BTS_userInputs[channel].enable_logic;
 
                 //
@@ -2395,10 +2750,12 @@ void modeCallback(float value, uint16_t channel)
 // updated by CPU2 before the flag was raised - CPU1 only reacts to the
 // change, it never writes the register file.
 //
-void BTS_HandleRegisterWrite(void)
+//
+// One queued host write. See BTS_ipcMessage for why this is a queue.
+//
+static void handleOneRegisterWrite(uint16_t regIdx, float32_t value)
 {
-    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_REG_WRITE)) {
-        uint16_t regIdx = ipcMsg.regAddr;
+    {
 
         //
         // The decode is by index range, so it has to be re-derived from the
@@ -2411,7 +2768,7 @@ void BTS_HandleRegisterWrite(void)
             uint16_t offset  = (regIdx - BTS_SET_BASE(0)) % BTS_SET_REGS_PER_CH;
 
             if (offset == BTS_SET_MODE) {
-                modeCallback(ipcMsg.value, channel);
+                modeCallback(value, channel);
             } else if ((offset >= (BTS_CAL_BASE(0) - BTS_SET_BASE(0))) &&
                        (offset <  (BTS_CAL_BASE(0) - BTS_SET_BASE(0)) +
                                   BTS_CAL_REGS_PER_CH)) {
@@ -2445,11 +2802,47 @@ void BTS_HandleRegisterWrite(void)
             // flag is acked, and every command is accepted by CPU2 and
             // silently discarded here.
             //
-            calHandleCommand((uint16_t)ipcMsg.value,
+            calHandleCommand((uint16_t)value,
                              registers[BTS_REG_IDX(eCalArgument)]);
         }
+    }
+}
 
+void BTS_HandleRegisterWrite(void)
+{
+    //
+    // Drain the whole ring, oldest first, so writes are acted on in the
+    // order the host made them - limits before the mode that latches them.
+    // The flag is acked BEFORE draining: a post landing mid-drain raises it
+    // again and is picked up next pass rather than being acked unseen.
+    //
+    if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_REG_WRITE)) {
         IPC_ackFlagRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_REG_WRITE);
+    }
+    {
+        uint16_t tail = ipcAck.tail;
+        uint16_t guard = 0U;
+
+        //
+        // A head out of range can only be a CPU2 that has not started yet;
+        // a tail out of range, message RAM that was never initialised. In
+        // either case there is nothing valid to replay.
+        //
+        if ((ipcMsg.head >= BTS_IPC_QUEUE_LEN) || (tail >= BTS_IPC_QUEUE_LEN)) {
+            tail = (ipcMsg.head < BTS_IPC_QUEUE_LEN) ? ipcMsg.head : 0U;
+            ipcAck.tail = tail;
+            guard = BTS_IPC_QUEUE_LEN;      // nothing valid to drain this pass
+        }
+
+        while ((tail != ipcMsg.head) && (guard++ < BTS_IPC_QUEUE_LEN)) {
+            uint16_t  regIdx = ipcMsg.entries[tail].regAddr;
+            float32_t value  = ipcMsg.entries[tail].value;
+
+            handleOneRegisterWrite(regIdx, value);
+
+            tail = (uint16_t)((tail + 1U) % BTS_IPC_QUEUE_LEN);
+            ipcAck.tail = tail;
+        }
     }
 
     if (IPC_isFlagBusyRtoL(IPC_CPU1_L_CPU2_R, BTS_IPC_FLAG_TEMP_UPDATE)) {
@@ -2728,6 +3121,13 @@ void A1(void)
     BTS_updateReference(&BTS_userInput_ch8,&BTS_ctrlLoopVariable_ch8);
 
     //
+    // Planned stops ramp here, on the same pass the references update, and
+    // make their cut once the converter has settled at zero current.
+    //
+    serviceSoftStop();
+    serviceSoftStart();
+
+    //
     // Execute task A2 the next time CpuTimer0 decrements to 0
     //
     A_Task_Ptr = &A2;
@@ -2815,7 +3215,7 @@ void B3(void)
 // THE PROBLEM. Each slot's current-sense chain is an instrumentation amplifier
 // referenced to 1.25 V, and 1.25 V is what it reads at zero current. Before
 // its supply has come up and settled, its output sits near 0 V - and on that
-// chain 0 V means -10 A, well past the low comparator's -9.5 A threshold.
+// chain 0 V means -10 A, well past the low comparator's -9.75 A threshold.
 // Arming the trips during boot therefore latches an over-current on every
 // slot before the board has done anything at all. Because the trip is a
 // one-shot it then STAYS latched, and clearing it while the source is still
@@ -2954,6 +3354,7 @@ void C1(void)
     // performed as a group member falling out of step.
     //
     serviceTermination();
+    serviceSeedRefresh();
 
     checkGroupIntegrity();
 
@@ -3101,6 +3502,32 @@ void C3(void)
 }
 
 //
+// Keeps the trip-release duty seed tracking the cell through a run.
+//
+// BTS_tripEpwm() seeds the CC biquad from dutySetRef_pu on every trip-release
+// edge, and a software trip releases within a millisecond while enable_logic
+// holds. dutySetRef_pu comes from BTS_seedConverterDuty(), which used to run
+// only at the start - so a trip late in a discharge restarted the converter
+// at the duty for the cell's STARTING voltage. In a discharge that is too
+// high a duty: the restart pushes current INTO the cell before the loop can
+// pull it back, a step big enough to reach the CMPSS comparator and stop the
+// slot outright. Recomputing it at 10 Hz keeps any restart at Vout/Vin.
+//
+// Running leaders only: a follower mirrors its leader's duty and never seeds.
+//
+static void serviceSeedRefresh(void)
+{
+    uint16_t ch;
+
+    for (ch = 0; ch < NUM_CHANNELS; ch++) {
+        if ((slotIsRunning(ch) != 0U) && (btsSlotIsLeader[ch] != 0U) &&
+            !calSlotIsCalibrating(ch)) {
+            BTS_seedConverterDuty(ch);
+        }
+    }
+}
+
+//
 // Ends a test that has run to completion.
 //
 // CHARGE terminates on CURRENT. In CCCV the loop holds V_MAX while the cell
@@ -3182,23 +3609,15 @@ static void serviceTermination(void)
         }
 
         //
-        // Confirmed. End the leader and every member of its group together -
-        // a partially ended group would leave the leader driving followers
-        // that consider themselves finished.
+        // Confirmed. Ramp the leader's current to zero and end it, and every
+        // member of its group with it, once the converter has settled -
+        // serviceSoftStop() makes the cut. A partially ended group would
+        // leave the leader driving followers that consider themselves
+        // finished, which is why the members are ended at the same instant.
         //
-        {
-            uint16_t m;
-
-            for (m = 0; m < NUM_CHANNELS; m++) {
-                if ((m != ch) && (btsSlotLeader[m] == ch) &&
-                    (btsSlotEnabled[m] != 0U)) {
-                    slotFinish(m);
-                }
-            }
-            slotFinish(ch);
+        if (slotSoftStopping(ch) == 0U) {
+            slotSoftStop(ch, BTS_SOFT_STOP_FINISH);
         }
-
-        updateStatusRegisters();
     }
 }
 
@@ -3340,6 +3759,7 @@ static void servicePreChargeBalance(void)
                         updateStatusRegisters();
                     } else {
                         softStartRetries[ch]++;
+                        slotSoftStartArm(ch);
                         BTS_userInputs[ch].enable_logic = 1;
                         balanceDwell[ch] = 0U;
                     }
@@ -3408,6 +3828,7 @@ static void servicePreChargeBalance(void)
                     // loop runs, in diode emulation, into a connected cell.
                     //
                     btsSlotPreCharging[ch] = 0U;
+                    slotSoftStartArm(ch);
                     BTS_userInputs[ch].enable_logic = 1;
                     balanceDwell[ch] = 0U;
                     softStartRetries[ch] = 0U;
@@ -3827,6 +4248,41 @@ __interrupt void adcCellVoltageISR(void)
 // below simply finds several channels flagged rather than one. That is the
 // point of the grouped routing: no software in the stopping path.
 //
+//
+// Trip forensics. Written once per running-slot trip, read with the
+// debugger: which comparator side fired, the raw ADS current and the control
+// state at that instant. Kept because a start-up trip with no current flowing
+// was reported three times on 2026-11-11/12 and the registers alone could not
+// say which side of the comparator latched.
+//
+typedef struct {
+    uint32_t  count;
+    uint16_t  slot;
+    uint16_t  compsts;          // COMPSTS of the slot's own comparator
+    uint16_t  tzflg;
+    uint16_t  tzostflg;
+    uint16_t  enable;
+    uint16_t  running;
+    uint16_t  direction;
+    float32_t isenseA;
+    float32_t vsenseV;
+    float32_t ioutRefPu;
+    float32_t dutySetPu;
+    float32_t startRampPu;
+} BTS_tripRecord;
+volatile BTS_tripRecord btsLastTrip;
+
+static const uint32_t btsSlotCmpssBase[NUM_CHANNELS] = {
+    CMPSS1_BASE + (BTS_TRP_CMPSS_CH1 - 1U) * (CMPSS2_BASE - CMPSS1_BASE),
+    CMPSS1_BASE + (BTS_TRP_CMPSS_CH2 - 1U) * (CMPSS2_BASE - CMPSS1_BASE),
+    CMPSS1_BASE + (BTS_TRP_CMPSS_CH3 - 1U) * (CMPSS2_BASE - CMPSS1_BASE),
+    CMPSS1_BASE + (BTS_TRP_CMPSS_CH4 - 1U) * (CMPSS2_BASE - CMPSS1_BASE),
+    CMPSS1_BASE + (BTS_TRP_CMPSS_CH5 - 1U) * (CMPSS2_BASE - CMPSS1_BASE),
+    CMPSS1_BASE + (BTS_TRP_CMPSS_CH6 - 1U) * (CMPSS2_BASE - CMPSS1_BASE),
+    CMPSS1_BASE + (BTS_TRP_CMPSS_CH7 - 1U) * (CMPSS2_BASE - CMPSS1_BASE),
+    CMPSS1_BASE + (BTS_TRP_CMPSS_CH8 - 1U) * (CMPSS2_BASE - CMPSS1_BASE),
+};
+
 #pragma CODE_SECTION(epwmTripISR, "isrcodefuncs")
 #pragma INTERRUPT(epwmTripISR, HPI)
 __interrupt void epwmTripISR(void) {
@@ -3847,6 +4303,51 @@ __interrupt void epwmTripISR(void) {
         if ((tzStatus & (EPWM_TZ_FLAG_DCAEVT1 | EPWM_TZ_FLAG_OST)) == 0U) {
             continue;
         }
+
+        //
+        // A TRIP ON A STAGE THAT IS ALREADY OFF IS NOT A FAULT.
+        //
+        // The trip exists to take a driving converter down. If the slot had
+        // already been stopped - enable_logic clear, not running, not
+        // balancing or soft-starting - the gates were already released when
+        // the comparator fired, so there was nothing to protect and nothing
+        // to report. That is the cut-then-trip sequence at the end of a run:
+        // the stop drops the gates, the inductor current collapses through
+        // the body diodes, and the edge can cross a comparator threshold an
+        // instant AFTER the slot is safe. Seen on hardware 2026-11-10, slot 8:
+        // a clean CV termination at 4.200 V / 0.125 A logged cmpss_trip
+        // 0.5 s later and held the slot in a fault for an operator to clear.
+        //
+        // So the flags are cleared and the event dropped. A trip on a slot
+        // that IS driving - including one that is soft-stopping, which still
+        // reports running - takes the full path below, unchanged.
+        //
+        if ((BTS_userInputs[channel].enable_logic == 0U) &&
+            (status[channel].running == 0U) &&
+            (status[channel].balancing == 0U) &&
+            (status[channel].softStart == 0U)) {
+            EPWM_clearOneShotTripZoneFlag(epwmBase,
+                                          EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2 |
+                                          EPWM_TZ_OST_FLAG_DCAEVT1);
+            EPWM_clearTripZoneFlag(epwmBase,
+                                   EPWM_TZ_FLAG_OST | EPWM_TZ_FLAG_DCAEVT1 |
+                                   EPWM_TZ_INTERRUPT);
+            continue;
+        }
+
+        btsLastTrip.count++;
+        btsLastTrip.slot        = channel;
+        btsLastTrip.compsts     = HWREGH(btsSlotCmpssBase[channel] + CMPSS_O_COMPSTS);
+        btsLastTrip.tzflg       = tzStatus;
+        btsLastTrip.tzostflg    = EPWM_getOneShotTripZoneFlagStatus(epwmBase);
+        btsLastTrip.enable      = BTS_userInputs[channel].enable_logic;
+        btsLastTrip.running     = status[channel].running;
+        btsLastTrip.direction   = BTS_userInputs[channel].direction_logic;
+        btsLastTrip.isenseA     = BTS_measValues[channel].Isense_A;
+        btsLastTrip.vsenseV     = BTS_measValues[channel].Vsense_V;
+        btsLastTrip.ioutRefPu   = BTS_ctrlLoopVariables[channel].ioutRef_pu;
+        btsLastTrip.dutySetPu   = BTS_ctrlLoopVariables[channel].dutySet_pu;
+        btsLastTrip.startRampPu = BTS_userInputs[channel].startRamp_pu;
 
         // TripStatusBitfield packs two bits per channel: cmpss then gpio.
         if (tzStatus & EPWM_TZ_FLAG_DCAEVT1) {
@@ -3914,7 +4415,8 @@ __interrupt void epwmTripISR(void) {
         // the global trip-zone interrupt flag so the next trip can assert.
         //
         EPWM_clearOneShotTripZoneFlag(epwmBase,
-                                      EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2);
+                                      EPWM_TZ_OST_FLAG_OST1 | EPWM_TZ_OST_FLAG_OST2 |
+                                      EPWM_TZ_OST_FLAG_DCAEVT1);
         EPWM_clearTripZoneFlag(epwmBase,
                                EPWM_TZ_FLAG_OST | EPWM_TZ_FLAG_DCAEVT1 |
                                EPWM_TZ_INTERRUPT);

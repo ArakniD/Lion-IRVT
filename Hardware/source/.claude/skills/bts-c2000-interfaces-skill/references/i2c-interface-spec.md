@@ -18,15 +18,15 @@ how the buses behave, what breaks, and why.
 | Pins | GPIO32 = SDAA, GPIO33 = SCLA | `bts_hal.c:972-976`, `bts_user_settings.h:556-557` |
 | Address | `0x50`, 7-bit | `BTS_I2C_TARGET_ADDRESS`, `com_cpu2.c:125` |
 | Target clock config | 100 kHz | `com_cpu2.c` `initI2C_Slave` |
-| Actual bus speed | **50 kHz**, set by the ESP32 controller | `bts_link.c:708` |
-| Pull-ups | board 10 kΩ + ESP32 internal | |
+| Actual bus speed | **150 kHz**, set by the ESP32 controller | `BTS_I2C_SCL_HZ`, `bts_link.c` |
+| Pull-ups | board 10 kΩ **∥ 4.7 kΩ added 2026-11-12 = 3.2 kΩ** + ESP32 internal | `Docs/hardware-resources.md` §10.0 |
 
 The 100 kHz in `I2C_initController()` on the target sets the module
 prescaler, which the TRM requires even on a target because it times the data
 setup/hold windows and clocks the input filter. It does **not** set the bus
-speed — a target never drives SCL. The controller decides, and the ESP32 runs
-50 kHz because the ribbon to the BTS board with weak pull-ups will not
-reliably make the rise time at 100 kHz.
+speed — a target never drives SCL. The controller decides. The ESP32 ran
+50 kHz while the board had only its 10 kΩ pull-ups; with the 4.7 kΩ added in
+parallel it runs 150 kHz. An unmodified board must go back to 50 kHz.
 
 ### Protocol
 
@@ -61,6 +61,25 @@ register is worse than an obvious failure.
 
 The pad is **one byte per transaction**, not per register: a 14-register burst
 reads 57 bytes and drops exactly one.
+
+### A write must not shift the next read
+
+The byte staged at the address phase is staged for a WRITE too, which never
+sends it. Before 2026-11-11 it stayed in the FIFO, so the first read after
+any write came back one more byte late and decoded as garbage. On the ESP32
+that read is the unit block: eTripStatus and eUnitState decoded as nonsense
+and the test engine faulted running slots with a `cmpss_trip` or
+`unit_state` the C2000 never raised.
+
+Fixed on the target: `txStagedUnsent` marks a staged byte no read has begun
+to send, and a write's first data byte or a stop with it still unsent
+restores the TX FIFO to its prior level (`i2cTargetDropStaged()` in
+`com_cpu2.c`). The ESP32 also issues a throwaway one-register read after
+every write, believes a trip bit only beside the slot's own over-current
+status bit, and drops a unit block whose state or Vin is implausible.
+
+Check from the ESP32 console: `AT+WD=30` then `AT+TRIPS?` must read the
+real value. On an unfixed target it read 8.00, then 0.00 on the next read.
 
 The reference implementation is `bus_read_block()` in
 `esp32-btle-proxy/components/bts_link/bts_link.c:52-91`. Keep its handling

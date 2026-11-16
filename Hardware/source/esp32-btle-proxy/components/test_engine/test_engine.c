@@ -75,6 +75,35 @@ static const char *TAG = "test_engine";
 /* Measured current is allowed this much over the setpoint before faulting. */
 #define OVER_CURRENT_MARGIN     1.30f
 
+/*
+ * A charge that reaches charge_v_max plus this has escaped its CV loop.
+ *
+ * The C2000 regulates the charge ceiling; the engine never used to check it,
+ * so when the CV controller failed to take over (2026-11-09, slot 8: CV held
+ * off by stale integrator state) a 4.20 V cell was charged at full current to
+ * 4.445 V and only a hardware trip stopped it. 50 mV clears the loop's
+ * regulation band and sense noise, and is well short of an unsafe voltage.
+ */
+#define OVER_VOLTAGE_MARGIN_V   0.050f
+
+/*
+ * A discharge that is moving charge INTO the cell has reached its floor.
+ *
+ * The C2000 used to do exactly this: its CV clamp was symmetric, so once the
+ * cell sagged below V_MIN the loop pushed charge back in to hold it there,
+ * and the cell never sat under the cutoff long enough for either end of the
+ * link to call the discharge finished. Seen on hardware 2026-11-07 - +2.8 A
+ * into a cell the engine believed was discharging, then -8 A, then +2.8 A,
+ * round and round. The C2000 now clamps that output to its own direction,
+ * but the engine must not depend on it: a discharge reading this much
+ * CHARGING current for this long is over, whatever the voltage says.
+ */
+#define REVERSE_CURRENT_A       0.10f
+#define REVERSE_CURRENT_TICKS   4       /* 1 s at TICK_MS */
+
+/* Input-window fault: must be reported this many ticks in a row. */
+#define UNIT_STATE_TICKS        4       /* 1 s at TICK_MS */
+
 typedef struct {
     slot_state_t            state;
     slot_fault_t            fault;
@@ -101,6 +130,28 @@ typedef struct {
     uint32_t                start_mode;
     bool                    start_retried;
 
+    /* Consecutive ticks a discharge has read charging current. */
+    uint8_t                 reverse_ticks;
+
+    /* Consecutive ticks the unit has reported its input outside the window. */
+    uint8_t                 unit_state_ticks;
+
+    /*
+     * The powered state a BTS_PAUSED slot goes back to on a resume, or IDLE
+     * when there is nothing to pick up: a slot restored from F-RAM after a
+     * reset was never this engine's run. See enter_bts_paused().
+     */
+    slot_state_t            resume_state;
+
+    /*
+     * When the current BTS pause began, 0 when not paused. A pause is not
+     * test time: the clocks are stopped at this instant and, on a resume,
+     * every start time is moved forward by the length of the pause - so the
+     * elapsed time, the time limit and the result's discharge seconds all
+     * count only time the stage was actually driving.
+     */
+    int64_t                 paused_since_us;
+
     bool                    changed;     /* pending notification */
 
     slot_result_t           result;
@@ -124,7 +175,7 @@ static const char *k_state_names[SLOT_STATE_COUNT] = {
 static const char *k_fault_names[SLOT_FAULT_COUNT] = {
     "NONE", "OVER_TEMP", "UNDER_TEMP", "OVER_CURRENT", "CMPSS_TRIP",
     "GPIO_TRIP", "TIMEOUT", "BTS_OFFLINE", "UNIT_STATE", "NO_CELL",
-    "CELL_REVERSED", "COMMS",
+    "CELL_REVERSED", "COMMS", "OVER_VOLTAGE", "DISCONNECT",
 };
 
 const char *slot_state_name(slot_state_t state)
@@ -137,12 +188,30 @@ const char *slot_fault_name(slot_fault_t fault)
     return (fault < SLOT_FAULT_COUNT) ? k_fault_names[fault] : "?";
 }
 
+static uint32_t test_elapsed_s(const slot_ctx_t *c);
+
 static inline uint32_t seconds_since(int64_t us)
 {
     if (us == 0) {
         return 0;
     }
     const int64_t d = esp_timer_get_time() - us;
+    return (d > 0) ? (uint32_t)(d / 1000000) : 0;
+}
+
+/*
+ * The test's elapsed run time, with any pause taken out. While paused the
+ * clock reads as it did the moment the pause began; leave_bts_paused() then
+ * moves the start forward by the pause's length, so it carries on from there.
+ */
+static uint32_t test_elapsed_s(const slot_ctx_t *c)
+{
+    if (c->test_started_us == 0) {
+        return 0;
+    }
+    const int64_t end = (c->paused_since_us != 0) ? c->paused_since_us
+                                                  : esp_timer_get_time();
+    const int64_t d = end - c->test_started_us;
     return (d > 0) ? (uint32_t)(d / 1000000) : 0;
 }
 
@@ -165,6 +234,8 @@ static void enter_state(uint8_t slot, slot_state_t state)
     c->state            = state;
     c->state_entered_us = esp_timer_get_time();
     c->power_started    = false;
+    c->reverse_ticks    = 0;
+    c->unit_state_ticks = 0;
     c->changed          = true;
 }
 
@@ -313,6 +384,18 @@ static slot_fault_t check_safety(uint8_t slot, const bts_snapshot_t *snap)
     if (ch->gpio_trip) {
         return SLOT_FAULT_GPIO_TRIP;
     }
+    /*
+     * The C2000 stopped the slot because its two voltage readings disagreed
+     * (serviceDivergenceFault) or a group member strayed. Before this check
+     * the engine read only "stopped" and took it for a finished phase: slot 8
+     * on 2026-11-12 'started' a charge that never drew current, sat in CHARGE
+     * for three minutes, was stopped with this bit set, and the engine
+     * carried on into REST as if the charge had completed.
+     */
+    if (state_is_powered(c->state) && c->power_started &&
+        (ch->status_bits & BTS_STATUS_GROUP_DISCONNECT)) {
+        return SLOT_FAULT_DISCONNECT;
+    }
 
     if (ch->cell_temp_c > c->profile.temp_max_c) {
         return SLOT_FAULT_OVER_TEMP;
@@ -331,16 +414,30 @@ static slot_fault_t check_safety(uint8_t slot, const bts_snapshot_t *snap)
             fabsf(ch->sense_current_a) > setpoint * OVER_CURRENT_MARGIN) {
             return SLOT_FAULT_OVER_CURRENT;
         }
+        if (!discharging && c->profile.charge_v_max > 0.0f &&
+            ch->sense_voltage_v > c->profile.charge_v_max + OVER_VOLTAGE_MARGIN_V) {
+            return SLOT_FAULT_OVER_VOLTAGE;
+        }
 
         /*
          * The unit refuses to start, and will stop, outside its input
          * window. Treat the disabled states as a fault so the operator sees
          * why the test stalled rather than watching it sit at 0 A.
          */
-        if (snap->unit.unit_state == BTS_UNIT_INPUT_LOW_CHARGE_DISABLED && !discharging) {
-            return SLOT_FAULT_UNIT_STATE;
-        }
-        if (snap->unit.unit_state == BTS_UNIT_INPUT_HIGH_DISCHARGE_DISABLED && discharging) {
+        /*
+         * Held for UNIT_STATE_TICKS consecutive ticks before it counts. The
+         * unit stops the channel itself the instant its input leaves the
+         * window, so this fault only has to explain the stall, not cause the
+         * stop - and a single misread status word faulted slot 1 on
+         * 2026-11-11 with the input at 14.0 V the whole time.
+         */
+        const bool bad_input =
+            (snap->unit.unit_state == BTS_UNIT_INPUT_LOW_CHARGE_DISABLED && !discharging) ||
+            (snap->unit.unit_state == BTS_UNIT_INPUT_HIGH_DISCHARGE_DISABLED && discharging);
+        slot_ctx_t *cm = &s_slot[slot];
+        if (!bad_input) {
+            cm->unit_state_ticks = 0;
+        } else if (++cm->unit_state_ticks >= UNIT_STATE_TICKS) {
             return SLOT_FAULT_UNIT_STATE;
         }
     }
@@ -348,7 +445,7 @@ static slot_fault_t check_safety(uint8_t slot, const bts_snapshot_t *snap)
     const uint32_t limit_min = c->config.max_duration_minutes
                                    ? c->config.max_duration_minutes
                                    : DEFAULT_MAX_MINUTES;
-    if (c->test_started_us != 0 && seconds_since(c->test_started_us) > limit_min * 60u) {
+    if (c->test_started_us != 0 && test_elapsed_s(c) > limit_min * 60u) {
         return SLOT_FAULT_TIMEOUT;
     }
 
@@ -552,7 +649,15 @@ static void tick_discharge(uint8_t slot, const bts_channel_state_t *ch)
         return;
     }
 
-    coulomb_update(&c->discharge_cc, ch->sense_voltage_v, ch->sense_current_a,
+    /*
+     * Discharge current is negative. Only that sign is integrated: the
+     * counter takes |I|, so a charging current fed to it would be ADDED to
+     * the discharge total - which is how a loop holding the cell at its floor
+     * would have inflated the capacity figure.
+     */
+    const bool reversed = ch->sense_current_a > REVERSE_CURRENT_A;
+    coulomb_update(&c->discharge_cc, ch->sense_voltage_v,
+                   reversed ? 0.0f : ch->sense_current_a,
                    ch->cell_temp_c, esp_timer_get_time());
 
     /*
@@ -560,11 +665,31 @@ static void tick_discharge(uint8_t slot, const bts_channel_state_t *ch)
      * before believing the voltage, otherwise the first samples - taken
      * while the power stage is still ramping - can read below the cutoff on
      * a sagging cell and end the test immediately.
+     *
+     * Charging current in a discharge also ends it - see REVERSE_CURRENT_A.
+     * The grace period is the same one bts_says_done() uses, so the ramp
+     * and the unit's first status publish cannot trip it.
      */
     const bool under_load = fabsf(ch->sense_current_a) > 0.05f;
     const bool at_cutoff  = ch->sense_voltage_v <= c->profile.discharge_v_min;
 
-    if ((under_load && at_cutoff) || bts_says_done(c, ch)) {
+    if (reversed &&
+        (esp_timer_get_time() - c->mode_issued_us) >= (MODE_GRACE_MS * 1000LL)) {
+        if (c->reverse_ticks < REVERSE_CURRENT_TICKS) {
+            c->reverse_ticks++;
+        }
+    } else {
+        c->reverse_ticks = 0;
+    }
+    const bool held_at_floor = c->reverse_ticks >= REVERSE_CURRENT_TICKS;
+
+    if ((under_load && at_cutoff) || held_at_floor || bts_says_done(c, ch)) {
+        if (held_at_floor) {
+            ESP_LOGW(TAG, "slot %u: discharge reading +%.2f A at %.3f V - the "
+                          "unit is holding the cell at its floor; ending the "
+                          "discharge", slot, ch->sense_current_a,
+                     ch->sense_voltage_v);
+        }
         bts_link_stop_channel(slot);
         coulomb_stop(&c->discharge_cc);
 
@@ -632,7 +757,9 @@ static void tick_recharge(uint8_t slot, const bts_channel_state_t *ch,
         return;
     }
 
-    coulomb_update(&c->charge_cc, ch->sense_voltage_v, ch->sense_current_a,
+    /* Charge current is positive; only that sign counts toward the target. */
+    coulomb_update(&c->charge_cc, ch->sense_voltage_v,
+                   (ch->sense_current_a > 0.0f) ? ch->sense_current_a : 0.0f,
                    ch->cell_temp_c, esp_timer_get_time());
 
     /*
@@ -672,11 +799,14 @@ static void tick_recharge(uint8_t slot, const bts_channel_state_t *ch,
 /*
  * Parks a slot the BTS is holding paused.
  *
- * Reached either from a running engine state (the watchdog fired while the
- * link was down and the BTS pulled the slot's power) or from IDLE at boot
- * (the unit reset and restored the run from F-RAM). Both stop the local
- * integrators - their totals no longer track the BTS's, which kept counting
- * up to the pause - and neither resumes anything.
+ * Reached either from a running engine state (the watchdog fired, or an
+ * operator paused it) or from IDLE at boot (the unit reset and restored the
+ * run from F-RAM). The integrators are stopped, not reset: a resume of this
+ * engine's own run continues them from where they froze.
+ *
+ * The phase it was in is remembered, so a resume puts the slot back under
+ * supervision in that phase - its cutoff, its termination and its result -
+ * rather than dropping it to IDLE while the BTS drives it unsupervised.
  */
 static void enter_bts_paused(uint8_t slot, const bts_channel_state_t *ch)
 {
@@ -685,6 +815,23 @@ static void enter_bts_paused(uint8_t slot, const bts_channel_state_t *ch)
     coulomb_stop(&c->discharge_cc);
     coulomb_stop(&c->charge_cc);
     c->power_started = false;
+    if (c->paused_since_us == 0) {
+        c->paused_since_us = esp_timer_get_time();
+    }
+
+    /*
+     * A restored slot was never this engine's run - the ESP32 restarted too,
+     * or the BTS kept the run across a reset the engine never saw - so there
+     * is no sequence to go back to. It resumes as a bare run in the direction
+     * the BTS held. CHECK_REST and the two rests have no power to resume; a
+     * pause landing in one of them returns to it.
+     */
+    if (c->state == SLOT_STATE_IDLE || ch->restored) {
+        c->resume_state = SLOT_STATE_DIRECT;
+        c->direct_charge = (ch->status_bits & BTS_STATUS_CHARGING) != 0;
+    } else {
+        c->resume_state = c->state;
+    }
 
     ESP_LOGW(TAG, "slot %u held PAUSED by the BTS (%s), was %s; counters kept "
                   "(%.0f mAh in / %.0f mAh out) - resume is an operator action",
@@ -696,6 +843,88 @@ static void enter_bts_paused(uint8_t slot, const bts_channel_state_t *ch)
              ch->charge_mah, ch->discharge_mah);
 
     enter_state(slot, SLOT_STATE_BTS_PAUSED);
+}
+
+/*
+ * Puts a resumed slot back into the phase it was paused in.
+ *
+ * Called once the BTS reports the slot running again. The limits were
+ * already re-applied by test_engine_resume() before the resume went out, and
+ * the BTS re-latches them on the resume itself; this restores the engine's
+ * side - supervision, the counters and the phase's own termination - without
+ * resetting anything a run has accumulated.
+ */
+static void leave_bts_paused(uint8_t slot)
+{
+    slot_ctx_t *c = &s_slot[slot];
+    const slot_state_t back = c->resume_state;
+
+    /*
+     * Take the pause back out of every clock that spans it, so a test paused
+     * overnight resumes at the elapsed time it was paused at rather than one
+     * eight hours later - and so the pause cannot trip the time limit.
+     */
+    if (c->paused_since_us != 0) {
+        const int64_t gap = esp_timer_get_time() - c->paused_since_us;
+        if (gap > 0) {
+            if (c->test_started_us != 0) {
+                c->test_started_us += gap;
+            }
+            if (c->discharge_cc.start_us != 0) {
+                c->discharge_cc.start_us += gap;
+            }
+            if (c->charge_cc.start_us != 0) {
+                c->charge_cc.start_us += gap;
+            }
+        }
+        c->paused_since_us = 0;
+    }
+
+    enter_state(slot, back);
+
+    if (!state_is_powered(back)) {
+        /* A rest or the open-circuit check: the timer restarts, which is the
+         * conservative reading of "paused while resting". */
+        return;
+    }
+
+    /*
+     * enter_state() cleared power_started, which would make the phase's
+     * handler issue a fresh start - and a fresh start zeroes the BTS's
+     * counters for that direction. The stage is already running on the
+     * resume, so mark it started and pick the integrators up where they
+     * froze.
+     */
+    c->power_started  = true;
+    c->start_retried  = true;
+    c->mode_issued_us = esp_timer_get_time();
+
+    if (back == SLOT_STATE_DIRECT) {
+        /* A bare run keeps no integrator - the BTS's counters are its
+         * figures, and they carry on from the pause by themselves. */
+        if (c->test_started_us == 0) {
+            c->test_started_us = esp_timer_get_time();
+        }
+        ESP_LOGI(TAG, "slot %u resumed as a direct %s", slot,
+                 c->direct_charge ? "charge" : "discharge");
+        return;
+    }
+
+    coulomb_counter_t *cc = (back == SLOT_STATE_DISCHARGE) ? &c->discharge_cc
+                                                           : &c->charge_cc;
+    if (cc->start_us == 0) {
+        /* Never started here - a restored run. Count from now. */
+        coulomb_reset(cc);
+    } else {
+        /* Continue: no credit for the paused interval. */
+        cc->running        = true;
+        cc->last_sample_us = esp_timer_get_time();
+        cc->last_current_a = 0.0f;
+        cc->last_power_w   = 0.0f;
+    }
+
+    ESP_LOGI(TAG, "slot %u resumed into %s, counters continued", slot,
+             slot_state_name(back));
 }
 
 /*
@@ -722,6 +951,17 @@ static void tick_direct(uint8_t slot, const bts_channel_state_t *ch)
     } else {
         const bool under_load = fabsf(ch->sense_current_a) > 0.05f;
         done = done || (under_load && ch->sense_voltage_v <= c->profile.discharge_v_min);
+
+        /* Charging current in a discharge: held at the floor. See
+         * REVERSE_CURRENT_A. */
+        if (ch->sense_current_a > REVERSE_CURRENT_A &&
+            (esp_timer_get_time() - c->mode_issued_us) >= (MODE_GRACE_MS * 1000LL)) {
+            if (++c->reverse_ticks >= REVERSE_CURRENT_TICKS) {
+                done = true;
+            }
+        } else {
+            c->reverse_ticks = 0;
+        }
     }
 
     if (done) {
@@ -764,11 +1004,23 @@ static void tick_slot(uint8_t slot, const bts_snapshot_t *snap)
     case SLOT_STATE_ABORTED:
         return;
     case SLOT_STATE_BTS_PAUSED:
-        /* Leaves only when the BTS itself says the slot is no longer
-         * paused: an operator resume, or an abort that stopped it. */
+        /*
+         * Leaves only when the BTS itself says the slot is no longer paused.
+         * Running again is a resume: back into the phase it was in, still
+         * supervised. Anything else is a stop or an abort, and ends it.
+         *
+         * It used to go to IDLE either way, so a resumed discharge ran on the
+         * BTS with no engine watching its cutoff at all.
+         */
         if (ch->valid && !ch->paused) {
-            ESP_LOGI(TAG, "slot %u no longer paused on the BTS", slot);
-            enter_state(slot, SLOT_STATE_IDLE);
+            if (ch->status_bits & BTS_STATUS_RUNNING) {
+                leave_bts_paused(slot);
+            } else {
+                ESP_LOGI(TAG, "slot %u no longer paused on the BTS", slot);
+                c->test_started_us = 0;
+                c->paused_since_us = 0;
+                enter_state(slot, SLOT_STATE_IDLE);
+            }
         }
         return;
     default:
@@ -849,7 +1101,7 @@ static void fill_status_locked(uint8_t slot, const bts_snapshot_t *snap,
     out->bts_discharge_mwh     = ch->discharge_mwh;
     out->bts_discharge_seconds = ch->discharge_seconds;
 
-    out->elapsed_s       = seconds_since(c->test_started_us);
+    out->elapsed_s       = test_elapsed_s(c);
     out->state_elapsed_s = seconds_since(c->state_entered_us);
 
     switch (c->state) {
@@ -1184,8 +1436,15 @@ static esp_err_t configure_slot(uint8_t slot, const slot_config_t *config, bool 
     }
 
     slot_ctx_t *c = &s_slot[slot];
+    /*
+     * A held pause may be reconfigured: the converter is off, and
+     * test_engine_resume() writes the new limits before it lets the slot run
+     * again, so the change takes effect on the resume. Nothing about the
+     * run's counters or result is touched here.
+     */
     if (c->state != SLOT_STATE_IDLE && c->state != SLOT_STATE_COMPLETE &&
-        c->state != SLOT_STATE_ABORTED && c->state != SLOT_STATE_FAULT) {
+        c->state != SLOT_STATE_ABORTED && c->state != SLOT_STATE_FAULT &&
+        c->state != SLOT_STATE_BTS_PAUSED) {
         xSemaphoreGive(s_lock);
         ESP_LOGW(TAG, "slot %u busy in %s, refusing reconfigure",
                  slot, slot_state_name(c->state));
@@ -1297,6 +1556,7 @@ esp_err_t test_engine_start(uint8_t slot)
         c->recharge_target_mah = 0.0f;
         c->mode_issued_us      = 0;
         c->test_started_us     = esp_timer_get_time();
+        c->paused_since_us     = 0;
         /* Stopped first: CHECK_REST needs an open-circuit reading. */
         bts_link_stop_channel(slot);
         enter_state(slot, SLOT_STATE_CHECK_REST);
@@ -1323,6 +1583,7 @@ esp_err_t test_engine_abort(uint8_t slot)
     bts_link_stop_channel(slot);
     coulomb_stop(&c->discharge_cc);
     coulomb_stop(&c->charge_cc);
+    c->paused_since_us = 0;
 
     if (c->state == SLOT_STATE_DIRECT) {
         /* Stopping a bare run is the normal way to end it, not an abort. */
@@ -1450,14 +1711,57 @@ esp_err_t test_engine_resume(uint8_t slot)
 
     bts_snapshot_t snap;
     bts_link_get_snapshot(&snap);
-    if (!snap.channel[slot].valid || !snap.channel[slot].paused) {
+    const bts_channel_state_t *ch = &snap.channel[slot];
+    if (!ch->valid || !ch->paused) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    /*
+     * Re-apply the slot's settings for the direction the BTS is holding,
+     * BEFORE the resume, so they are in the registers when the unit latches
+     * them. The C2000 re-latches its limits on a resume too, from these
+     * registers - this write is what puts the CURRENT profile there, including
+     * anything an operator changed while the slot was paused.
+     *
+     * Only the limits are written. Nothing here, on either side, touches the
+     * counters: a resume carries the run on from where it stopped.
+     */
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const bool configured = s_slot[slot].configured;
+    cell_resolved_profile_t profile = s_slot[slot].profile;
+    xSemaphoreGive(s_lock);
+
+    if (configured) {
+        bts_channel_limits_t limits;
+        cell_profile_to_bts_limits(&profile, &limits);
+        const bts_limits_dir_t dir = (ch->status_bits & BTS_STATUS_CHARGING)
+                                         ? BTS_LIMITS_CHARGE
+                                         : BTS_LIMITS_DISCHARGE;
+        const esp_err_t err = bts_link_set_limits(slot, &limits, dir);
+        if (err != ESP_OK) {
+            /* Resuming on limits that may be stale is how a cell overran its
+             * floor; refuse instead, and the operator can retry. */
+            ESP_LOGE(TAG, "slot %u: resume refused, limits not written (%s)",
+                     slot, esp_err_to_name(err));
+            return err;
+        }
+        ESP_LOGI(TAG, "slot %u: limits re-applied for resume: %s %.3f A, "
+                      "%.3f-%.3f V", slot,
+                 dir == BTS_LIMITS_CHARGE ? "charge" : "discharge",
+                 dir == BTS_LIMITS_CHARGE ? limits.charge_current_max
+                                          : limits.discharge_current_max,
+                 limits.discharge_voltage_min, limits.charge_voltage_max);
+    } else {
+        ESP_LOGW(TAG, "slot %u: resuming with no profile on this proxy; the "
+                      "unit's stored limits apply", slot);
+    }
+
     ESP_LOGW(TAG, "slot %u: operator resume of a %s pause", slot,
-             snap.channel[slot].restored     ? "restored"
-             : snap.channel[slot].wd_tripped ? "watchdog"
-                                             : "commanded");
+             ch->restored     ? "restored"
+             : ch->wd_tripped ? "watchdog"
+                              : "commanded");
     return bts_link_resume_channel(slot);
 }
 
@@ -1518,6 +1822,7 @@ esp_err_t test_engine_run_direct(uint8_t slot, bool charge)
         c->fault           = SLOT_FAULT_NONE;
         c->direct_charge   = charge;
         c->test_started_us = esp_timer_get_time();
+        c->paused_since_us = 0;
         err = start_power(slot, charge ? BTS_MODE_RUN_CHARGE : BTS_MODE_RUN_DISCHARGE);
         if (err == ESP_OK) {
             const int64_t issued = c->mode_issued_us;

@@ -181,7 +181,7 @@ Each element of `slots`:
 |---|---|---|
 | `slot` | 0–7 | Slot index |
 | `state` | string | `IDLE`, `CHECK_REST`, `CHARGE`, `REST`, `DISCHARGE`, `DISCHARGE_REST`, `RECHARGE`, `COMPLETE`, `FAULT`, `ABORTED`, `BTS_PAUSED`, `DIRECT`. `DIRECT` is a bare charge or discharge started from the front panel, supervised but with no test sequence |
-| `fault` | string | `NONE`, `OVER_TEMP`, `UNDER_TEMP`, `OVER_CURRENT`, `CMPSS_TRIP`, `GPIO_TRIP`, `TIMEOUT`, `BTS_OFFLINE`, `UNIT_STATE`, `NO_CELL`, `CELL_REVERSED`, `COMMS` |
+| `fault` | string | `NONE`, `OVER_TEMP`, `UNDER_TEMP`, `OVER_CURRENT`, `CMPSS_TRIP`, `GPIO_TRIP`, `TIMEOUT`, `BTS_OFFLINE`, `UNIT_STATE`, `NO_CELL`, `CELL_REVERSED`, `COMMS`, `OVER_VOLTAGE`, `DISCONNECT` |
 | `configured` | bool | A cell profile has been applied |
 | `voltage_v` | float, 3 dp | Cell volts, **16-bit ADS131M08** (register `eChX_SenseVoltage`) |
 | `current_a` | float, 3 dp | Cell amps, same path (`eChX_SenseCurrent`). Negative = discharge |
@@ -457,8 +457,8 @@ parameters. Status: `200`.
 {
   "chemistries": [
     {"name":"NMC","nominal_v":3.70,"charge_v_max":4.200,
-     "discharge_v_min":2.500,"storage_v":3.700,"default_charge_c":0.50,
-     "default_discharge_c":1.00,"charge_term_c":0.050,"temp_min_c":0.0,
+     "discharge_v_min":2.500,"storage_v":3.700,"default_charge_c":1.00,
+     "default_discharge_c":3.00,"charge_term_c":0.100,"temp_min_c":0.0,
      "temp_max_c":45.0,"rest_tolerance_pct":1.0,"rest_minutes":30}
   ],
   "models": [
@@ -1379,7 +1379,7 @@ bits 16-31     reserved
 > not fitted on this board (`BTS_TRIP_GPIO_CHn_ENABLED`, all false).
 >
 > The **software** over-current check (`BTS_tripEpwm()`) still runs every
-> control pass as the first line, at ±8 A against the hardware's ±9.5 A. It
+> control pass as the first line, at ±9 A against the hardware's ±9.75 A. It
 > forces the trip zone itself and does not go through the ISR, so it does not
 > set these bits.
 
@@ -1861,8 +1861,8 @@ CPU1 owns `enable_logic` and the control loop.
 ### This is not over-current protection
 
 The watchdog is a supervision timeout measured in **seconds**. The fast
-protection is the software check in `BTS_tripEpwm()` (±8 A, every control
-pass) and the CMPSS hardware trips (±9.5 A, within the switching cycle). Do
+protection is the software check in `BTS_tripEpwm()` (±9 A, every control
+pass) and the CMPSS hardware trips (±9.75 A, within the switching cycle). Do
 not describe or rely on the watchdog as anything else.
 
 The spurious `WARNING: host watchdog DISABLED` that earlier revisions of this

@@ -426,10 +426,16 @@ typedef enum {
 /*
  * Hardware envelope of the TIDA-010086 unit itself. Any cell profile that
  * asks for more than this is clamped before it reaches the BTS - see
- * cell_profiles.c. Sourced from bts_user_settings.h
- * (BTS_CMPSS_FULLSCALE_A) and the 0-5 V per-channel output range.
+ * cell_profiles.c.
+ *
+ * The current is the highest SETPOINT, not the sense chain's 10 A full
+ * scale. It mirrors BTS_SETPOINT_MAX_A in the C2000's bts_user_settings.h,
+ * which clamps there too. It used to be 10 A, above the C2000's then-8 A
+ * software trip, so an 8 A run regulated with its own trip exactly on it and
+ * faulted over and over (2026-11-07). The trip is now 9 A and the hardware
+ * comparator 9.75 A; change these together.
  */
-#define BTS_UNIT_MAX_CURRENT_A      10.0f
+#define BTS_UNIT_MAX_CURRENT_A      8.0f
 #define BTS_UNIT_MAX_VOLTAGE_V      5.0f
 
 /*

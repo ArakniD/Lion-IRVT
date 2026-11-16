@@ -380,6 +380,15 @@ void BTS_initUserVariables(void)
         }
     }
 
+    {
+        uint16_t ch;
+        for (ch = 0; ch < PWM_CH_MAX; ch++) {
+            BTS_userInputs[ch].stopRamp_pu = (float32_t)1.0;
+            BTS_userInputs[ch].stopDwell   = 0U;
+            BTS_userInputs[ch].stopPending = 0U;
+            BTS_userInputs[ch].startRamp_pu = (float32_t)1.0;
+        }
+    }
 }
 
 void BTS_calcUserProgramVariables(uint16_t i)
@@ -734,16 +743,44 @@ void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoo
         return;
     }
 
+    //
+    // A stage about to be released starts its ramp from zero - whatever is
+    // releasing it. tripFlag still holds last pass's value here, so this
+    // catches a fresh start and a resume (slotSoftStartArm() has already
+    // zeroed the ramp for those) and also a software over-current trip
+    // releasing mid-run, which used to restart straight onto the full
+    // setpoint from the seed duty.
+    //
 #if(BTS_TRIP_CODE)
-    if(userInput->enable_logic){
-        ctrlLoopVariable->tripFlag=0;
-    }
-    else{
-        ctrlLoopVariable->tripFlag=1;
+    if ((userInput->enable_logic != 0U) && (ctrlLoopVariable->tripFlag != 0U)) {
+        userInput->startRamp_pu = (float32_t)0.0;
     }
 #endif
 
     ctrlLoopVariable->ioutRef_pu = userInput->iref_A * userInput->IoutGain_pu + userInput->IoutOffset_pu;
+
+    //
+    // SOFT STOP: scale the current reference down to zero rather than
+    // cutting the gates under load. serviceSoftStop() drives stopRamp_pu;
+    // it is 1.0 whenever a slot is running normally, so this is a no-op then.
+    //
+    // The scale is applied to the per-unit reference including its offset
+    // term, so 0.0 is genuinely zero current through the loop - the CC
+    // controller regulates to it and the converter idles in CCM at ~0 A
+    // average with the synchronous rectifier still switching, before the
+    // gates are released.
+    //
+    ctrlLoopVariable->ioutRef_pu *= userInput->stopRamp_pu;
+
+    //
+    // SOFT START: the same scale on the way up. A start or a resume sets
+    // startRamp_pu to 0 and serviceSoftStart() raises it to 1 over
+    // BTS_SOFT_START_RAMP_MS, so the CC loop is first released at zero
+    // current - the feed-forward duty seeded at the release edge is exactly
+    // the 0 A operating point - and then follows a reference that climbs to
+    // the setpoint, rather than a step from 0 to 8 A on the first pass.
+    //
+    ctrlLoopVariable->ioutRef_pu *= userInput->startRamp_pu;
 
     ctrlLoopVariable->dutySetRef_pu=  userInput->dutyRef_pu;
 
@@ -757,6 +794,44 @@ void BTS_updateReference(BTS_userInput *userInput, BTS_ctrlLoopVariable *ctrlLoo
         ctrlLoopVariable->direction_logic=0U;
         ctrlLoopVariable->voutRef_pu = userInput->vref_discharge_V * userInput->VoutGain_pu + userInput->VoutOffset_pu;
     }
+
+    //
+    // THE RELEASE IS THE LAST THING THIS FUNCTION DOES.
+    //
+    // Clearing tripFlag is what lets the control ISR release the stage, and
+    // the ISR seeds the CC biquad from dutySetRef_pu on that very edge. It
+    // used to be cleared FIRST, before dutySetRef_pu and the references were
+    // copied in, and the ISR runs every 31 us - so it could land in between
+    // and release the converter on the PREVIOUS run's seed duty, or on zero
+    // after a boot, with the previous reference. In a discharge a zero duty
+    // is the documented inrush: the cell drives current back into the slot
+    // and the comparator latches. Everything the release edge reads is now
+    // in place before the flag that triggers it.
+    //
+#if(BTS_TRIP_CODE)
+    if(userInput->enable_logic){
+        //
+        // A STARTING STAGE IS RELEASED ONE PASS LATE.
+        //
+        // The first time enable_logic is seen with the stage still tripped,
+        // it stays tripped for this pass. The ISR keeps running BTS_tripEpwm()
+        // meanwhile, which now writes dutySetRef_pu - the seed copied just
+        // above - into the PWM compares, so by the release the active CMPA
+        // already holds the seed and the first period is not a full period of
+        // low-side conduction. A software trip releasing mid-run (releaseArmed
+        // still set) goes at once: the trip pass itself wrote the compares.
+        //
+        if ((ctrlLoopVariable->tripFlag != 0U) && (userInput->releaseArmed == 0U)) {
+            userInput->releaseArmed = 1U;
+        } else {
+            ctrlLoopVariable->tripFlag=0;
+        }
+    }
+    else{
+        ctrlLoopVariable->tripFlag=1;
+        userInput->releaseArmed = 0U;
+    }
+#endif
 }
 
 //

@@ -170,7 +170,7 @@ flowchart LR
         DCLCV["CV DF22 @ 31.96 kHz<br/>(designed for 31.25 kHz)"]
         DCLCC["CC DF22 @ 31.96 kHz<br/>(designed for 31.25 kHz)"]
         HR["HRPWM duty<br/>EPWM1–8 @ 99.67 kHz"]
-        TRIP["BTS_tripEpwm() ±8 A<br/>BTS_ctrlDirection()<br/><b>raw, unfiltered</b>"]
+        TRIP["BTS_tripEpwm() ±9 A<br/>BTS_ctrlDirection()<br/><b>raw, unfiltered</b>"]
     end
 
     subgraph TEL ["Telemetry branch"]
@@ -579,6 +579,25 @@ into the settings range.
   write from `eCalSlot` covering slot/command/argument delivers them in
   exactly the wrong order.
 
+### How a start reaches the stage
+
+A start or resume does four things in a fixed order, and the release is last:
+
+1. **Limits latched** from the settings registers (`slotLatchLimits()`).
+2. **Feed-forward duty** Vout/Vin seeded (`BTS_seedConverterDuty()`).
+3. **Soft start armed** (`slotSoftStartArm()`): the current-reference scale
+   `startRamp_pu` goes to 0, and any stale comparator one-shot latch
+   (`TZOSTFLG.DCAEVT1`) left by a trip armed while the slot sat idle is
+   cleared.
+4. **`enable_logic` set.** `BTS_updateReference()` copies the references and
+   seed and clears `tripFlag` as its LAST step, so the control ISR never
+   releases on a half-written reference.
+
+The CC reference then climbs from 0 A to the setpoint over 50 ms
+(`BTS_SOFT_START_RAMP_MS`), mirroring the 50 ms soft stop. Any release -
+including a software over-current trip releasing mid-run - restarts the ramp
+from zero.
+
 ---
 
 ## 4. Settings and persistence
@@ -827,8 +846,8 @@ unit for 30 seconds, every running slot pauses with the converter off and
 `BTS_STATUS_WD_TRIPPED` set.
 
 It is a supervision timeout measured in seconds. It is **not** over-current
-protection. That is the software check in `BTS_tripEpwm()` (±8 A, every
-control pass) and the CMPSS hardware trips (±9.5 A, within a switching cycle)
+protection. That is the software check in `BTS_tripEpwm()` (±9 A, every
+control pass) and the CMPSS hardware trips (±9.75 A, within a switching cycle)
 — whose level is still untested against a real over-current, so on the bench
 the supply's own current limit remains the protection to trust.
 

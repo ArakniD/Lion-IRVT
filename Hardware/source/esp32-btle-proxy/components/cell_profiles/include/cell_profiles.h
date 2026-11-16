@@ -175,7 +175,7 @@ esp_err_t cell_profile_resolve(cell_chemistry_t chem,
 /*
  * Converts a resolved profile into the BTS control-block limits.
  *
- * This is where the unit envelope is enforced: 0-5 V and +/-10 A per
+ * This is where the unit envelope is enforced: 0-5 V and +/-8 A per
  * channel, from BTS_UNIT_MAX_VOLTAGE_V / BTS_UNIT_MAX_CURRENT_A.
  */
 void cell_profile_to_bts_limits(const cell_resolved_profile_t *profile,

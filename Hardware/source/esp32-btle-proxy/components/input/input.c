@@ -108,9 +108,15 @@ static void post(input_event_type_t type, int32_t steps)
  * builds speed over a few clicks rather than on the first one - a single
  * accidental flick then cannot jump an edited value by a decade. A pause
  * longer than RATE_IDLE_MS resets it, so the next turn always starts fine.
+ *
+ * RATE_ALPHA sets how long acceleration takes to build. It was 0.4, so three
+ * or four quick detents reached full speed and the value leapt away under
+ * the operator's hand. At 0.15 a steady spin takes a dozen or so detents to
+ * reach the same estimate - roughly three times as long - and the gear
+ * thresholds in display.c accel_step() were raised to match.
  */
 #define RATE_IDLE_MS        300
-#define RATE_ALPHA          0.4f
+#define RATE_ALPHA          0.15f
 
 static float   s_rate_dps;
 static int64_t s_last_detent_us;

@@ -67,3 +67,8 @@ CONFIG_SPI_MASTER_ISR_IN_IRAM=n
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# The NimBLE host task runs the GATT write handlers, which call into the
+# test engine and the BTS link with a ~1 KB snapshot on the stack. 4 KB was
+# overflowed by a resume over BLE on 2026-11-12 (reset: PANIC).
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144

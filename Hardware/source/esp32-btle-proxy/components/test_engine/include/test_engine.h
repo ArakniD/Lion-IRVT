@@ -112,6 +112,19 @@ typedef enum {
     SLOT_FAULT_NO_CELL,
     SLOT_FAULT_CELL_REVERSED,
     SLOT_FAULT_COMMS,
+    /*
+     * A charge carried the cell past its charge_v_max by OVER_VOLTAGE_MARGIN_V.
+     * The C2000's CV loop should hold it there; this is the engine's backstop
+     * for when it does not. Appended, so every earlier fault keeps its number.
+     */
+    SLOT_FAULT_OVER_VOLTAGE,
+    /*
+     * The unit stopped a running slot with its group-disconnect bit set: its
+     * two voltage readings disagreed (a cell pulled or a contact opened), or
+     * a group member strayed. Appended, so every earlier fault keeps its
+     * number on the wire.
+     */
+    SLOT_FAULT_DISCONNECT,
     SLOT_FAULT_COUNT,
 } slot_fault_t;
 

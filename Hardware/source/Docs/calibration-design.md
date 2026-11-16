@@ -401,8 +401,8 @@ These are not optional and must be visible in code review:
    disabled, masked or re-thresholded during calibration. A trip exits
    calibration immediately and zeroes the reference.
 
-   > **Bench warning.** The hardware over-current trips are enabled (±9.5 A,
-   > above the software check's ±8 A) and the path has been seen to latch on
+   > **Bench warning.** The hardware over-current trips are enabled (±9.75 A,
+   > above the software check's ±9 A) and the path has been seen to latch on
    > hardware — but the **level** has never been tested against a real
    > over-current. Calibration drives real current into an external supply, so
    > **do not run this procedure unattended**, and set the supply's own

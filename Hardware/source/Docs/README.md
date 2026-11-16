@@ -42,7 +42,7 @@ a calibration.
 >
 > **What is still unproven is the trip LEVEL**, which is why the section below
 > stands. The comparators have now been seen to latch - wrongly, on the old
-> deadband - but never against a real over-current at the ±9.5 A threshold.
+> deadband - but never against a real over-current at the ±9.75 A threshold.
 >
 > **Two things that look like faults and are not:**
 >
@@ -81,7 +81,7 @@ a calibration.
 >
 > The caution is therefore not "there is no trip". It is this: **the trips are
 > live and have been seen to latch, but never against a real over-current.**
-> The levels (±9.5 A hardware, above the 8 A software trip) have not been
+> The levels (±9.75 A hardware, above the 9 A software trip) have not been
 > measured, so treat the supply's own limit as the protection you trust.
 >
 > Three consequences, all of which matter during calibration because
@@ -573,7 +573,7 @@ Verify the result independently before you trust the unit:
 ## Safety summary
 
 - **The hardware over-current trips are enabled but unproven.** All eight are
-  armed while a slot runs, at ±9.5 A, above the 8 A software trip. No board has
+  armed while a slot runs, at ±9.75 A, above the 9 A software trip. No board has
   been seen to trip. Keep the bench supply's current limit set and stay at the
   bench until one has.
 - **The host watchdog is not over-current protection.** It pauses running

@@ -42,6 +42,15 @@
  * minute the panel returns to the slot list, so an abandoned menu does not
  * sit over the live table.
  *
+ * On the slot list the pane always shows the selected slot's summary: mAh in
+ * big figures, with mWh and minutes beneath in white - counting up live
+ * during a run, holding the end figure after one. Turning moves between
+ * slots with the summary following at once; a press opens the menu.
+ *
+ * Settings can be opened and saved while a slot is PAUSED. The change takes
+ * effect on the resume, which re-applies the slot's limits; the run's
+ * counters carry on untouched.
+ *
  * FAULTS
  * ------
  * A slot that faults raises a dialog over everything, naming the fault and
@@ -103,6 +112,10 @@ static const char *TAG = "display";
 
 /* The menu gives up and returns to the slot list after this much idling. */
 #define MENU_IDLE_MS        60000
+
+/* Scale of the big mAh figure: 4 x 6 px per character, so four digits are
+ * 96 px and fit the 100 px pane; each glyph is 28 px tall. */
+#define BIG_MAH_SCALE       4
 
 /*
  * The unit's latched fault indications. Each holds the slot off until it is
@@ -654,9 +667,10 @@ static const set_def_t k_set_defs[SET_COUNT] = {
     [SET_CAPACITY] = { "Cap",      "mAh", 100, 20000,              0 },
     [SET_CHG_V]    = { "Chg V",    "V",   0, 5000,                 3 },
     [SET_DIS_V]    = { "Cut V",    "V",   0, 5000,                 3 },
-    [SET_CHG_I]    = { "Chg I",    "A",   0, 10000,                3 },
-    [SET_DIS_I]    = { "Dsg I",    "A",   0, 10000,                3 },
-    [SET_TERM_I]   = { "Term I",   "A",   0, 10000,                3 },
+    /* 8000 mA: BTS_UNIT_MAX_CURRENT_A, the highest setpoint the unit takes. */
+    [SET_CHG_I]    = { "Chg I",    "A",   0, 8000,                 3 },
+    [SET_DIS_I]    = { "Dsg I",    "A",   0, 8000,                 3 },
+    [SET_TERM_I]   = { "Term I",   "A",   0, 8000,                 3 },
     [SET_TEMP_MAX] = { "T max",    "C",   0, 1000,                 1 },
     [SET_TIME_MAX] = { "Time",     "min", 0, 2880,                 0 },
     [SET_RECHARGE] = { "Rechg",    "",    0, 1,                    0 },
@@ -731,8 +745,21 @@ static bool slot_is_faulted(const slot_status_t *st)
 static const char *fault_text(const slot_status_t *st)
 {
     if (st->state != SLOT_STATE_FAULT) {
-        return (st->status_bits & BTS_STATUS_OVERCURRENT) ? "Over-current trip"
-                                                          : "Group disconnect";
+        /*
+         * Named by the bit that is actually up, with no default. This used to
+         * fall through to "Group disconnect" for anything that was not an
+         * over-current - and since the dialog is redrawn from live status,
+         * a dialog left open after the slot recovered (a cleared trip, a run
+         * that started) read "Group disconnect" over a slot that was running
+         * normally. Seen on the bench 2026-11-10.
+         */
+        if (st->status_bits & BTS_STATUS_OVERCURRENT) {
+            return "Over-current trip";
+        }
+        if (st->status_bits & BTS_STATUS_GROUP_DISCONNECT) {
+            return "Group disconnect";
+        }
+        return "Cleared";
     }
     switch (st->fault) {
     case SLOT_FAULT_OVER_TEMP:     return "Over temperature";
@@ -746,6 +773,8 @@ static const char *fault_text(const slot_status_t *st)
     case SLOT_FAULT_NO_CELL:       return "No cell";
     case SLOT_FAULT_CELL_REVERSED: return "Cell reversed";
     case SLOT_FAULT_COMMS:         return "Command failed";
+    case SLOT_FAULT_OVER_VOLTAGE:  return "Over voltage";
+    case SLOT_FAULT_DISCONNECT:    return "Cell disconnect";
     default:                       return slot_fault_name(st->fault);
     }
 }
@@ -1014,6 +1043,12 @@ static void setting_text(set_item_t item, int32_t v, char *buf, size_t len)
  * voltages and currents. Turning faster moves tens, hundreds, then
  * thousands, so crossing 4 V takes a spin rather than four thousand clicks.
  * The thresholds are in detents per second, measured by input.c.
+ *
+ * Toned down on 2026-11-11 - the operator found it accelerated too quickly.
+ * Every gear now needs about twice the speed it did (6/14/28 became
+ * 12/26/48 detents/s), and the rate itself builds about three times more
+ * slowly (RATE_ALPHA in input.c), so a step change takes a sustained spin
+ * rather than a flick.
  */
 static int32_t accel_step(set_item_t item, float rate_dps)
 {
@@ -1021,11 +1056,11 @@ static int32_t accel_step(set_item_t item, float rate_dps)
         return 1;
     }
     int32_t step;
-    if (rate_dps < 6.0f) {
+    if (rate_dps < 12.0f) {
         step = 1;
-    } else if (rate_dps < 14.0f) {
+    } else if (rate_dps < 26.0f) {
         step = 10;
-    } else if (rate_dps < 28.0f) {
+    } else if (rate_dps < 48.0f) {
         step = 100;
     } else {
         step = 1000;
@@ -1367,6 +1402,18 @@ static void on_press(void)
 static void check_faults(void)
 {
     if (s_ui.fault_open) {
+        /*
+         * A dialog over a slot that is no longer faulted is stale: the trip
+         * was cleared from another host, or the run that tripped has been
+         * restarted. Close it rather than leave an alarm over a slot that is
+         * running normally.
+         */
+        slot_status_t open;
+        test_engine_get_status((uint8_t)s_ui.fault_slot, &open);
+        if (!slot_is_faulted(&open)) {
+            s_ui.fault_open = false;
+            s_ui.fault_seen[s_ui.fault_slot] = false;
+        }
         return;
     }
     const bts_unit_status_t u = ui_unit();
@@ -1442,6 +1489,128 @@ static void draw_header(const bts_snapshot_t *snap)
 }
 
 /*
+ * The slot-list pane: the selected slot's summary in big figures.
+ *
+ * Shown whenever the slot list is up. It used to wait behind a "Turn / Press"
+ * hint for 10 s; the operator wanted the figures at once, so turning the knob
+ * now lands straight on the next slot's summary, and only a press opens the
+ * menu. The figure is the one the slot's row already shows - slot_figures() -
+ * so a running slot counts up live and a finished one holds its end figure.
+ * The caption says which.
+ *
+ *   line 0      SLOT n
+ *   line 1      caption - CHARGING, TEST RESULT, ...
+ *   lines 2-3   mAh, 28 px, across two bands
+ *   line 4      "mAh"
+ *   line 5      mWh, double size, white
+ *   line 6      minutes, double size, white
+ *
+ * It spans several row bands, so like the fault dialog it is drawn a band at
+ * a time; draw_pane_line() calls this with the band's own line number.
+ */
+#define BIG_PANE_LINE_LABEL   1     /* what the figure is              */
+#define BIG_PANE_LINE_FIGURE  2     /* the figure, 28 px, two bands    */
+#define BIG_PANE_LINE_UNIT    4     /* "mAh", then mWh and minutes     */
+
+static const char *big_caption(const slot_status_t *st, uint16_t *colour)
+{
+    *colour = C_GREY;
+    switch (st->state) {
+    case SLOT_STATE_CHARGE:
+    case SLOT_STATE_RECHARGE:
+        *colour = C_ORANGE;
+        return st->state == SLOT_STATE_RECHARGE ? "RECHARGING" : "CHARGING";
+    case SLOT_STATE_DISCHARGE:
+        *colour = C_CYAN;
+        return "DISCHARGING";
+    case SLOT_STATE_DIRECT:
+        *colour = st->direct_charge ? C_ORANGE : C_CYAN;
+        return st->direct_charge ? "CHARGING" : "DISCHARGING";
+    case SLOT_STATE_DISCHARGE_REST:
+        return "DISCHG DONE";
+    case SLOT_STATE_COMPLETE:
+        *colour = C_GREEN;
+        return "TEST RESULT";
+    case SLOT_STATE_BTS_PAUSED:
+        *colour = C_YELLOW;
+        return "PAUSED";
+    case SLOT_STATE_FAULT:
+        *colour = C_RED;
+        return "FAULTED AT";
+    case SLOT_STATE_ABORTED:
+        return "STOPPED AT";
+    default:
+        break;
+    }
+    if (st->bts_ended) {
+        *colour = C_GREEN;
+        return "ENDED AT";
+    }
+    return "LAST RUN";
+}
+
+static void draw_big_pane(int line, int y, int band_y, const slot_status_t *sel)
+{
+    char buf[24];
+    float mah, mwh;
+    uint32_t mins;
+    slot_figures(sel, &mah, &mwh, &mins);
+
+    if (line == 0) {
+        snprintf(buf, sizeof(buf), "SLOT %d", s_ui.slot + 1);
+        band_text(PANE_TEXT_X, y + (ROW_H - FONT_H * 2) / 2, band_y, buf, C_CYAN, 2);
+    } else if (line == BIG_PANE_LINE_LABEL) {
+        uint16_t c;
+        const char *cap = big_caption(sel, &c);
+        band_text(PANE_TEXT_X, y + (ROW_H - FONT_H) / 2, band_y, cap, c, 1);
+    }
+
+    /*
+     * The figure crosses the boundary between two bands, so both draw it and
+     * each keeps only its own half - band_char() clips to the band.
+     */
+    if (line == BIG_PANE_LINE_FIGURE || line == BIG_PANE_LINE_FIGURE + 1) {
+        const int fig_y = ROWS_TOP + BIG_PANE_LINE_FIGURE * ROW_H +
+                          (2 * ROW_H - FONT_H * BIG_MAH_SCALE) / 2;
+        /* Four characters at most - "9999", then "10k". */
+        fmt_value(buf, sizeof(buf), mah, 0);
+        int scale = BIG_MAH_SCALE;
+        while (scale > 2 &&
+               (int)strlen(buf) * FONT_CELL_W * scale > s_cfg.width - PANE_X - 2) {
+            scale--;
+        }
+        band_text_centre(PANE_X + (s_cfg.width - PANE_X) / 2,
+                         fig_y + (FONT_H * (BIG_MAH_SCALE - scale)) / 2,
+                         band_y, buf, C_WHITE, scale);
+    }
+
+    if (line == BIG_PANE_LINE_UNIT) {
+        band_text_centre(PANE_X + (s_cfg.width - PANE_X) / 2,
+                         y + (ROW_H - FONT_H * 2) / 2, band_y, "mAh", C_GREY, 2);
+    } else if (line == BIG_PANE_LINE_UNIT + 1 || line == BIG_PANE_LINE_UNIT + 2) {
+        /*
+         * mWh and minutes, at double size and in white so they read from
+         * across the bench. Eight characters at 12 px is 96 px, inside the
+         * 100 px pane, so the unit is dropped to single size only for an
+         * unusually long figure.
+         */
+        char line_txt[24];
+        if (line == BIG_PANE_LINE_UNIT + 1) {
+            char e[12];
+            fmt_value(e, sizeof(e), mwh, 0);
+            snprintf(line_txt, sizeof(line_txt), "%smWh", e);
+        } else {
+            snprintf(line_txt, sizeof(line_txt), "%lumin", (unsigned long)mins);
+        }
+        const int scale = ((int)strlen(line_txt) * FONT_CELL_W * 2 <=
+                           s_cfg.width - PANE_X - 2) ? 2 : 1;
+        band_text_centre(PANE_X + (s_cfg.width - PANE_X) / 2,
+                         y + (ROW_H - FONT_H * scale) / 2, band_y, line_txt,
+                         C_WHITE, scale);
+    }
+}
+
+/*
  * The menu pane occupies x 210..319 and the same rows as the slot table,
  * one menu line per slot row. Drawn inside each slot-row band, so the
  * table and the pane repaint together with no extra pass.
@@ -1460,18 +1629,9 @@ static void draw_pane_line(int line, int y, int band_y, const slot_status_t *sel
 
     switch (s_ui.view) {
     case VIEW_SLOTS:
-        /* The pane is a hint until a slot is picked. */
-        if (line == 0) {
-            snprintf(buf, sizeof(buf), "SLOT %d", s_ui.slot + 1);
-            band_text(PANE_TEXT_X, ty - 3, band_y, buf, C_CYAN, 2);
-        } else if (line == 2) {
-            text = "Turn: slot";
-            colour = C_GREY;
-        } else if (line == 3) {
-            text = "Press: menu";
-            colour = C_GREY;
-        }
-        break;
+        /* The summary, always - a fault dialog draws over it. */
+        draw_big_pane(line, y, band_y, sel);
+        return;
 
     case VIEW_MENU: {
         menu_item_t items[8];

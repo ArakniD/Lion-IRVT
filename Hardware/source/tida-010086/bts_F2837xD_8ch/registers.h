@@ -971,11 +971,37 @@ typedef struct {
 #define BTS_STATE_FLAGS_SHIFT(ch)  ((uint16_t)(ch) * 4U)
 #define BTS_STATE_FLAGS_MASK       0xFUL
 
-// CPU2 -> CPU1 single register mailbox. Lives in CPU2TOCPU1RAM.
+// CPU2 -> CPU1 register-write queue. Lives in CPU2TOCPU1RAM.
+//
+// IT WAS A SINGLE MAILBOX, AND IT DROPPED WRITES. CPU2 posts on every host
+// write, CPU1 drains in its 200 Hz B3 task - up to 15 ms later - and a post
+// that found the previous one not yet taken was simply skipped. The ESP32
+// writes limits and then a mode 30 ms apart, so a slow drain lost the MODE:
+// a resume on 2026-11-12 reached registers[] (eChMode read 16) and never
+// reached modeCallback(), and the slot stayed paused.
+//
+// Now a ring. CPU2 alone writes entries[] and head; CPU1 alone writes tail,
+// which lives in CPU1TOCPU2RAM (ipcAck) to keep the single-writer rule. The
+// IPC flag only wakes CPU1 - the ring is the record. Sixteen entries is far
+// more than any burst a host sends between two B3 passes.
+//
+#define BTS_IPC_QUEUE_LEN   16U
+
 typedef struct {
     uint16_t  regAddr;   // index into registers[], i.e. byte address / 4
     float32_t value;
+} BTS_ipcEntry;
+
+typedef struct {
+    BTS_ipcEntry       entries[BTS_IPC_QUEUE_LEN];
+    volatile uint16_t  head;     // next slot CPU2 writes; CPU2 only
+    volatile uint16_t  dropped;  // posts refused because the ring was full
 } BTS_ipcMessage;
+
+// CPU1's side of the ring: how far it has consumed. In CPU1TOCPU2RAM.
+typedef struct {
+    volatile uint16_t  tail;
+} BTS_ipcAck;
 
 // CPU1 -> CPU2 status and measurement block. Lives in CPU1TOCPU2RAM.
 // Single writer (CPU1), single reader (CPU2). seq is incremented after a
@@ -1086,6 +1112,36 @@ typedef struct
     /* Set to 1 to enforce updating of internal measurement data */
     /* Set to 2 to enforce updating and save to EEPROM */
     uint16_t  pendingUpdate;
+
+    /*
+     * Soft stop. A planned stop does not cut the gates while the converter
+     * is carrying current: it ramps the reference down to zero, lets the
+     * loop settle there, and only then drops enable_logic. stopRamp_pu is
+     * the fraction of the setpoint still applied, 1.0 when running, and
+     * stopDwell counts the settled passes. stopPending is the request, set
+     * by slotSoftStop() and consumed by serviceSoftStop(). CPU1-local - not
+     * in message RAM.
+     */
+    float32_t stopRamp_pu;
+    uint16_t  stopDwell;
+    uint16_t  stopPending;
+
+    /*
+     * Soft START, the mirror of the above. A start or a resume sets
+     * startRamp_pu to 0.0 and serviceSoftStart() raises it to 1.0 over
+     * BTS_SOFT_START_RAMP_MS, so the CC reference climbs from zero to the
+     * setpoint instead of stepping onto it. CPU1-local - not in message RAM.
+     */
+    float32_t startRamp_pu;
+
+    /*
+     * Set by BTS_updateReference() on the pass a starting slot would have
+     * been released, which it holds tripped instead; the release follows on
+     * the next pass. The extra ~3 ms lets the control ISR write the new seed
+     * duty into the PWM compares while the gates are still forced off - see
+     * BTS_tripEpwm(). Cleared whenever the stage is disabled.
+     */
+    uint16_t  releaseArmed;
 
 }BTS_userInput;
 
@@ -1345,6 +1401,7 @@ extern volatile CAN_data               canData[NUM_CHANNELS];
 extern volatile BTS_cpu1Status         cpu1Status;
 extern volatile uint32_t               startup_mode;
 extern volatile uint32_t               startup_enable;
+extern volatile BTS_ipcAck             ipcAck;
 
 // Access tables (in flash, compiled into both cores):
 extern const RegisterConfig     regConfig[TOTAL_REGISTERS];

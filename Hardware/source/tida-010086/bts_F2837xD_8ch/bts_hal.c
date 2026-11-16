@@ -1846,6 +1846,12 @@ void BTS_HAL_armTripZones(bool arm)
             // settling would otherwise fire the ISR the moment the signal is
             // unmasked, reporting an over-current that never happened.
             //
+            //
+            // The one-shot latch underneath (TZOSTFLG.DCAEVT1) is cleared too.
+            // Clearing TZFLG alone left it set, so a spike during the settle
+            // re-raised the flag the moment the zone was enabled.
+            //
+            EPWM_clearOneShotTripZoneFlag(epwmBase, EPWM_TZ_OST_FLAG_DCAEVT1);
             EPWM_clearTripZoneFlag(epwmBase,
                                    EPWM_TZ_FLAG_DCAEVT1 | EPWM_TZ_INTERRUPT);
             EPWM_enableTripZoneSignals(epwmBase, EPWM_TZ_SIGNAL_DCAEVT1);

@@ -80,8 +80,16 @@ Ten facts that invalidate the obvious guess. Each is confirmed in source.
    termination and the CV loop are not yet. It was CC-only until then, and
    anything that says so is stale.
 
+   **The CV loop can only taper, never reverse.** Its output is clamped to
+   `0 .. ioutRef_pu` and signed by `direction_coeff`, and a discharge never
+   enters CV at all. It used to be clamped to ±`ioutRef_pu` and written
+   unsigned inside the CC/CV hysteresis band, so a discharge at its floor
+   *charged* the cell back to ~0.5 V above `V_MIN`, dropped to CC, sagged,
+   and charged again — never ending, never reaching the ESP32's recharge
+   (seen 2026-11-07, fixed in `BTS_ctrlISR()`).
+
 5. **The hardware over-current trips are live, and they arm on first run.**
-   All eight are enabled at ±9.5 A, above the software trip's ±8 A — layered,
+   All eight are enabled at ±9.75 A, above the software trip's ±9 A — layered,
    not duplicated, so the software path still catches an ordinary
    over-current and the comparator is there for a genuine short.
 

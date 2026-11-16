@@ -30,16 +30,24 @@ proxy can outlive a BTS power cycle, so at startup it cannot know what the
 unit is doing and must not assume the channels are idle. The one exception is
 a slot the BTS reports `PAUSED` — see the watchdog and pause section below.
 
-### The I2C link runs at 50 kHz
+### The I2C link runs at 150 kHz — on a board with the extra pull-ups
 
-`main.c` asks for 100 kHz, but `bts_link.c` sets the device to **50 kHz**,
-and that is what runs. The BTS board pulls the bus up with only 10 kΩ, over a
-ribbon, so rise time — not bandwidth — is the limit: at 100 pF a 10 k
-pull-up takes ~850 ns to rise, against the 1000 ns standard mode allows. The
-ESP32's internal pull-ups are enabled as well. A poll cycle is nine
-transactions, so 50 kHz costs nothing that matters.
+`main.c` asks for 100 kHz, but `bts_link.c` sets the device to **150 kHz**
+(`BTS_I2C_SCL_HZ`), and that is what runs.
 
-At start-up the link tries 50 kHz and 10 kHz, in both pin orders, before
+**This needs a hardware change.** The BTS board pulls SDA and SCL up with
+10 kΩ, over a ribbon. On 2026-11-12 a **4.7 kΩ resistor was added in
+parallel with each**, giving 3.2 kΩ per line. Before that the link ran at
+50 kHz and, with cells fitted and converters switching, still returned
+corrupt reads — values from the wrong registers and flickering status flags.
+The stiffer pull-ups cured it: they rise in ~270 ns at 100 pF instead of
+~850 ns and take three times the coupled noise to disturb.
+
+**On an unmodified board, set `BTS_I2C_SCL_HZ` back to 50000** — at 10 kΩ the
+edges do not make 150 kHz. The ESP32's internal pull-ups are enabled as well.
+A poll cycle is nine transactions, about 30 ms at 150 kHz.
+
+At start-up the link tries the configured speed and 10 kHz, in both pin orders, before
 falling back to the configured pins, so a swapped SDA/SCL or a marginal
 harness still comes up. After any failed transfer the bus is reset
 (`bus_recover()`), and the poll task does **not** scan the bus while the link
@@ -332,6 +340,12 @@ its chemistry. A user-entered capacity always wins, because aged cells are
 the normal case.
 
 Chemistries: **LCO, LTO, LFP, NMC, NCA**.
+
+Default rates: **NMC charges at 1C and discharges at 3C**, so a 2500 mAh
+cell runs 2.5 A in and 7.5 A out and a 3000 mAh cell 3 A in and 8 A out
+(its 9 A 3C capped at the unit's 8 A). **Every chemistry ends a charge at
+10% of nominal capacity** - 0.25 A for a 2500 mAh cell. A rate typed on the
+panel or sent as a C-rate still wins over these.
 
 LTO is the outlier and is worth checking if something looks wrong: 2.4 V
 nominal, 2.8 V max, **1.5 V** cutoff, and it tolerates sub-zero charging.

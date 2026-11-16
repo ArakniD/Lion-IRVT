@@ -10,9 +10,10 @@
  * deliberately NOT the datasheet maximum:
  *
  *   VTC5A and VTC6 are rated 30 A and 20 A continuous respectively, and the
- *   20Q/25R/30R family runs to 15-20 A. The TIDA-010086 channel tops out at
- *   10 A (BTS_CMPSS_FULLSCALE_A in bts_user_settings.h), so every entry is
- *   capped at the unit envelope by cell_profile_to_bts_limits() anyway. The
+ *   20Q/25R/30R family runs to 15-20 A. The TIDA-010086 channel regulates
+ *   at most 8 A (BTS_UNIT_MAX_CURRENT_A, below the C2000's 9 A software
+ *   trip), so every entry is capped at the unit envelope by
+ *   cell_profile_resolve() anyway. The
  *   table keeps the true datasheet figure so that the cap is visible and
  *   auditable rather than silently baked in.
  *
@@ -35,6 +36,17 @@ static const char *NVS_NAMESPACE = "cellchem";
 /* ------------------------------------------------------------------ */
 
 /*
+ * DEFAULT RATES (2026-11-11, operator's standard)
+ *
+ *   NMC        1C charge, 3C discharge - so a 2500 mAh cell runs 2.5 A in
+ *              and 7.5 A out, and a 3000 mAh cell 3 A in and 8 A out (9 A is
+ *              its 3C, capped at the unit's 8 A in cell_profile_resolve()).
+ *   all        charge termination at 10% of nominal capacity - 0.25 A for a
+ *              2500 mAh cell. charge_term_c is 0.10 everywhere.
+ *
+ * The other chemistries keep their rates: the 3C figure is an NMC high-drain
+ * standard and is not safe to assume for LCO or LFP cells generally.
+ *
  * storage_v is the resting voltage at roughly 60% state of charge, which is
  * the shipping state the "recharge to shipping capacity" step targets. It is
  * only used as a sanity bound - the actual target is a coulomb count, not a
@@ -50,7 +62,7 @@ static const cell_chemistry_profile_t k_chemistry[CELL_CHEM_COUNT] = {
         .storage_v = 3.80f,
         .default_charge_c = 0.5f,
         .default_discharge_c = 0.5f,
-        .charge_term_c = 0.05f,
+        .charge_term_c = 0.10f,
         .temp_min_c = 0.0f,
         .temp_max_c = 45.0f,
         .rest_tolerance_pct = 5.0f,
@@ -69,7 +81,7 @@ static const cell_chemistry_profile_t k_chemistry[CELL_CHEM_COUNT] = {
         .storage_v = 2.30f,
         .default_charge_c = 1.0f,
         .default_discharge_c = 1.0f,
-        .charge_term_c = 0.05f,
+        .charge_term_c = 0.10f,
         .temp_min_c = -20.0f,
         .temp_max_c = 55.0f,
         .rest_tolerance_pct = 5.0f,
@@ -83,7 +95,7 @@ static const cell_chemistry_profile_t k_chemistry[CELL_CHEM_COUNT] = {
         .storage_v = 3.30f,
         .default_charge_c = 0.5f,
         .default_discharge_c = 0.5f,
-        .charge_term_c = 0.05f,
+        .charge_term_c = 0.10f,
         .temp_min_c = 0.0f,
         .temp_max_c = 55.0f,
         .rest_tolerance_pct = 5.0f,
@@ -95,9 +107,9 @@ static const cell_chemistry_profile_t k_chemistry[CELL_CHEM_COUNT] = {
         .charge_v_max = 4.20f,
         .discharge_v_min = 2.50f,
         .storage_v = 3.75f,
-        .default_charge_c = 0.5f,
-        .default_discharge_c = 1.0f,
-        .charge_term_c = 0.05f,
+        .default_charge_c = 1.0f,
+        .default_discharge_c = 3.0f,
+        .charge_term_c = 0.10f,
         .temp_min_c = 0.0f,
         .temp_max_c = 60.0f,
         .rest_tolerance_pct = 5.0f,
@@ -117,7 +129,7 @@ static const cell_chemistry_profile_t k_chemistry[CELL_CHEM_COUNT] = {
         .storage_v = 0.0f,
         .default_charge_c = 1.0f,
         .default_discharge_c = 1.0f,
-        .charge_term_c = 0.05f,
+        .charge_term_c = 0.10f,
         .temp_min_c = -20.0f,
         .temp_max_c = 60.0f,
         .rest_tolerance_pct = 5.0f,
@@ -131,7 +143,7 @@ static const cell_chemistry_profile_t k_chemistry[CELL_CHEM_COUNT] = {
         .storage_v = 3.75f,
         .default_charge_c = 0.5f,
         .default_discharge_c = 1.0f,
-        .charge_term_c = 0.05f,
+        .charge_term_c = 0.10f,
         .temp_min_c = 0.0f,
         .temp_max_c = 60.0f,
         .rest_tolerance_pct = 5.0f,
